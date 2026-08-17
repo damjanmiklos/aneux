@@ -60,6 +60,7 @@ def _weighted_total(terms, weights):
 def losses_from_output(out, batch):
     batch_mid = getattr(batch, "pos_mid_batch", None)
     batch_coarse = getattr(batch, "pos_coarse_batch", None)
+    cl_batch = getattr(batch, "cl_dense_batch", None)
     return compute_losses(
         out.x_pred,
         batch.x_true,
@@ -72,10 +73,15 @@ def losses_from_output(out, batch):
         face=_face_from_batch(batch),
         batch_tube=batch.batch,
         delta_x=out.delta_x,
+        delta_r=getattr(out, "delta_r", None),
+        delta_s=getattr(out, "delta_s", None),
         x_pred_mid=out.x_pred_mid,
         batch_mid=batch_mid,
         x_pred_coarse=out.x_pred_coarse,
         batch_coarse=batch_coarse,
+        x_true_cl_dist=getattr(batch, "x_true_cl_dist", None),
+        cl_dense=getattr(batch, "cl_dense", None),
+        cl_dense_batch=cl_batch,
     )
 
 
@@ -247,10 +253,10 @@ def train_model(
             for key, value in val_metrics.items():
                 metrics[f"val_{key}"] = value
 
-            if ckpt_dir and val_metrics["loss"] < best_val:
-                best_val = val_metrics["loss"]
+            if ckpt_dir and val_metrics["recon"] < best_val:
+                best_val = val_metrics["recon"]
                 torch.save(model.state_dict(), os.path.join(ckpt_dir, "best.pt"))
-                print(f"  saved best checkpoint (val {best_val:.4f})")
+                print(f"  saved best checkpoint (val_recon {best_val:.4f})")
 
         if ckpt_dir:
             torch.save(

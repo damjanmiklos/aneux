@@ -4,113 +4,164 @@ from __future__ import annotations
 
 import math
 import os
+import shutil
 import sys
+import tempfile
 import traceback
 
 import numpy as np
+import pyvista as pv
 import torch
-from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import FOLLOW_BATCH, GAMMA_THETA_DIM, GAMMA_U_DIM, K_THETA, K_U, configure_stage1_precision
-from dataset import AneurysmDataset, allocate_ring_counts
+from config import (
+    CACHE_VERSION,
+    FOLLOW_BATCH,
+    GAMMA_THETA_DIM,
+    GAMMA_U_DIM,
+    K_THETA,
+    K_U,
+    LAMBDA_CD_COARSE,
+    LOGVAR_CLAMP,
+    MAX_TRACTS,
+    SA_STAGES,
+    configure_stage1_precision,
+)
+from dataset import (
+    AneurysmDataset,
+    allocate_ring_counts,
+    allocate_token_counts,
+    extract_unique_tracts,
+)
 from geometry import (
     bilinear_cylindrical_upsample,
     fps_metric,
     harmonic_encoding_theta,
     harmonic_encoding_u,
+    intrinsic_spline_pseudo_coords,
     radial_bias_for_zero_init,
-    spline_pseudo_coords,
     upsample_branch_concat,
 )
-from losses import displacement_dirichlet, vae_kl_loss
+from losses import (
+    compute_losses,
+    displacement_dirichlet,
+    displacement_dirichlet_local,
+    vae_kl_loss,
+)
 from model import DecoupledDisplacementHead, GraphVAE
 from ops import bspline_basis_1d, farthest_point_sample_torch, fps_indices
 from train import kl_anneal_weight
 
-
-class _TubeFactory(AneurysmDataset):
-    def __init__(self, radius=2.0):
-        self.tube_radius = radius
+TINY_HIERARCHY = ((8, 4), (16, 8), (32, 16))
+TINY_SA = ((32, 4.0, 8, 32, 1), (8, 8.0, 8, 64, 1))
 
 
-def _straight_branch(n=24, length=20.0):
+def _make_factory(radius=2.0, n_true=64, hierarchy=TINY_HIERARCHY, latent_len=8):
+    ds = AneurysmDataset.__new__(AneurysmDataset)
+    ds.tube_radius = float(radius)
+    ds.n_true = int(n_true)
+    ds.latent_len = int(latent_len)
+    ds.hierarchy = tuple(tuple(lv) for lv in hierarchy)
+    ds.n_length = int(ds.hierarchy[-1][0])
+    ds.n_radial = int(ds.hierarchy[-1][1])
+    ds.samples = []
+    ds.cache_dir = None
+    return ds
+
+
+def _straight_branch(n=24, length=20.0, offset=(3.0, -2.0, 5.0)):
     z = np.linspace(0.0, length, n)
-    return np.stack([np.zeros(n), np.zeros(n), z], axis=1).astype(np.float32)
+    pts = np.stack([np.zeros(n), np.zeros(n), z], axis=1).astype(np.float64)
+    return pts + np.asarray(offset, dtype=np.float64)
+
+
+def _polyline_mesh(pts):
+    pts = np.asarray(pts, dtype=np.float64)
+    if hasattr(pv, "lines_from_points"):
+        return pv.lines_from_points(pts)
+    n = len(pts)
+    lines = np.hstack(([n], np.arange(n, dtype=np.int64)))
+    return pv.PolyData(pts, lines=lines)
+
+
+def _polylines_mesh(paths):
+    meshes = [_polyline_mesh(p) for p in paths]
+    out = meshes[0]
+    for m in meshes[1:]:
+        out = out.merge(m)
+    return out
+
+
+def _y_paths():
+    parent = np.stack([np.zeros(12), np.zeros(12), np.linspace(0.0, 12.0, 12)], axis=1)
+    child_a = np.stack([np.linspace(0.0, 8.0, 10), np.zeros(10), np.full(10, 12.0)], axis=1)
+    child_b = np.stack([np.zeros(10), np.linspace(0.0, 8.0, 10), np.full(10, 12.0)], axis=1)
+    path1 = np.concatenate([parent, child_a[1:]], axis=0)
+    path2 = np.concatenate([parent, child_b[1:]], axis=0)
+    return path1, path2
+
+
+def _tube_cloud(polyline, radius=2.2, n_u=40, n_th=16, sac=False):
+    poly = np.asarray(polyline, dtype=np.float64)
+    seg = np.linalg.norm(np.diff(poly, axis=0), axis=1)
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
+    total = float(cum[-1])
+    if total <= 1e-12:
+        xyz = np.repeat(poly[:1], n_u, axis=0)
+    else:
+        u = np.linspace(0.0, 1.0, n_u)
+        xyz = np.stack([np.interp(u, cum / total, poly[:, d]) for d in range(3)], axis=1)
+    th = np.linspace(0.0, 2.0 * np.pi, n_th, endpoint=False)
+    pts = []
+    for p in xyz:
+        for a in th:
+            pts.append(p + radius * np.array([np.cos(a), np.sin(a), 0.0]))
+    pts = np.asarray(pts, dtype=np.float32)
+    if sac:
+        center = xyz[len(xyz) // 2] + np.array([6.0, 0.0, 0.0])
+        sac_pts = center + 0.4 * np.random.RandomState(0).randn(48, 3)
+        pts = np.concatenate([pts, sac_pts.astype(np.float32)], axis=0)
+    return pts
 
 
 def make_synthetic_data(
     n_true=64,
-    hierarchy=((8, 4), (16, 8), (32, 16)),
+    hierarchy=TINY_HIERARCHY,
     latent_len=8,
     radius=2.0,
+    sac=True,
 ):
-    factory = _TubeFactory(radius=radius)
+    factory = _make_factory(
+        radius=radius, n_true=n_true, hierarchy=hierarchy, latent_len=latent_len
+    )
     branch = _straight_branch()
-    arc = [float(np.sum(np.linalg.norm(np.diff(branch, axis=0), axis=1)))]
-    names = ("coarse", "mid", "fine")
-    levels = {}
-    for name, (nl, nr) in zip(names, hierarchy):
-        levels[name] = factory._generate_level([branch], nl, nr, arc)
+    mesh = _polyline_mesh(branch)
+    vessel = _tube_cloud(branch, sac=sac)
+    return factory.build_scaffold(mesh, vessel_points=vessel)
 
-    fine, mid, coarse = levels["fine"], levels["mid"], levels["coarse"]
-    rng = np.random.RandomState(0)
-    x_true = torch.tensor(fine["pos"].numpy() + 0.1 * rng.randn(*fine["pos"].shape), dtype=torch.float32)
-    if x_true.size(0) >= n_true:
-        x_true = torch.tensor(fps_metric(x_true.numpy(), n_true), dtype=torch.float32)
-    else:
-        reps = int(math.ceil(n_true / x_true.size(0)))
-        x_true = x_true.repeat(reps, 1)[:n_true]
 
-    cl_xyz = fine["cl_dense"].numpy()
-    cl_u = fine["cl_dense_u"].numpy()
-    cl_pos = factory._resample_centerline(cl_xyz, cl_u, latent_len)
-    cl_dense = torch.cat([fine["cl_dense"], fine["cl_dense_u"].unsqueeze(-1)], dim=-1)
-
-    return Data(
-        x=fine["pos"],
-        edge_index=fine["edge_index"],
-        face=fine["face"],
-        u=fine["u"],
-        u_local=fine["u_local"],
-        theta=fine["theta"],
-        normal=fine["normal"],
-        tangent=fine["tangent"],
-        binormal=fine["binormal"],
-        pos_mid=mid["pos"],
-        edge_index_mid=mid["edge_index"],
-        face_mid=mid["face"],
-        u_mid=mid["u"],
-        theta_mid=mid["theta"],
-        normal_mid=mid["normal"],
-        tangent_mid=mid["tangent"],
-        binormal_mid=mid["binormal"],
-        pos_coarse=coarse["pos"],
-        edge_index_coarse=coarse["edge_index"],
-        face_coarse=coarse["face"],
-        u_coarse=coarse["u"],
-        theta_coarse=coarse["theta"],
-        normal_coarse=coarse["normal"],
-        tangent_coarse=coarse["tangent"],
-        binormal_coarse=coarse["binormal"],
-        x_true=x_true,
-        cl_pos=cl_pos,
-        cl_dense=cl_dense,
-        branch_nl_fine=fine["branch_nl"],
-        branch_nl_mid=mid["branch_nl"],
-        branch_nl_coarse=coarse["branch_nl"],
-        n_radial_fine=fine["n_radial"],
-        n_radial_mid=mid["n_radial"],
-        n_radial_coarse=coarse["n_radial"],
-        origin_shift=torch.zeros(3, dtype=torch.float32),
+def _tiny_model(latent_len=8, latent_dim=8):
+    return GraphVAE(
+        latent_dim=latent_dim,
+        latent_len=latent_len,
+        hidden_dim=16,
+        tube_radius=2.0,
+        sa_stages=TINY_SA,
     )
 
 
 def _assert(cond, msg):
     if not cond:
         raise AssertionError(msg)
+
+
+def test_config_contracts():
+    _assert(SA_STAGES[-1][0] == 64, f"last SA n_out {SA_STAGES[-1][0]}")
+    _assert(LOGVAR_CLAMP == (-8.0, 2.0), LOGVAR_CLAMP)
+    _assert(LAMBDA_CD_COARSE <= 0.05 + 1e-12, LAMBDA_CD_COARSE)
+    _assert(CACHE_VERSION >= 4, CACHE_VERSION)
 
 
 def test_fourier_shapes():
@@ -122,12 +173,10 @@ def test_fourier_shapes():
     _assert(gu.shape == (11, GAMMA_U_DIM), f"γ(u) shape {gu.shape}")
     _assert(gt.shape == (12, GAMMA_THETA_DIM), f"γ(θ) shape {gt.shape}")
     _assert(torch.isfinite(gu).all() and torch.isfinite(gt).all(), "non-finite Fourier")
-    # Highest frequency bands at the interval endpoints must stay finite in FP32.
     u_hi = torch.tensor([0.0, 0.5, 1.0], dtype=torch.float32)
     th_hi = torch.tensor([-math.pi, 0.0, math.pi], dtype=torch.float32)
     _assert(torch.isfinite(harmonic_encoding_u(u_hi)).all(), "γ(u) max-band")
     _assert(torch.isfinite(harmonic_encoding_theta(th_hi)).all(), "γ(θ) max-band")
-    # Periodicity in θ for the lowest band.
     th0 = torch.tensor([-math.pi, math.pi - 1e-6])
     gt0 = harmonic_encoding_theta(th0)
     _assert((gt0[0] - gt0[1]).abs().max() < 1e-3, "θ encoding should be nearly 2π-periodic")
@@ -146,11 +195,16 @@ def test_kl_and_anneal():
 
 
 def test_pseudo_coords_range():
-    pos = torch.tensor([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 3.0, 0.0]])
-    ei = torch.tensor([[0, 1, 0, 2], [1, 0, 2, 0]])
-    e = spline_pseudo_coords(pos, ei, r_edge_max=2.0)
+    data = make_synthetic_data(sac=False)
+    e = intrinsic_spline_pseudo_coords(
+        data.u, data.theta, data.tract_id, data.edge_index, data.u_step
+    )
     _assert(e.dtype == torch.float32, "pseudo dtype")
     _assert(e.min() >= 0.0 and e.max() <= 1.0, f"pseudo coords out of [0,1]: {e.min()}, {e.max()}")
+    src, dst = data.edge_index
+    same = data.tract_id[src] == data.tract_id[dst]
+    _assert(bool(same.all()), "synthetic single tract should have no cross-tract edges")
+    _assert(torch.allclose(e[:, 2], torch.full((e.size(0),), 0.5)), "same-tract kind channel")
 
 
 def test_bilinear_identity_and_wrap():
@@ -159,7 +213,6 @@ def test_bilinear_identity_and_wrap():
     out = bilinear_cylindrical_upsample(field, nl, nr, nl, nr)
     _assert(torch.allclose(out, field, atol=1e-5), "identity upsample failed")
 
-    # A spike on the last radial index should wrap to the first on a finer grid.
     src = torch.zeros(2, 4, 1)
     src[0, 0, 0] = 1.0
     src[0, 3, 0] = 1.0
@@ -172,8 +225,8 @@ def test_bilinear_identity_and_wrap():
 
 
 def test_bishop_frames_orthonormal():
-    factory = _TubeFactory(radius=2.0)
-    tube = factory._generate_branch_tube(_straight_branch(), n_length_branch=12, n_radial=6)
+    factory = _make_factory()
+    tube = factory._generate_branch_tube(_straight_branch(offset=(0.0, 0.0, 0.0)), 12, 6)
     n_v, t_v, b_v = tube["n_v"], tube["t_v"], tube["b_v"]
     _assert(n_v.dtype == np.float64, f"Bishop n dtype {n_v.dtype}")
     _assert(np.allclose(np.linalg.norm(n_v, axis=1), 1.0, atol=1e-5), "n not unit")
@@ -182,16 +235,12 @@ def test_bishop_frames_orthonormal():
     _assert(np.allclose((n_v * t_v).sum(1), 0.0, atol=1e-4), "n·t")
     _assert(np.allclose((n_v * b_v).sum(1), 0.0, atol=1e-4), "n·b")
     _assert(np.allclose((t_v * b_v).sum(1), 0.0, atol=1e-4), "t·b")
-    # Right-handed: n × t should align with... t × n = b? stored t, n, b:
-    # n_v × t_v should be related to b. Local basis (t, n, b) at centerline;
-    # vertex: t_v, n_v, b_v should be right-handed.
     cross = np.cross(n_v, t_v)
-    # n × t = n × tangent; for θ=0, n_v=n, t_v=t, n×t = -t×n = -b. Sign depends.
     _assert(np.allclose(np.abs((cross * b_v).sum(1)), 1.0, atol=1e-4), "frame not orthonormal triad")
     _assert(tube["theta"].min() >= -np.pi - 1e-6 and tube["theta"].max() < np.pi + 1e-6, "θ range")
 
-    arc = [float(np.sum(np.linalg.norm(np.diff(_straight_branch(), axis=0), axis=1)))]
-    level = factory._generate_level([_straight_branch()], 12, 6, arc)
+    dense = factory._fit_dense_tract(_straight_branch(offset=(0.0, 0.0, 0.0)))
+    level = factory._generate_level([dense], 12, 6, [float(dense["arc"])])
     n, t, b = level["normal"], level["tangent"], level["binormal"]
     _assert(n.dtype == torch.float32, "packed normal dtype")
     _assert(float((n * t).sum(-1).abs().max()) < 1e-4, "packed n·t")
@@ -216,6 +265,8 @@ def test_fps_cuda_path():
     _assert(idx_cpu.min() >= 0 and idx_cpu.max() < 128, "CPU FPS out of range")
     idx_loop = farthest_point_sample_torch(pts, 16)
     _assert(idx_loop.numel() == 16, idx_loop.shape)
+    start = int((pts - pts.mean(0)).pow(2).sum(-1).argmax())
+    _assert(int(idx_loop[0]) == start, "FPS start")
     if not torch.cuda.is_available():
         return
     pts_g = pts.cuda()
@@ -245,11 +296,35 @@ def test_ball_query_index_order():
         _assert(int(got_g[0].max()) < 4 and int(got_g[1].max()) < 2, got_g)
 
 
+def test_radius_all_in_ball():
+    from ops import _ball_query_torch
+
+    ang = torch.linspace(0, 2 * math.pi, 9)[:-1]
+    support = torch.stack([torch.cos(ang), torch.sin(ang)], dim=-1)
+    query = torch.zeros(1, 2)
+    sb = torch.zeros(8, dtype=torch.long)
+    qb = torch.zeros(1, dtype=torch.long)
+    ei = _ball_query_torch(support, query, 1.1, sb, qb, 256)
+    _assert(ei.size(1) == 8, f"expected all 8 neighbors, got {ei.size(1)}")
+    ei_cap = _ball_query_torch(support, query, 1.1, sb, qb, 3)
+    _assert(ei_cap.size(1) == 3, f"cap should keep 3 nearest, got {ei_cap.size(1)}")
+
+
 def test_allocate_rings():
-    alloc = allocate_ring_counts(40, [10.0, 10.0])
-    _assert(len(alloc) == 2 and min(alloc) >= 2, alloc)
-    alloc2 = allocate_ring_counts(10, [1.0, 1.0, 1.0, 1.0, 1.0])
-    _assert(len(alloc2) == 5, alloc2)
+    cases = [
+        (40, [10.0, 10.0]),
+        (250, [1.0, 2.0, 3.0]),
+        (1000, [5.0, 5.0, 5.0]),
+        (10, [1.0, 1.0, 1.0, 1.0, 1.0]),
+    ]
+    for n_len, arcs in cases:
+        alloc = allocate_ring_counts(n_len, arcs)
+        _assert(len(alloc) == len(arcs), alloc)
+        _assert(sum(alloc) == n_len, f"ring counts {alloc} sum to {sum(alloc)} != {n_len}")
+        _assert(min(alloc) >= 1, alloc)
+    alloc, n_junc = allocate_token_counts(64, [10.0, 10.0, 5.0], 2)
+    _assert(sum(alloc) + n_junc == 64, (alloc, n_junc))
+    _assert(n_junc == 2, n_junc)
 
 
 def test_decoupled_head_no_inversion():
@@ -276,21 +351,131 @@ def test_bspline_partition_of_unity():
 def test_dirichlet_zero_on_rigid():
     delta = torch.ones(5, 3)
     ei = torch.tensor([[0, 1, 2], [1, 2, 3]])
-    loss = displacement_dirichlet(delta, ei)
-    _assert(float(loss) < 1e-8, "uniform displacement should have zero Dirichlet energy")
+    _assert(float(displacement_dirichlet(delta, ei)) < 1e-8, "uniform Δx should have zero energy")
+    dr = torch.ones(5, 1)
+    ds = torch.zeros(5, 2)
+    _assert(float(displacement_dirichlet_local(dr, ds, ei)) < 1e-8, "uniform Δr should have zero energy")
+
+
+def test_unique_tracts_from_overlapping_paths():
+    mesh = _polylines_mesh(list(_y_paths()))
+    tracts, endpoints, junctions = extract_unique_tracts(mesh)
+    _assert(len(tracts) == 3, f"expected 3 unique tracts, got {len(tracts)}")
+    _assert(len(endpoints) == 3, endpoints)
+    _assert(len(junctions) >= 1, "expected a junction node")
+
+
+def test_tree_token_mask():
+    factory = _make_factory(latent_len=16)
+    paths = _y_paths()
+    data = factory.build_scaffold(_polylines_mesh(list(paths)), vessel_points=_tube_cloud(paths[0]))
+    n_tracts = int(data.n_tracts)
+    _assert(n_tracts >= 2, f"Y-junction should have ≥2 tracts, got {n_tracts}")
+    _assert(tuple(data.token_attend.shape) == (16, MAX_TRACTS), data.token_attend.shape)
+    attend = data.token_attend.cpu().numpy()
+    tract_ids = data.latent_tract_id.cpu().numpy()
+    is_junc = data.latent_is_junction.cpu().numpy()
+    for tid in range(n_tracts):
+        _assert(bool(attend[:, tid].any()), f"tract {tid} has no attending tokens")
+    exclusive = (tract_ids == 0) & (is_junc == 0)
+    _assert(bool(exclusive.any()), "expected exclusive tract-0 tokens")
+    slot0 = int(np.where(exclusive)[0][0])
+    _assert(not bool(attend[slot0, 1]), "tract-0 token must not attend tract 1")
+    node_t = int(data.tract_id[0].item())
+    foreign = [t for t in range(n_tracts) if t != node_t]
+    if foreign:
+        foreign_ex = (tract_ids == foreign[0]) & (is_junc == 0)
+        if foreign_ex.any():
+            slot_f = int(np.where(foreign_ex)[0][0])
+            _assert(not bool(attend[slot_f, node_t]), "foreign exclusive token attends this tract")
+
+
+def test_pose_roundtrip():
+    data = make_synthetic_data(sac=False)
+    R = data.pose_R.numpy()
+    _assert(np.allclose(R.T @ R, np.eye(3), atol=1e-4), "R not orthogonal")
+    _assert(abs(float(np.linalg.det(R)) - 1.0) < 1e-3, f"det R {np.linalg.det(R)}")
+    origin = data.origin_shift.numpy()
+    x_can = data.x[:8].numpy()
+    x_world = x_can @ R.T + origin
+    x_back = (x_world - origin) @ R
+    _assert(np.allclose(x_can, x_back, atol=1e-4), "pose round-trip failed")
+
+
+def test_hybrid_far_points():
+    data = make_synthetic_data(sac=True)
+    _assert(data.x_true.size(0) == 64, data.x_true.shape)
+    _assert(data.x_true_cl_dist.numel() == 64, data.x_true_cl_dist.shape)
+    _assert(float(data.x_true_cl_dist.max()) > 2.0, "expected far-from-CL oversample")
+
+
+def test_cache_hit():
+    factory = _make_factory()
+    factory.cache_dir = tempfile.mkdtemp(prefix="aneux_cache_")
+    factory.samples = [{"dataset_id": "synthetic0", "vessel_file": "n/a", "centerline_file": "n/a"}]
+    built = {"n": 0}
+
+    def _build(_sample):
+        built["n"] += 1
+        return make_synthetic_data(sac=False)
+
+    factory._build_data = _build
+    try:
+        a = factory[0]
+        b = factory[0]
+        _assert(built["n"] == 1, f"cache missed, built {built['n']} times")
+        _assert(a.x.shape == b.x.shape, "cached shape")
+        _assert(int(b.cache_version) == CACHE_VERSION, "cache version")
+        path = factory._cache_path("synthetic0")
+        stale = make_synthetic_data(sac=False)
+        stale.cache_version = torch.tensor(-1)
+        torch.save(stale, path)
+        _ = factory[0]
+        _assert(built["n"] == 2, "stale cache_version should rebuild")
+    finally:
+        shutil.rmtree(factory.cache_dir, ignore_errors=True)
+
+
+def test_batch_inc():
+    d1 = make_synthetic_data(sac=False)
+    d2 = make_synthetic_data(sac=False)
+    loader = DataLoader([d1, d2], batch_size=2, follow_batch=FOLLOW_BATCH)
+    batch = next(iter(loader))
+    _assert(batch.num_graphs == 2, batch.num_graphs)
+    _assert(int(batch.edge_index.max()) < batch.x.size(0), "fine edge __inc__")
+    _assert(int(batch.edge_index_mid.max()) < batch.pos_mid.size(0), "mid edge __inc__")
+    _assert(int(batch.edge_index_coarse.max()) < batch.pos_coarse.size(0), "coarse edge __inc__")
+    _assert(int(batch.face.max()) < batch.x.size(0), "fine face __inc__")
+    _assert(int(batch.face_mid.max()) < batch.pos_mid.size(0), "mid face __inc__")
+    _assert(int(batch.face_coarse.max()) < batch.pos_coarse.size(0), "coarse face __inc__")
+    model = _tiny_model()
+    model.eval()
+    with torch.no_grad():
+        out = model(batch)
+    _assert(out.mu.shape[0] == 2, out.mu.shape)
+    _assert(out.x_pred.size(0) == batch.x.size(0), "batched pred nodes")
+    _assert(out.logvar.min() >= LOGVAR_CLAMP[0] - 1e-5, out.logvar.min())
+    _assert(out.logvar.max() <= LOGVAR_CLAMP[1] + 1e-5, out.logvar.max())
+
+
+def test_scaffold_decode_without_vessel():
+    factory = _make_factory()
+    data = factory.build_scaffold_from_centerline(_polyline_mesh(_straight_branch()))
+    _assert(data.x_true.size(0) == 1, "Stage-2 scaffold should not require GT surface")
+    model = _tiny_model()
+    model.eval()
+    z = torch.zeros(1, 8, 8)
+    with torch.no_grad():
+        x = model.decode(z, data)
+    _assert(x.shape == data.x.shape, "decode contract shape")
+    _assert(torch.isfinite(x).all(), "non-finite decode")
 
 
 def test_forward_backward():
     data = make_synthetic_data()
     loader = DataLoader([data], batch_size=1, follow_batch=FOLLOW_BATCH)
     batch = next(iter(loader))
-    model = GraphVAE(
-        latent_dim=8,
-        latent_len=8,
-        hidden_dim=16,
-        tube_radius=2.0,
-        sa_stages=((32, 4.0, 8, 32, 1), (8, 8.0, 8, 64, 1)),
-    )
+    model = _tiny_model()
     model.train()
     out = model(batch)
     _assert(out.x_pred.shape == batch.x.shape, f"pred {out.x_pred.shape} vs {batch.x.shape}")
@@ -299,6 +484,8 @@ def test_forward_backward():
     _assert(out.z.shape == (1, 8, 8), f"z {out.z.shape}")
     _assert(out.x_pred_coarse.shape == batch.pos_coarse.shape, "coarse pred")
     _assert(out.x_pred_mid.shape == batch.pos_mid.shape, "mid pred")
+    _assert(out.delta_r.shape[0] == batch.x.size(0), "delta_r")
+    _assert(out.delta_s.shape == (batch.x.size(0), 2), "delta_s")
     _assert(torch.isfinite(out.x_pred).all(), "non-finite prediction")
     _assert(out.x_pred.dtype == torch.float32, "pred dtype")
     _assert(out.mu.dtype == torch.float32 and out.logvar.dtype == torch.float32, "latent dtype")
@@ -306,13 +493,27 @@ def test_forward_backward():
     for p in model.parameters():
         _assert(p.dtype == torch.float32, f"param dtype {p.dtype}")
 
-    from losses import compute_losses
-
     terms = compute_losses(
-        out.x_pred, batch.x_true, out.mu, out.logvar, batch.x, batch.edge_index,
-        batch.x_true_batch, batch.num_graphs, face=batch.face, batch_tube=batch.batch,
-        delta_x=out.delta_x, x_pred_mid=out.x_pred_mid, batch_mid=batch.pos_mid_batch,
-        x_pred_coarse=out.x_pred_coarse, batch_coarse=batch.pos_coarse_batch,
+        out.x_pred,
+        batch.x_true,
+        out.mu,
+        out.logvar,
+        batch.x,
+        batch.edge_index,
+        batch.x_true_batch,
+        batch.num_graphs,
+        face=batch.face,
+        batch_tube=batch.batch,
+        delta_x=out.delta_x,
+        delta_r=out.delta_r,
+        delta_s=out.delta_s,
+        x_pred_mid=out.x_pred_mid,
+        batch_mid=batch.pos_mid_batch,
+        x_pred_coarse=out.x_pred_coarse,
+        batch_coarse=batch.pos_coarse_batch,
+        x_true_cl_dist=batch.x_true_cl_dist,
+        cl_dense=batch.cl_dense,
+        cl_dense_batch=batch.cl_dense_batch,
     )
     loss = terms["recon"] + 0.001 * terms["kl"] + 0.1 * terms["disp"] + 0.05 * terms["lap"] + 0.02 * terms["norm"]
     loss.backward()
@@ -337,17 +538,48 @@ def test_stage1_precision_flags():
 
 def test_synthetic_data_fp32():
     data = make_synthetic_data()
-    for name in ("x", "x_true", "cl_pos", "cl_dense", "pos_mid", "pos_coarse", "u", "theta", "normal"):
+    for name in (
+        "x",
+        "x_true",
+        "x_true_cl_dist",
+        "latent_pos",
+        "cl_dense",
+        "pos_mid",
+        "pos_coarse",
+        "u",
+        "theta",
+        "normal",
+        "pose_R",
+        "origin_shift",
+    ):
         t = getattr(data, name)
         _assert(t.dtype == torch.float32, f"{name} dtype {t.dtype}")
     _assert(data.edge_index.dtype == torch.long, "edge_index dtype")
     _assert(data.face.dtype == torch.long, "face dtype")
+    _assert(data.token_attend.dtype == torch.bool, data.token_attend.dtype)
+    _assert(not hasattr(data, "cl_pos") or getattr(data, "cl_pos") is None, "cl_pos should be gone")
+
+
+def test_stratified_split_keeps_train():
+    from aneuxai import stratified_split
+
+    class Dummy:
+        samples = [{"location": "ICA pcom"}] * 4 + [{"location": "ICA oph"}]
+
+        def __len__(self):
+            return len(self.samples)
+
+    train, val = stratified_split(Dummy(), 0.15, 0)
+    _assert(len(train) >= 1 and len(val) >= 1, (len(train), len(val)))
+    oph = [i for i, s in enumerate(Dummy.samples) if s["location"] == "ICA oph"][0]
+    _assert(oph in train.indices, "singleton location should stay in train")
 
 
 def main():
     configure_stage1_precision()
     tests = [
         test_stage1_precision_flags,
+        test_config_contracts,
         test_synthetic_data_fp32,
         test_fourier_shapes,
         test_kl_and_anneal,
@@ -357,10 +589,19 @@ def main():
         test_fps_count,
         test_fps_cuda_path,
         test_ball_query_index_order,
+        test_radius_all_in_ball,
         test_allocate_rings,
         test_decoupled_head_no_inversion,
         test_bspline_partition_of_unity,
         test_dirichlet_zero_on_rigid,
+        test_unique_tracts_from_overlapping_paths,
+        test_tree_token_mask,
+        test_pose_roundtrip,
+        test_hybrid_far_points,
+        test_cache_hit,
+        test_batch_inc,
+        test_scaffold_decode_without_vessel,
+        test_stratified_split_keeps_train,
         test_forward_backward,
     ]
     failed = 0

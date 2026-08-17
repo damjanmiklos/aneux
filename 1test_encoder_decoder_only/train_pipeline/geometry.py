@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from config import EDGE_MAX_MM, K_THETA, K_U
+from config import K_THETA, K_U
 
 
 def harmonic_encoding_u(u: Tensor, k_u: int = K_U) -> Tensor:
@@ -27,19 +27,38 @@ def harmonic_encoding_theta(theta: Tensor, k_theta: int = K_THETA) -> Tensor:
     return torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)
 
 
-def spline_pseudo_coords(
-    pos: Tensor,
-    edge_index: Tensor,
-    r_edge_max: float = EDGE_MAX_MM,
-) -> Tensor:
-    """Open-spline pseudo-coordinates in [0, 1]^3 from rest-pose tube edges.
+def wrap_pi(delta: Tensor) -> Tensor:
+    """Wrap angle differences into (-π, π]."""
+    return torch.remainder(delta + math.pi, 2.0 * math.pi) - math.pi
 
-    e_ij = 0.5 + 0.5 * clamp((x_j - x_i) / (2 r_edge_max), -1, 1)
+
+def intrinsic_spline_pseudo_coords(
+    u: Tensor,
+    theta: Tensor,
+    tract_id: Tensor,
+    edge_index: Tensor,
+    u_step: Tensor,
+) -> Tensor:
+    """Open-spline pseudo-coordinates in [0, 1]^3 from intrinsic (Δu, Δθ, kind).
+
+    Δu is scaled so one longitudinal ring step maps to the cube edge.
+    Δθ is wrapped to [-π, π] and mapped to [0, 1].
+    The third channel is 0.5 on same-tract edges and 0 on any cross-tract edge.
     """
-    pos = pos.to(dtype=torch.float32)
+    u = u.to(dtype=torch.float32).reshape(-1)
+    theta = theta.to(dtype=torch.float32).reshape(-1)
+    u_step = u_step.to(dtype=torch.float32).reshape(-1).clamp_min(1e-4)
     src, dst = edge_index[0], edge_index[1]
-    delta = (pos[dst] - pos[src]) / (2.0 * r_edge_max)
-    return 0.5 + 0.5 * delta.clamp(-1.0, 1.0)
+    du = u[dst] - u[src]
+    step = torch.maximum(u_step[src], u_step[dst])
+    e_u = 0.5 + 0.5 * (du / step).clamp(-1.0, 1.0)
+
+    dth = wrap_pi(theta[dst] - theta[src])
+    e_th = 0.5 + 0.5 * (dth / math.pi).clamp(-1.0, 1.0)
+
+    same = (tract_id[src] == tract_id[dst]).to(dtype=torch.float32)
+    e_kind = 0.5 * same
+    return torch.stack([e_u, e_th, e_kind], dim=-1)
 
 
 def vertex_frames(theta: Tensor, n_cl: Tensor, t_cl: Tensor, b_cl: Tensor):
@@ -96,7 +115,6 @@ def bilinear_cylindrical_upsample(
         i1 = i0 + 1
         wu = (u_idx - i0.to(dtype)).reshape(-1, 1, 1)
 
-    # Radial samples are equally spaced on the circle; wrap with modulo.
     j_idx = (
         torch.arange(n_radial_dst, device=device, dtype=dtype) * (n_radial_src / n_radial_dst)
     )
@@ -141,22 +159,31 @@ def upsample_branch_concat(
     return torch.cat(pieces, dim=0)
 
 
+def _centroid_start_index(pts: np.ndarray) -> int:
+    c = pts.mean(axis=0)
+    return int(np.argmax(np.linalg.norm(pts - c, axis=1)))
+
+
 def fps_metric(points: np.ndarray, n_samples: int) -> np.ndarray:
-    """Metric-space farthest point sampling in millimetres. Returns [n_samples, 3]."""
+    """Metric-space FPS starting at the point farthest from the centroid."""
     pts = np.asarray(points, dtype=np.float32)
     n = int(pts.shape[0])
     if n == 0:
         raise ValueError("Cannot FPS an empty point set")
     k = min(int(n_samples), n)
 
-    pts_t = torch.from_numpy(pts).unsqueeze(0)
+    start = _centroid_start_index(pts)
     try:
         from pytorch3d.ops import sample_farthest_points
 
-        sampled, _ = sample_farthest_points(pts_t, K=k, random_start_point=False)
+        swapped = pts.copy()
+        swapped[[0, start]] = swapped[[start, 0]]
+        sampled, _ = sample_farthest_points(
+            torch.from_numpy(swapped).unsqueeze(0), K=k, random_start_point=False
+        )
         sampled = sampled.squeeze(0).numpy()
     except Exception:
-        sampled = _fps_numpy(pts, k)
+        sampled = _fps_numpy(pts, k, start=start)
 
     if sampled.shape[0] < n_samples:
         reps = int(math.ceil(n_samples / sampled.shape[0]))
@@ -164,16 +191,26 @@ def fps_metric(points: np.ndarray, n_samples: int) -> np.ndarray:
     return sampled.astype(np.float32)
 
 
-def _fps_numpy(pts: np.ndarray, k: int) -> np.ndarray:
+def _fps_numpy(pts: np.ndarray, k: int, start: int = 0) -> np.ndarray:
     n = pts.shape[0]
     selected = np.empty(k, dtype=np.int64)
-    selected[0] = 0
+    selected[0] = int(start)
     dist = np.full(n, np.inf, dtype=np.float64)
     for i in range(1, k):
         last = pts[selected[i - 1]]
         dist = np.minimum(dist, np.linalg.norm(pts - last, axis=1))
         selected[i] = int(np.argmax(dist))
     return pts[selected]
+
+
+def point_to_polyline_dist(points: np.ndarray, polyline: np.ndarray) -> np.ndarray:
+    """Nearest distance from each point to a concatenation of polyline vertices."""
+    pts = np.asarray(points, dtype=np.float64)
+    cl = np.asarray(polyline, dtype=np.float64)
+    if cl.shape[0] == 0:
+        return np.full(pts.shape[0], np.inf, dtype=np.float64)
+    d = np.linalg.norm(pts[:, None, :] - cl[None, :, :], axis=2)
+    return d.min(axis=1)
 
 
 def radial_bias_for_zero_init(r_margin: float) -> float:

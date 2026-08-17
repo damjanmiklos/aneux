@@ -252,8 +252,14 @@ def generate_vtp_for_sample(target_patient_id, output_filename=None):
     print(f"Creating VTP file: {output_filename}")
     faces_np = _faces_np(data)
     origin = data.origin_shift.to(x_pred.device).reshape(1, 3)
-    tensor_to_vtp(x_pred + origin, faces_np, output_filename)
+    pose_R = getattr(data, "pose_R", None)
+    x_world = x_pred
+    if pose_R is not None:
+        R = pose_R.to(x_pred.device).reshape(3, 3)
+        x_world = x_pred @ R.t()
+    tensor_to_vtp(x_world + origin, faces_np, output_filename)
     print("Done!")
 
-# Example usage (Uncomment and change patient ID to run):
-generate_vtp_for_sample("SNF00000419")
+
+if __name__ == "__main__":
+    generate_vtp_for_sample("SNF00000419")

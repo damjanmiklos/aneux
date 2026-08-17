@@ -26,7 +26,9 @@ configure_stage1_precision()
 # --- Scaffold / data ---
 TUBE_RADIUS_MM = 2.0
 N_TRUE = 4096
-CACHE_VERSION = 3
+N_TRUE_FAR_FRAC = 0.5
+FAR_CL_MARGIN_MM = 1.0
+CACHE_VERSION = 4
 
 # (n_length, n_radial) per hierarchy level
 LEVEL_COARSE = (40, 6)
@@ -35,6 +37,9 @@ LEVEL_FINE = (1000, 50)
 HIERARCHY_LEVELS = (LEVEL_COARSE, LEVEL_MID, LEVEL_FINE)
 
 MIN_RINGS_PER_BRANCH = 2
+MAX_TRACTS = 16
+MIN_TOKENS_PER_TRACT = 2
+DENSE_CL_SPACING_MM = 0.2
 
 # --- Intrinsic Fourier encodings ---
 K_U = 8
@@ -42,19 +47,20 @@ K_THETA = 6
 GAMMA_U_DIM = 2 * K_U  # 16
 GAMMA_THETA_DIM = 2 * K_THETA  # 12
 
-# --- Latent trajectory ---
+# --- Latent trajectory (tree-valued; LATENT_LEN includes junction tokens) ---
 LATENT_LEN = 64
 LATENT_DIM = 64
-LOGVAR_CLAMP = (-30.0, 20.0)
+LOGVAR_CLAMP = (-8.0, 2.0)
 
 # --- PointNeXt encoder ---
 STEM_DIM = 32
+RADIUS_NEIGHBOR_CAP = 256
 SA_STAGES = (
-    # n_out, radius_mm, k_neighbors, hidden_dim, n_invres
-    (1024, 1.5, 32, 64, 2),
-    (256, 3.0, 32, 128, 2),
-    (64, 6.0, 32, 256, 2),
-    (16, 12.0, 16, 512, 2),
+    # n_out, radius_mm, neighbor_cap, hidden_dim, n_invres
+    (1024, 1.5, RADIUS_NEIGHBOR_CAP, 64, 2),
+    (256, 3.0, RADIUS_NEIGHBOR_CAP, 128, 2),
+    (64, 6.0, RADIUS_NEIGHBOR_CAP, 256, 2),
+    (64, 12.0, RADIUS_NEIGHBOR_CAP, 512, 2),
 )
 INVRES_EXPANSION = 4
 INVRES_ALPHA_INIT = 0.1
@@ -64,7 +70,6 @@ DECODER_HIDDEN_DIM = 64
 ATTN_DIM = 128
 SPLINE_KERNEL_SIZE = 5
 SPLINE_DEGREE = 2
-EDGE_MAX_MM = 2.0
 N_SPLINE_COARSE = 4
 N_SPLINE_MID = 2
 N_SPLINE_FINE = 2
@@ -83,9 +88,8 @@ LAMBDA_KL = 5e-4
 LAMBDA_DISP = 0.15
 LAMBDA_LAP = 0.05
 LAMBDA_NORM = 0.02
-# Auxiliary Chamfer on coarser decoder stages (multi-scale reconstruction).
 LAMBDA_CD_MID = 0.5
-LAMBDA_CD_COARSE = 0.25
+LAMBDA_CD_COARSE = 0.05
 
 DEFAULT_LOSS_WEIGHTS = {
     "recon": LAMBDA_RECON,
@@ -98,10 +102,17 @@ DEFAULT_LOSS_WEIGHTS = {
 # DataLoader node sets that do not match the fine-graph node count.
 FOLLOW_BATCH = [
     "x_true",
+    "x_true_cl_dist",
     "pos_coarse",
     "pos_mid",
     "cl_dense",
+    "cl_tract_id",
     "branch_nl_coarse",
     "branch_nl_mid",
     "branch_nl_fine",
+    "latent_u",
+    "latent_tract_id",
+    "latent_is_junction",
+    "latent_pos",
+    "token_attend",
 ]

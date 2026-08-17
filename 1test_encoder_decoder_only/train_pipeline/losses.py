@@ -1,14 +1,15 @@
 import torch
-from pytorch3d.loss import chamfer_distance, mesh_laplacian_smoothing, mesh_normal_consistency
-from pytorch3d.structures import Meshes
 
-from config import LAMBDA_CD_COARSE, LAMBDA_CD_MID, LOGVAR_CLAMP
+from config import LAMBDA_CD_COARSE, LAMBDA_CD_MID, LOGVAR_CLAMP, TUBE_RADIUS_MM
+from pytorch3d.loss import mesh_laplacian_smoothing, mesh_normal_consistency
+from pytorch3d.structures import Meshes
 
 
 def vae_kl_loss(mu, logvar):
-    """Sequence-wise KL of a diagonal Gaussian posterior against N(0, I).
+    """KL of a diagonal Gaussian posterior against N(0, I).
 
     mu, logvar: [B, L, D] or [B, D]. Averaged over batch and latent tokens.
+    logvar is log(σ²) of a Gaussian, not a lognormal.
     """
     logvar = torch.clamp(logvar, LOGVAR_CLAMP[0], LOGVAR_CLAMP[1])
     kl = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp())
@@ -16,11 +17,21 @@ def vae_kl_loss(mu, logvar):
 
 
 def displacement_dirichlet(delta_x, edge_index):
-    """Penalize displacement spikes between adjacent scaffold vertices."""
+    """Cartesian Dirichlet energy (uniform Δx has zero energy)."""
     if edge_index.numel() == 0:
         return delta_x.new_zeros(())
     src, dst = edge_index[0], edge_index[1]
     return torch.mean((delta_x[src] - delta_x[dst]).pow(2).sum(dim=-1))
+
+
+def displacement_dirichlet_local(delta_r, delta_s, edge_index):
+    """Smooth Δr and Δs on the scaffold graph, not Cartesian Δx."""
+    if edge_index.numel() == 0:
+        return delta_r.new_zeros(())
+    src, dst = edge_index[0], edge_index[1]
+    dr = (delta_r.reshape(-1)[src] - delta_r.reshape(-1)[dst]).pow(2).mean()
+    ds = (delta_s[src] - delta_s[dst]).pow(2).sum(dim=-1).mean()
+    return dr + ds
 
 
 def _as_face_index(face):
@@ -35,16 +46,28 @@ def _as_face_index(face):
     return None
 
 
-def _batched_chamfer(pred, pred_batch, true, true_batch, num_graphs):
+def _cl_radius(points, cl_xyz):
+    if cl_xyz is None or cl_xyz.numel() == 0:
+        return points.new_zeros(points.size(0))
+    return torch.cdist(points, cl_xyz[:, :3]).min(dim=1).values
+
+
+def _weighted_chamfer(pred, pred_batch, true, true_batch, w_pred, w_true, num_graphs):
     loss = pred.new_zeros(())
     n_ok = 0
     for i in range(num_graphs):
-        p = pred[pred_batch == i].unsqueeze(0)
-        t = true[true_batch == i].unsqueeze(0)
-        if p.size(1) == 0 or t.size(1) == 0:
+        p = pred[pred_batch == i]
+        t = true[true_batch == i]
+        if p.size(0) == 0 or t.size(0) == 0:
             continue
-        cd, _ = chamfer_distance(p, t)
-        loss = loss + cd
+        wp = w_pred[pred_batch == i]
+        wt = w_true[true_batch == i]
+        dist = torch.cdist(p, t, p=2).pow(2)
+        min_true = dist.min(dim=1).values
+        min_pred = dist.min(dim=0).values
+        loss_p = (wp * min_true).sum() / wp.sum().clamp_min(1e-8)
+        loss_t = (wt * min_pred).sum() / wt.sum().clamp_min(1e-8)
+        loss = loss + 0.5 * (loss_p + loss_t)
         n_ok += 1
     if n_ok > 0:
         loss = loss / n_ok
@@ -85,10 +108,16 @@ def compute_losses(
     batch_tube=None,
     faces=None,
     delta_x=None,
+    delta_r=None,
+    delta_s=None,
     x_pred_mid=None,
     batch_mid=None,
     x_pred_coarse=None,
     batch_coarse=None,
+    x_true_cl_dist=None,
+    cl_dense=None,
+    cl_dense_batch=None,
+    tube_radius=TUBE_RADIUS_MM,
     lambda_cd_mid=LAMBDA_CD_MID,
     lambda_cd_coarse=LAMBDA_CD_COARSE,
 ):
@@ -112,18 +141,54 @@ def compute_losses(
     if face is None:
         face = faces
 
-    loss_recon = _batched_chamfer(x_pred, batch_tube, x_true, batch_x_true, num_graphs)
+    r = float(tube_radius)
+    if x_true_cl_dist is None:
+        x_true_cl_dist = x_true.new_zeros(x_true.size(0))
+    w_true = 1.0 + (x_true_cl_dist.float() / r).pow(2)
+
+    cl_xyz = cl_dense
+    if cl_xyz is not None and cl_dense_batch is None:
+        cl_dense_batch = torch.zeros(cl_xyz.size(0), dtype=torch.long, device=cl_xyz.device)
+
+    def pred_weights(points, point_batch):
+        w = points.new_ones(points.size(0))
+        if cl_xyz is None:
+            return w
+        n_graphs = int(point_batch.max().item()) + 1 if point_batch.numel() else 1
+        for g in range(n_graphs):
+            pm = point_batch == g
+            cm = cl_dense_batch == g if cl_dense_batch is not None else slice(None)
+            if not torch.any(pm):
+                continue
+            rad = _cl_radius(points[pm], cl_xyz[cm])
+            w[pm] = 1.0 + (rad / r).pow(2)
+        return w
+
+    w_pred = pred_weights(x_pred, batch_tube)
+    loss_recon = _weighted_chamfer(
+        x_pred, batch_tube, x_true, batch_x_true, w_pred, w_true, num_graphs
+    )
     if x_pred_mid is not None and batch_mid is not None:
-        loss_recon = loss_recon + lambda_cd_mid * _batched_chamfer(
-            x_pred_mid, batch_mid, x_true, batch_x_true, num_graphs
+        w_mid = pred_weights(x_pred_mid, batch_mid)
+        loss_recon = loss_recon + lambda_cd_mid * _weighted_chamfer(
+            x_pred_mid, batch_mid, x_true, batch_x_true, w_mid, w_true, num_graphs
         )
     if x_pred_coarse is not None and batch_coarse is not None:
-        loss_recon = loss_recon + lambda_cd_coarse * _batched_chamfer(
-            x_pred_coarse, batch_coarse, x_true, batch_x_true, num_graphs
+        w_c = pred_weights(x_pred_coarse, batch_coarse)
+        loss_recon = loss_recon + lambda_cd_coarse * _weighted_chamfer(
+            x_pred_coarse, batch_coarse, x_true, batch_x_true, w_c, w_true, num_graphs
         )
 
     loss_kl = vae_kl_loss(mu, logvar)
-    loss_disp = displacement_dirichlet(delta_x, edge_index)
+    if delta_r is not None and delta_s is not None:
+        loss_disp = displacement_dirichlet_local(delta_r, delta_s, edge_index)
+    else:
+        src, dst = edge_index[0], edge_index[1]
+        loss_disp = (
+            torch.mean((delta_x[src] - delta_x[dst]).pow(2).sum(dim=-1))
+            if edge_index.numel()
+            else delta_x.new_zeros(())
+        )
 
     loss_lap = x_pred.new_zeros(())
     loss_norm = x_pred.new_zeros(())

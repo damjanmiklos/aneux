@@ -1,6 +1,6 @@
 # %% [markdown]
 # # Hierarchical PointNeXt–SplineConv VAE for Aneurysm Mesh Deformation
-# Geometry autoencoder: 1D centerline latent trajectory + progressive tube decoder.
+# Geometry autoencoder: tree-valued centerline latent + progressive tube decoder.
 
 # %%
 import json
@@ -70,8 +70,8 @@ LOSS_WEIGHTS = dict(DEFAULT_LOSS_WEIGHTS)
 
 # %% [markdown]
 # ## 2. Data Preparation
-# ICA-filtered paired vessel/centerline meshes, 3-level Bishop-frame tubes,
-# metric FPS to 4096 true points, centerline-COM canonicalization (mm preserved).
+# ICA-filtered paired vessel/centerline meshes, unique-tract Bishop tubes,
+# hybrid far-from-centerline FPS for x_true, canonical ICA pose (mm preserved).
 
 # %%
 def seed_everything(seed):
@@ -93,7 +93,11 @@ def stratified_split(dataset, val_fraction, seed):
     for idxs in by_loc.values():
         idxs = list(idxs)
         rng.shuffle(idxs)
-        n_val = int(len(idxs) * val_fraction)
+        if len(idxs) >= 2:
+            n_val = max(1, int(len(idxs) * val_fraction))
+            n_val = min(n_val, len(idxs) - 1)
+        else:
+            n_val = 0
         val_idx.extend(idxs[:n_val])
         train_idx.extend(idxs[n_val:])
 
@@ -160,17 +164,18 @@ if __name__ == "__main__":
         print(f"Sample coarse shape: {sample_data.pos_coarse.shape}")
         print(f"Sample Edge Index shape: {sample_data.edge_index.shape}")
         print(f"Sample face shape: {sample_data.face.shape}")
-        print(f"Latent query centerline: {sample_data.cl_pos.shape}")
+        print(f"Latent tokens: {sample_data.latent_pos.shape}  n_tracts={int(sample_data.n_tracts)}")
+        print(f"pose_R: {tuple(sample_data.pose_R.shape)}  origin: {tuple(sample_data.origin_shift.shape)}")
         print(
             f"dtypes: x={sample_data.x.dtype} x_true={sample_data.x_true.dtype} "
-            f"cl_pos={sample_data.cl_pos.dtype} "
+            f"latent_pos={sample_data.latent_pos.dtype} "
             f"matmul={torch.get_float32_matmul_precision()} "
             f"tf32={torch.backends.cuda.matmul.allow_tf32}"
         )
 
     # %% [markdown]
     # ## 3. Model Initialization
-    # PointNeXt encoder → 1D latent trajectory Z ∈ R^{64×64}; progressive SplineConv decoder.
+    # PointNeXt encoder → tree latent Z ∈ R^{64×64}; progressive SplineConv decoder.
 
     # %%
     print("Initializing Graph VAE model...")
@@ -181,7 +186,6 @@ if __name__ == "__main__":
         tube_radius=TUBE_RADIUS,
     )
     n_params = sum(p.numel() for p in model.parameters())
-    print(model)
     print(f"Trainable parameters: {n_params:,}")
 
     # %% [markdown]

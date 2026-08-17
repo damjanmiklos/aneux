@@ -14,18 +14,23 @@ def _num_graphs(batch: Tensor) -> int:
     return int(batch.max().item()) + 1
 
 
-_PYTORCH3D_CUDA_FPS = None
+_PYTORCH3D_FPS_OK = {}
+
+
+def _centroid_start_index(pts: Tensor) -> Tensor:
+    c = pts.mean(dim=0, keepdim=True)
+    return (pts - c).pow(2).sum(dim=-1).argmax()
 
 
 def farthest_point_sample_torch(pts: Tensor, k: int) -> Tensor:
-    """Iterative metric FPS on the tensor's device. Returns local indices [k]."""
+    """Iterative metric FPS starting at the point farthest from the centroid."""
     pts = pts.to(dtype=torch.float32)
     n = int(pts.size(0))
     k = min(int(k), n)
     selected = torch.empty(k, dtype=torch.long, device=pts.device)
-    selected[0] = 0
+    selected[0] = _centroid_start_index(pts)
     dist = torch.full((n,), float("inf"), device=pts.device, dtype=torch.float32)
-    last = pts[0]
+    last = pts[selected[0]]
     for i in range(1, k):
         dist = torch.minimum(dist, (pts - last).pow(2).sum(dim=-1))
         farthest = dist.argmax()
@@ -35,31 +40,33 @@ def farthest_point_sample_torch(pts: Tensor, k: int) -> Tensor:
 
 
 def _pytorch3d_fps_ok(device: torch.device) -> bool:
-    """True if pytorch3d FPS has CUDA kernels for this device (or the tensor is on CPU)."""
-    global _PYTORCH3D_CUDA_FPS
-    if device.type != "cuda":
-        return True
-    if _PYTORCH3D_CUDA_FPS is None:
-        try:
-            from pytorch3d.ops import sample_farthest_points
+    """True if pytorch3d `sample_farthest_points` works on this device."""
+    key = device.type
+    cached = _PYTORCH3D_FPS_OK.get(key)
+    if cached is not None:
+        return cached
+    try:
+        from pytorch3d.ops import sample_farthest_points
 
-            probe = torch.zeros(1, 4, 3, device=device, dtype=torch.float32)
-            sample_farthest_points(probe, K=2, random_start_point=False)
+        if key == "cuda":
+            probe = torch.randn(1, 64, 3, device=device, dtype=torch.float32)
+            sample_farthest_points(probe, K=8, random_start_point=False)
             torch.cuda.synchronize()
-            _PYTORCH3D_CUDA_FPS = True
-        except Exception as exc:
-            msg = str(exc).lower()
-            if "illegal" in msg or "cuda" in type(exc).__name__.lower():
-                raise
-            import warnings
+        _PYTORCH3D_FPS_OK[key] = True
+        return True
+    except Exception as exc:
+        import warnings
 
-            warnings.warn(f"pytorch3d CUDA FPS unavailable ({type(exc).__name__}: {exc})")
-            _PYTORCH3D_CUDA_FPS = False
-    return bool(_PYTORCH3D_CUDA_FPS)
+        warnings.warn(
+            f"pytorch3d FPS unavailable on {key} ({type(exc).__name__}: {exc}); "
+            "using the slower PyTorch loop"
+        )
+        _PYTORCH3D_FPS_OK[key] = False
+        return False
 
 
 def fps_indices(pts: Tensor, k: int) -> Tensor:
-    """FPS indices for a single cloud [N, 3]. Prefers pytorch3d CUDA, else in-device torch FPS."""
+    """FPS indices for a single cloud [N, 3]. Prefers pytorch3d; else in-device torch FPS."""
     k = min(int(k), int(pts.size(0)))
     if k <= 0:
         return pts.new_zeros((0,), dtype=torch.long)
@@ -67,10 +74,27 @@ def fps_indices(pts: Tensor, k: int) -> Tensor:
         return torch.arange(k, device=pts.device)
     pts_f = pts.to(dtype=torch.float32).contiguous()
     if _pytorch3d_fps_ok(pts.device):
-        from pytorch3d.ops import sample_farthest_points
+        try:
+            from pytorch3d.ops import sample_farthest_points
 
-        _, loc = sample_farthest_points(pts_f.unsqueeze(0), K=k, random_start_point=False)
-        return loc.squeeze(0).long()
+            start = int(_centroid_start_index(pts_f).item())
+            perm = torch.arange(pts_f.size(0), device=pts_f.device)
+            if start != 0:
+                perm[0] = start
+                perm[start] = 0
+            swapped = pts_f[perm]
+            _, loc = sample_farthest_points(
+                swapped.unsqueeze(0), K=k, random_start_point=False
+            )
+            return perm[loc.squeeze(0).long()]
+        except Exception as exc:
+            _PYTORCH3D_FPS_OK[pts.device.type] = False
+            import warnings
+
+            warnings.warn(
+                f"pytorch3d FPS failed ({type(exc).__name__}: {exc}); "
+                "falling back to the PyTorch loop"
+            )
     return farthest_point_sample_torch(pts_f, k)
 
 
@@ -88,7 +112,11 @@ def ball_query_packed(
     query_batch: Tensor,
     max_num_neighbors: int,
 ) -> Tensor:
-    """Neighbors in `support` for each `query` point. Returns [2, E] = (support_idx, query_idx)."""
+    """Neighbors in `support` for each `query` point. Returns [2, E] = (support_idx, query_idx).
+
+    All points with distance <= radius are returned, capped at `max_num_neighbors`
+    nearest if a query has more than that many hits.
+    """
     try:
         from torch_geometric.nn import radius as _radius
 
@@ -119,13 +147,23 @@ def _ball_query_torch(
 ) -> Tensor:
     srcs, dsts = [], []
     n_graphs = max(_num_graphs(support_batch), _num_graphs(query_batch))
+    cap = max(int(max_num_neighbors), 1)
     for g in range(n_graphs):
         s_idx = (support_batch == g).nonzero(as_tuple=False).view(-1)
         q_idx = (query_batch == g).nonzero(as_tuple=False).view(-1)
         if s_idx.numel() == 0 or q_idx.numel() == 0:
             continue
         dist = torch.cdist(query[q_idx], support[s_idx])
-        k = min(int(max_num_neighbors), int(s_idx.numel()))
+        in_ball = dist <= radius
+        counts = in_ball.sum(dim=1)
+        if int(counts.max().item()) <= cap:
+            q_local, s_local = torch.where(in_ball)
+            if q_local.numel() == 0:
+                continue
+            srcs.append(s_idx[s_local])
+            dsts.append(q_idx[q_local])
+            continue
+        k = min(cap, int(s_idx.numel()))
         knn_dist, knn_loc = dist.topk(k, dim=1, largest=False)
         valid = knn_dist <= radius
         q_local, slot = torch.where(valid)
@@ -143,7 +181,7 @@ def radius_graph_packed(
     radius: float,
     batch: Tensor,
     loop: bool = True,
-    max_num_neighbors: int = 32,
+    max_num_neighbors: int = 256,
     flow: str = "source_to_target",
 ) -> Tensor:
     try:
@@ -161,7 +199,6 @@ def radius_graph_packed(
         if not _missing_pyg_lib(exc):
             raise
         ei = _ball_query_torch(pos, pos, radius, batch, batch, max_num_neighbors)
-        # ei[0] = neighbors (support), ei[1] = centers (query)
         if flow != "source_to_target":
             ei = ei.flip(0)
         if loop:

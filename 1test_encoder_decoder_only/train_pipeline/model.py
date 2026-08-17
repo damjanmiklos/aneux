@@ -2,8 +2,8 @@
 
 Encoder follows PointNeXt (Qian et al., NeurIPS 2022): stem MLP, FPS set
 abstraction, radius grouping with Δp / r, and inverted-residual MLP blocks.
-The decoder is the spec's geometry-aware progressive SplineConv deformer
-with a 1D centerline latent trajectory.
+The decoder is a geometry-aware progressive SplineConv deformer with a
+tree-valued centerline latent.
 """
 
 from __future__ import annotations
@@ -22,7 +22,6 @@ from torch_geometric.utils import scatter
 from config import (
     ATTN_DIM,
     DECODER_HIDDEN_DIM,
-    EDGE_MAX_MM,
     GAMMA_THETA_DIM,
     GAMMA_U_DIM,
     INVRES_ALPHA_INIT,
@@ -30,6 +29,7 @@ from config import (
     LATENT_DIM,
     LATENT_LEN,
     LOGVAR_CLAMP,
+    MAX_TRACTS,
     N_SPLINE_COARSE,
     N_SPLINE_FINE,
     N_SPLINE_MID,
@@ -45,8 +45,8 @@ from geometry import (
     decoupled_displacement,
     harmonic_encoding_theta,
     harmonic_encoding_u,
+    intrinsic_spline_pseudo_coords,
     radial_bias_for_zero_init,
-    spline_pseudo_coords,
     upsample_branch_concat,
 )
 from ops import ball_query_packed, fps_indices, make_spline_conv, radius_graph_packed
@@ -89,24 +89,54 @@ def fps_packed(pos: Tensor, batch: Tensor, n_out: int) -> Tensor:
     return torch.cat(pieces, dim=0)
 
 
-def nearest_centerline_u(
+def nearest_centerline_attr(
     pos: Tensor,
     pos_batch: Tensor,
     cl_dense: Tensor,
     cl_batch: Tensor,
-) -> Tensor:
-    """Assign each point the arc-length u of its nearest dense centerline sample."""
+    cl_tract: Tensor,
+):
+    """Nearest dense centerline sample → (u_local, tract_id) for each point."""
     u_out = pos.new_zeros(pos.size(0))
+    t_out = torch.zeros(pos.size(0), dtype=torch.long, device=pos.device)
     n_graphs = _num_graphs(pos_batch)
     for g in range(n_graphs):
-        p = pos[pos_batch == g]
-        c = cl_dense[cl_batch == g]
+        p_mask = pos_batch == g
+        c_mask = cl_batch == g
+        p = pos[p_mask]
+        c = cl_dense[c_mask]
         if p.numel() == 0 or c.numel() == 0:
             continue
         d = torch.cdist(p, c[:, :3])
         idx = d.argmin(dim=1)
-        u_out[pos_batch == g] = c[idx, 3]
-    return u_out
+        u_out[p_mask] = c[idx, 3]
+        t_out[p_mask] = cl_tract[c_mask][idx]
+    return u_out, t_out
+
+
+def _token_tables(data, n_graphs: int, latent_len: int):
+    """Return [B, L] token descriptors from a possibly batched Data object."""
+    u = data.latent_u
+    tract = data.latent_tract_id
+    attend = data.token_attend
+    is_junc = data.latent_is_junction
+    if attend.dtype != torch.bool:
+        attend = attend.bool()
+    if u.dim() == 2 and u.size(0) == n_graphs:
+        return u, tract, attend, is_junc
+    if getattr(data, "latent_u_batch", None) is not None or u.numel() == n_graphs * latent_len:
+        u = u.reshape(n_graphs, latent_len)
+        tract = tract.reshape(n_graphs, latent_len)
+        is_junc = is_junc.reshape(n_graphs, latent_len)
+        attend = attend.reshape(n_graphs, latent_len, attend.size(-1))
+        return u, tract, attend, is_junc
+    u = u.reshape(1, -1)
+    tract = tract.reshape(1, -1)
+    is_junc = is_junc.reshape(1, -1)
+    attend = attend.reshape(1, attend.size(0), attend.size(-1))
+    if n_graphs != 1:
+        raise ValueError("Missing latent_u_batch for batched tree tokens")
+    return u, tract, attend, is_junc
 
 
 class InvResMLP(nn.Module):
@@ -199,31 +229,39 @@ class SetAbstraction(nn.Module):
 
 
 class CenterlineLatentHead(nn.Module):
-    """Cross-attention from L centerline queries onto the coarsest PointNeXt tokens."""
+    """Cross-attention from tree-valued centerline queries onto PointNeXt tokens."""
 
     def __init__(self, in_dim: int, latent_dim: int, latent_len: int, attn_dim: int):
         super().__init__()
         self.latent_len = int(latent_len)
         self.attn_dim = int(attn_dim)
-        self.w_q = nn.Linear(GAMMA_U_DIM, attn_dim)
-        self.w_k = nn.Linear(in_dim + GAMMA_U_DIM, attn_dim)
+        self.tract_emb = nn.Embedding(MAX_TRACTS + 1, attn_dim)
+        self.w_q = nn.Linear(GAMMA_U_DIM + attn_dim, attn_dim)
+        self.w_k = nn.Linear(in_dim + GAMMA_U_DIM + attn_dim, attn_dim)
         self.w_v = nn.Linear(in_dim, attn_dim)
         self.mu_head = nn.Linear(attn_dim, latent_dim)
         self.logvar_head = nn.Linear(attn_dim, latent_dim)
 
-    def forward(self, h: Tensor, u_pts: Tensor, batch: Tensor):
+    def _tract_index(self, tract_id: Tensor) -> Tensor:
+        idx = tract_id.clone()
+        idx = torch.where(idx < 0, torch.full_like(idx, MAX_TRACTS), idx)
+        return idx.clamp(0, MAX_TRACTS)
+
+    def forward(self, h: Tensor, u_pts: Tensor, tract_pts: Tensor, batch: Tensor, data):
         n_graphs = _num_graphs(batch)
-        device = h.device
-        u_q = torch.linspace(0.0, 1.0, self.latent_len, device=device)
-        q = self.w_q(harmonic_encoding_u(u_q))
-        mu_out, lv_out = [], []
+        token_u, token_tract, _, _ = _token_tables(data, n_graphs, self.latent_len)
         scale = math.sqrt(self.attn_dim)
+        mu_out, lv_out = [], []
         for g in range(n_graphs):
             mask = batch == g
             hg = h[mask]
             ug = u_pts[mask]
-            kg = self.w_k(torch.cat([hg, harmonic_encoding_u(ug)], dim=-1))
+            tg = self.tract_emb(self._tract_index(tract_pts[mask]))
+            kg = self.w_k(torch.cat([hg, harmonic_encoding_u(ug), tg], dim=-1))
             vg = self.w_v(hg)
+            uq = token_u[g]
+            tq = self.tract_emb(self._tract_index(token_tract[g]))
+            q = self.w_q(torch.cat([harmonic_encoding_u(uq), tq], dim=-1))
             attn = torch.softmax(q @ kg.t() / scale, dim=-1) @ vg
             mu_out.append(self.mu_head(attn))
             lv_out.append(self.logvar_head(attn).clamp(*LOGVAR_CLAMP))
@@ -237,7 +275,6 @@ class PointNeXtEncoder(nn.Module):
         latent_len: int = LATENT_LEN,
         stem_dim: int = STEM_DIM,
         stages=SA_STAGES,
-        attn_dim: int = ATTN_DIM,
     ):
         super().__init__()
         self.latent_dim = int(latent_dim)
@@ -260,7 +297,15 @@ class PointNeXtEncoder(nn.Module):
         self.inv_layers = nn.ModuleList(inv)
         self.latent_head = CenterlineLatentHead(in_dim, latent_dim, latent_len, attn_dim=in_dim)
 
-    def forward(self, x_true: Tensor, x_true_batch: Tensor, cl_dense: Tensor, cl_batch: Tensor):
+    def forward(self, data):
+        x_true = data.x_true
+        x_true_batch = (
+            data.x_true_batch
+            if getattr(data, "x_true_batch", None) is not None
+            else _ones_batch(x_true.size(0), x_true.device)
+        )
+        cl_batch = _attr_batch(data, "cl_dense", data.cl_dense.size(0))
+        cl_tract = data.cl_tract_id
         h = self.stem(x_true)
         pos, batch = x_true, x_true_batch
         for sa, inv_blocks in zip(self.sa_layers, self.inv_layers):
@@ -270,12 +315,14 @@ class PointNeXtEncoder(nn.Module):
                     h = checkpoint(blk, h, pos, batch, use_reentrant=False)
                 else:
                     h = blk(h, pos, batch)
-        u_pts = nearest_centerline_u(pos, batch, cl_dense, cl_batch)
-        return self.latent_head(h, u_pts, batch)
+        u_pts, tract_pts = nearest_centerline_attr(
+            pos, batch, data.cl_dense, cl_batch, cl_tract
+        )
+        return self.latent_head(h, u_pts, tract_pts, batch, data)
 
 
 class LatentCrossAttention(nn.Module):
-    """Scaffold nodes query the 1D latent trajectory via Fourier (u, θ)."""
+    """Scaffold nodes query the tree latent via Fourier (u, θ) with a tract mask."""
 
     def __init__(self, latent_dim: int, hidden_dim: int, attn_dim: int, latent_len: int):
         super().__init__()
@@ -286,20 +333,35 @@ class LatentCrossAttention(nn.Module):
         self.w_v = nn.Linear(latent_dim, attn_dim)
         self.out = nn.Linear(attn_dim + GAMMA_U_DIM + GAMMA_THETA_DIM, hidden_dim)
 
-    def forward(self, z: Tensor, u: Tensor, theta: Tensor, node_batch: Tensor) -> Tensor:
+    def forward(
+        self,
+        z: Tensor,
+        u: Tensor,
+        theta: Tensor,
+        node_batch: Tensor,
+        node_tract: Tensor,
+        token_u: Tensor,
+        token_attend: Tensor,
+    ) -> Tensor:
         gamma_u = harmonic_encoding_u(u)
         gamma_th = harmonic_encoding_theta(theta)
         q = self.w_q(torch.cat([gamma_u, gamma_th], dim=-1))
         n_graphs = z.size(0)
-        device = z.device
-        u_k = torch.linspace(0.0, 1.0, self.latent_len, device=device)
-        gamma_uk = harmonic_encoding_u(u_k).unsqueeze(0).expand(n_graphs, -1, -1)
+        gamma_uk = harmonic_encoding_u(token_u.reshape(-1)).reshape(n_graphs, self.latent_len, -1)
         k = self.w_k(torch.cat([z, gamma_uk], dim=-1))
         v = self.w_v(z)
         k_n = k[node_batch]
         v_n = v[node_batch]
         scale = math.sqrt(self.attn_dim)
         scores = (q.unsqueeze(1) * k_n).sum(-1) / scale
+        attend_n = token_attend[node_batch]
+        tract_idx = node_tract.clamp(0, MAX_TRACTS - 1).view(-1, 1, 1).expand(-1, self.latent_len, 1)
+        allow = attend_n.gather(2, tract_idx).squeeze(-1)
+        scores = scores.masked_fill(~allow, -1.0e4)
+        orphan = ~allow.any(dim=-1)
+        if orphan.any():
+            scores = scores.clone()
+            scores[orphan, 0] = 0.0
         w = torch.softmax(scores, dim=-1)
         a = (w.unsqueeze(-1) * v_n).sum(1)
         return self.out(torch.cat([a, gamma_u, gamma_th], dim=-1))
@@ -396,13 +458,13 @@ class ProgressiveSplineDecoder(nn.Module):
         attn_dim: int = ATTN_DIM,
         r_margin: float = R_MARGIN_MM,
         s_max: float = SHEAR_MAX_MM,
-        r_edge_max: float = EDGE_MAX_MM,
     ):
         super().__init__()
         self.hidden_dim = int(hidden_dim)
-        self.r_edge_max = float(r_edge_max)
+        self.latent_len = int(latent_len)
         self.cross_coarse = LatentCrossAttention(latent_dim, hidden_dim, attn_dim, latent_len)
         self.cross_mid = LatentCrossAttention(latent_dim, hidden_dim, attn_dim, latent_len)
+        self.cross_fine = LatentCrossAttention(latent_dim, hidden_dim, attn_dim, latent_len)
         self.coarse_convs = nn.ModuleList(
             [ResidualSplineConv(hidden_dim) for _ in range(N_SPLINE_COARSE)]
         )
@@ -412,14 +474,10 @@ class ProgressiveSplineDecoder(nn.Module):
         self.fine_convs = nn.ModuleList(
             [ResidualSplineConv(hidden_dim) for _ in range(N_SPLINE_FINE)]
         )
-        self.coarse_delta = nn.Linear(hidden_dim, 3)
-        self.mid_delta = nn.Linear(hidden_dim, 3)
-        self.fine_in = nn.Linear(3 + GAMMA_U_DIM + GAMMA_THETA_DIM, hidden_dim)
         self.mid_init = nn.Linear(3, hidden_dim)
-        nn.init.zeros_(self.coarse_delta.weight)
-        nn.init.zeros_(self.coarse_delta.bias)
-        nn.init.zeros_(self.mid_delta.weight)
-        nn.init.zeros_(self.mid_delta.bias)
+        self.fine_init = nn.Linear(3, hidden_dim)
+        self.coarse_head = DecoupledDisplacementHead(hidden_dim, r_margin=r_margin, s_max=s_max)
+        self.mid_head = DecoupledDisplacementHead(hidden_dim, r_margin=r_margin, s_max=s_max)
         self.head = DecoupledDisplacementHead(hidden_dim, r_margin=r_margin, s_max=s_max)
 
     def _run_convs(self, h, edge_index, pseudo, convs):
@@ -430,8 +488,13 @@ class ProgressiveSplineDecoder(nn.Module):
                 h = conv(h, edge_index, pseudo)
         return h
 
+    def _cross(self, layer, z, u, theta, node_batch, tract, token_u, token_attend):
+        return layer(z, u, theta, node_batch, tract, token_u, token_attend)
+
     def forward(self, z: Tensor, data):
         n_graphs = z.size(0)
+        token_u, _, token_attend, _ = _token_tables(data, n_graphs, self.latent_len)
+
         pos_c = data.pos_coarse
         batch_c = _attr_batch(data, "pos_coarse", pos_c.size(0))
         pos_m = data.pos_mid
@@ -441,10 +504,17 @@ class ProgressiveSplineDecoder(nn.Module):
             pos_f.size(0), pos_f.device
         )
 
-        h_c = self.cross_coarse(z, data.u_coarse, data.theta_coarse, batch_c)
-        pseudo_c = spline_pseudo_coords(pos_c, data.edge_index_coarse, self.r_edge_max)
+        h_c = self._cross(
+            self.cross_coarse, z, data.u_coarse, data.theta_coarse, batch_c,
+            data.tract_id_coarse, token_u, token_attend,
+        )
+        pseudo_c = intrinsic_spline_pseudo_coords(
+            data.u_coarse, data.theta_coarse, data.tract_id_coarse,
+            data.edge_index_coarse, data.u_step_coarse,
+        )
         h_c = self._run_convs(h_c, data.edge_index_coarse, pseudo_c, self.coarse_convs)
-        dx_c = self.coarse_delta(h_c)
+        dr_c, ds_c = self.coarse_head(h_c)
+        dx_c = decoupled_displacement(dr_c, ds_c, data.normal_coarse, data.tangent_coarse, data.binormal_coarse)
 
         dx_m0 = _upsample_level(
             dx_c, data,
@@ -452,10 +522,19 @@ class ProgressiveSplineDecoder(nn.Module):
             "branch_nl_coarse", "branch_nl_mid",
             batch_c, batch_m, n_graphs,
         )
-        h_m = self.cross_mid(z, data.u_mid, data.theta_mid, batch_m) + self.mid_init(dx_m0)
-        pseudo_m = spline_pseudo_coords(pos_m, data.edge_index_mid, self.r_edge_max)
+        h_m = self._cross(
+            self.cross_mid, z, data.u_mid, data.theta_mid, batch_m,
+            data.tract_id_mid, token_u, token_attend,
+        ) + self.mid_init(dx_m0)
+        pseudo_m = intrinsic_spline_pseudo_coords(
+            data.u_mid, data.theta_mid, data.tract_id_mid,
+            data.edge_index_mid, data.u_step_mid,
+        )
         h_m = self._run_convs(h_m, data.edge_index_mid, pseudo_m, self.mid_convs)
-        dx_m = dx_m0 + self.mid_delta(h_m)
+        dr_m, ds_m = self.mid_head(h_m)
+        dx_m = dx_m0 + decoupled_displacement(
+            dr_m, ds_m, data.normal_mid, data.tangent_mid, data.binormal_mid
+        )
 
         dx_f0 = _upsample_level(
             dx_m, data,
@@ -463,13 +542,13 @@ class ProgressiveSplineDecoder(nn.Module):
             "branch_nl_mid", "branch_nl_fine",
             batch_m, batch_f, n_graphs,
         )
-        h_f = self.fine_in(
-            torch.cat(
-                [dx_f0, harmonic_encoding_u(data.u), harmonic_encoding_theta(data.theta)],
-                dim=-1,
-            )
+        h_f = self._cross(
+            self.cross_fine, z, data.u, data.theta, batch_f,
+            data.tract_id, token_u, token_attend,
+        ) + self.fine_init(dx_f0)
+        pseudo_f = intrinsic_spline_pseudo_coords(
+            data.u, data.theta, data.tract_id, data.edge_index, data.u_step,
         )
-        pseudo_f = spline_pseudo_coords(pos_f, data.edge_index, self.r_edge_max)
         h_f = self._run_convs(h_f, data.edge_index, pseudo_f, self.fine_convs)
         delta_r, delta_s = self.head(h_f)
         dx_decoupled = decoupled_displacement(
@@ -477,7 +556,7 @@ class ProgressiveSplineDecoder(nn.Module):
         )
         delta_x = dx_f0 + dx_decoupled
         x_pred = pos_f + delta_x
-        return x_pred, delta_x, pos_c + dx_c, pos_m + dx_m
+        return x_pred, delta_x, pos_c + dx_c, pos_m + dx_m, delta_r, delta_s
 
 
 @dataclass
@@ -487,6 +566,8 @@ class VAEOutput:
     logvar: Tensor
     z: Tensor
     delta_x: Tensor
+    delta_r: Tensor
+    delta_s: Tensor
     x_pred_coarse: Tensor
     x_pred_mid: Tensor
 
@@ -527,29 +608,25 @@ class GraphVAE(nn.Module):
         return mu
 
     def encode(self, data):
-        x_true_batch = (
-            data.x_true_batch
-            if getattr(data, "x_true_batch", None) is not None
-            else _ones_batch(data.x_true.size(0), data.x_true.device)
-        )
-        cl_batch = _attr_batch(data, "cl_dense", data.cl_dense.size(0))
-        return self.encoder(data.x_true, x_true_batch, data.cl_dense, cl_batch)
+        return self.encoder(data)
 
     def decode(self, z: Tensor, data) -> Tensor:
         """Deterministic frozen-decoder forward for Stage-2 diffusion inference."""
-        x_pred, _, _, _ = self.decoder(z, data)
+        x_pred, _, _, _, _, _ = self.decoder(z, data)
         return x_pred
 
     def forward(self, data) -> VAEOutput:
         mu, logvar = self.encode(data)
         z = self.reparameterize(mu, logvar)
-        x_pred, delta_x, x_coarse, x_mid = self.decoder(z, data)
+        x_pred, delta_x, x_coarse, x_mid, delta_r, delta_s = self.decoder(z, data)
         return VAEOutput(
             x_pred=x_pred,
             mu=mu,
             logvar=logvar,
             z=z,
             delta_x=delta_x,
+            delta_r=delta_r,
+            delta_s=delta_s,
             x_pred_coarse=x_coarse,
             x_pred_mid=x_mid,
         )
