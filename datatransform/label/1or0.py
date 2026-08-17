@@ -1,15 +1,16 @@
 import os
 import csv
+import sys
 import pandas as pd
 from paraview.simple import *
 
-# --- CONFIGURATION ---
-# Use raw strings (r"...") to safely handle Windows backslashes
-FOLDER_PATH = r"C:\Users\miklo\OneDrive\UQ\aneux\rawdata\models-v1.0\models\vessels\original"
-OUTPUT_CSV_PATH = r"C:\Users\miklo\OneDrive\UQ\aneux\datatransform\label\hascap.csv"
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+from aneux_paths import VESSELS_ORIGINAL, HASCAP_CSV, CSV_PATH
 
-# Add the path to the CSV containing the 'dataset' and 'location' columns
-METADATA_CSV_PATH = r"C:\Users\miklo\OneDrive\UQ\aneux\rawdata\data-v1.0\data\clinical.csv" 
+# --- CONFIGURATION ---
+FOLDER_PATH = VESSELS_ORIGINAL
+OUTPUT_CSV_PATH = HASCAP_CSV
+METADATA_CSV_PATH = CSV_PATH 
 
 SUPPORTED_EXTENSIONS = ('.vtp', '.stl')
 FILTER_LOCATIONS = ['ICA pcom', 'ICA oph', 'ICA cav', 'ICA bif']

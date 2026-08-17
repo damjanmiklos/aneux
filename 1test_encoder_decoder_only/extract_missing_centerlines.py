@@ -4,16 +4,19 @@ Splits missing patients into N chunks and processes them in parallel.
 Uses 8 threads by default.
 """
 import os
+import sys
 import pandas as pd
 import subprocess
 import json
 import numpy as np
 from concurrent.futures import ProcessPoolExecutor
 
-CSV_PATH = "/home/dmiklos/aneux/rawdata/rawdata/data-v1.0/data/clinical.csv"
-VESSEL_REM_DIR = "/home/dmiklos/aneux/rawdata/rawdata/models-v1.0/models/vessels/remeshed/area-005"
-CENTERLINE_IN_DIR = "/home/dmiklos/aneux/rawdata/rawdata/models-v1.0/models/centerlines"
-CENTERLINE_OUT_DIR = "/home/dmiklos/aneux/code/test_1stage_encoder_decoder_only/centerlines"
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from aneux_paths import CSV_PATH, VESSELS_AREA005, CENTERLINES, EXTRA_CENTERLINES
+
+VESSEL_REM_DIR = VESSELS_AREA005
+CENTERLINE_IN_DIR = CENTERLINES
+CENTERLINE_OUT_DIR = EXTRA_CENTERLINES
 
 NUM_WORKERS = 8 # Parallel processes
 

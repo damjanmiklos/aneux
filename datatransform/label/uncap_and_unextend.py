@@ -1,4 +1,5 @@
 import os
+import sys
 import pandas as pd
 import numpy as np
 import pyvista as pv
@@ -8,16 +9,18 @@ from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import gc
 
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+from aneux_paths import CSV_PATH, VESSELS_AREA001, CENTERLINES, CLEANED_VESSELS, LABEL_OUTPUT_DIR, HASEXTENSION_CSV
+
 
 class UnrealisticMeshError(ValueError):
     pass
 
 
 # --- CONFIGURATION ---
-CSV_PATH = r"C:\Users\miklo\OneDrive\UQ\aneux\rawdata\data-v1.0\data\clinical.csv"
-VESSEL_DIR = r"C:\Users\miklo\OneDrive\UQ\aneux\rawdata\models-v1.0\models\vessels\remeshed\area-001"
-CENTERLINE_DIR = r"C:\Users\miklo\OneDrive\UQ\aneux\rawdata\models-v1.0\models\centerlines"
-OUTPUT_DIR = r"C:\Users\miklo\OneDrive\UQ\aneux\datatransform\cleaned_data\vessels_cleaned_and_decapped"
+VESSEL_DIR = VESSELS_AREA001
+CENTERLINE_DIR = CENTERLINES
+OUTPUT_DIR = CLEANED_VESSELS
 
 DISTANCE_THRESHOLD = 0.5  # in mm, to classify boundary as extension vs native
 SMOOTHING_ITERATIONS = 5  # localized Laplacian iterations for boundary smoothing
@@ -575,7 +578,7 @@ def main():
         print(f"Deleting existing directory: {OUTPUT_DIR}")
         shutil.rmtree(OUTPUT_DIR)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    os.makedirs("C:\\Users\\miklo\\OneDrive\\UQ\\aneux\\datatransform\\label\\output", exist_ok=True)
+    os.makedirs(LABEL_OUTPUT_DIR, exist_ok=True)
     
     # Read clinical metadata and filter ICA locations
     df = pd.read_csv(CSV_PATH)
@@ -595,7 +598,7 @@ def main():
     log_records = []
     
     # Load hasextension mapping
-    has_ext_csv = "C:\\Users\\miklo\\OneDrive\\UQ\\aneux\\datatransform\\label\\hasextension.csv"
+    has_ext_csv = HASEXTENSION_CSV
     has_ext_map = {}
     if os.path.exists(has_ext_csv):
         has_ext_df = pd.read_csv(has_ext_csv)
@@ -648,8 +651,8 @@ def main():
                 
     # Write the log to Excel and CSV fallback
     log_df = pd.DataFrame(log_records)
-    log_xlsx = "C:\\Users\\miklo\\OneDrive\\UQ\\aneux\\datatransform\\label\\output\\clean_and_uncap_log.xlsx"
-    log_csv = "C:\\Users\\miklo\\OneDrive\\UQ\\aneux\\datatransform\\label\\output\\clean_and_uncap_log.csv"
+    log_xlsx = os.path.join(LABEL_OUTPUT_DIR, "clean_and_uncap_log.xlsx")
+    log_csv = os.path.join(LABEL_OUTPUT_DIR, "clean_and_uncap_log.csv")
     
     try:
         log_df.to_excel(log_xlsx, index=False)

@@ -7,19 +7,34 @@ import numpy as np
 import pandas as pd
 import json
 import os
+import sys
 import pyvista as pv
+from contextlib import nullcontext
 from tqdm import tqdm
 from torch_geometric.loader import DataLoader
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..")))
+sys.path.insert(0, os.path.join(_HERE, "train_pipeline"))
+
+from aneux_paths import (
+    CSV_PATH,
+    VESSELS_AREA005,
+    CENTERLINES,
+    EXTRA_CENTERLINES,
+    EXPERIMENT_OUTPUT,
+    EXPERIMENT_CACHE,
+)
 from dataset import AneurysmDataset
 from model import GraphVAE
 from losses import compute_losses
 
 # --- CONFIGURATION ---
-CSV_PATH = "/home/dmiklos/aneux/rawdata/rawdata/data-v1.0/data/clinical.csv"
-VESSEL_DIR = "/home/dmiklos/aneux/rawdata/rawdata/models-v1.0/models/vessels/remeshed/area-005"
-CENTERLINE_DIR = "/home/dmiklos/aneux/rawdata/rawdata/models-v1.0/models/centerlines"
-EXTRA_CENTERLINE_DIR = "/home/dmiklos/aneux/code/test_1stage_encoder_decoder_only/centerlines"
+OUTPUT_DIR = EXPERIMENT_OUTPUT
+CACHE_DIR = EXPERIMENT_CACHE
+VESSEL_DIR = VESSELS_AREA005
+CENTERLINE_DIR = CENTERLINES
+EXTRA_CENTERLINE_DIR = EXTRA_CENTERLINES
 TUBE_RADIUS = 2.0
 N_LENGTH = 1000
 N_RADIAL = 50
@@ -30,15 +45,14 @@ HIDDEN_DIM = 128
 K_NEIGHBORS = 32
 
 DEVICE = 'cuda:1' if torch.cuda.is_available() else 'cpu'
-if 'cuda:1' in DEVICE:
-    torch.cuda.set_device(1)
+if str(DEVICE).startswith('cuda'):
+    torch.cuda.set_device(int(str(DEVICE).split(':')[1]))
 
-OUTPUT_DIR = "/home/dmiklos/aneux/code/test_1stage_encoder_decoder_only/output"
 SPLIT_FILE = os.path.join(OUTPUT_DIR, "train_val_split.json")
 MODEL_FILE = os.path.join(OUTPUT_DIR, "graph_vae_aneurysm.pth")
 RESULTS_CSV = os.path.join(OUTPUT_DIR, "per_patient_losses.csv")
 
-LOSS_WEIGHTS = {'recon': 1.0, 'kl': 1, 'geom': 1}
+LOSS_WEIGHTS = {'recon': 1.0, 'kl': 0.001, 'geom': 0.1}
 
 # Opt-in to sparse tensor invariant checks globally to guarantee memory safety 
 torch.sparse.check_sparse_tensor_invariants.enable()
@@ -48,10 +62,26 @@ torch.sparse.check_sparse_tensor_invariants.enable()
 # ==========================================
 # CORE POST-PROCESSING FUNCTIONS
 # ==========================================
+def _faces_np(data):
+    """Return triangle indices as [F, 3] from PyG `face` ([3, F]) or legacy `faces`."""
+    face = getattr(data, "face", None)
+    if face is not None and torch.is_tensor(face) and face.numel() > 0:
+        arr = face.detach().cpu().numpy()
+        if arr.shape[0] == 3:
+            return arr.T
+        return arr
+    faces = getattr(data, "faces", None)
+    if faces is None:
+        raise AttributeError("Data object has neither face nor faces")
+    if torch.is_tensor(faces):
+        return faces.detach().cpu().numpy()
+    return np.asarray(faces)
+
+
 def tensor_to_vtp(x_pred_tensor, original_faces, output_filepath):
     """
-    Converts predicted continuous coordinates from the PyTorch GNN into a 
-    physics-ready, watertight .vtp surface mesh for CFD.
+    Write predicted tube coordinates plus scaffold triangles to a .vtp file.
+    The scaffold is a set of open branch cylinders, not a watertight CFD surface.
     
     Args:
         x_pred_tensor (torch.Tensor): Tensor of shape [N, 3] with predicted coordinates.
@@ -97,7 +127,8 @@ def evaluate_all_samples():
         tube_radius=TUBE_RADIUS,
         n_length=N_LENGTH,
         n_radial=N_RADIAL,
-        extra_centerline_dir=EXTRA_CENTERLINE_DIR
+        extra_centerline_dir=EXTRA_CENTERLINE_DIR,
+        cache_dir=CACHE_DIR,
     )
     
     print(f"Loading split from {SPLIT_FILE}...")
@@ -131,12 +162,17 @@ def evaluate_all_samples():
             patient_id = dataset.samples[i]['dataset_id']
             split = 'train' if patient_id in train_ids else ('val' if patient_id in val_ids else 'unknown')
             
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            autocast_ctx = (
+                torch.autocast(device_type='cuda', dtype=torch.bfloat16)
+                if str(DEVICE).startswith('cuda') else nullcontext()
+            )
+            with autocast_ctx:
                 x_pred, mu, logvar = model(batch)
                 
                 loss_recon, loss_kl, loss_geom = compute_losses(
                     x_pred, batch.x_true, mu, logvar, batch.x, batch.edge_index, batch.x_true_batch, batch.num_graphs,
-                    batch.faces if hasattr(batch, 'faces') and batch.faces is not None else None
+                    face=getattr(batch, 'face', None),
+                    batch_tube=batch.batch,
                 )
                 
                 total_loss = LOSS_WEIGHTS['recon'] * loss_recon + LOSS_WEIGHTS['kl'] * loss_kl + LOSS_WEIGHTS['geom'] * loss_geom
@@ -176,7 +212,8 @@ def generate_vtp_for_sample(target_patient_id, output_filename=None):
         tube_radius=TUBE_RADIUS,
         n_length=N_LENGTH,
         n_radial=N_RADIAL,
-        extra_centerline_dir=EXTRA_CENTERLINE_DIR
+        extra_centerline_dir=EXTRA_CENTERLINE_DIR,
+        cache_dir=CACHE_DIR,
     )
     
     # Find the index of the requested patient
@@ -207,12 +244,14 @@ def generate_vtp_for_sample(target_patient_id, output_filename=None):
     batch = next(iter(loader)).to(DEVICE)
     
     with torch.no_grad():
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+        if str(DEVICE).startswith('cuda'):
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                x_pred, _, _ = model(batch)
+        else:
             x_pred, _, _ = model(batch)
             
     print(f"Creating VTP file: {output_filename}")
-    # Extract the original faces (PyG stores them as a tensor)
-    faces_np = data.faces.numpy() if isinstance(data.faces, torch.Tensor) else data.faces
+    faces_np = _faces_np(data)
     
     tensor_to_vtp(x_pred, faces_np, output_filename)
     print("Done!")

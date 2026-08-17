@@ -1,9 +1,12 @@
 import os
+import sys
 import pandas as pd
 
-# Paths (update the CSV path if needed)
-FOLDER_PATH = r"C:\Users\miklo\OneDrive\UQ\aneux\rawdata\models-v1.0\models\vessels\original"
-METADATA_CSV_PATH = r"C:\Users\miklo\OneDrive\UQ\aneux\rawdata\data-v1.0\data\clinical.csv" 
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+from aneux_paths import VESSELS_ORIGINAL, CSV_PATH
+
+FOLDER_PATH = VESSELS_ORIGINAL
+METADATA_CSV_PATH = CSV_PATH 
 FILTER_LOCATIONS = ['ICA pcom', 'ICA oph', 'ICA cav', 'ICA bif']
 
 # 1. Get the list of expected datasets from the CSV

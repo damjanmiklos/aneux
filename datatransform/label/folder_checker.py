@@ -1,12 +1,13 @@
 import os
+import sys
 from paraview.simple import *
 
-# --- CONFIGURATION ---
-# Folder 1: Your cleaned/filtered data
-FOLDER_1 = r"C:\Users\miklo\OneDrive\UQ\aneux\datatransform\cleaned_data\vessels_cleaned_and_decapped"
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+from aneux_paths import CLEANED_VESSELS, VESSELS_AREA001
 
-# Folder 2: Your original/unfiltered data
-FOLDER_2 = r"C:\Users\miklo\OneDrive\UQ\aneux\rawdata\models-v1.0\models\vessels\remeshed\area-001"
+# --- CONFIGURATION ---
+FOLDER_1 = CLEANED_VESSELS
+FOLDER_2 = VESSELS_AREA001
 
 
 SUPPORTED_EXTENSIONS = ('.vtp', '.stl')

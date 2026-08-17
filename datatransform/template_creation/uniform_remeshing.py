@@ -1,4 +1,5 @@
 import os
+import sys
 os.environ["VTK_OFFSCREEN"] = "1"
 os.environ["EGL_PLATFORM"] = "surfaceless"
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -22,10 +23,10 @@ except ImportError:
     HAS_VMTK = False
     print("Warning: VMTK Python bindings not found in default import path.")
 
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+from aneux_paths import CSV_PATH as DEFAULT_CSV_PATH, VESSELS_AREA005 as DEFAULT_VESSEL_DIR, TEMPLATE_OUTPUT_REMESHED as DEFAULT_OUTPUT_DIR
+
 # --- DEFAULT CONFIGURATION PATHS & PARAMETERS ---
-DEFAULT_CSV_PATH = r"C:\Users\miklo\OneDrive\UQ\aneux\rawdata\data-v1.0\data\clinical.csv"
-DEFAULT_VESSEL_DIR = r"C:\Users\miklo\OneDrive\UQ\aneux\rawdata\models-v1.0\models\vessels\remeshed\area-005"
-DEFAULT_OUTPUT_DIR = r"C:\Users\miklo\OneDrive\UQ\aneux\datatransform\template_creation\output_remeshed"
 DEFAULT_NUM_SAMPLES = None
 DEFAULT_TARGET_EDGE_LENGTH = 0.5  # mm (Isotropic uniform edge length)
 DEFAULT_EXTENSION_LENGTH = 5.0    # mm (Flow extensions)
@@ -34,9 +35,6 @@ DEFAULT_GRID_SPACING = 0.08       # mm (3D image modeller grid spacing)
 DEFAULT_MAX_GRID_SIZE = 50       # Upper voxel dimension cap for CenterlineModeller
 DEFAULT_NUM_WORKERS = 2
 FILTER_LOCATIONS = ["ICA pcom", "ICA oph", "ICA cav", "ICA bif"]
-
-# Fallback relative/alternative paths if default absolute paths don't exist
-ALT_CSV_PATH = "/home/dmiklos/aneux/rawdata/rawdata/data-v1.0/data/clinical.csv"
 
 
 def get_existing_path(primary_path, alt_path=None):
@@ -474,7 +472,7 @@ def main():
 
     args = parser.parse_args()
 
-    csv_path = get_existing_path(args.csv, ALT_CSV_PATH)
+    csv_path = args.csv
     vessel_dir = args.vessel_dir
     output_dir = args.output_dir
     num_samples = args.limit

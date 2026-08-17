@@ -1,13 +1,15 @@
 import os
+import sys
 import pandas as pd
 import zipfile
 
-# --- CONFIGURATION ---
-CSV_PATH = r"C:\Users\miklo\OneDrive\UQ\aneux\datatransform\label\hascap.csv"
-SOURCE_DIR = r"C:\Users\miklo\OneDrive\UQ\aneux\rawdata\models-v1.0\models\vessels\original"
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+from aneux_paths import HASCAP_CSV, VESSELS_ORIGINAL, KEPT_VESSELS_ZIP
 
-# The output zip file will be created in your label folder
-OUTPUT_ZIP_PATH = r"C:\Users\miklo\OneDrive\UQ\aneux\datatransform\label\kept_vessels.zip"
+# --- CONFIGURATION ---
+CSV_PATH = HASCAP_CSV
+SOURCE_DIR = VESSELS_ORIGINAL
+OUTPUT_ZIP_PATH = KEPT_VESSELS_ZIP
 
 SUPPORTED_EXTENSIONS = ['.vtp', '.stl']
 # ---------------------
