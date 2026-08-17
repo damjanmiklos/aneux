@@ -125,14 +125,12 @@ def compute_losses(
     loss_kl = vae_kl_loss(mu, logvar)
     loss_disp = displacement_dirichlet(delta_x, edge_index)
 
-    device_type = "cuda" if x_pred.is_cuda else "cpu"
     loss_lap = x_pred.new_zeros(())
     loss_norm = x_pred.new_zeros(())
     meshes = _meshes_from_batch(x_pred, face, batch_tube, num_graphs)
     if meshes is not None:
-        with torch.autocast(device_type=device_type, enabled=False):
-            loss_lap = mesh_laplacian_smoothing(meshes, method="uniform")
-            loss_norm = mesh_normal_consistency(meshes)
+        loss_lap = mesh_laplacian_smoothing(meshes, method="uniform")
+        loss_norm = mesh_normal_consistency(meshes)
 
     return {
         "recon": loss_recon,

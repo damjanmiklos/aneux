@@ -20,11 +20,29 @@ from geometry import fps_metric
 
 
 def _dedup_polyline(pts):
+    pts = np.asarray(pts, dtype=np.float64)
     if len(pts) < 2:
         return pts
     diffs = np.linalg.norm(np.diff(pts, axis=0), axis=1)
     mask = np.concatenate(([True], diffs > 1e-6))
     return pts[mask]
+
+
+def _as_f64(x):
+    return np.asarray(x, dtype=np.float64)
+
+
+def _torch_f32(x):
+    return torch.tensor(np.ascontiguousarray(x, dtype=np.float32), dtype=torch.float32)
+
+
+def _ensure_fp32_data(data):
+    """Cast cached floating tensors to float32; leave index tensors as long."""
+    for key in data.keys():
+        val = data[key]
+        if torch.is_tensor(val) and val.is_floating_point() and val.dtype != torch.float32:
+            data[key] = val.to(dtype=torch.float32)
+    return data
 
 
 def allocate_ring_counts(n_length, arc_lengths):
@@ -145,13 +163,15 @@ class AneurysmDataset(Dataset):
         return branches
 
     def _orthonormalize_frame(self, tangent, normal):
-        t = tangent / (np.linalg.norm(tangent) + 1e-12)
-        n = normal - t * np.dot(normal, t)
+        t = _as_f64(tangent)
+        n = _as_f64(normal)
+        t = t / (np.linalg.norm(t) + 1e-12)
+        n = n - t * np.dot(n, t)
         n_norm = np.linalg.norm(n)
         if n_norm < 1e-8:
-            v = np.array([1.0, 0.0, 0.0])
+            v = np.array([1.0, 0.0, 0.0], dtype=np.float64)
             if abs(np.dot(t, v)) > 0.99:
-                v = np.array([0.0, 1.0, 0.0])
+                v = np.array([0.0, 1.0, 0.0], dtype=np.float64)
             n = np.cross(t, v)
             n = n / (np.linalg.norm(n) + 1e-12)
         else:
@@ -162,22 +182,24 @@ class AneurysmDataset(Dataset):
 
     def _compute_parallel_transport_frames(self, derivatives):
         """Bishop frame along the curve via Rodrigues parallel transport."""
+        derivatives = _as_f64(derivatives)
         t_norm = np.linalg.norm(derivatives, axis=1, keepdims=True)
         t_norm = np.maximum(t_norm, 1e-8)
         tangents = derivatives / t_norm
         n_pts = len(tangents)
 
-        normals = np.zeros_like(tangents)
-        binormals = np.zeros_like(tangents)
+        normals = np.zeros_like(tangents, dtype=np.float64)
+        binormals = np.zeros_like(tangents, dtype=np.float64)
 
         t0 = tangents[0]
-        v = np.array([1.0, 0.0, 0.0])
+        v = np.array([1.0, 0.0, 0.0], dtype=np.float64)
         if abs(np.dot(t0, v)) > 0.99:
-            v = np.array([0.0, 1.0, 0.0])
+            v = np.array([0.0, 1.0, 0.0], dtype=np.float64)
         n0 = np.cross(t0, v)
         t0, n0, b0 = self._orthonormalize_frame(t0, n0)
         tangents[0], normals[0], binormals[0] = t0, n0, b0
 
+        eye3 = np.eye(3, dtype=np.float64)
         for i in range(1, n_pts):
             t_prev = tangents[i - 1]
             t_curr = tangents[i]
@@ -187,12 +209,15 @@ class AneurysmDataset(Dataset):
 
             if sin_angle > 1e-6:
                 axis = axis / sin_angle
-                k_mat = np.array([
-                    [0, -axis[2], axis[1]],
-                    [axis[2], 0, -axis[0]],
-                    [-axis[1], axis[0], 0],
-                ])
-                rot = np.eye(3) + sin_angle * k_mat + (1 - cos_angle) * (k_mat @ k_mat)
+                k_mat = np.array(
+                    [
+                        [0.0, -axis[2], axis[1]],
+                        [axis[2], 0.0, -axis[0]],
+                        [-axis[1], axis[0], 0.0],
+                    ],
+                    dtype=np.float64,
+                )
+                rot = eye3 + sin_angle * k_mat + (1.0 - cos_angle) * (k_mat @ k_mat)
                 n_i = rot @ normals[i - 1]
             else:
                 n_i = normals[i - 1]
@@ -203,6 +228,7 @@ class AneurysmDataset(Dataset):
         return tangents, normals, binormals
 
     def _fit_centerline_spline(self, branch_points):
+        branch_points = _as_f64(branch_points)
         n = len(branch_points)
         k = int(min(5, n - 1))
         if k < 1:
@@ -215,19 +241,21 @@ class AneurysmDataset(Dataset):
         return tck
 
     def _arc_length_parameter(self, eval_points):
+        eval_points = _as_f64(eval_points)
         seg = np.linalg.norm(np.diff(eval_points, axis=0), axis=1)
         cum = np.concatenate([[0.0], np.cumsum(seg)])
         total = float(cum[-1])
         if total <= 1e-12:
-            return np.linspace(0.0, 1.0, len(eval_points)), 0.0
+            return np.linspace(0.0, 1.0, len(eval_points), dtype=np.float64), 0.0
         return cum / total, total
 
     def _generate_branch_tube(self, branch_points, n_length_branch, n_radial):
+        branch_points = _as_f64(branch_points)
         tck = self._fit_centerline_spline(branch_points)
-        u_new = np.linspace(0, 1, n_length_branch)
-        eval_points = np.vstack(splev(u_new, tck)).T
+        u_new = np.linspace(0.0, 1.0, n_length_branch, dtype=np.float64)
+        eval_points = np.vstack(splev(u_new, tck)).T.astype(np.float64, copy=False)
 
-        derivatives = np.vstack(splev(u_new, tck, der=1)).T
+        derivatives = np.vstack(splev(u_new, tck, der=1)).T.astype(np.float64, copy=False)
         dnorm = np.linalg.norm(derivatives, axis=1, keepdims=True)
         if np.any(dnorm < 1e-8):
             fd = np.gradient(eval_points, axis=0)
@@ -236,7 +264,7 @@ class AneurysmDataset(Dataset):
         tangents, normals, binormals = self._compute_parallel_transport_frames(derivatives)
         u_local, arc = self._arc_length_parameter(eval_points)
 
-        theta = (2.0 * np.pi * np.arange(n_radial) / n_radial) - np.pi
+        theta = (2.0 * np.pi * np.arange(n_radial, dtype=np.float64) / n_radial) - np.pi
         cos_t = np.cos(theta)
         sin_t = np.sin(theta)
 
@@ -328,13 +356,13 @@ class AneurysmDataset(Dataset):
             all_faces.append(faces)
             node_offset += n_len * n_radial
 
-        pos = torch.tensor(np.concatenate(node_chunks, axis=0), dtype=torch.float32)
-        u_local = torch.tensor(np.concatenate(u_local_chunks), dtype=torch.float32)
-        u_global = torch.tensor(np.concatenate(global_u_chunks), dtype=torch.float32)
-        theta = torch.tensor(np.concatenate(theta_chunks), dtype=torch.float32)
-        n_v = torch.tensor(np.concatenate(n_chunks, axis=0), dtype=torch.float32)
-        t_v = torch.tensor(np.concatenate(t_chunks, axis=0), dtype=torch.float32)
-        b_v = torch.tensor(np.concatenate(b_chunks, axis=0), dtype=torch.float32)
+        pos = _torch_f32(np.concatenate(node_chunks, axis=0))
+        u_local = _torch_f32(np.concatenate(u_local_chunks))
+        u_global = _torch_f32(np.concatenate(global_u_chunks))
+        theta = _torch_f32(np.concatenate(theta_chunks))
+        n_v = _torch_f32(np.concatenate(n_chunks, axis=0))
+        t_v = _torch_f32(np.concatenate(t_chunks, axis=0))
+        b_v = _torch_f32(np.concatenate(b_chunks, axis=0))
         n_v = n_v / n_v.norm(dim=-1, keepdim=True).clamp_min(1e-8)
         t_v = t_v / t_v.norm(dim=-1, keepdim=True).clamp_min(1e-8)
         b_v = b_v / b_v.norm(dim=-1, keepdim=True).clamp_min(1e-8)
@@ -371,8 +399,8 @@ class AneurysmDataset(Dataset):
             "face": face,
             "branch_nl": torch.tensor(alloc, dtype=torch.long),
             "n_radial": torch.tensor(int(n_radial), dtype=torch.long),
-            "cl_dense": torch.tensor(cl_dense, dtype=torch.float32),
-            "cl_dense_u": torch.tensor(cl_u, dtype=torch.float32),
+            "cl_dense": _torch_f32(cl_dense),
+            "cl_dense_u": _torch_f32(cl_u),
         }
 
     def _resample_centerline(self, cl_xyz, cl_u, n_out):
@@ -395,10 +423,10 @@ class AneurysmDataset(Dataset):
 
     def _build_data(self, sample):
         vessel_mesh = pv.read(sample["vessel_file"])
-        x_true_raw = np.asarray(vessel_mesh.points, dtype=np.float32)
+        x_true_raw = _as_f64(vessel_mesh.points)
 
         centerline_mesh = pv.read(sample["centerline_file"])
-        branches = self._extract_branches(centerline_mesh)
+        branches = [_as_f64(b) for b in self._extract_branches(centerline_mesh)]
 
         arc_lengths = []
         for pts in branches:
@@ -407,12 +435,12 @@ class AneurysmDataset(Dataset):
             else:
                 arc_lengths.append(float(np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1))))
 
-        cl_all = np.concatenate([np.asarray(b, dtype=np.float32) for b in branches], axis=0)
+        cl_all = np.concatenate(branches, axis=0)
         origin = cl_all.mean(axis=0)
-        branches = [np.asarray(b, dtype=np.float32) - origin for b in branches]
+        branches = [b - origin for b in branches]
         x_true_raw = x_true_raw - origin
 
-        x_true = torch.tensor(fps_metric(x_true_raw, self.n_true), dtype=torch.float32)
+        x_true = _torch_f32(fps_metric(x_true_raw, self.n_true))
 
         levels = {}
         names = ("coarse", "mid", "fine")
@@ -465,7 +493,7 @@ class AneurysmDataset(Dataset):
             n_radial_fine=fine["n_radial"],
             n_radial_mid=mid["n_radial"],
             n_radial_coarse=coarse["n_radial"],
-            origin_shift=torch.tensor(origin, dtype=torch.float32),
+            origin_shift=_torch_f32(origin),
             cache_version=torch.tensor(CACHE_VERSION, dtype=torch.long),
         )
         return data
@@ -480,11 +508,11 @@ class AneurysmDataset(Dataset):
                     data = torch.load(cache_path, map_location="cpu", weights_only=False)
                 except TypeError:
                     data = torch.load(cache_path, map_location="cpu")
-                if int(getattr(data, "cache_version", torch.tensor(-1))) == CACHE_VERSION:
-                    if getattr(data, "face", None) is None and getattr(data, "faces", None) is not None:
-                        faces = data.faces
-                        data.face = faces.t().contiguous() if faces.size(-1) == 3 else faces
-                    return data
+                    if int(getattr(data, "cache_version", torch.tensor(-1))) == CACHE_VERSION:
+                        if getattr(data, "face", None) is None and getattr(data, "faces", None) is not None:
+                            faces = data.faces
+                            data.face = faces.t().contiguous() if faces.size(-1) == 3 else faces
+                        return _ensure_fp32_data(data)
             except Exception:
                 pass
 

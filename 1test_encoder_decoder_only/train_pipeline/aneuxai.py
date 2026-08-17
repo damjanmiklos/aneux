@@ -36,6 +36,7 @@ from config import (
     N_TRUE,
     TUBE_RADIUS_MM,
     WEIGHT_DECAY,
+    configure_stage1_precision,
 )
 from dataset import AneurysmDataset
 from model import GraphVAE
@@ -108,6 +109,7 @@ def stratified_split(dataset, val_fraction, seed):
 
 if __name__ == "__main__":
     seed_everything(SEED)
+    configure_stage1_precision()
 
     if hasattr(os, "sched_setaffinity"):
         os.sched_setaffinity(0, CPU_AFFINITY)
@@ -159,6 +161,12 @@ if __name__ == "__main__":
         print(f"Sample Edge Index shape: {sample_data.edge_index.shape}")
         print(f"Sample face shape: {sample_data.face.shape}")
         print(f"Latent query centerline: {sample_data.cl_pos.shape}")
+        print(
+            f"dtypes: x={sample_data.x.dtype} x_true={sample_data.x_true.dtype} "
+            f"cl_pos={sample_data.cl_pos.dtype} "
+            f"matmul={torch.get_float32_matmul_precision()} "
+            f"tf32={torch.backends.cuda.matmul.allow_tf32}"
+        )
 
     # %% [markdown]
     # ## 3. Model Initialization
@@ -208,8 +216,7 @@ if __name__ == "__main__":
         trained_model, history = None, []
 
     # %% [markdown]
-    # ## 5. Save the Model
-
+    # ## 5. Save the Model 
     # %%
     if trained_model is not None:
         model_path = os.path.join(OUTPUT_DIR, "graph_vae_aneurysm.pth")

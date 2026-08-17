@@ -1,7 +1,27 @@
 """Hyperparameters for the hierarchical PointNeXt–SplineConv deformation VAE.
 
 Values follow the architectural specification. Physical units are millimetres.
+
+Stage-1 precision (see configure_stage1_precision):
+  CPU preprocessing in dataset.py is NumPy float64 (splines, Bishop frames,
+  arc-length, COM). All model parameters, GPU tensors, and Data fields are
+  torch.float32. Ampere matmuls use TF32 execution with FP32 storage.
+  Autocast / bfloat16 / float16 are not used in Stage 1.
 """
+
+import torch
+
+
+def configure_stage1_precision():
+    """FP32 tensor storage, TF32 Ampere matmuls, no autocast or reduced dtypes."""
+    torch.set_float32_matmul_precision("high")
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    torch.sparse.check_sparse_tensor_invariants.disable()
+
+
+configure_stage1_precision()
 
 # --- Scaffold / data ---
 TUBE_RADIUS_MM = 2.0

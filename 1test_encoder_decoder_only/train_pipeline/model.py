@@ -324,12 +324,9 @@ class ResidualSplineConv(nn.Module):
         )
 
     def forward(self, h: Tensor, edge_index: Tensor, pseudo: Tensor) -> Tensor:
-        # pyg-lib spline CUDA kernels are float32-only; bf16 autocast illegal-accesses.
-        device_type = "cuda" if h.is_cuda else "cpu"
-        with torch.autocast(device_type=device_type, enabled=False):
-            h32 = h.float()
-            out = h32 + F.elu(self.conv(h32, edge_index, pseudo.float()))
-        return out.to(dtype=h.dtype)
+        h = h.to(dtype=torch.float32)
+        pseudo = pseudo.to(dtype=torch.float32)
+        return h + F.elu(self.conv(h, edge_index, pseudo))
 
 
 class DecoupledDisplacementHead(nn.Module):
@@ -345,6 +342,7 @@ class DecoupledDisplacementHead(nn.Module):
         nn.init.zeros_(self.shear.bias)
 
     def forward(self, h: Tensor):
+        h = h.to(dtype=torch.float32)
         delta_r = F.softplus(self.radial(h)) - self.r_margin
         delta_s = torch.tanh(self.shear(h)) * self.s_max
         return delta_r, delta_s

@@ -9,7 +9,6 @@ import json
 import os
 import sys
 import pyvista as pv
-from contextlib import nullcontext
 from tqdm import tqdm
 from torch_geometric.loader import DataLoader
 
@@ -34,6 +33,7 @@ from config import (
     LATENT_LEN,
     N_TRUE,
     TUBE_RADIUS_MM,
+    configure_stage1_precision,
 )
 from dataset import AneurysmDataset
 from model import GraphVAE
@@ -63,8 +63,7 @@ RESULTS_CSV = os.path.join(OUTPUT_DIR, "per_patient_losses.csv")
 
 LOSS_WEIGHTS = dict(DEFAULT_LOSS_WEIGHTS)
 
-# Opt-in to sparse tensor invariant checks globally to guarantee memory safety 
-torch.sparse.check_sparse_tensor_invariants.enable()
+configure_stage1_precision()
 
 
 # %% 
@@ -173,14 +172,9 @@ def evaluate_all_samples():
             patient_id = dataset.samples[i]['dataset_id']
             split = 'train' if patient_id in train_ids else ('val' if patient_id in val_ids else 'unknown')
             
-            autocast_ctx = (
-                torch.autocast(device_type='cuda', dtype=torch.bfloat16)
-                if str(DEVICE).startswith('cuda') else nullcontext()
-            )
-            with autocast_ctx:
-                out = model(batch)
-                terms = losses_from_output(out, batch)
-                total_loss = weighted_total(terms, LOSS_WEIGHTS)
+            out = model(batch)
+            terms = losses_from_output(out, batch)
+            total_loss = weighted_total(terms, LOSS_WEIGHTS)
             
             results.append({
                 'patient_id': patient_id,
@@ -252,11 +246,7 @@ def generate_vtp_for_sample(target_patient_id, output_filename=None):
     batch = next(iter(loader)).to(DEVICE)
     
     with torch.no_grad():
-        if str(DEVICE).startswith('cuda'):
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                out = model(batch)
-        else:
-            out = model(batch)
+        out = model(batch)
         x_pred = out.x_pred
             
     print(f"Creating VTP file: {output_filename}")

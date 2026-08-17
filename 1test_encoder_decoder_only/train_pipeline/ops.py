@@ -17,17 +17,14 @@ def _num_graphs(batch: Tensor) -> int:
 _PYTORCH3D_CUDA_FPS = None
 
 
-def _no_autocast(x: Tensor):
-    return torch.autocast(device_type="cuda" if x.is_cuda else "cpu", enabled=False)
-
-
 def farthest_point_sample_torch(pts: Tensor, k: int) -> Tensor:
     """Iterative metric FPS on the tensor's device. Returns local indices [k]."""
+    pts = pts.to(dtype=torch.float32)
     n = int(pts.size(0))
     k = min(int(k), n)
     selected = torch.empty(k, dtype=torch.long, device=pts.device)
     selected[0] = 0
-    dist = torch.full((n,), float("inf"), device=pts.device, dtype=pts.dtype)
+    dist = torch.full((n,), float("inf"), device=pts.device, dtype=torch.float32)
     last = pts[0]
     for i in range(1, k):
         dist = torch.minimum(dist, (pts - last).pow(2).sum(dim=-1))
@@ -46,10 +43,9 @@ def _pytorch3d_fps_ok(device: torch.device) -> bool:
         try:
             from pytorch3d.ops import sample_farthest_points
 
-            with torch.autocast(device_type="cuda", enabled=False):
-                probe = torch.zeros(1, 4, 3, device=device, dtype=torch.float32)
-                sample_farthest_points(probe, K=2, random_start_point=False)
-                torch.cuda.synchronize()
+            probe = torch.zeros(1, 4, 3, device=device, dtype=torch.float32)
+            sample_farthest_points(probe, K=2, random_start_point=False)
+            torch.cuda.synchronize()
             _PYTORCH3D_CUDA_FPS = True
         except Exception as exc:
             msg = str(exc).lower()
@@ -69,14 +65,13 @@ def fps_indices(pts: Tensor, k: int) -> Tensor:
         return pts.new_zeros((0,), dtype=torch.long)
     if k == pts.size(0):
         return torch.arange(k, device=pts.device)
-    with _no_autocast(pts):
-        pts_f = pts.float().contiguous()
-        if _pytorch3d_fps_ok(pts.device):
-            from pytorch3d.ops import sample_farthest_points
+    pts_f = pts.to(dtype=torch.float32).contiguous()
+    if _pytorch3d_fps_ok(pts.device):
+        from pytorch3d.ops import sample_farthest_points
 
-            _, loc = sample_farthest_points(pts_f.unsqueeze(0), K=k, random_start_point=False)
-            return loc.squeeze(0).long()
-        return farthest_point_sample_torch(pts_f, k)
+        _, loc = sample_farthest_points(pts_f.unsqueeze(0), K=k, random_start_point=False)
+        return loc.squeeze(0).long()
+    return farthest_point_sample_torch(pts_f, k)
 
 
 def _missing_pyg_lib(exc: BaseException) -> bool:
@@ -98,15 +93,14 @@ def ball_query_packed(
         from torch_geometric.nn import radius as _radius
 
         # pyg-lib radius is (query, support); PointNeXt grouping wants (support, query).
-        with _no_autocast(support):
-            return _radius(
-                support.float().contiguous(),
-                query.float().contiguous(),
-                radius,
-                support_batch,
-                query_batch,
-                max_num_neighbors=max_num_neighbors,
-            ).flip(0)
+        return _radius(
+            support.to(dtype=torch.float32).contiguous(),
+            query.to(dtype=torch.float32).contiguous(),
+            radius,
+            support_batch,
+            query_batch,
+            max_num_neighbors=max_num_neighbors,
+        ).flip(0)
     except Exception as exc:
         if not _missing_pyg_lib(exc):
             raise
@@ -155,15 +149,14 @@ def radius_graph_packed(
     try:
         from torch_geometric.nn import radius_graph as _rg
 
-        with _no_autocast(pos):
-            return _rg(
-                pos.float().contiguous(),
-                r=radius,
-                batch=batch,
-                loop=loop,
-                max_num_neighbors=max_num_neighbors,
-                flow=flow,
-            )
+        return _rg(
+            pos.to(dtype=torch.float32).contiguous(),
+            r=radius,
+            batch=batch,
+            loop=loop,
+            max_num_neighbors=max_num_neighbors,
+            flow=flow,
+        )
     except Exception as exc:
         if not _missing_pyg_lib(exc):
             raise
@@ -190,8 +183,8 @@ def _open_uniform_knots(n_ctrl: int, degree: int, device, dtype) -> Tensor:
 
 def bspline_basis_1d(u: Tensor, n_ctrl: int, degree: int) -> Tensor:
     """Open B-spline basis of `degree` with `n_ctrl` functions. u in [0, 1] → [E, n_ctrl]."""
-    u = u.clamp(0.0, 1.0 - 1e-6)
-    knots = _open_uniform_knots(n_ctrl, degree, u.device, u.dtype)
+    u = u.to(dtype=torch.float32).clamp(0.0, 1.0 - 1e-6)
+    knots = _open_uniform_knots(n_ctrl, degree, u.device, torch.float32)
     left = knots[:-1]
     right = knots[1:]
     basis = ((u.unsqueeze(1) >= left) & (u.unsqueeze(1) < right)).to(u.dtype)
@@ -242,6 +235,8 @@ class BSplineConv(MessagePassing):
         self.bias = nn.Parameter(torch.zeros(out_channels)) if bias else None
 
     def forward(self, x: Tensor, edge_index: Tensor, edge_attr: Tensor) -> Tensor:
+        x = x.to(dtype=torch.float32)
+        edge_attr = edge_attr.to(dtype=torch.float32)
         out = self.propagate(edge_index, x=x, edge_attr=edge_attr)
         if self.root is not None:
             out = out + self.root(x)

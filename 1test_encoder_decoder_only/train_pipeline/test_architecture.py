@@ -14,7 +14,7 @@ from torch_geometric.loader import DataLoader
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import FOLLOW_BATCH, GAMMA_THETA_DIM, GAMMA_U_DIM, K_THETA, K_U
+from config import FOLLOW_BATCH, GAMMA_THETA_DIM, GAMMA_U_DIM, K_THETA, K_U, configure_stage1_precision
 from dataset import AneurysmDataset, allocate_ring_counts
 from geometry import (
     bilinear_cylindrical_upsample,
@@ -104,7 +104,7 @@ def make_synthetic_data(
         n_radial_fine=fine["n_radial"],
         n_radial_mid=mid["n_radial"],
         n_radial_coarse=coarse["n_radial"],
-        origin_shift=torch.zeros(3),
+        origin_shift=torch.zeros(3, dtype=torch.float32),
     )
 
 
@@ -118,9 +118,15 @@ def test_fourier_shapes():
     th = torch.linspace(-math.pi, math.pi, 13)[:-1]
     gu = harmonic_encoding_u(u)
     gt = harmonic_encoding_theta(th)
+    _assert(gu.dtype == torch.float32 and gt.dtype == torch.float32, "Fourier dtype")
     _assert(gu.shape == (11, GAMMA_U_DIM), f"γ(u) shape {gu.shape}")
     _assert(gt.shape == (12, GAMMA_THETA_DIM), f"γ(θ) shape {gt.shape}")
     _assert(torch.isfinite(gu).all() and torch.isfinite(gt).all(), "non-finite Fourier")
+    # Highest frequency bands at the interval endpoints must stay finite in FP32.
+    u_hi = torch.tensor([0.0, 0.5, 1.0], dtype=torch.float32)
+    th_hi = torch.tensor([-math.pi, 0.0, math.pi], dtype=torch.float32)
+    _assert(torch.isfinite(harmonic_encoding_u(u_hi)).all(), "γ(u) max-band")
+    _assert(torch.isfinite(harmonic_encoding_theta(th_hi)).all(), "γ(θ) max-band")
     # Periodicity in θ for the lowest band.
     th0 = torch.tensor([-math.pi, math.pi - 1e-6])
     gt0 = harmonic_encoding_theta(th0)
@@ -143,6 +149,7 @@ def test_pseudo_coords_range():
     pos = torch.tensor([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 3.0, 0.0]])
     ei = torch.tensor([[0, 1, 0, 2], [1, 0, 2, 0]])
     e = spline_pseudo_coords(pos, ei, r_edge_max=2.0)
+    _assert(e.dtype == torch.float32, "pseudo dtype")
     _assert(e.min() >= 0.0 and e.max() <= 1.0, f"pseudo coords out of [0,1]: {e.min()}, {e.max()}")
 
 
@@ -168,6 +175,7 @@ def test_bishop_frames_orthonormal():
     factory = _TubeFactory(radius=2.0)
     tube = factory._generate_branch_tube(_straight_branch(), n_length_branch=12, n_radial=6)
     n_v, t_v, b_v = tube["n_v"], tube["t_v"], tube["b_v"]
+    _assert(n_v.dtype == np.float64, f"Bishop n dtype {n_v.dtype}")
     _assert(np.allclose(np.linalg.norm(n_v, axis=1), 1.0, atol=1e-5), "n not unit")
     _assert(np.allclose(np.linalg.norm(t_v, axis=1), 1.0, atol=1e-5), "t not unit")
     _assert(np.allclose(np.linalg.norm(b_v, axis=1), 1.0, atol=1e-5), "b not unit")
@@ -181,6 +189,14 @@ def test_bishop_frames_orthonormal():
     # n × t = n × tangent; for θ=0, n_v=n, t_v=t, n×t = -t×n = -b. Sign depends.
     _assert(np.allclose(np.abs((cross * b_v).sum(1)), 1.0, atol=1e-4), "frame not orthonormal triad")
     _assert(tube["theta"].min() >= -np.pi - 1e-6 and tube["theta"].max() < np.pi + 1e-6, "θ range")
+
+    arc = [float(np.sum(np.linalg.norm(np.diff(_straight_branch(), axis=0), axis=1)))]
+    level = factory._generate_level([_straight_branch()], 12, 6, arc)
+    n, t, b = level["normal"], level["tangent"], level["binormal"]
+    _assert(n.dtype == torch.float32, "packed normal dtype")
+    _assert(float((n * t).sum(-1).abs().max()) < 1e-4, "packed n·t")
+    _assert(float((n * b).sum(-1).abs().max()) < 1e-4, "packed n·b")
+    _assert(torch.allclose(n.norm(dim=-1), torch.ones(n.size(0)), atol=1e-4), "packed ||n||")
 
 
 def test_fps_count():
@@ -284,6 +300,11 @@ def test_forward_backward():
     _assert(out.x_pred_coarse.shape == batch.pos_coarse.shape, "coarse pred")
     _assert(out.x_pred_mid.shape == batch.pos_mid.shape, "mid pred")
     _assert(torch.isfinite(out.x_pred).all(), "non-finite prediction")
+    _assert(out.x_pred.dtype == torch.float32, "pred dtype")
+    _assert(out.mu.dtype == torch.float32 and out.logvar.dtype == torch.float32, "latent dtype")
+    _assert(not torch.is_autocast_enabled(), "autocast must stay off")
+    for p in model.parameters():
+        _assert(p.dtype == torch.float32, f"param dtype {p.dtype}")
 
     from losses import compute_losses
 
@@ -304,8 +325,30 @@ def test_forward_backward():
     _assert(x_dec.shape == batch.x.shape, "decode contract shape")
 
 
+def test_stage1_precision_flags():
+    configure_stage1_precision()
+    _assert(torch.get_float32_matmul_precision() == "high", torch.get_float32_matmul_precision())
+    if torch.cuda.is_available():
+        _assert(bool(torch.backends.cuda.matmul.allow_tf32), "tf32 matmul")
+        _assert(bool(torch.backends.cudnn.allow_tf32), "tf32 cudnn")
+    _assert(not torch.sparse.check_sparse_tensor_invariants.is_enabled(), "sparse checks")
+    _assert(not torch.is_autocast_enabled(), "autocast")
+
+
+def test_synthetic_data_fp32():
+    data = make_synthetic_data()
+    for name in ("x", "x_true", "cl_pos", "cl_dense", "pos_mid", "pos_coarse", "u", "theta", "normal"):
+        t = getattr(data, name)
+        _assert(t.dtype == torch.float32, f"{name} dtype {t.dtype}")
+    _assert(data.edge_index.dtype == torch.long, "edge_index dtype")
+    _assert(data.face.dtype == torch.long, "face dtype")
+
+
 def main():
+    configure_stage1_precision()
     tests = [
+        test_stage1_precision_flags,
+        test_synthetic_data_fp32,
         test_fourier_shapes,
         test_kl_and_anneal,
         test_pseudo_coords_range,

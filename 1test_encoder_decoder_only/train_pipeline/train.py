@@ -1,5 +1,4 @@
 import os
-from contextlib import nullcontext
 
 import torch
 from torch.optim import AdamW
@@ -15,6 +14,7 @@ from config import (
     LAMBDA_KL,
     LEARNING_RATE,
     WEIGHT_DECAY,
+    configure_stage1_precision,
 )
 from losses import compute_losses
 
@@ -23,12 +23,6 @@ def _device_type(device):
     if isinstance(device, torch.device):
         return device.type
     return str(device).split(":")[0]
-
-
-def _autocast(device):
-    # SplineConv / pytorch3d / pyg-lib CUDA kernels are float32-only.
-    # bf16 autocast poisons the GPU and shows up later as illegal memory access.
-    return nullcontext()
 
 
 def _face_from_batch(batch):
@@ -107,8 +101,7 @@ def train_epoch(model, dataloader, optimizer, weights, device, accum_steps=1, gr
         total_samples += batch_size
         window_len = _accum_window_len(step, n_batches, accum_steps)
 
-        with _autocast(device):
-            out = model(batch)
+        out = model(batch)
         terms = losses_from_output(out, batch)
         loss = _weighted_total(terms, weights) / window_len
 
@@ -139,8 +132,7 @@ def evaluate_epoch(model, dataloader, weights, device):
             batch = batch.to(device)
             batch_size = batch.num_graphs
             total_samples += batch_size
-            with _autocast(device):
-                out = model(batch)
+            out = model(batch)
             terms = losses_from_output(out, batch)
             loss = _weighted_total(terms, weights)
             totals["loss"] += loss.item() * batch_size
@@ -189,6 +181,13 @@ def train_model(
 ):
     if weights is None:
         weights = dict(DEFAULT_LOSS_WEIGHTS)
+
+    configure_stage1_precision()
+    print(
+        f"Stage-1 precision: matmul={torch.get_float32_matmul_precision()} "
+        f"tf32_matmul={torch.backends.cuda.matmul.allow_tf32} "
+        f"tf32_cudnn={torch.backends.cudnn.allow_tf32}"
+    )
 
     use_cuda = _device_type(device) == "cuda"
     loader_kwargs = dict(

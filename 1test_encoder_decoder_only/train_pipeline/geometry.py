@@ -13,16 +13,16 @@ from config import EDGE_MAX_MM, K_THETA, K_U
 
 def harmonic_encoding_u(u: Tensor, k_u: int = K_U) -> Tensor:
     """γ(u) = [sin(2^i π u), cos(2^i π u)]_{i=0}^{K_u-1} ∈ R^{2 K_u}."""
-    u = u.float().reshape(-1, 1)
-    freqs = (2.0 ** torch.arange(k_u, device=u.device, dtype=u.dtype)) * math.pi
+    u = u.to(dtype=torch.float32).reshape(-1, 1)
+    freqs = (2.0 ** torch.arange(k_u, device=u.device, dtype=torch.float32)) * math.pi
     ang = u * freqs.unsqueeze(0)
     return torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)
 
 
 def harmonic_encoding_theta(theta: Tensor, k_theta: int = K_THETA) -> Tensor:
     """γ(θ) = [sin(2^i θ), cos(2^i θ)]_{i=0}^{K_θ-1} ∈ R^{2 K_θ}."""
-    theta = theta.float().reshape(-1, 1)
-    freqs = 2.0 ** torch.arange(k_theta, device=theta.device, dtype=theta.dtype)
+    theta = theta.to(dtype=torch.float32).reshape(-1, 1)
+    freqs = 2.0 ** torch.arange(k_theta, device=theta.device, dtype=torch.float32)
     ang = theta * freqs.unsqueeze(0)
     return torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)
 
@@ -36,6 +36,7 @@ def spline_pseudo_coords(
 
     e_ij = 0.5 + 0.5 * clamp((x_j - x_i) / (2 r_edge_max), -1, 1)
     """
+    pos = pos.to(dtype=torch.float32)
     src, dst = edge_index[0], edge_index[1]
     delta = (pos[dst] - pos[src]) / (2.0 * r_edge_max)
     return 0.5 + 0.5 * delta.clamp(-1.0, 1.0)
@@ -48,7 +49,10 @@ def vertex_frames(theta: Tensor, n_cl: Tensor, t_cl: Tensor, b_cl: Tensor):
     b_v(θ) = -sinθ n(u) + cosθ b(u)
     t_v     = t(u)
     """
-    th = theta.reshape(-1, 1)
+    th = theta.to(dtype=torch.float32).reshape(-1, 1)
+    n_cl = n_cl.to(dtype=torch.float32)
+    t_cl = t_cl.to(dtype=torch.float32)
+    b_cl = b_cl.to(dtype=torch.float32)
     cos_t = torch.cos(th)
     sin_t = torch.sin(th)
     n_v = cos_t * n_cl + sin_t * b_cl
@@ -73,13 +77,15 @@ def bilinear_cylindrical_upsample(
     """
     if n_length_src < 1 or n_radial_src < 1:
         raise ValueError("Source grid must be non-empty")
+    field = field.to(dtype=torch.float32)
     c = field.shape[-1]
     src = field.reshape(n_length_src, n_radial_src, c)
 
     if n_length_dst == n_length_src and n_radial_dst == n_radial_src:
         return field
 
-    device, dtype = field.device, field.dtype
+    device = field.device
+    dtype = torch.float32
     if n_length_src == 1:
         i0 = torch.zeros(n_length_dst, dtype=torch.long, device=device)
         i1 = i0
@@ -186,4 +192,9 @@ def decoupled_displacement(
     b_v: Tensor,
 ) -> Tensor:
     """x displacement from radial scalar and 2D shear in the local frame."""
+    delta_r = delta_r.to(dtype=torch.float32)
+    delta_s = delta_s.to(dtype=torch.float32)
+    n_v = n_v.to(dtype=torch.float32)
+    t_v = t_v.to(dtype=torch.float32)
+    b_v = b_v.to(dtype=torch.float32)
     return delta_r * n_v + delta_s[:, 0:1] * t_v + delta_s[:, 1:2] * b_v
