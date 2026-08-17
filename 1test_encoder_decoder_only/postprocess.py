@@ -49,9 +49,13 @@ TUBE_RADIUS = TUBE_RADIUS_MM
 N_LENGTH = HIERARCHY_LEVELS[-1][0]
 N_RADIAL = HIERARCHY_LEVELS[-1][1]
 
-DEVICE = 'cuda:1' if torch.cuda.is_available() else 'cpu'
-if str(DEVICE).startswith('cuda'):
-    torch.cuda.set_device(int(str(DEVICE).split(':')[1]))
+if torch.cuda.is_available():
+    n_gpu = torch.cuda.device_count()
+    gpu_index = 1 if n_gpu > 1 else 0
+    DEVICE = f"cuda:{gpu_index}"
+    torch.cuda.set_device(gpu_index)
+else:
+    DEVICE = "cpu"
 
 SPLIT_FILE = os.path.join(OUTPUT_DIR, "train_val_split.json")
 MODEL_FILE = os.path.join(OUTPUT_DIR, "graph_vae_aneurysm.pth")

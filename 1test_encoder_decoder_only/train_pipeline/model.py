@@ -49,7 +49,7 @@ from geometry import (
     spline_pseudo_coords,
     upsample_branch_concat,
 )
-from ops import ball_query_packed, make_spline_conv, radius_graph_packed
+from ops import ball_query_packed, fps_indices, make_spline_conv, radius_graph_packed
 
 
 def _num_graphs(batch: Tensor) -> int:
@@ -82,21 +82,8 @@ def fps_packed(pos: Tensor, batch: Tensor, n_out: int) -> Tensor:
         if k == pts.size(0):
             pieces.append(node_idx)
             continue
-        try:
-            from pytorch3d.ops import sample_farthest_points
-
-            _, loc = sample_farthest_points(pts.unsqueeze(0), K=k, random_start_point=False)
-            pieces.append(node_idx[loc.squeeze(0).long()])
-        except Exception:
-            from torch_geometric.nn import fps as pyg_fps
-
-            loc = pyg_fps(
-                pts,
-                torch.zeros(pts.size(0), dtype=torch.long, device=pts.device),
-                ratio=float(k) / float(max(pts.size(0), 1)),
-            )
-            loc = loc[:k]
-            pieces.append(node_idx[loc])
+        loc = fps_indices(pts, k)
+        pieces.append(node_idx[loc])
     if not pieces:
         return torch.arange(pos.size(0), device=pos.device)
     return torch.cat(pieces, dim=0)
@@ -337,7 +324,12 @@ class ResidualSplineConv(nn.Module):
         )
 
     def forward(self, h: Tensor, edge_index: Tensor, pseudo: Tensor) -> Tensor:
-        return h + F.elu(self.conv(h, edge_index, pseudo))
+        # pyg-lib spline CUDA kernels are float32-only; bf16 autocast illegal-accesses.
+        device_type = "cuda" if h.is_cuda else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            h32 = h.float()
+            out = h32 + F.elu(self.conv(h32, edge_index, pseudo.float()))
+        return out.to(dtype=h.dtype)
 
 
 class DecoupledDisplacementHead(nn.Module):

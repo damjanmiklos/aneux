@@ -48,3 +48,6 @@ tensorboard/
 # Generated output & datasets
 datatransform/cleaned_data/
 datatransform/template_creation/output*/
+
+# Local agent troubleshooting (never commit)
+scratch//

@@ -26,8 +26,8 @@ def _device_type(device):
 
 
 def _autocast(device):
-    if _device_type(device) == "cuda" and torch.cuda.is_available():
-        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    # SplineConv / pytorch3d / pyg-lib CUDA kernels are float32-only.
+    # bf16 autocast poisons the GPU and shows up later as illegal memory access.
     return nullcontext()
 
 
@@ -109,8 +109,8 @@ def train_epoch(model, dataloader, optimizer, weights, device, accum_steps=1, gr
 
         with _autocast(device):
             out = model(batch)
-            terms = losses_from_output(out, batch)
-            loss = _weighted_total(terms, weights) / window_len
+        terms = losses_from_output(out, batch)
+        loss = _weighted_total(terms, weights) / window_len
 
         loss.backward()
 
@@ -141,8 +141,8 @@ def evaluate_epoch(model, dataloader, weights, device):
             total_samples += batch_size
             with _autocast(device):
                 out = model(batch)
-                terms = losses_from_output(out, batch)
-                loss = _weighted_total(terms, weights)
+            terms = losses_from_output(out, batch)
+            loss = _weighted_total(terms, weights)
             totals["loss"] += loss.item() * batch_size
             for key in ("recon", "kl", "disp", "lap", "norm"):
                 totals[key] += terms[key].item() * batch_size
@@ -213,6 +213,12 @@ def train_model(
     )
 
     model = model.to(device)
+    if use_cuda:
+        torch.cuda.synchronize()
+        from ops import fps_indices
+
+        fps_indices(torch.randn(64, 3, device=device), 8)
+        torch.cuda.synchronize()
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=max(lr * 1e-2, 1e-7))
 

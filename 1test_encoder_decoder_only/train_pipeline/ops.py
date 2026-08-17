@@ -14,6 +14,77 @@ def _num_graphs(batch: Tensor) -> int:
     return int(batch.max().item()) + 1
 
 
+_PYTORCH3D_CUDA_FPS = None
+
+
+def _no_autocast(x: Tensor):
+    return torch.autocast(device_type="cuda" if x.is_cuda else "cpu", enabled=False)
+
+
+def farthest_point_sample_torch(pts: Tensor, k: int) -> Tensor:
+    """Iterative metric FPS on the tensor's device. Returns local indices [k]."""
+    n = int(pts.size(0))
+    k = min(int(k), n)
+    selected = torch.empty(k, dtype=torch.long, device=pts.device)
+    selected[0] = 0
+    dist = torch.full((n,), float("inf"), device=pts.device, dtype=pts.dtype)
+    last = pts[0]
+    for i in range(1, k):
+        dist = torch.minimum(dist, (pts - last).pow(2).sum(dim=-1))
+        farthest = dist.argmax()
+        selected[i] = farthest
+        last = pts[farthest]
+    return selected
+
+
+def _pytorch3d_fps_ok(device: torch.device) -> bool:
+    """True if pytorch3d FPS has CUDA kernels for this device (or the tensor is on CPU)."""
+    global _PYTORCH3D_CUDA_FPS
+    if device.type != "cuda":
+        return True
+    if _PYTORCH3D_CUDA_FPS is None:
+        try:
+            from pytorch3d.ops import sample_farthest_points
+
+            with torch.autocast(device_type="cuda", enabled=False):
+                probe = torch.zeros(1, 4, 3, device=device, dtype=torch.float32)
+                sample_farthest_points(probe, K=2, random_start_point=False)
+                torch.cuda.synchronize()
+            _PYTORCH3D_CUDA_FPS = True
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "illegal" in msg or "cuda" in type(exc).__name__.lower():
+                raise
+            import warnings
+
+            warnings.warn(f"pytorch3d CUDA FPS unavailable ({type(exc).__name__}: {exc})")
+            _PYTORCH3D_CUDA_FPS = False
+    return bool(_PYTORCH3D_CUDA_FPS)
+
+
+def fps_indices(pts: Tensor, k: int) -> Tensor:
+    """FPS indices for a single cloud [N, 3]. Prefers pytorch3d CUDA, else in-device torch FPS."""
+    k = min(int(k), int(pts.size(0)))
+    if k <= 0:
+        return pts.new_zeros((0,), dtype=torch.long)
+    if k == pts.size(0):
+        return torch.arange(k, device=pts.device)
+    with _no_autocast(pts):
+        pts_f = pts.float().contiguous()
+        if _pytorch3d_fps_ok(pts.device):
+            from pytorch3d.ops import sample_farthest_points
+
+            _, loc = sample_farthest_points(pts_f.unsqueeze(0), K=k, random_start_point=False)
+            return loc.squeeze(0).long()
+        return farthest_point_sample_torch(pts_f, k)
+
+
+def _missing_pyg_lib(exc: BaseException) -> bool:
+    return isinstance(exc, (ImportError, OSError)) or (
+        isinstance(exc, RuntimeError) and "pyg-lib" in str(exc).lower()
+    )
+
+
 def ball_query_packed(
     support: Tensor,
     query: Tensor,
@@ -26,15 +97,19 @@ def ball_query_packed(
     try:
         from torch_geometric.nn import radius as _radius
 
-        return _radius(
-            support,
-            query,
-            radius,
-            support_batch,
-            query_batch,
-            max_num_neighbors=max_num_neighbors,
-        )
-    except ImportError:
+        # pyg-lib radius is (query, support); PointNeXt grouping wants (support, query).
+        with _no_autocast(support):
+            return _radius(
+                support.float().contiguous(),
+                query.float().contiguous(),
+                radius,
+                support_batch,
+                query_batch,
+                max_num_neighbors=max_num_neighbors,
+            ).flip(0)
+    except Exception as exc:
+        if not _missing_pyg_lib(exc):
+            raise
         return _ball_query_torch(
             support, query, radius, support_batch, query_batch, max_num_neighbors
         )
@@ -80,15 +155,18 @@ def radius_graph_packed(
     try:
         from torch_geometric.nn import radius_graph as _rg
 
-        return _rg(
-            pos,
-            r=radius,
-            batch=batch,
-            loop=loop,
-            max_num_neighbors=max_num_neighbors,
-            flow=flow,
-        )
-    except ImportError:
+        with _no_autocast(pos):
+            return _rg(
+                pos.float().contiguous(),
+                r=radius,
+                batch=batch,
+                loop=loop,
+                max_num_neighbors=max_num_neighbors,
+                flow=flow,
+            )
+    except Exception as exc:
+        if not _missing_pyg_lib(exc):
+            raise
         ei = _ball_query_torch(pos, pos, radius, batch, batch, max_num_neighbors)
         # ei[0] = neighbors (support), ei[1] = centers (query)
         if flow != "source_to_target":

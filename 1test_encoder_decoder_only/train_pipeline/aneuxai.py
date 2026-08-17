@@ -41,8 +41,6 @@ from dataset import AneurysmDataset
 from model import GraphVAE
 from train import train_model
 
-torch.sparse.check_sparse_tensor_invariants.enable()
-
 # %% [markdown]
 # ## 1. Configuration & Hyperparameters
 
@@ -65,7 +63,7 @@ VAL_EVERY = 5
 SEED = 31
 
 CPU_AFFINITY = [1, 2, 3]
-NUM_WORKERS = 2
+NUM_WORKERS = 0
 
 LOSS_WEIGHTS = dict(DEFAULT_LOSS_WEIGHTS)
 
@@ -115,9 +113,15 @@ if __name__ == "__main__":
         os.sched_setaffinity(0, CPU_AFFINITY)
         torch.set_num_threads(len(CPU_AFFINITY))
 
-    DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
-    if DEVICE.startswith("cuda"):
-        torch.cuda.set_device(int(DEVICE.split(":")[1]))
+    if torch.cuda.is_available():
+        n_gpu = torch.cuda.device_count()
+        gpu_index = 1 if n_gpu > 1 else 0
+        DEVICE = f"cuda:{gpu_index}"
+        torch.cuda.set_device(gpu_index)
+        print(f"Using {DEVICE} ({torch.cuda.get_device_name(gpu_index)}); {n_gpu} GPU(s) visible")
+    else:
+        DEVICE = "cpu"
+        print("CUDA not available; using CPU")
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 

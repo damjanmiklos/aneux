@@ -93,12 +93,24 @@ def compute_losses(
     lambda_cd_coarse=LAMBDA_CD_COARSE,
 ):
     """Return a dict of unweighted loss terms."""
+    x_pred = x_pred.float()
+    x_true = x_true.float()
+    x_tube = x_tube.float()
+    mu = mu.float()
+    logvar = logvar.float()
+    if delta_x is None:
+        delta_x = x_pred - x_tube
+    else:
+        delta_x = delta_x.float()
+    if x_pred_mid is not None:
+        x_pred_mid = x_pred_mid.float()
+    if x_pred_coarse is not None:
+        x_pred_coarse = x_pred_coarse.float()
+
     if batch_tube is None:
         raise ValueError("compute_losses requires batch_tube (the PyG batch vector for tube nodes)")
     if face is None:
         face = faces
-    if delta_x is None:
-        delta_x = x_pred - x_tube
 
     loss_recon = _batched_chamfer(x_pred, batch_tube, x_true, batch_x_true, num_graphs)
     if x_pred_mid is not None and batch_mid is not None:

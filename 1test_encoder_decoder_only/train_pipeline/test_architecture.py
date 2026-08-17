@@ -27,7 +27,7 @@ from geometry import (
 )
 from losses import displacement_dirichlet, vae_kl_loss
 from model import DecoupledDisplacementHead, GraphVAE
-from ops import bspline_basis_1d
+from ops import bspline_basis_1d, farthest_point_sample_torch, fps_indices
 from train import kl_anneal_weight
 
 
@@ -191,6 +191,44 @@ def test_fps_count():
     _assert(short.shape == (32, 3), "FPS pad failed")
 
 
+def test_fps_cuda_path():
+    from ops import _pytorch3d_fps_ok
+
+    pts = torch.randn(128, 3)
+    idx_cpu = fps_indices(pts, 16)
+    _assert(idx_cpu.numel() == 16, idx_cpu.shape)
+    _assert(idx_cpu.min() >= 0 and idx_cpu.max() < 128, "CPU FPS out of range")
+    idx_loop = farthest_point_sample_torch(pts, 16)
+    _assert(idx_loop.numel() == 16, idx_loop.shape)
+    if not torch.cuda.is_available():
+        return
+    pts_g = pts.cuda()
+    _assert(_pytorch3d_fps_ok(pts_g.device), "pytorch3d CUDA FPS unavailable")
+    idx_g = fps_indices(pts_g, 16)
+    _assert(idx_g.device.type == "cuda", f"expected CUDA indices, got {idx_g.device}")
+    _assert(idx_g.numel() == 16, idx_g.shape)
+    _assert(int(idx_g.max()) < 128, "CUDA FPS out of range")
+
+
+def test_ball_query_index_order():
+    from ops import ball_query_packed, _ball_query_torch
+
+    support = torch.tensor([[-1.0, -1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0]])
+    query = torch.tensor([[-1.0, 0.0], [1.0, 0.0]])
+    sb = torch.zeros(4, dtype=torch.long)
+    qb = torch.zeros(2, dtype=torch.long)
+    ref = _ball_query_torch(support, query, 1.5, sb, qb, 32)
+    got = ball_query_packed(support, query, 1.5, sb, qb, 32)
+    _assert(int(got[0].max()) < 4, f"support idx {got[0]}")
+    _assert(int(got[1].max()) < 2, f"query idx {got[1]}")
+    pairs = lambda ei: set(zip(ei[0].tolist(), ei[1].tolist()))
+    _assert(pairs(got) == pairs(ref), f"{got} vs {ref}")
+    if torch.cuda.is_available():
+        got_g = ball_query_packed(support.cuda(), query.cuda(), 1.5, sb.cuda(), qb.cuda(), 32)
+        _assert(got_g.device.type == "cuda", got_g.device)
+        _assert(int(got_g[0].max()) < 4 and int(got_g[1].max()) < 2, got_g)
+
+
 def test_allocate_rings():
     alloc = allocate_ring_counts(40, [10.0, 10.0])
     _assert(len(alloc) == 2 and min(alloc) >= 2, alloc)
@@ -274,6 +312,8 @@ def main():
         test_bilinear_identity_and_wrap,
         test_bishop_frames_orthonormal,
         test_fps_count,
+        test_fps_cuda_path,
+        test_ball_query_index_order,
         test_allocate_rings,
         test_decoupled_head_no_inversion,
         test_bspline_partition_of_unity,
