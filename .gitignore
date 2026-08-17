@@ -1,0 +1,50 @@
+# Python virtual environments & bytecode
+.venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# PyTorch Model Weights & Checkpoints (Heavy Binaries)
+*.pt
+*.pth
+*.bin
+*.onnx
+*.safetensors
+checkpoints/
+weights/
+models/
+
+# Datasets & Large Data
+data/
+datasets/
+*.csv
+*.h5
+*.hdf5
+*.tar.gz
+*.zip
+
+# Experiment Tracking & Logs
+runs/
+wandb/
+lightning_logs/
+*.log
+tensorboard/
+
+# Environment Variables / Secrets
+.env
+.env.local
+
+# Jupyter Notebook Checkpoints
+.ipynb_checkpoints/
+
+# 3D Data & Meshes
+*.vtp
+*.vtk
+*.stl
+*.obj
+*.ply
+
+# Generated output & datasets
+datatransform/cleaned_data/
+datatransform/template_creation/output*/
