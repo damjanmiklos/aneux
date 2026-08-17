@@ -1,34 +1,29 @@
 import torch
-from pytorch3d.loss import chamfer_distance, mesh_laplacian_smoothing
+from pytorch3d.loss import chamfer_distance, mesh_laplacian_smoothing, mesh_normal_consistency
 from pytorch3d.structures import Meshes
+
+from config import LAMBDA_CD_COARSE, LAMBDA_CD_MID, LOGVAR_CLAMP
 
 
 def vae_kl_loss(mu, logvar):
+    """Sequence-wise KL of a diagonal Gaussian posterior against N(0, I).
+
+    mu, logvar: [B, L, D] or [B, D]. Averaged over batch and latent tokens.
     """
-    KL divergence of a diagonal Gaussian posterior against N(0, I).
-    logvar is clamped to keep exp() finite.
-    """
-    logvar = torch.clamp(logvar, -30.0, 20.0)
-    kld_loss = torch.mean(-0.5 * torch.sum(1 + logvar - mu ** 2 - logvar.exp(), dim=1), dim=0)
-    return kld_loss
+    logvar = torch.clamp(logvar, LOGVAR_CLAMP[0], LOGVAR_CLAMP[1])
+    kl = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp())
+    return kl.sum(dim=-1).mean()
 
 
-def edge_length_penalty(x_pred, x_tube, edge_index):
-    """
-    Penalizes edges that stretch too much compared to the base tube.
-    """
-    src_pred, dst_pred = x_pred[edge_index[0]], x_pred[edge_index[1]]
-    src_tube, dst_tube = x_tube[edge_index[0]], x_tube[edge_index[1]]
-
-    len_pred = torch.norm(dst_pred - src_pred, dim=1)
-    len_tube = torch.norm(dst_tube - src_tube, dim=1)
-
-    loss_edge = torch.mean((len_pred - len_tube) ** 2)
-    return loss_edge
+def displacement_dirichlet(delta_x, edge_index):
+    """Penalize displacement spikes between adjacent scaffold vertices."""
+    if edge_index.numel() == 0:
+        return delta_x.new_zeros(())
+    src, dst = edge_index[0], edge_index[1]
+    return torch.mean((delta_x[src] - delta_x[dst]).pow(2).sum(dim=-1))
 
 
 def _as_face_index(face):
-    """Return face indices as [3, F], or None."""
     if face is None or face.numel() == 0:
         return None
     if face.dim() != 2:
@@ -38,6 +33,43 @@ def _as_face_index(face):
     if face.size(1) == 3:
         return face.t().contiguous()
     return None
+
+
+def _batched_chamfer(pred, pred_batch, true, true_batch, num_graphs):
+    loss = pred.new_zeros(())
+    n_ok = 0
+    for i in range(num_graphs):
+        p = pred[pred_batch == i].unsqueeze(0)
+        t = true[true_batch == i].unsqueeze(0)
+        if p.size(1) == 0 or t.size(1) == 0:
+            continue
+        cd, _ = chamfer_distance(p, t)
+        loss = loss + cd
+        n_ok += 1
+    if n_ok > 0:
+        loss = loss / n_ok
+    return loss
+
+
+def _meshes_from_batch(verts, faces, batch_tube, num_graphs):
+    face = _as_face_index(faces)
+    if face is None:
+        return None
+    counts = torch.bincount(batch_tube, minlength=num_graphs)
+    ptr = torch.zeros(num_graphs + 1, device=verts.device, dtype=torch.long)
+    ptr[1:] = torch.cumsum(counts, dim=0)
+    face_owner = batch_tube[face[0]]
+    x_f32 = verts.to(torch.float32)
+    verts_list, faces_list = [], []
+    for i in range(num_graphs):
+        f_i = face[:, face_owner == i] - ptr[i]
+        if f_i.numel() == 0:
+            continue
+        verts_list.append(x_f32[ptr[i]:ptr[i + 1]])
+        faces_list.append(f_i.t().contiguous())
+    if not verts_list:
+        return None
+    return Meshes(verts=verts_list, faces=faces_list)
 
 
 def compute_losses(
@@ -52,63 +84,48 @@ def compute_losses(
     face=None,
     batch_tube=None,
     faces=None,
+    delta_x=None,
+    x_pred_mid=None,
+    batch_mid=None,
+    x_pred_coarse=None,
+    batch_coarse=None,
+    lambda_cd_mid=LAMBDA_CD_MID,
+    lambda_cd_coarse=LAMBDA_CD_COARSE,
 ):
-    """
-    Combined loss for variable-size tube graphs.
-
-    x_pred / x_tube: [total_nodes, 3]
-    x_true: [M_batched, 3]
-    edge_index: [2, E] (PyG-incremented)
-    batch_x_true: [M_batched]
-    batch_tube: [total_nodes] PyG batch vector for tube nodes (required for batch_size > 1)
-    face: [3, F] PyG-incremented face index, or [F, 3]
-    faces: legacy alias for face
-    """
+    """Return a dict of unweighted loss terms."""
     if batch_tube is None:
         raise ValueError("compute_losses requires batch_tube (the PyG batch vector for tube nodes)")
-
     if face is None:
         face = faces
-    face = _as_face_index(face)
+    if delta_x is None:
+        delta_x = x_pred - x_tube
 
-    loss_recon = x_pred.new_zeros(())
-    n_recon = 0
-    for i in range(num_graphs):
-        x_pred_i = x_pred[batch_tube == i].unsqueeze(0)
-        x_true_i = x_true[batch_x_true == i].unsqueeze(0)
-        if x_pred_i.size(1) == 0 or x_true_i.size(1) == 0:
-            continue
-        loss_chamfer, _ = chamfer_distance(x_pred_i, x_true_i)
-        loss_recon = loss_recon + loss_chamfer
-        n_recon += 1
-    if n_recon > 0:
-        loss_recon = loss_recon / n_recon
+    loss_recon = _batched_chamfer(x_pred, batch_tube, x_true, batch_x_true, num_graphs)
+    if x_pred_mid is not None and batch_mid is not None:
+        loss_recon = loss_recon + lambda_cd_mid * _batched_chamfer(
+            x_pred_mid, batch_mid, x_true, batch_x_true, num_graphs
+        )
+    if x_pred_coarse is not None and batch_coarse is not None:
+        loss_recon = loss_recon + lambda_cd_coarse * _batched_chamfer(
+            x_pred_coarse, batch_coarse, x_true, batch_x_true, num_graphs
+        )
 
     loss_kl = vae_kl_loss(mu, logvar)
-    loss_edge = edge_length_penalty(x_pred, x_tube, edge_index)
+    loss_disp = displacement_dirichlet(delta_x, edge_index)
 
     device_type = "cuda" if x_pred.is_cuda else "cpu"
-    loss_laplacian = x_pred.new_zeros(())
-    if face is not None:
-        counts = torch.bincount(batch_tube, minlength=num_graphs)
-        ptr = torch.zeros(num_graphs + 1, device=x_pred.device, dtype=torch.long)
-        ptr[1:] = torch.cumsum(counts, dim=0)
-        face_owner = batch_tube[face[0]]
-        x_f32 = x_pred.to(torch.float32)
+    loss_lap = x_pred.new_zeros(())
+    loss_norm = x_pred.new_zeros(())
+    meshes = _meshes_from_batch(x_pred, face, batch_tube, num_graphs)
+    if meshes is not None:
+        with torch.autocast(device_type=device_type, enabled=False):
+            loss_lap = mesh_laplacian_smoothing(meshes, method="uniform")
+            loss_norm = mesh_normal_consistency(meshes)
 
-        verts_list = []
-        faces_list = []
-        for i in range(num_graphs):
-            f_i = face[:, face_owner == i] - ptr[i]
-            if f_i.numel() == 0:
-                continue
-            verts_list.append(x_f32[ptr[i]:ptr[i + 1]])
-            faces_list.append(f_i.t().contiguous())
-
-        if verts_list:
-            with torch.autocast(device_type=device_type, enabled=False):
-                meshes = Meshes(verts=verts_list, faces=faces_list)
-                loss_laplacian = mesh_laplacian_smoothing(meshes, method="uniform")
-
-    loss_geom = loss_edge + loss_laplacian
-    return loss_recon, loss_kl, loss_geom
+    return {
+        "recon": loss_recon,
+        "kl": loss_kl,
+        "disp": loss_disp,
+        "lap": loss_lap,
+        "norm": loss_norm,
+    }

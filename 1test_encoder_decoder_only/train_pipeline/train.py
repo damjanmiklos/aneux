@@ -3,9 +3,19 @@ from contextlib import nullcontext
 
 import torch
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
+from config import (
+    DEFAULT_LOSS_WEIGHTS,
+    FOLLOW_BATCH,
+    GRAD_CLIP,
+    KL_WARMUP_EPOCHS,
+    LAMBDA_KL,
+    LEARNING_RATE,
+    WEIGHT_DECAY,
+)
 from losses import compute_losses
 
 
@@ -31,18 +41,47 @@ def _face_from_batch(batch):
     return None
 
 
-def losses_from_batch(x_pred, mu, logvar, batch):
+def kl_anneal_weight(epoch, max_weight=LAMBDA_KL, warmup_epochs=KL_WARMUP_EPOCHS):
+    """Linear KL anneal: 0 at epoch 1, `max_weight` from epoch `warmup_epochs` onward."""
+    if warmup_epochs <= 1:
+        return float(max_weight)
+    t = min(1.0, max(0.0, (epoch - 1) / float(warmup_epochs - 1)))
+    return float(max_weight) * t
+
+
+def weighted_total(terms, weights):
+    return (
+        weights["recon"] * terms["recon"]
+        + weights["kl"] * terms["kl"]
+        + weights["disp"] * terms["disp"]
+        + weights["lap"] * terms["lap"]
+        + weights["norm"] * terms["norm"]
+    )
+
+
+def _weighted_total(terms, weights):
+    return weighted_total(terms, weights)
+
+
+def losses_from_output(out, batch):
+    batch_mid = getattr(batch, "pos_mid_batch", None)
+    batch_coarse = getattr(batch, "pos_coarse_batch", None)
     return compute_losses(
-        x_pred,
+        out.x_pred,
         batch.x_true,
-        mu,
-        logvar,
+        out.mu,
+        out.logvar,
         batch.x,
         batch.edge_index,
         batch.x_true_batch,
         batch.num_graphs,
         face=_face_from_batch(batch),
         batch_tube=batch.batch,
+        delta_x=out.delta_x,
+        x_pred_mid=out.x_pred_mid,
+        batch_mid=batch_mid,
+        x_pred_coarse=out.x_pred_coarse,
+        batch_coarse=batch_coarse,
     )
 
 
@@ -51,15 +90,14 @@ def _accum_window_len(step, n_batches, accum_steps):
     return min(accum_steps, n_batches - window_start)
 
 
-def train_epoch(model, dataloader, optimizer, weights, device, accum_steps=1, grad_clip=1.0):
+def _zero_meters():
+    return {"loss": 0.0, "recon": 0.0, "kl": 0.0, "disp": 0.0, "lap": 0.0, "norm": 0.0}
+
+
+def train_epoch(model, dataloader, optimizer, weights, device, accum_steps=1, grad_clip=GRAD_CLIP):
     model.train()
-
-    total_loss = 0.0
-    total_recon = 0.0
-    total_kl = 0.0
-    total_geom = 0.0
+    totals = _zero_meters()
     total_samples = 0
-
     optimizer.zero_grad()
     n_batches = len(dataloader)
 
@@ -70,13 +108,9 @@ def train_epoch(model, dataloader, optimizer, weights, device, accum_steps=1, gr
         window_len = _accum_window_len(step, n_batches, accum_steps)
 
         with _autocast(device):
-            x_pred, mu, logvar = model(batch)
-            loss_recon, loss_kl, loss_geom = losses_from_batch(x_pred, mu, logvar, batch)
-            loss = (
-                weights["recon"] * loss_recon
-                + weights["kl"] * loss_kl
-                + weights["geom"] * loss_geom
-            ) / window_len
+            out = model(batch)
+            terms = losses_from_output(out, batch)
+            loss = _weighted_total(terms, weights) / window_len
 
         loss.backward()
 
@@ -86,29 +120,18 @@ def train_epoch(model, dataloader, optimizer, weights, device, accum_steps=1, gr
             optimizer.step()
             optimizer.zero_grad()
 
-        total_loss += loss.item() * window_len * batch_size
-        total_recon += loss_recon.item() * batch_size
-        total_kl += loss_kl.item() * batch_size
-        total_geom += loss_geom.item() * batch_size
+        totals["loss"] += loss.item() * window_len * batch_size
+        for key in ("recon", "kl", "disp", "lap", "norm"):
+            totals[key] += terms[key].item() * batch_size
 
     if total_samples == 0:
-        return {"loss": 0.0, "recon": 0.0, "kl": 0.0, "geom": 0.0}
-
-    return {
-        "loss": total_loss / total_samples,
-        "recon": total_recon / total_samples,
-        "kl": total_kl / total_samples,
-        "geom": total_geom / total_samples,
-    }
+        return _zero_meters()
+    return {k: v / total_samples for k, v in totals.items()}
 
 
 def evaluate_epoch(model, dataloader, weights, device):
     model.eval()
-
-    total_loss = 0.0
-    total_recon = 0.0
-    total_kl = 0.0
-    total_geom = 0.0
+    totals = _zero_meters()
     total_samples = 0
 
     with torch.no_grad():
@@ -116,30 +139,34 @@ def evaluate_epoch(model, dataloader, weights, device):
             batch = batch.to(device)
             batch_size = batch.num_graphs
             total_samples += batch_size
-
             with _autocast(device):
-                x_pred, mu, logvar = model(batch)
-                loss_recon, loss_kl, loss_geom = losses_from_batch(x_pred, mu, logvar, batch)
-                loss = (
-                    weights["recon"] * loss_recon
-                    + weights["kl"] * loss_kl
-                    + weights["geom"] * loss_geom
-                )
-
-            total_loss += loss.item() * batch_size
-            total_recon += loss_recon.item() * batch_size
-            total_kl += loss_kl.item() * batch_size
-            total_geom += loss_geom.item() * batch_size
+                out = model(batch)
+                terms = losses_from_output(out, batch)
+                loss = _weighted_total(terms, weights)
+            totals["loss"] += loss.item() * batch_size
+            for key in ("recon", "kl", "disp", "lap", "norm"):
+                totals[key] += terms[key].item() * batch_size
 
     if total_samples == 0:
-        return {"loss": 0.0, "recon": 0.0, "kl": 0.0, "geom": 0.0}
+        return _zero_meters()
+    return {k: v / total_samples for k, v in totals.items()}
 
-    return {
-        "loss": total_loss / total_samples,
-        "recon": total_recon / total_samples,
-        "kl": total_kl / total_samples,
-        "geom": total_geom / total_samples,
-    }
+
+def _format_metrics(metrics, weights, tag, epoch, epochs):
+    return (
+        f"Epoch {epoch:03d}/{epochs:03d} [{tag}] | "
+        f"Total: {metrics['loss']:.4f} | "
+        f"Recon: {metrics['recon']:.4f} | "
+        f"KL: {metrics['kl']:.4f} | "
+        f"Disp: {metrics['disp']:.4f} | "
+        f"Lap: {metrics['lap']:.4f} | "
+        f"Norm: {metrics['norm']:.4f} | "
+        f"w_recon: {metrics['recon'] * weights['recon']:.4f} | "
+        f"w_kl: {metrics['kl'] * weights['kl']:.4f} | "
+        f"w_disp: {metrics['disp'] * weights['disp']:.4f} | "
+        f"w_lap: {metrics['lap'] * weights['lap']:.4f} | "
+        f"w_norm: {metrics['norm'] * weights['norm']:.4f}"
+    )
 
 
 def train_model(
@@ -148,21 +175,24 @@ def train_model(
     val_dataset,
     epochs=100,
     batch_size=4,
-    lr=1e-4,
+    lr=LEARNING_RATE,
     weights=None,
     device="cuda",
     accum_steps=1,
     val_every=5,
     num_workers=0,
     ckpt_dir=None,
-    grad_clip=1.0,
+    grad_clip=GRAD_CLIP,
+    weight_decay=WEIGHT_DECAY,
+    kl_max=LAMBDA_KL,
+    kl_warmup_epochs=KL_WARMUP_EPOCHS,
 ):
     if weights is None:
-        weights = {"recon": 1.0, "kl": 0.001, "geom": 0.1}
+        weights = dict(DEFAULT_LOSS_WEIGHTS)
 
     use_cuda = _device_type(device) == "cuda"
     loader_kwargs = dict(
-        follow_batch=["x_true"],
+        follow_batch=FOLLOW_BATCH,
         pin_memory=use_cuda,
     )
     train_loader = DataLoader(
@@ -183,7 +213,8 @@ def train_model(
     )
 
     model = model.to(device)
-    optimizer = AdamW(model.parameters(), lr=lr)
+    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=max(lr * 1e-2, 1e-7))
 
     if ckpt_dir:
         os.makedirs(ckpt_dir, exist_ok=True)
@@ -196,37 +227,20 @@ def train_model(
     best_val = float("inf")
 
     for epoch in range(1, epochs + 1):
+        epoch_weights = dict(weights)
+        epoch_weights["kl"] = kl_anneal_weight(epoch, max_weight=kl_max, warmup_epochs=kl_warmup_epochs)
         metrics = train_epoch(
-            model, train_loader, optimizer, weights, device, accum_steps, grad_clip=grad_clip
+            model, train_loader, optimizer, epoch_weights, device, accum_steps, grad_clip=grad_clip
         )
-
-        print(
-            f"Epoch {epoch:03d}/{epochs:03d} [TRAIN] | "
-            f"Total: {metrics['loss']:.4f} | "
-            f"Recon: {metrics['recon']:.4f} | "
-            f"KL: {metrics['kl']:.4f} | "
-            f"Geom: {metrics['geom']:.4f} | "
-            f"weighted recon: {metrics['recon'] * weights['recon']:.4f} | "
-            f"weighted kl: {metrics['kl'] * weights['kl']:.4f} | "
-            f"weighted geom: {metrics['geom'] * weights['geom']:.4f}"
-        )
+        scheduler.step()
+        print(_format_metrics(metrics, epoch_weights, "TRAIN", epoch, epochs)
+              + f" | kl_lambda: {epoch_weights['kl']:.6f} | lr: {scheduler.get_last_lr()[0]:.2e}")
 
         if epoch % val_every == 0 or epoch == epochs:
-            val_metrics = evaluate_epoch(model, val_loader, weights, device)
-            print(
-                f"Epoch {epoch:03d}/{epochs:03d} [VAL]   | "
-                f"Total: {val_metrics['loss']:.4f} | "
-                f"Recon: {val_metrics['recon']:.4f} | "
-                f"KL: {val_metrics['kl']:.4f} | "
-                f"Geom: {val_metrics['geom']:.4f} | "
-                f"weighted recon: {val_metrics['recon'] * weights['recon']:.4f} | "
-                f"weighted kl: {val_metrics['kl'] * weights['kl']:.4f} | "
-                f"weighted geom: {val_metrics['geom'] * weights['geom']:.4f}"
-            )
-            metrics["val_loss"] = val_metrics["loss"]
-            metrics["val_recon"] = val_metrics["recon"]
-            metrics["val_kl"] = val_metrics["kl"]
-            metrics["val_geom"] = val_metrics["geom"]
+            val_metrics = evaluate_epoch(model, val_loader, epoch_weights, device)
+            print(_format_metrics(val_metrics, epoch_weights, "VAL  ", epoch, epochs))
+            for key, value in val_metrics.items():
+                metrics[f"val_{key}"] = value
 
             if ckpt_dir and val_metrics["loss"] < best_val:
                 best_val = val_metrics["loss"]
@@ -239,6 +253,7 @@ def train_model(
                     "epoch": epoch,
                     "model": model.state_dict(),
                     "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
                     "metrics": metrics,
                 },
                 os.path.join(ckpt_dir, "last.pt"),

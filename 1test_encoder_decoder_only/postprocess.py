@@ -25,9 +25,19 @@ from aneux_paths import (
     EXPERIMENT_OUTPUT,
     EXPERIMENT_CACHE,
 )
+from config import (
+    DEFAULT_LOSS_WEIGHTS,
+    DECODER_HIDDEN_DIM,
+    FOLLOW_BATCH,
+    HIERARCHY_LEVELS,
+    LATENT_DIM,
+    LATENT_LEN,
+    N_TRUE,
+    TUBE_RADIUS_MM,
+)
 from dataset import AneurysmDataset
 from model import GraphVAE
-from losses import compute_losses
+from train import losses_from_output, weighted_total
 
 # --- CONFIGURATION ---
 OUTPUT_DIR = EXPERIMENT_OUTPUT
@@ -35,14 +45,9 @@ CACHE_DIR = EXPERIMENT_CACHE
 VESSEL_DIR = VESSELS_AREA005
 CENTERLINE_DIR = CENTERLINES
 EXTRA_CENTERLINE_DIR = EXTRA_CENTERLINES
-TUBE_RADIUS = 2.0
-N_LENGTH = 1000
-N_RADIAL = 50
-
-# Model parameters
-LATENT_DIM = 256
-HIDDEN_DIM = 128
-K_NEIGHBORS = 32
+TUBE_RADIUS = TUBE_RADIUS_MM
+N_LENGTH = HIERARCHY_LEVELS[-1][0]
+N_RADIAL = HIERARCHY_LEVELS[-1][1]
 
 DEVICE = 'cuda:1' if torch.cuda.is_available() else 'cpu'
 if str(DEVICE).startswith('cuda'):
@@ -52,7 +57,7 @@ SPLIT_FILE = os.path.join(OUTPUT_DIR, "train_val_split.json")
 MODEL_FILE = os.path.join(OUTPUT_DIR, "graph_vae_aneurysm.pth")
 RESULTS_CSV = os.path.join(OUTPUT_DIR, "per_patient_losses.csv")
 
-LOSS_WEIGHTS = {'recon': 1.0, 'kl': 0.001, 'geom': 0.1}
+LOSS_WEIGHTS = dict(DEFAULT_LOSS_WEIGHTS)
 
 # Opt-in to sparse tensor invariant checks globally to guarantee memory safety 
 torch.sparse.check_sparse_tensor_invariants.enable()
@@ -129,6 +134,7 @@ def evaluate_all_samples():
         n_radial=N_RADIAL,
         extra_centerline_dir=EXTRA_CENTERLINE_DIR,
         cache_dir=CACHE_DIR,
+        n_true=N_TRUE,
     )
     
     print(f"Loading split from {SPLIT_FILE}...")
@@ -139,9 +145,10 @@ def evaluate_all_samples():
     
     print("Initializing model...")
     model = GraphVAE(
-        latent_dim=LATENT_DIM, 
-        hidden_dim=HIDDEN_DIM, 
-        k=K_NEIGHBORS
+        latent_dim=LATENT_DIM,
+        latent_len=LATENT_LEN,
+        hidden_dim=DECODER_HIDDEN_DIM,
+        tube_radius=TUBE_RADIUS,
     ).to(DEVICE)
     
     print(f"Loading model weights from {MODEL_FILE}...")
@@ -149,7 +156,7 @@ def evaluate_all_samples():
     model.eval()
     
 # Use num_workers=0 for stability during post-processing
-    loader = DataLoader(dataset, batch_size=1, shuffle=False, follow_batch=['x_true'], num_workers=0)
+    loader = DataLoader(dataset, batch_size=1, shuffle=False, follow_batch=FOLLOW_BATCH, num_workers=0)
     
     results = []
     
@@ -167,23 +174,19 @@ def evaluate_all_samples():
                 if str(DEVICE).startswith('cuda') else nullcontext()
             )
             with autocast_ctx:
-                x_pred, mu, logvar = model(batch)
-                
-                loss_recon, loss_kl, loss_geom = compute_losses(
-                    x_pred, batch.x_true, mu, logvar, batch.x, batch.edge_index, batch.x_true_batch, batch.num_graphs,
-                    face=getattr(batch, 'face', None),
-                    batch_tube=batch.batch,
-                )
-                
-                total_loss = LOSS_WEIGHTS['recon'] * loss_recon + LOSS_WEIGHTS['kl'] * loss_kl + LOSS_WEIGHTS['geom'] * loss_geom
+                out = model(batch)
+                terms = losses_from_output(out, batch)
+                total_loss = weighted_total(terms, LOSS_WEIGHTS)
             
             results.append({
                 'patient_id': patient_id,
                 'split': split,
                 'total_loss': total_loss.item(),
-                'recon_loss': loss_recon.item(),
-                'kl_loss': loss_kl.item(),
-                'geom_loss': loss_geom.item()
+                'recon_loss': terms['recon'].item(),
+                'kl_loss': terms['kl'].item(),
+                'disp_loss': terms['disp'].item(),
+                'lap_loss': terms['lap'].item(),
+                'norm_loss': terms['norm'].item(),
             })
             
     df = pd.DataFrame(results)
@@ -214,6 +217,7 @@ def generate_vtp_for_sample(target_patient_id, output_filename=None):
         n_radial=N_RADIAL,
         extra_centerline_dir=EXTRA_CENTERLINE_DIR,
         cache_dir=CACHE_DIR,
+        n_true=N_TRUE,
     )
     
     # Find the index of the requested patient
@@ -229,9 +233,10 @@ def generate_vtp_for_sample(target_patient_id, output_filename=None):
         
     print("Initializing model...")
     model = GraphVAE(
-        latent_dim=LATENT_DIM, 
-        hidden_dim=HIDDEN_DIM, 
-        k=K_NEIGHBORS
+        latent_dim=LATENT_DIM,
+        latent_len=LATENT_LEN,
+        hidden_dim=DECODER_HIDDEN_DIM,
+        tube_radius=TUBE_RADIUS,
     ).to(DEVICE)
     model.load_state_dict(torch.load(MODEL_FILE, map_location=DEVICE))
     model.eval()
@@ -239,21 +244,21 @@ def generate_vtp_for_sample(target_patient_id, output_filename=None):
     print(f"Processing sample {target_patient_id}...")
     data = dataset[target_idx]
     
-    # Use PyG DataLoader to get proper batching structures (like batch_x_true)
-    loader = DataLoader([data], batch_size=1, follow_batch=['x_true'])
+    loader = DataLoader([data], batch_size=1, follow_batch=FOLLOW_BATCH)
     batch = next(iter(loader)).to(DEVICE)
     
     with torch.no_grad():
         if str(DEVICE).startswith('cuda'):
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                x_pred, _, _ = model(batch)
+                out = model(batch)
         else:
-            x_pred, _, _ = model(batch)
+            out = model(batch)
+        x_pred = out.x_pred
             
     print(f"Creating VTP file: {output_filename}")
     faces_np = _faces_np(data)
-    
-    tensor_to_vtp(x_pred, faces_np, output_filename)
+    origin = data.origin_shift.to(x_pred.device).reshape(1, 3)
+    tensor_to_vtp(x_pred + origin, faces_np, output_filename)
     print("Done!")
 
 # Example usage (Uncomment and change patient ID to run):

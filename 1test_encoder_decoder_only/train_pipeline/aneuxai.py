@@ -1,6 +1,6 @@
 # %% [markdown]
-# # 3D Graph Variational Autoencoder for Aneurysm Mesh Deformation
-# Phase 1: Autoencoder Proof-of-Concept
+# # Hierarchical PointNeXt–SplineConv VAE for Aneurysm Mesh Deformation
+# Geometry autoencoder: 1D centerline latent trajectory + progressive tube decoder.
 
 # %%
 import json
@@ -23,6 +23,20 @@ from aneux_paths import (
     EXPERIMENT_CACHE,
 )
 
+from config import (
+    DEFAULT_LOSS_WEIGHTS,
+    DECODER_HIDDEN_DIM,
+    GRAD_CLIP,
+    HIERARCHY_LEVELS,
+    KL_WARMUP_EPOCHS,
+    LAMBDA_KL,
+    LATENT_DIM,
+    LATENT_LEN,
+    LEARNING_RATE,
+    N_TRUE,
+    TUBE_RADIUS_MM,
+    WEIGHT_DECAY,
+)
 from dataset import AneurysmDataset
 from model import GraphVAE
 from train import train_model
@@ -39,14 +53,13 @@ VESSEL_DIR = VESSELS_AREA005
 CENTERLINE_DIR = CENTERLINES
 EXTRA_CENTERLINE_DIR = EXTRA_CENTERLINES
 
-TUBE_RADIUS = 2.0
-N_LENGTH = 1000
-N_RADIAL = 50
+TUBE_RADIUS = TUBE_RADIUS_MM
+N_LENGTH = HIERARCHY_LEVELS[-1][0]
+N_RADIAL = HIERARCHY_LEVELS[-1][1]
 
 BATCH_SIZE = 1
 ACCUM_STEPS = 8
 EPOCHS = 100
-LEARNING_RATE = 1e-4
 VAL_SPLIT = 0.15
 VAL_EVERY = 5
 SEED = 31
@@ -54,17 +67,14 @@ SEED = 31
 CPU_AFFINITY = [1, 2, 3]
 NUM_WORKERS = 2
 
-LOSS_WEIGHTS = {
-    "recon": 1.0,
-    "kl": 0.001,
-    "geom": 0.1,
-}
+LOSS_WEIGHTS = dict(DEFAULT_LOSS_WEIGHTS)
 
-LATENT_DIM = 256
-HIDDEN_DIM = 128
-K_NEIGHBORS = 32
+# %% [markdown]
+# ## 2. Data Preparation
+# ICA-filtered paired vessel/centerline meshes, 3-level Bishop-frame tubes,
+# metric FPS to 4096 true points, centerline-COM canonicalization (mm preserved).
 
-
+# %%
 def seed_everything(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -98,13 +108,6 @@ def stratified_split(dataset, val_fraction, seed):
     return Subset(dataset, train_idx), Subset(dataset, val_idx)
 
 
-# %% [markdown]
-# ## 2. Data Preparation
-# 1. Parse clinical.csv and filter ICA locations.
-# 2. Match vessel and centerline `.vtp` files.
-# 3. Generate (and cache) B-spline tube scaffolds.
-
-# %%
 if __name__ == "__main__":
     seed_everything(SEED)
 
@@ -128,6 +131,7 @@ if __name__ == "__main__":
         n_radial=N_RADIAL,
         extra_centerline_dir=EXTRA_CENTERLINE_DIR,
         cache_dir=CACHE_DIR,
+        n_true=N_TRUE,
     )
 
     print(f"Dataset loaded. Total paired and filtered samples: {len(dataset)}")
@@ -145,23 +149,33 @@ if __name__ == "__main__":
     if len(dataset) > 0:
         sample_data = dataset[0]
         print(f"Sample X_true shape: {sample_data.x_true.shape}")
-        print(f"Sample X_tube shape: {sample_data.x.shape}")
+        print(f"Sample X_tube (fine) shape: {sample_data.x.shape}")
+        print(f"Sample mid shape: {sample_data.pos_mid.shape}")
+        print(f"Sample coarse shape: {sample_data.pos_coarse.shape}")
         print(f"Sample Edge Index shape: {sample_data.edge_index.shape}")
         print(f"Sample face shape: {sample_data.face.shape}")
+        print(f"Latent query centerline: {sample_data.cl_pos.shape}")
 
     # %% [markdown]
     # ## 3. Model Initialization
-    # PointTransformer encoder on the vessel point cloud, SplineConv decoder
-    # predicting Δx on the centerline tube.
+    # PointNeXt encoder → 1D latent trajectory Z ∈ R^{64×64}; progressive SplineConv decoder.
 
     # %%
     print("Initializing Graph VAE model...")
-    model = GraphVAE(latent_dim=LATENT_DIM, hidden_dim=HIDDEN_DIM, k=K_NEIGHBORS)
+    model = GraphVAE(
+        latent_dim=LATENT_DIM,
+        latent_len=LATENT_LEN,
+        hidden_dim=DECODER_HIDDEN_DIM,
+        tube_radius=TUBE_RADIUS,
+    )
+    n_params = sum(p.numel() for p in model.parameters())
     print(model)
+    print(f"Trainable parameters: {n_params:,}")
 
     # %% [markdown]
     # ## 4. Training Loop
-    # Chamfer Distance, KL Divergence, edge-length penalty, Laplacian smoothing.
+    # Multi-scale Chamfer, sequence KL (annealed), displacement Dirichlet,
+    # Laplacian smoothing, normal consistency. AdamW + cosine decay.
 
     # %%
     print(f"Starting training on {DEVICE}...")
@@ -179,6 +193,10 @@ if __name__ == "__main__":
             val_every=VAL_EVERY,
             num_workers=NUM_WORKERS,
             ckpt_dir=OUTPUT_DIR,
+            grad_clip=GRAD_CLIP,
+            weight_decay=WEIGHT_DECAY,
+            kl_max=LAMBDA_KL,
+            kl_warmup_epochs=KL_WARMUP_EPOCHS,
         )
         print("Training complete.")
     else:
@@ -209,41 +227,49 @@ if __name__ == "__main__":
         train_loss = [h["loss"] for h in history]
         val_epochs = [i + 1 for i, h in enumerate(history) if "val_loss" in h]
         val_loss = [h["val_loss"] for h in history if "val_loss" in h]
-        val_recon = [h["val_recon"] for h in history if "val_recon" in h]
-        val_kl = [h["val_kl"] for h in history if "val_kl" in h]
-        val_geom = [h["val_geom"] for h in history if "val_geom" in h]
 
-        plt.figure(figsize=(12, 8))
+        plt.figure(figsize=(14, 10))
 
-        plt.subplot(2, 2, 1)
-        plt.plot(epochs_range, train_loss, label="Train Total Loss")
+        plt.subplot(2, 3, 1)
+        plt.plot(epochs_range, train_loss, label="Train Total")
         if val_loss:
-            plt.plot(val_epochs, val_loss, "ro-", label="Val Total Loss")
+            plt.plot(val_epochs, val_loss, "ro-", label="Val Total")
         plt.title("Total Loss")
         plt.xlabel("Epoch")
         plt.legend()
 
-        plt.subplot(2, 2, 2)
+        plt.subplot(2, 3, 2)
         plt.plot(epochs_range, [h["recon"] for h in history], label="Train Recon")
-        if val_recon:
-            plt.plot(val_epochs, val_recon, "ro-", label="Val Recon")
-        plt.title("Reconstruction Loss (Chamfer)")
+        plt.plot(val_epochs, [h["val_recon"] for h in history if "val_recon" in h], "ro-", label="Val Recon")
+        plt.title("Reconstruction (Chamfer)")
         plt.xlabel("Epoch")
         plt.legend()
 
-        plt.subplot(2, 2, 3)
+        plt.subplot(2, 3, 3)
         plt.plot(epochs_range, [h["kl"] for h in history], label="Train KL")
-        if val_kl:
-            plt.plot(val_epochs, val_kl, "ro-", label="Val KL")
+        plt.plot(val_epochs, [h["val_kl"] for h in history if "val_kl" in h], "ro-", label="Val KL")
         plt.title("KL Divergence")
         plt.xlabel("Epoch")
         plt.legend()
 
-        plt.subplot(2, 2, 4)
-        plt.plot(epochs_range, [h["geom"] for h in history], label="Train Geom")
-        if val_geom:
-            plt.plot(val_epochs, val_geom, "ro-", label="Val Geom")
-        plt.title("Geometric Regularization")
+        plt.subplot(2, 3, 4)
+        plt.plot(epochs_range, [h["disp"] for h in history], label="Train Disp")
+        plt.plot(val_epochs, [h["val_disp"] for h in history if "val_disp" in h], "ro-", label="Val Disp")
+        plt.title("Displacement Dirichlet")
+        plt.xlabel("Epoch")
+        plt.legend()
+
+        plt.subplot(2, 3, 5)
+        plt.plot(epochs_range, [h["lap"] for h in history], label="Train Lap")
+        plt.plot(val_epochs, [h["val_lap"] for h in history if "val_lap" in h], "ro-", label="Val Lap")
+        plt.title("Laplacian")
+        plt.xlabel("Epoch")
+        plt.legend()
+
+        plt.subplot(2, 3, 6)
+        plt.plot(epochs_range, [h["norm"] for h in history], label="Train Norm")
+        plt.plot(val_epochs, [h["val_norm"] for h in history if "val_norm" in h], "ro-", label="Val Norm")
+        plt.title("Normal Consistency")
         plt.xlabel("Epoch")
         plt.legend()
 
