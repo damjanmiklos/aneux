@@ -2,17 +2,22 @@
 
 Values follow the architectural specification. Physical units are millimetres.
 
-Stage-1 precision (see configure_stage1_precision):
+This package trains Stage 2: a geometry VAE that maps a vessel surface to a
+tree-valued latent Z on the centerline and decodes (Z, centerline tube) to a
+deformed mesh. A future Stage 1 will map a condition vector to a centerline
+and to Z on that centerline, then call Stage 2's `decode()`.
+
+Stage-2 precision (see configure_stage2_precision):
   CPU preprocessing in dataset.py is NumPy float64 (splines, Bishop frames,
   arc-length, COM). All model parameters, GPU tensors, and Data fields are
   torch.float32. Ampere matmuls use TF32 execution with FP32 storage.
-  Autocast / bfloat16 / float16 are not used in Stage 1.
+  Autocast / bfloat16 / float16 are not used in Stage 2.
 """
 
 import torch
 
 
-def configure_stage1_precision():
+def configure_stage2_precision():
     """FP32 tensor storage, TF32 Ampere matmuls, no autocast or reduced dtypes."""
     torch.set_float32_matmul_precision("high")
     if torch.cuda.is_available():
@@ -21,7 +26,7 @@ def configure_stage1_precision():
     torch.sparse.check_sparse_tensor_invariants.disable()
 
 
-configure_stage1_precision()
+configure_stage2_precision()
 
 # --- Scaffold / data ---
 TUBE_RADIUS_MM = 2.0
@@ -74,7 +79,8 @@ N_SPLINE_COARSE = 4
 N_SPLINE_MID = 2
 N_SPLINE_FINE = 2
 SHEAR_MAX_MM = 3.0
-# Softplus margin: Δr > -R_MARGIN so the lumen cannot invert through the centerline.
+# Softplus margin on each head: Δr ≥ -R_MARGIN. Mid/fine residuals are further
+# clamped so the composed radial offset n·Δx_total stays ≥ -R_MARGIN.
 R_MARGIN_MM = TUBE_RADIUS_MM
 
 # --- Optimisation ---

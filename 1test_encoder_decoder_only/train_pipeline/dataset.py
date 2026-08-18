@@ -816,7 +816,7 @@ class AneurysmDataset(Dataset):
         return tracts, junc_inc, junc_xyz, origin, R, inlet_i
 
     def build_scaffold(self, centerline_mesh, vessel_points=None):
-        """Build tube / latent tensors from a centerline. `vessel_points` is optional (Stage-2)."""
+        """Build tube / latent tensors from a centerline. `vessel_points` is optional (Stage-2 decode)."""
         tracts, junc_inc, junc_xyz, origin, R, _ = self._prepare_tracts(centerline_mesh)
         dense_tracts = [self._fit_dense_tract(t) for t in tracts]
         arc_lengths = [float(d["arc"]) if d["arc"] > 1e-12 else _arc_len(t) for d, t in zip(dense_tracts, tracts)]
@@ -887,7 +887,7 @@ class AneurysmDataset(Dataset):
         return data
 
     def build_scaffold_from_centerline(self, centerline_mesh):
-        """Stage-2 contract: tube + tree tokens, no GT surface."""
+        """Stage-2 scaffold from a centerline only (no GT surface; used when Stage 1 supplies the tree)."""
         return self.build_scaffold(centerline_mesh, vessel_points=None)
 
     def __len__(self):

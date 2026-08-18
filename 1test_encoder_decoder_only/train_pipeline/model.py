@@ -1,9 +1,10 @@
-"""Hierarchical PointNeXt encoder + progressive SplineConv decoder VAE.
+"""Stage-2 hierarchical PointNeXt encoder + progressive SplineConv decoder VAE.
 
 Encoder follows PointNeXt (Qian et al., NeurIPS 2022): stem MLP, FPS set
 abstraction, radius grouping with Δp / r, and inverted-residual MLP blocks.
 The decoder is a geometry-aware progressive SplineConv deformer with a
-tree-valued centerline latent.
+tree-valued centerline latent. A future Stage 1 will produce the centerline
+and Z that this decoder consumes.
 """
 
 from __future__ import annotations
@@ -42,6 +43,7 @@ from config import (
     TUBE_RADIUS_MM,
 )
 from geometry import (
+    clamp_residual_radial,
     decoupled_displacement,
     harmonic_encoding_theta,
     harmonic_encoding_u,
@@ -360,8 +362,10 @@ class LatentCrossAttention(nn.Module):
         scores = scores.masked_fill(~allow, -1.0e4)
         orphan = ~allow.any(dim=-1)
         if orphan.any():
+            # Fully masked queries would otherwise one-hot token 0 (inlet).
+            # Zeroing the whole row makes softmax uniform over all L tokens.
             scores = scores.clone()
-            scores[orphan, 0] = 0.0
+            scores[orphan] = 0.0
         w = torch.softmax(scores, dim=-1)
         a = (w.unsqueeze(-1) * v_n).sum(1)
         return self.out(torch.cat([a, gamma_u, gamma_th], dim=-1))
@@ -462,6 +466,7 @@ class ProgressiveSplineDecoder(nn.Module):
         super().__init__()
         self.hidden_dim = int(hidden_dim)
         self.latent_len = int(latent_len)
+        self.r_margin = float(r_margin)
         self.cross_coarse = LatentCrossAttention(latent_dim, hidden_dim, attn_dim, latent_len)
         self.cross_mid = LatentCrossAttention(latent_dim, hidden_dim, attn_dim, latent_len)
         self.cross_fine = LatentCrossAttention(latent_dim, hidden_dim, attn_dim, latent_len)
@@ -532,6 +537,7 @@ class ProgressiveSplineDecoder(nn.Module):
         )
         h_m = self._run_convs(h_m, data.edge_index_mid, pseudo_m, self.mid_convs)
         dr_m, ds_m = self.mid_head(h_m)
+        dr_m = clamp_residual_radial(dr_m, dx_m0, data.normal_mid, self.r_margin)
         dx_m = dx_m0 + decoupled_displacement(
             dr_m, ds_m, data.normal_mid, data.tangent_mid, data.binormal_mid
         )
@@ -551,6 +557,7 @@ class ProgressiveSplineDecoder(nn.Module):
         )
         h_f = self._run_convs(h_f, data.edge_index, pseudo_f, self.fine_convs)
         delta_r, delta_s = self.head(h_f)
+        delta_r = clamp_residual_radial(delta_r, dx_f0, data.normal, self.r_margin)
         dx_decoupled = decoupled_displacement(
             delta_r, delta_s, data.normal, data.tangent, data.binormal
         )
@@ -573,7 +580,7 @@ class VAEOutput:
 
 
 class GraphVAE(nn.Module):
-    """Deformation VAE. `decode(z, data)` is the frozen Stage-2 inference contract."""
+    """Stage-2 deformation VAE. `decode(z, data)` maps latent Z and a centerline scaffold to a surface."""
 
     def __init__(
         self,
@@ -611,7 +618,7 @@ class GraphVAE(nn.Module):
         return self.encoder(data)
 
     def decode(self, z: Tensor, data) -> Tensor:
-        """Deterministic frozen-decoder forward for Stage-2 diffusion inference."""
+        """Stage-2 decoder: map latent Z and scaffold `data` to surface coordinates."""
         x_pred, _, _, _, _, _ = self.decoder(z, data)
         return x_pred
 

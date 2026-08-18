@@ -1,6 +1,6 @@
 # %% [markdown]
 # # Hierarchical PointNeXt–SplineConv VAE for Aneurysm Mesh Deformation
-# Geometry autoencoder: tree-valued centerline latent + progressive tube decoder.
+# Stage 2 geometry autoencoder: tree-valued centerline latent + progressive tube decoder.
 
 # %%
 import json
@@ -36,7 +36,7 @@ from config import (
     N_TRUE,
     TUBE_RADIUS_MM,
     WEIGHT_DECAY,
-    configure_stage1_precision,
+    configure_stage2_precision,
 )
 from dataset import AneurysmDataset
 from model import GraphVAE
@@ -113,7 +113,7 @@ def stratified_split(dataset, val_fraction, seed):
 
 if __name__ == "__main__":
     seed_everything(SEED)
-    configure_stage1_precision()
+    configure_stage2_precision()
 
     if hasattr(os, "sched_setaffinity"):
         os.sched_setaffinity(0, CPU_AFFINITY)
@@ -175,7 +175,7 @@ if __name__ == "__main__":
 
     # %% [markdown]
     # ## 3. Model Initialization
-    # PointNeXt encoder → tree latent Z ∈ R^{64×64}; progressive SplineConv decoder.
+    # PointNeXt encoder → tree latent Z ∈ R^{64×64}; progressive SplineConv decoder (Stage 2).
 
     # %%
     print("Initializing Graph VAE model...")

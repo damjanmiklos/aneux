@@ -235,3 +235,25 @@ def decoupled_displacement(
     t_v = t_v.to(dtype=torch.float32)
     b_v = b_v.to(dtype=torch.float32)
     return delta_r * n_v + delta_s[:, 0:1] * t_v + delta_s[:, 1:2] * b_v
+
+
+def clamp_residual_radial(
+    delta_r: Tensor,
+    dx_up: Tensor,
+    n_v: Tensor,
+    r_margin: float,
+) -> Tensor:
+    """Clamp residual Δr so the composed radial offset stays ≥ -r_margin.
+
+    Coarse Δr already satisfies Δr ≥ -r_margin. Mid/fine add a residual on top of
+    an upsampled Cartesian field `dx_up`. Requiring
+    `Δr ≥ -(r_margin + n_v · dx_up)` restores `n_v · (dx_up + Δr n_v) ≥ -r_margin`.
+    """
+    delta_r = delta_r.to(dtype=torch.float32)
+    if delta_r.dim() == 1:
+        delta_r = delta_r.unsqueeze(-1)
+    n_v = n_v.to(dtype=torch.float32)
+    dx_up = dx_up.to(dtype=torch.float32)
+    r_up = (n_v * dx_up).sum(dim=-1, keepdim=True)
+    r_min = -(float(r_margin) + r_up)
+    return torch.maximum(delta_r, r_min)

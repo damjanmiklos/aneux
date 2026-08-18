@@ -27,7 +27,7 @@ from config import (
     LOGVAR_CLAMP,
     MAX_TRACTS,
     SA_STAGES,
-    configure_stage1_precision,
+    configure_stage2_precision,
 )
 from dataset import (
     AneurysmDataset,
@@ -37,6 +37,7 @@ from dataset import (
 )
 from geometry import (
     bilinear_cylindrical_upsample,
+    clamp_residual_radial,
     fps_metric,
     harmonic_encoding_theta,
     harmonic_encoding_u,
@@ -45,12 +46,14 @@ from geometry import (
     upsample_branch_concat,
 )
 from losses import (
+    _cl_radius,
+    _weighted_chamfer,
     compute_losses,
     displacement_dirichlet,
     displacement_dirichlet_local,
     vae_kl_loss,
 )
-from model import DecoupledDisplacementHead, GraphVAE
+from model import DecoupledDisplacementHead, GraphVAE, LatentCrossAttention
 from ops import bspline_basis_1d, farthest_point_sample_torch, fps_indices
 from train import kl_anneal_weight
 
@@ -340,6 +343,92 @@ def test_decoupled_head_no_inversion():
     _assert(abs(radial_bias_for_zero_init(2.0) - math.log(math.expm1(2.0))) < 1e-8, "bias formula")
 
 
+def test_residual_radial_floor():
+    n = torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    dx_up = torch.tensor([[-1.5, 0.0, 0.0], [0.0, 0.5, 0.0]])
+    dr = torch.tensor([[-1.8], [-1.8]])
+    out = clamp_residual_radial(dr, dx_up, n, 2.0)
+    _assert(torch.allclose(out[0], torch.tensor([-0.5]), atol=1e-5), f"inward floor {out[0]}")
+    _assert(torch.allclose(out[1], torch.tensor([-1.8]), atol=1e-5), f"outward unchanged {out[1]}")
+    composed = (n * (dx_up + out * n)).sum(dim=-1)
+    _assert(bool((composed >= -2.0 - 1e-5).all()), f"composed radial {composed}")
+
+    head = DecoupledDisplacementHead(hidden=4, r_margin=2.0, s_max=3.0)
+    dr_h, _ = head(50 * torch.randn(2, 4))
+    dr_c = clamp_residual_radial(dr_h, dx_up, n, 2.0)
+    composed_h = (n * (dx_up + dr_c * n)).sum(dim=-1)
+    _assert(bool((composed_h >= -2.0 - 1e-5).all()), f"head+clamp radial {composed_h}")
+
+
+def test_decoder_composed_non_inversion():
+    data = make_synthetic_data()
+    loader = DataLoader([data], batch_size=1, follow_batch=FOLLOW_BATCH)
+    batch = next(iter(loader))
+    model = _tiny_model()
+    model.eval()
+    for head in (model.decoder.coarse_head, model.decoder.mid_head, model.decoder.head):
+        torch.nn.init.zeros_(head.radial.weight)
+        head.radial.bias.data.fill_(-80.0)
+        torch.nn.init.zeros_(head.shear.weight)
+        torch.nn.init.zeros_(head.shear.bias)
+    z = torch.zeros(1, 8, 8)
+    with torch.no_grad():
+        _, delta_x, x_c, x_m, _, _ = model.decoder(z, batch)
+    r_c = (batch.normal_coarse * (x_c - batch.pos_coarse)).sum(-1)
+    r_m = (batch.normal_mid * (x_m - batch.pos_mid)).sum(-1)
+    r_f = (batch.normal * delta_x).sum(-1)
+    _assert(bool((r_c >= -2.0 - 1e-3).all()), f"coarse composed Δr min={float(r_c.min())}")
+    _assert(bool((r_m >= -2.0 - 1e-3).all()), f"mid composed Δr min={float(r_m.min())}")
+    _assert(bool((r_f >= -2.0 - 1e-3).all()), f"fine composed Δr min={float(r_f.min())}")
+
+
+def test_orphan_attention_uniform():
+    torch.manual_seed(0)
+    latent_len, latent_dim, attn_dim, hidden = 5, 4, 8, 8
+    layer = LatentCrossAttention(latent_dim, hidden, attn_dim, latent_len)
+    layer.eval()
+    n = 3
+    z = torch.randn(1, latent_len, latent_dim)
+    u = torch.full((n,), 0.4)
+    theta = torch.zeros(n)
+    node_batch = torch.zeros(n, dtype=torch.long)
+    node_tract = torch.zeros(n, dtype=torch.long)
+    token_u = torch.linspace(0, 1, latent_len).unsqueeze(0)
+    token_attend = torch.zeros(1, latent_len, MAX_TRACTS, dtype=torch.bool)
+    with torch.no_grad():
+        out = layer(z, u, theta, node_batch, node_tract, token_u, token_attend)
+        gamma_u = harmonic_encoding_u(u)
+        gamma_th = harmonic_encoding_theta(theta)
+        v = layer.w_v(z)[0]
+        a = v.mean(dim=0, keepdim=True).expand(n, -1)
+        expected = layer.out(torch.cat([a, gamma_u, gamma_th], dim=-1))
+    _assert(torch.allclose(out, expected, atol=1e-5), "orphan queries must attend uniformly")
+
+
+def test_knn_chamfer_matches_cdist():
+    torch.manual_seed(1)
+    pred = torch.randn(17, 3)
+    true = torch.randn(9, 3)
+    pred_batch = torch.zeros(17, dtype=torch.long)
+    true_batch = torch.zeros(9, dtype=torch.long)
+    w_pred = torch.linspace(0.5, 1.5, 17)
+    w_true = torch.linspace(0.8, 1.2, 9)
+    knn_loss = _weighted_chamfer(pred, pred_batch, true, true_batch, w_pred, w_true, 1)
+    dist = torch.cdist(pred, true, p=2).pow(2)
+    min_true = dist.min(dim=1).values
+    min_pred = dist.min(dim=0).values
+    cdist_loss = 0.5 * (
+        (w_pred * min_true).sum() / w_pred.sum()
+        + (w_true * min_pred).sum() / w_true.sum()
+    )
+    _assert(torch.allclose(knn_loss, cdist_loss, atol=1e-4), f"chamfer {knn_loss} vs {cdist_loss}")
+
+    cl = torch.randn(11, 4)
+    rad_knn = _cl_radius(pred, cl)
+    rad_cd = torch.cdist(pred, cl[:, :3]).min(dim=1).values
+    _assert(torch.allclose(rad_knn, rad_cd, atol=1e-4), f"cl radius {rad_knn[:3]} vs {rad_cd[:3]}")
+
+
 def test_bspline_partition_of_unity():
     u = torch.linspace(0, 1, 64)
     basis = bspline_basis_1d(u, n_ctrl=5, degree=2)
@@ -526,8 +615,8 @@ def test_forward_backward():
     _assert(x_dec.shape == batch.x.shape, "decode contract shape")
 
 
-def test_stage1_precision_flags():
-    configure_stage1_precision()
+def test_stage2_precision_flags():
+    configure_stage2_precision()
     _assert(torch.get_float32_matmul_precision() == "high", torch.get_float32_matmul_precision())
     if torch.cuda.is_available():
         _assert(bool(torch.backends.cuda.matmul.allow_tf32), "tf32 matmul")
@@ -576,9 +665,9 @@ def test_stratified_split_keeps_train():
 
 
 def main():
-    configure_stage1_precision()
+    configure_stage2_precision()
     tests = [
-        test_stage1_precision_flags,
+        test_stage2_precision_flags,
         test_config_contracts,
         test_synthetic_data_fp32,
         test_fourier_shapes,
@@ -592,6 +681,10 @@ def main():
         test_radius_all_in_ball,
         test_allocate_rings,
         test_decoupled_head_no_inversion,
+        test_residual_radial_floor,
+        test_decoder_composed_non_inversion,
+        test_orphan_attention_uniform,
+        test_knn_chamfer_matches_cdist,
         test_bspline_partition_of_unity,
         test_dirichlet_zero_on_rigid,
         test_unique_tracts_from_overlapping_paths,

@@ -1,4 +1,4 @@
-"""One CUDA train step under Stage-1 FP32+TF32 (no autocast)."""
+"""One CUDA train step under Stage-2 FP32+TF32 (no autocast)."""
 
 import os
 import sys
@@ -8,11 +8,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "1test_encoder_
 import torch
 from torch_geometric.loader import DataLoader
 
-from config import FOLLOW_BATCH, configure_stage1_precision
+from config import FOLLOW_BATCH, configure_stage2_precision
 from losses import compute_losses
 from test_architecture import GraphVAE, make_synthetic_data
 
-configure_stage1_precision()
+configure_stage2_precision()
 assert torch.cuda.is_available()
 assert torch.get_float32_matmul_precision() == "high"
 assert torch.backends.cuda.matmul.allow_tf32

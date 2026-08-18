@@ -14,7 +14,7 @@ from config import (
     LAMBDA_KL,
     LEARNING_RATE,
     WEIGHT_DECAY,
-    configure_stage1_precision,
+    configure_stage2_precision,
 )
 from losses import compute_losses
 
@@ -188,9 +188,9 @@ def train_model(
     if weights is None:
         weights = dict(DEFAULT_LOSS_WEIGHTS)
 
-    configure_stage1_precision()
+    configure_stage2_precision()
     print(
-        f"Stage-1 precision: matmul={torch.get_float32_matmul_precision()} "
+        f"Stage-2 precision: matmul={torch.get_float32_matmul_precision()} "
         f"tf32_matmul={torch.backends.cuda.matmul.allow_tf32} "
         f"tf32_cudnn={torch.backends.cudnn.allow_tf32}"
     )

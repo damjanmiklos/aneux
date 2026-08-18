@@ -33,7 +33,7 @@ from config import (
     LATENT_LEN,
     N_TRUE,
     TUBE_RADIUS_MM,
-    configure_stage1_precision,
+    configure_stage2_precision,
 )
 from dataset import AneurysmDataset
 from model import GraphVAE
@@ -63,7 +63,7 @@ RESULTS_CSV = os.path.join(OUTPUT_DIR, "per_patient_losses.csv")
 
 LOSS_WEIGHTS = dict(DEFAULT_LOSS_WEIGHTS)
 
-configure_stage1_precision()
+configure_stage2_precision()
 
 
 # %% 

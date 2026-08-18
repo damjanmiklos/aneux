@@ -1,8 +1,9 @@
 import torch
+from pytorch3d.loss import mesh_laplacian_smoothing, mesh_normal_consistency
+from pytorch3d.ops import knn_points
+from pytorch3d.structures import Meshes
 
 from config import LAMBDA_CD_COARSE, LAMBDA_CD_MID, LOGVAR_CLAMP, TUBE_RADIUS_MM
-from pytorch3d.loss import mesh_laplacian_smoothing, mesh_normal_consistency
-from pytorch3d.structures import Meshes
 
 
 def vae_kl_loss(mu, logvar):
@@ -46,10 +47,19 @@ def _as_face_index(face):
     return None
 
 
+def _knn_min_sq(src, dst):
+    """Squared L2 distance from each `src` point to its nearest `dst` point."""
+    src = src.to(dtype=torch.float32).contiguous().unsqueeze(0)
+    dst = dst.to(dtype=torch.float32).contiguous().unsqueeze(0)
+    return knn_points(src, dst, K=1, return_nn=False).dists.reshape(-1)
+
+
 def _cl_radius(points, cl_xyz):
     if cl_xyz is None or cl_xyz.numel() == 0:
         return points.new_zeros(points.size(0))
-    return torch.cdist(points, cl_xyz[:, :3]).min(dim=1).values
+    if points.size(0) == 0:
+        return points.new_zeros(0)
+    return _knn_min_sq(points, cl_xyz[:, :3]).sqrt()
 
 
 def _weighted_chamfer(pred, pred_batch, true, true_batch, w_pred, w_true, num_graphs):
@@ -62,9 +72,8 @@ def _weighted_chamfer(pred, pred_batch, true, true_batch, w_pred, w_true, num_gr
             continue
         wp = w_pred[pred_batch == i]
         wt = w_true[true_batch == i]
-        dist = torch.cdist(p, t, p=2).pow(2)
-        min_true = dist.min(dim=1).values
-        min_pred = dist.min(dim=0).values
+        min_true = _knn_min_sq(p, t)
+        min_pred = _knn_min_sq(t, p)
         loss_p = (wp * min_true).sum() / wp.sum().clamp_min(1e-8)
         loss_t = (wt * min_pred).sum() / wt.sum().clamp_min(1e-8)
         loss = loss + 0.5 * (loss_p + loss_t)
