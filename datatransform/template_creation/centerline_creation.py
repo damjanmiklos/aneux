@@ -17,10 +17,12 @@ from tqdm import tqdm
 try:
     from vmtk import vmtkscripts
     from vmtk import vtkvmtk
-    HAS_VMTK = True
-except ImportError:
-    HAS_VMTK = False
-    print("Warning: VMTK Python bindings not found in default import path.")
+except ImportError as exc:
+    raise ImportError(
+        "Required package 'vmtk' is not installed. "
+        "Install VMTK Python bindings so that `from vmtk import vmtkscripts` succeeds "
+        "(e.g. conda install -c vmtk vmtk)."
+    ) from exc
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 from aneux_paths import CSV_PATH as DEFAULT_CSV_PATH, VESSELS_AREA005 as DEFAULT_VESSEL_DIR, TEMPLATE_OUTPUT as DEFAULT_OUTPUT_DIR
@@ -78,10 +80,6 @@ def add_flow_extensions(surface_mesh, extension_length=5.0, extension_mode="boun
     Extrudes cylindrical tubes normal to inlet/outlet boundaries to push chaotic
     Voronoi boundary collapse away from the anatomical region of interest.
     """
-    if not HAS_VMTK:
-        print("VMTK is required for vmtkflowextensions. Returning smoothed surface without extensions.")
-        return surface_mesh
-
     vtk_poly = to_vtk_poly(surface_mesh)
 
     # Cap open profiles to enable extension extrusion
@@ -113,9 +111,6 @@ def find_largest_open_profile_seed(surface_mesh):
         source_pts: list with one point [x, y, z] — the main ICA inlet barycenter
         target_pts: list of points [x, y, z] — all outlet barycenters
     """
-    if not HAS_VMTK:
-        raise RuntimeError("VMTK is required for boundary extraction.")
-
     vtk_poly = to_vtk_poly(surface_mesh)
     boundary_extractor = vtkvmtk.vtkvmtkPolyDataBoundaryExtractor()
     boundary_extractor.SetInputData(vtk_poly)
@@ -170,9 +165,6 @@ def extract_voronoi_centerlines(extended_surface, source_points, target_points):
     
     source_points and target_points are required: list of [x, y, z] coordinates.
     """
-    if not HAS_VMTK:
-        raise RuntimeError("VMTK is required for Voronoi centerline extraction.")
-
     vtk_poly = to_vtk_poly(extended_surface)
 
     centerlines = vmtkscripts.vmtkCenterlines()
@@ -192,9 +184,6 @@ def resample_and_smooth_centerline(centerline, sample_spacing=0.1, smoothing_fac
     Resamples the centerline at uniform intervals (e.g. 0.1 mm) and applies
     spline smoothing to ensure fluid trajectory without macroscopic jaggedness.
     """
-    if not HAS_VMTK:
-        return to_vtk_poly(centerline)
-
     vtk_poly = to_vtk_poly(centerline)
 
     # Spline resampling at uniform step size
@@ -220,9 +209,6 @@ def extract_branches(centerline):
     Analyzes bifurcations and splits continuous centerline into distinct branch groups
     assigning GroupIds, TractIds, and CenterlineId arrays.
     """
-    if not HAS_VMTK:
-        return to_vtk_poly(centerline)
-
     vtk_poly = to_vtk_poly(centerline)
 
     extractor = vmtkscripts.vmtkBranchExtractor()
@@ -270,13 +256,6 @@ def process_dataset(dataset_id, v_file, output_dir, extension_length=5.0, sample
     # Step 1: Taubin Volume-Preserving Surface Smoothing
     print("Step 1: Applying Taubin surface smoothing (volume preserving)...")
     smoothed_vessel = apply_taubin_smoothing(vessel_mesh, pass_band=0.1, n_iter=15)
-
-    if not HAS_VMTK:
-        print("VMTK Python library not found. Saving Taubin smoothed vessel reference mesh.")
-        out_file = os.path.join(output_dir, f"{dataset_id}_smoothed.vtp")
-        smoothed_pv = pv.wrap(to_vtk_poly(smoothed_vessel))
-        smoothed_pv.save(out_file, binary=True)
-        return
 
     # Detect inlet/outlet seed points on the smoothed vessel BEFORE flow extensions.
     print("Step 1b: Detecting inlet/outlet boundaries by open profile radius...")

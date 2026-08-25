@@ -352,22 +352,25 @@ class LatentCrossAttention(nn.Module):
         gamma_uk = harmonic_encoding_u(token_u.reshape(-1)).reshape(n_graphs, self.latent_len, -1)
         k = self.w_k(torch.cat([z, gamma_uk], dim=-1))
         v = self.w_v(z)
-        k_n = k[node_batch]
-        v_n = v[node_batch]
         scale = math.sqrt(self.attn_dim)
-        scores = (q.unsqueeze(1) * k_n).sum(-1) / scale
-        attend_n = token_attend[node_batch]
-        tract_idx = node_tract.clamp(0, MAX_TRACTS - 1).view(-1, 1, 1).expand(-1, self.latent_len, 1)
-        allow = attend_n.gather(2, tract_idx).squeeze(-1)
-        scores = scores.masked_fill(~allow, -1.0e4)
-        orphan = ~allow.any(dim=-1)
-        if orphan.any():
-            # Fully masked queries would otherwise one-hot token 0 (inlet).
-            # Zeroing the whole row makes softmax uniform over all L tokens.
-            scores = scores.clone()
-            scores[orphan] = 0.0
-        w = torch.softmax(scores, dim=-1)
-        a = (w.unsqueeze(-1) * v_n).sum(1)
+        a = q.new_empty(q.size(0), self.attn_dim)
+        tract = node_tract.clamp(0, MAX_TRACTS - 1)
+        # Per-graph GEMM: scores = q_g @ k[g].T, a = softmax @ v[g].
+        # Avoids materializing [N, L, D] broadcasts of k/v (~6 GiB at the fine scaffold).
+        for g in range(n_graphs):
+            mask = node_batch == g
+            qg = q[mask]
+            scores = qg.matmul(k[g].transpose(0, 1)) / scale
+            allow = token_attend[g][:, tract[mask]].transpose(0, 1)
+            scores = scores.masked_fill(~allow, -1.0e4)
+            orphan = ~allow.any(dim=-1)
+            if orphan.any():
+                # Fully masked queries would otherwise one-hot token 0 (inlet).
+                # Zeroing the whole row makes softmax uniform over all L tokens.
+                scores = scores.clone()
+                scores[orphan] = 0.0
+            w = torch.softmax(scores, dim=-1)
+            a[mask] = w.matmul(v[g])
         return self.out(torch.cat([a, gamma_u, gamma_th], dim=-1))
 
 

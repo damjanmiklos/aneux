@@ -47,6 +47,8 @@ from geometry import (
 )
 from losses import (
     _cl_radius,
+    _mesh_normal_consistency,
+    _uniform_laplacian_smoothing,
     _weighted_chamfer,
     compute_losses,
     displacement_dirichlet,
@@ -54,7 +56,7 @@ from losses import (
     vae_kl_loss,
 )
 from model import DecoupledDisplacementHead, GraphVAE, LatentCrossAttention
-from ops import bspline_basis_1d, farthest_point_sample_torch, fps_indices
+from ops import fps_indices, make_spline_conv
 from train import kl_anneal_weight
 
 TINY_HIERARCHY = ((8, 4), (16, 8), (32, 16))
@@ -260,39 +262,34 @@ def test_fps_count():
 
 
 def test_fps_cuda_path():
-    from ops import _pytorch3d_fps_ok
-
     pts = torch.randn(128, 3)
     idx_cpu = fps_indices(pts, 16)
     _assert(idx_cpu.numel() == 16, idx_cpu.shape)
     _assert(idx_cpu.min() >= 0 and idx_cpu.max() < 128, "CPU FPS out of range")
-    idx_loop = farthest_point_sample_torch(pts, 16)
-    _assert(idx_loop.numel() == 16, idx_loop.shape)
     start = int((pts - pts.mean(0)).pow(2).sum(-1).argmax())
-    _assert(int(idx_loop[0]) == start, "FPS start")
+    _assert(int(idx_cpu[0]) == start, "FPS start")
     if not torch.cuda.is_available():
         return
     pts_g = pts.cuda()
-    _assert(_pytorch3d_fps_ok(pts_g.device), "pytorch3d CUDA FPS unavailable")
     idx_g = fps_indices(pts_g, 16)
     _assert(idx_g.device.type == "cuda", f"expected CUDA indices, got {idx_g.device}")
     _assert(idx_g.numel() == 16, idx_g.shape)
     _assert(int(idx_g.max()) < 128, "CUDA FPS out of range")
+    _assert(int(idx_g[0]) == start, "CUDA FPS start")
 
 
 def test_ball_query_index_order():
-    from ops import ball_query_packed, _ball_query_torch
+    from ops import ball_query_packed
 
     support = torch.tensor([[-1.0, -1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0]])
     query = torch.tensor([[-1.0, 0.0], [1.0, 0.0]])
     sb = torch.zeros(4, dtype=torch.long)
     qb = torch.zeros(2, dtype=torch.long)
-    ref = _ball_query_torch(support, query, 1.5, sb, qb, 32)
     got = ball_query_packed(support, query, 1.5, sb, qb, 32)
     _assert(int(got[0].max()) < 4, f"support idx {got[0]}")
     _assert(int(got[1].max()) < 2, f"query idx {got[1]}")
-    pairs = lambda ei: set(zip(ei[0].tolist(), ei[1].tolist()))
-    _assert(pairs(got) == pairs(ref), f"{got} vs {ref}")
+    pairs = set(zip(got[0].tolist(), got[1].tolist()))
+    _assert(pairs == {(0, 0), (1, 0), (2, 1), (3, 1)}, f"{got}")
     if torch.cuda.is_available():
         got_g = ball_query_packed(support.cuda(), query.cuda(), 1.5, sb.cuda(), qb.cuda(), 32)
         _assert(got_g.device.type == "cuda", got_g.device)
@@ -300,16 +297,16 @@ def test_ball_query_index_order():
 
 
 def test_radius_all_in_ball():
-    from ops import _ball_query_torch
+    from ops import ball_query_packed
 
     ang = torch.linspace(0, 2 * math.pi, 9)[:-1]
     support = torch.stack([torch.cos(ang), torch.sin(ang)], dim=-1)
     query = torch.zeros(1, 2)
     sb = torch.zeros(8, dtype=torch.long)
     qb = torch.zeros(1, dtype=torch.long)
-    ei = _ball_query_torch(support, query, 1.1, sb, qb, 256)
+    ei = ball_query_packed(support, query, 1.1, sb, qb, 256)
     _assert(ei.size(1) == 8, f"expected all 8 neighbors, got {ei.size(1)}")
-    ei_cap = _ball_query_torch(support, query, 1.1, sb, qb, 3)
+    ei_cap = ball_query_packed(support, query, 1.1, sb, qb, 3)
     _assert(ei_cap.size(1) == 3, f"cap should keep 3 nearest, got {ei_cap.size(1)}")
 
 
@@ -405,6 +402,90 @@ def test_orphan_attention_uniform():
     _assert(torch.allclose(out, expected, atol=1e-5), "orphan queries must attend uniformly")
 
 
+def _broadcast_latent_cross_attn(layer, z, u, theta, node_batch, node_tract, token_u, token_attend):
+    """Old [N, L, D] broadcast formula; reference only (tiny N)."""
+    gamma_u = harmonic_encoding_u(u)
+    gamma_th = harmonic_encoding_theta(theta)
+    q = layer.w_q(torch.cat([gamma_u, gamma_th], dim=-1))
+    n_graphs = z.size(0)
+    gamma_uk = harmonic_encoding_u(token_u.reshape(-1)).reshape(n_graphs, layer.latent_len, -1)
+    k = layer.w_k(torch.cat([z, gamma_uk], dim=-1))
+    v = layer.w_v(z)
+    k_n = k[node_batch]
+    v_n = v[node_batch]
+    scale = math.sqrt(layer.attn_dim)
+    scores = (q.unsqueeze(1) * k_n).sum(-1) / scale
+    attend_n = token_attend[node_batch]
+    tract_idx = node_tract.clamp(0, MAX_TRACTS - 1).view(-1, 1, 1).expand(-1, layer.latent_len, 1)
+    allow = attend_n.gather(2, tract_idx).squeeze(-1)
+    scores = scores.masked_fill(~allow, -1.0e4)
+    orphan = ~allow.any(dim=-1)
+    if orphan.any():
+        scores = scores.clone()
+        scores[orphan] = 0.0
+    w = torch.softmax(scores, dim=-1)
+    a = (w.unsqueeze(-1) * v_n).sum(1)
+    return layer.out(torch.cat([a, gamma_u, gamma_th], dim=-1))
+
+
+def test_cross_attention_gemm_matches_broadcast():
+    torch.manual_seed(2)
+    latent_len, latent_dim, attn_dim, hidden = 6, 4, 8, 8
+    layer = LatentCrossAttention(latent_dim, hidden, attn_dim, latent_len)
+    layer.eval()
+    n0, n1 = 20, 12
+    n = n0 + n1
+    z = torch.randn(2, latent_len, latent_dim)
+    u = torch.rand(n)
+    theta = torch.rand(n) * 2 * math.pi - math.pi
+    node_batch = torch.cat([torch.zeros(n0), torch.ones(n1)]).long()
+    node_tract = torch.randint(0, 3, (n,))
+    token_u = torch.rand(2, latent_len)
+    token_attend = torch.zeros(2, latent_len, MAX_TRACTS, dtype=torch.bool)
+    token_attend[0, :, 0] = True
+    token_attend[0, :3, 1] = True
+    token_attend[1, :, 1] = True
+    token_attend[1, 2:, 2] = True
+    with torch.no_grad():
+        got = layer(z, u, theta, node_batch, node_tract, token_u, token_attend)
+        ref = _broadcast_latent_cross_attn(
+            layer, z, u, theta, node_batch, node_tract, token_u, token_attend
+        )
+    _assert(got.shape == ref.shape, f"shape {got.shape} vs {ref.shape}")
+    _assert(torch.allclose(got, ref, atol=1e-5, rtol=1e-5), "GEMM path must match broadcast scores")
+
+
+def test_cross_attention_two_graph_isolation():
+    torch.manual_seed(3)
+    latent_len, latent_dim, attn_dim, hidden = 6, 4, 8, 8
+    layer = LatentCrossAttention(latent_dim, hidden, attn_dim, latent_len)
+    layer.eval()
+    n0, n1 = 18, 14
+    z = torch.randn(2, latent_len, latent_dim)
+    u = torch.rand(n0 + n1)
+    theta = torch.rand(n0 + n1) * 2 * math.pi - math.pi
+    node_batch = torch.cat([torch.zeros(n0), torch.ones(n1)]).long()
+    node_tract = torch.cat([torch.zeros(n0), torch.ones(n1)]).long()
+    token_u = torch.rand(2, latent_len)
+    token_attend = torch.zeros(2, latent_len, MAX_TRACTS, dtype=torch.bool)
+    token_attend[0, :, 0] = True
+    token_attend[1, :, 1] = True
+    with torch.no_grad():
+        batched = layer(z, u, theta, node_batch, node_tract, token_u, token_attend)
+        out0 = layer(
+            z[0:1], u[:n0], theta[:n0],
+            torch.zeros(n0, dtype=torch.long), node_tract[:n0],
+            token_u[0:1], token_attend[0:1],
+        )
+        out1 = layer(
+            z[1:2], u[n0:], theta[n0:],
+            torch.zeros(n1, dtype=torch.long), node_tract[n0:],
+            token_u[1:2], token_attend[1:2],
+        )
+    _assert(torch.allclose(batched[:n0], out0, atol=1e-5, rtol=1e-5), "graph 0 mixed with graph 1")
+    _assert(torch.allclose(batched[n0:], out1, atol=1e-5, rtol=1e-5), "graph 1 mixed with graph 0")
+
+
 def test_knn_chamfer_matches_cdist():
     torch.manual_seed(1)
     pred = torch.randn(17, 3)
@@ -429,12 +510,48 @@ def test_knn_chamfer_matches_cdist():
     _assert(torch.allclose(rad_knn, rad_cd, atol=1e-4), f"cl radius {rad_knn[:3]} vs {rad_cd[:3]}")
 
 
-def test_bspline_partition_of_unity():
-    u = torch.linspace(0, 1, 64)
-    basis = bspline_basis_1d(u, n_ctrl=5, degree=2)
-    _assert(basis.shape == (64, 5), basis.shape)
-    _assert(torch.allclose(basis.sum(dim=1), torch.ones(64), atol=1e-4), "partition of unity")
-    _assert((basis >= -1e-5).all(), "basis should be non-negative")
+def test_mesh_losses_match_pytorch3d():
+    from pytorch3d.loss import mesh_laplacian_smoothing, mesh_normal_consistency
+    from pytorch3d.structures import Meshes
+
+    data = make_synthetic_data()
+    torch.manual_seed(2)
+    verts = data.x + 0.05 * torch.randn_like(data.x)
+    batch = torch.zeros(verts.size(0), dtype=torch.long)
+    face = data.face
+    meshes = Meshes(verts=[verts], faces=[face.t().contiguous()])
+    lap_ref = mesh_laplacian_smoothing(meshes, method="uniform")
+    norm_ref = mesh_normal_consistency(meshes)
+    lap = _uniform_laplacian_smoothing(verts, face, batch, 1)
+    nrm = _mesh_normal_consistency(verts, face, batch, 1)
+    _assert(torch.allclose(lap, lap_ref, atol=1e-5, rtol=1e-4), f"lap {float(lap)} vs {float(lap_ref)}")
+    _assert(torch.allclose(nrm, norm_ref, atol=1e-4, rtol=1e-3), f"norm {float(nrm)} vs {float(norm_ref)}")
+    shifted = verts + torch.tensor([1.5, -0.7, 2.0])
+    lap_shift = _uniform_laplacian_smoothing(shifted, face, batch, 1)
+    _assert(torch.allclose(lap, lap_shift, atol=1e-5), "uniform Laplacian should ignore rigid translation")
+
+    d1 = make_synthetic_data()
+    d2 = make_synthetic_data(sac=True)
+    loader = DataLoader([d1, d2], batch_size=2, follow_batch=FOLLOW_BATCH)
+    packed = next(iter(loader))
+    lap_b = _uniform_laplacian_smoothing(packed.x, packed.face, packed.batch, packed.num_graphs)
+    nrm_b = _mesh_normal_consistency(packed.x, packed.face, packed.batch, packed.num_graphs)
+    refs_lap, refs_nrm = [], []
+    for i, di in enumerate((d1, d2)):
+        m = Meshes(verts=[di.x], faces=[di.face.t().contiguous()])
+        refs_lap.append(mesh_laplacian_smoothing(m, method="uniform"))
+        refs_nrm.append(mesh_normal_consistency(m))
+    _assert(torch.allclose(lap_b, 0.5 * (refs_lap[0] + refs_lap[1]), atol=1e-5, rtol=1e-4), "batched lap")
+    _assert(torch.allclose(nrm_b, 0.5 * (refs_nrm[0] + refs_nrm[1]), atol=1e-4, rtol=1e-3), "batched norm")
+
+
+def test_spline_conv_backend():
+    conv = make_spline_conv(4, 4, dim=3, kernel_size=5, degree=2, root_weight=False)
+    x = torch.randn(6, 4)
+    ei = torch.tensor([[0, 1, 2], [1, 2, 3]])
+    attr = torch.rand(3, 3)
+    y = conv(x, ei, attr)
+    _assert(y.shape == (6, 4), y.shape)
 
 
 def test_dirichlet_zero_on_rigid():
@@ -684,8 +801,11 @@ def main():
         test_residual_radial_floor,
         test_decoder_composed_non_inversion,
         test_orphan_attention_uniform,
+        test_cross_attention_gemm_matches_broadcast,
+        test_cross_attention_two_graph_isolation,
         test_knn_chamfer_matches_cdist,
-        test_bspline_partition_of_unity,
+        test_mesh_losses_match_pytorch3d,
+        test_spline_conv_backend,
         test_dirichlet_zero_on_rigid,
         test_unique_tracts_from_overlapping_paths,
         test_tree_token_mask,

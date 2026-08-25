@@ -1,20 +1,45 @@
-"""Local geometric ops with PyG kernels when available and torch fallbacks otherwise."""
+"""Compiled geometric kernels: pytorch3d FPS, pyg-lib radius and SplineConv."""
 
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
 from torch import Tensor
-from torch_geometric.nn import MessagePassing
+
+_PYG_WHEEL_HINT = (
+    "Install CUDA-matched wheels from "
+    "https://pytorch-geometric.readthedocs.io/en/latest/install/installation.html "
+    "(pip install pyg-lib -f https://data.pyg.org/whl/torch-${TORCH}+${CUDA}.html)."
+)
 
 
-def _num_graphs(batch: Tensor) -> int:
-    if batch is None or batch.numel() == 0:
-        return 1
-    return int(batch.max().item()) + 1
+def _missing_package(name: str, hint: str) -> ImportError:
+    return ImportError(f"Required package '{name}' is not installed. {hint}")
 
 
-_PYTORCH3D_FPS_OK = {}
+try:
+    from pytorch3d.ops import sample_farthest_points
+except ImportError as exc:
+    raise _missing_package("pytorch3d", "Install it with: pip install pytorch3d") from exc
+
+try:
+    import pyg_lib  # noqa: F401
+except ImportError as exc:
+    raise _missing_package("pyg-lib", _PYG_WHEEL_HINT) from exc
+
+from torch_geometric.nn import radius as _pyg_radius
+from torch_geometric.nn import radius_graph as _pyg_radius_graph
+from torch_geometric.nn.conv import SplineConv
+from torch_geometric.typing import WITH_RADIUS, WITH_SPLINE
+
+if not WITH_SPLINE:
+    raise ImportError(
+        "SplineConv requires pyg-lib spline operators (pyg-lib>=0.6.0; "
+        "this replaced torch-spline-conv). " + _PYG_WHEEL_HINT
+    )
+if not WITH_RADIUS:
+    raise ImportError(
+        "radius / ball_query require pyg-lib radius operators. " + _PYG_WHEEL_HINT
+    )
 
 
 def _centroid_start_index(pts: Tensor) -> Tensor:
@@ -22,86 +47,22 @@ def _centroid_start_index(pts: Tensor) -> Tensor:
     return (pts - c).pow(2).sum(dim=-1).argmax()
 
 
-def farthest_point_sample_torch(pts: Tensor, k: int) -> Tensor:
-    """Iterative metric FPS starting at the point farthest from the centroid."""
-    pts = pts.to(dtype=torch.float32)
-    n = int(pts.size(0))
-    k = min(int(k), n)
-    selected = torch.empty(k, dtype=torch.long, device=pts.device)
-    selected[0] = _centroid_start_index(pts)
-    dist = torch.full((n,), float("inf"), device=pts.device, dtype=torch.float32)
-    last = pts[selected[0]]
-    for i in range(1, k):
-        dist = torch.minimum(dist, (pts - last).pow(2).sum(dim=-1))
-        farthest = dist.argmax()
-        selected[i] = farthest
-        last = pts[farthest]
-    return selected
-
-
-def _pytorch3d_fps_ok(device: torch.device) -> bool:
-    """True if pytorch3d `sample_farthest_points` works on this device."""
-    key = device.type
-    cached = _PYTORCH3D_FPS_OK.get(key)
-    if cached is not None:
-        return cached
-    try:
-        from pytorch3d.ops import sample_farthest_points
-
-        if key == "cuda":
-            probe = torch.randn(1, 64, 3, device=device, dtype=torch.float32)
-            sample_farthest_points(probe, K=8, random_start_point=False)
-            torch.cuda.synchronize()
-        _PYTORCH3D_FPS_OK[key] = True
-        return True
-    except Exception as exc:
-        import warnings
-
-        warnings.warn(
-            f"pytorch3d FPS unavailable on {key} ({type(exc).__name__}: {exc}); "
-            "using the slower PyTorch loop"
-        )
-        _PYTORCH3D_FPS_OK[key] = False
-        return False
-
-
 def fps_indices(pts: Tensor, k: int) -> Tensor:
-    """FPS indices for a single cloud [N, 3]. Prefers pytorch3d; else in-device torch FPS."""
+    """FPS indices for a single cloud [N, 3] via pytorch3d, starting at the centroid-farthest point."""
     k = min(int(k), int(pts.size(0)))
     if k <= 0:
         return pts.new_zeros((0,), dtype=torch.long)
     if k == pts.size(0):
         return torch.arange(k, device=pts.device)
     pts_f = pts.to(dtype=torch.float32).contiguous()
-    if _pytorch3d_fps_ok(pts.device):
-        try:
-            from pytorch3d.ops import sample_farthest_points
-
-            start = int(_centroid_start_index(pts_f).item())
-            perm = torch.arange(pts_f.size(0), device=pts_f.device)
-            if start != 0:
-                perm[0] = start
-                perm[start] = 0
-            swapped = pts_f[perm]
-            _, loc = sample_farthest_points(
-                swapped.unsqueeze(0), K=k, random_start_point=False
-            )
-            return perm[loc.squeeze(0).long()]
-        except Exception as exc:
-            _PYTORCH3D_FPS_OK[pts.device.type] = False
-            import warnings
-
-            warnings.warn(
-                f"pytorch3d FPS failed ({type(exc).__name__}: {exc}); "
-                "falling back to the PyTorch loop"
-            )
-    return farthest_point_sample_torch(pts_f, k)
-
-
-def _missing_pyg_lib(exc: BaseException) -> bool:
-    return isinstance(exc, (ImportError, OSError)) or (
-        isinstance(exc, RuntimeError) and "pyg-lib" in str(exc).lower()
-    )
+    start = int(_centroid_start_index(pts_f).item())
+    perm = torch.arange(pts_f.size(0), device=pts_f.device)
+    if start != 0:
+        perm[0] = start
+        perm[start] = 0
+    swapped = pts_f[perm]
+    _, loc = sample_farthest_points(swapped.unsqueeze(0), K=k, random_start_point=False)
+    return perm[loc.squeeze(0).long()]
 
 
 def ball_query_packed(
@@ -117,63 +78,15 @@ def ball_query_packed(
     All points with distance <= radius are returned, capped at `max_num_neighbors`
     nearest if a query has more than that many hits.
     """
-    try:
-        from torch_geometric.nn import radius as _radius
-
-        # pyg-lib radius is (query, support); PointNeXt grouping wants (support, query).
-        return _radius(
-            support.to(dtype=torch.float32).contiguous(),
-            query.to(dtype=torch.float32).contiguous(),
-            radius,
-            support_batch,
-            query_batch,
-            max_num_neighbors=max_num_neighbors,
-        ).flip(0)
-    except Exception as exc:
-        if not _missing_pyg_lib(exc):
-            raise
-        return _ball_query_torch(
-            support, query, radius, support_batch, query_batch, max_num_neighbors
-        )
-
-
-def _ball_query_torch(
-    support: Tensor,
-    query: Tensor,
-    radius: float,
-    support_batch: Tensor,
-    query_batch: Tensor,
-    max_num_neighbors: int,
-) -> Tensor:
-    srcs, dsts = [], []
-    n_graphs = max(_num_graphs(support_batch), _num_graphs(query_batch))
-    cap = max(int(max_num_neighbors), 1)
-    for g in range(n_graphs):
-        s_idx = (support_batch == g).nonzero(as_tuple=False).view(-1)
-        q_idx = (query_batch == g).nonzero(as_tuple=False).view(-1)
-        if s_idx.numel() == 0 or q_idx.numel() == 0:
-            continue
-        dist = torch.cdist(query[q_idx], support[s_idx])
-        in_ball = dist <= radius
-        counts = in_ball.sum(dim=1)
-        if int(counts.max().item()) <= cap:
-            q_local, s_local = torch.where(in_ball)
-            if q_local.numel() == 0:
-                continue
-            srcs.append(s_idx[s_local])
-            dsts.append(q_idx[q_local])
-            continue
-        k = min(cap, int(s_idx.numel()))
-        knn_dist, knn_loc = dist.topk(k, dim=1, largest=False)
-        valid = knn_dist <= radius
-        q_local, slot = torch.where(valid)
-        if q_local.numel() == 0:
-            continue
-        srcs.append(s_idx[knn_loc[q_local, slot]])
-        dsts.append(q_idx[q_local])
-    if not srcs:
-        return support.new_zeros((2, 0), dtype=torch.long)
-    return torch.stack([torch.cat(srcs), torch.cat(dsts)], dim=0)
+    # pyg-lib radius is (query, support); PointNeXt grouping wants (support, query).
+    return _pyg_radius(
+        support.to(dtype=torch.float32).contiguous(),
+        query.to(dtype=torch.float32).contiguous(),
+        radius,
+        support_batch,
+        query_batch,
+        max_num_neighbors=max_num_neighbors,
+    ).flip(0)
 
 
 def radius_graph_packed(
@@ -184,113 +97,15 @@ def radius_graph_packed(
     max_num_neighbors: int = 256,
     flow: str = "source_to_target",
 ) -> Tensor:
-    try:
-        from torch_geometric.nn import radius_graph as _rg
-
-        return _rg(
-            pos.to(dtype=torch.float32).contiguous(),
-            r=radius,
-            batch=batch,
-            loop=loop,
-            max_num_neighbors=max_num_neighbors,
-            flow=flow,
-        )
-    except Exception as exc:
-        if not _missing_pyg_lib(exc):
-            raise
-        ei = _ball_query_torch(pos, pos, radius, batch, batch, max_num_neighbors)
-        if flow != "source_to_target":
-            ei = ei.flip(0)
-        if loop:
-            self = torch.arange(pos.size(0), device=pos.device)
-            ei = torch.cat([ei, torch.stack([self, self], dim=0)], dim=1)
-            ei = torch.unique(ei, dim=1)
-        return ei
+    return _pyg_radius_graph(
+        pos.to(dtype=torch.float32).contiguous(),
+        r=radius,
+        batch=batch,
+        loop=loop,
+        max_num_neighbors=max_num_neighbors,
+        flow=flow,
+    )
 
 
-def _open_uniform_knots(n_ctrl: int, degree: int, device, dtype) -> Tensor:
-    n_internal = n_ctrl - degree - 1
-    zeros = torch.zeros(degree + 1, device=device, dtype=dtype)
-    ones = torch.ones(degree + 1, device=device, dtype=dtype)
-    if n_internal > 0:
-        internal = torch.linspace(0, 1, n_internal + 2, device=device, dtype=dtype)[1:-1]
-        return torch.cat([zeros, internal, ones], dim=0)
-    return torch.cat([zeros, ones], dim=0)
-
-
-def bspline_basis_1d(u: Tensor, n_ctrl: int, degree: int) -> Tensor:
-    """Open B-spline basis of `degree` with `n_ctrl` functions. u in [0, 1] → [E, n_ctrl]."""
-    u = u.to(dtype=torch.float32).clamp(0.0, 1.0 - 1e-6)
-    knots = _open_uniform_knots(n_ctrl, degree, u.device, torch.float32)
-    left = knots[:-1]
-    right = knots[1:]
-    basis = ((u.unsqueeze(1) >= left) & (u.unsqueeze(1) < right)).to(u.dtype)
-    for p in range(1, degree + 1):
-        n_fun = basis.size(1) - 1
-        k_i = knots[:n_fun]
-        k_ip = knots[p : p + n_fun]
-        k_i1 = knots[1 : 1 + n_fun]
-        k_ip1 = knots[p + 1 : p + 1 + n_fun]
-        denom1 = k_ip - k_i
-        denom2 = k_ip1 - k_i1
-        w1 = torch.where(denom1 > 1e-8, (u.unsqueeze(1) - k_i) / denom1, torch.zeros_like(denom1))
-        w2 = torch.where(denom2 > 1e-8, (k_ip1 - u.unsqueeze(1)) / denom2, torch.zeros_like(denom2))
-        basis = w1 * basis[:, :-1] + w2 * basis[:, 1:]
-    return basis
-
-
-def tensor_bspline_basis(edge_attr: Tensor, kernel_size: int, degree: int) -> Tensor:
-    b0 = bspline_basis_1d(edge_attr[:, 0], kernel_size, degree)
-    b1 = bspline_basis_1d(edge_attr[:, 1], kernel_size, degree)
-    b2 = bspline_basis_1d(edge_attr[:, 2], kernel_size, degree)
-    return torch.einsum("ei,ej,ek->eijk", b0, b1, b2).reshape(edge_attr.size(0), -1)
-
-
-class BSplineConv(MessagePassing):
-    """Pure-PyTorch SplineCNN kernel (Fey et al. 2018) used when pyg-lib is unavailable."""
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        dim: int = 3,
-        kernel_size: int = 5,
-        degree: int = 2,
-        aggr: str = "add",
-        root_weight: bool = False,
-        bias: bool = True,
-        **kwargs,
-    ):
-        super().__init__(aggr=aggr)
-        del dim, kwargs
-        self.kernel_size = int(kernel_size)
-        self.degree = int(degree)
-        n_basis = self.kernel_size ** 3
-        self.weight = nn.Parameter(torch.empty(n_basis, in_channels, out_channels))
-        nn.init.xavier_uniform_(self.weight)
-        self.root = nn.Linear(in_channels, out_channels, bias=False) if root_weight else None
-        self.bias = nn.Parameter(torch.zeros(out_channels)) if bias else None
-
-    def forward(self, x: Tensor, edge_index: Tensor, edge_attr: Tensor) -> Tensor:
-        x = x.to(dtype=torch.float32)
-        edge_attr = edge_attr.to(dtype=torch.float32)
-        out = self.propagate(edge_index, x=x, edge_attr=edge_attr)
-        if self.root is not None:
-            out = out + self.root(x)
-        if self.bias is not None:
-            out = out + self.bias
-        return out
-
-    def message(self, x_j: Tensor, edge_attr: Tensor) -> Tensor:
-        basis = tensor_bspline_basis(edge_attr, self.kernel_size, self.degree)
-        xw = torch.einsum("ei,pio->epo", x_j, self.weight)
-        return torch.einsum("ep,epo->eo", basis, xw)
-
-
-def make_spline_conv(in_channels: int, out_channels: int, **kwargs) -> nn.Module:
-    try:
-        from torch_geometric.nn.conv import SplineConv
-
-        return SplineConv(in_channels, out_channels, **kwargs)
-    except ImportError:
-        return BSplineConv(in_channels, out_channels, **kwargs)
+def make_spline_conv(in_channels: int, out_channels: int, **kwargs) -> SplineConv:
+    return SplineConv(in_channels, out_channels, **kwargs)

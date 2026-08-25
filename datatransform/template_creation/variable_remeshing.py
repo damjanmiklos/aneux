@@ -18,10 +18,12 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 try:
     from vmtk import vmtkscripts
     from vmtk import vtkvmtk
-    HAS_VMTK = True
-except ImportError:
-    HAS_VMTK = False
-    print("Warning: VMTK Python bindings not found in default import path.")
+except ImportError as exc:
+    raise ImportError(
+        "Required package 'vmtk' is not installed. "
+        "Install VMTK Python bindings so that `from vmtk import vmtkscripts` succeeds "
+        "(e.g. conda install -c vmtk vmtk)."
+    ) from exc
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 from aneux_paths import CSV_PATH as DEFAULT_CSV_PATH, VESSELS_AREA005 as DEFAULT_VESSEL_DIR, TEMPLATE_OUTPUT_VARIABLE as DEFAULT_OUTPUT_DIR
@@ -84,10 +86,6 @@ def add_flow_extensions(surface_mesh, extension_length=5.0, extension_mode="boun
     Voronoi boundary collapse away from the anatomical region of interest.
     Internal endcapping is performed by vmtkSurfaceCapper prior to extension extrusion.
     """
-    if not HAS_VMTK:
-        print("VMTK is required for vmtkflowextensions. Returning smoothed surface without extensions.")
-        return surface_mesh
-
     vtk_poly = to_vtk_poly(surface_mesh)
 
     # Cap open profiles to enable extension extrusion
@@ -114,9 +112,6 @@ def find_largest_open_profile_seed(surface_mesh):
     The main ICA inlet is defined as the open boundary profile with the LARGEST geometric
     radius.
     """
-    if not HAS_VMTK:
-        raise RuntimeError("VMTK is required for boundary extraction.")
-
     vtk_poly = to_vtk_poly(surface_mesh)
 
     ref_sys = vtkvmtk.vtkvmtkBoundaryReferenceSystems()
@@ -169,9 +164,6 @@ def extract_voronoi_centerlines(extended_surface, source_points, target_points):
     and stores it in the point data array 'MaximumInscribedSphereRadius'.
     The sphere centroids lie exactly on the extracted centerline.
     """
-    if not HAS_VMTK:
-        raise RuntimeError("VMTK is required for Voronoi centerline extraction.")
-
     vtk_poly = to_vtk_poly(extended_surface)
 
     centerlines = vmtkscripts.vmtkCenterlines()
@@ -191,9 +183,6 @@ def resample_and_smooth_centerline(centerline, sample_spacing=0.1, smoothing_fac
     Resamples the centerline at uniform high-resolution intervals (e.g. 0.1 mm)
     and applies spline smoothing while continuously evaluating MISR along the centerline.
     """
-    if not HAS_VMTK:
-        return to_vtk_poly(centerline)
-
     vtk_poly = to_vtk_poly(centerline)
 
     resampler = vmtkscripts.vmtkCenterlineResampling()
@@ -217,9 +206,6 @@ def extract_branches(centerline):
     Analyzes bifurcations and splits continuous centerline into distinct branch groups
     assigning GroupIds, TractIds, and CenterlineId arrays.
     """
-    if not HAS_VMTK:
-        return to_vtk_poly(centerline)
-
     vtk_poly = to_vtk_poly(centerline)
 
     extractor = vmtkscripts.vmtkBranchExtractor()
@@ -237,9 +223,6 @@ def generate_base_surface(branched_centerline, grid_spacing=0.08, max_grid_size=
     centerline nodes) onto a high-resolution 3D grid image, encompassing all vessel branches.
     Then extracts the zero-level isosurface with vmtkMarchingCubes.
     """
-    if not HAS_VMTK:
-        raise RuntimeError("VMTK is required for vmtkCenterlineModeller.")
-
     vtk_cl = to_vtk_poly(branched_centerline)
     
     # MISR Floor Guard: enforce minimum radius >= 0.35mm to prevent sub-mm branch collapse
@@ -479,9 +462,6 @@ def remesh_surface_adaptively(open_surface_with_array, edge_array_name="TargetEd
     Remeshes the uncapped surface adaptively using vmtkSurfaceRemeshing
     configured with ElementSizeMode='edgelengtharray' and PreserveBoundaryEdges=1.
     """
-    if not HAS_VMTK:
-        raise RuntimeError("VMTK is required for vmtkSurfaceRemeshing.")
-
     vtk_open = to_vtk_poly(open_surface_with_array)
 
     remesher = vmtkscripts.vmtkSurfaceRemeshing()

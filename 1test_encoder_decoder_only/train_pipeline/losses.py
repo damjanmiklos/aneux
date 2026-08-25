@@ -1,7 +1,6 @@
 import torch
-from pytorch3d.loss import mesh_laplacian_smoothing, mesh_normal_consistency
+import torch.nn.functional as F
 from pytorch3d.ops import knn_points
-from pytorch3d.structures import Meshes
 
 from config import LAMBDA_CD_COARSE, LAMBDA_CD_MID, LOGVAR_CLAMP, TUBE_RADIUS_MM
 
@@ -83,25 +82,88 @@ def _weighted_chamfer(pred, pred_batch, true, true_batch, w_pred, w_true, num_gr
     return loss
 
 
-def _meshes_from_batch(verts, faces, batch_tube, num_graphs):
-    face = _as_face_index(faces)
-    if face is None:
-        return None
-    counts = torch.bincount(batch_tube, minlength=num_graphs)
-    ptr = torch.zeros(num_graphs + 1, device=verts.device, dtype=torch.long)
-    ptr[1:] = torch.cumsum(counts, dim=0)
-    face_owner = batch_tube[face[0]]
-    x_f32 = verts.to(torch.float32)
-    verts_list, faces_list = [], []
-    for i in range(num_graphs):
-        f_i = face[:, face_owner == i] - ptr[i]
-        if f_i.numel() == 0:
-            continue
-        verts_list.append(x_f32[ptr[i]:ptr[i + 1]])
-        faces_list.append(f_i.t().contiguous())
-    if not verts_list:
-        return None
-    return Meshes(verts=verts_list, faces=faces_list)
+def _oriented_face_edges(face):
+    """Stack the three edges of each triangle. `face` is [3, F]; returns [3F, 2]."""
+    v0, v1, v2 = face[0], face[1], face[2]
+    return torch.stack(
+        (torch.stack((v0, v1), dim=1), torch.stack((v1, v2), dim=1), torch.stack((v2, v0), dim=1)),
+        dim=0,
+    ).reshape(-1, 2)
+
+
+def _unique_undirected_edges(face, n_verts):
+    """Bidirectional edge index [2, 2E] from triangle faces [3, F]."""
+    edges, _ = _oriented_face_edges(face).sort(dim=1)
+    key = edges[:, 0] * int(n_verts) + edges[:, 1]
+    uniq = torch.unique(key)
+    e0 = torch.div(uniq, n_verts, rounding_mode="floor")
+    e1 = torch.remainder(uniq, n_verts)
+    src = torch.cat([e0, e1], dim=0)
+    dst = torch.cat([e1, e0], dim=0)
+    return src, dst
+
+
+def _uniform_laplacian_smoothing(verts, face, batch, num_graphs):
+    """Uniform mesh Laplacian ||LV||, mean per vertex then mean over graphs.
+
+    Matches pytorch3d `mesh_laplacian_smoothing(..., method='uniform')` without
+    constructing a Meshes object (no CPU sync from packed-list conversion).
+    L V[i] = mean_{j ~ i}(V[j]) - V[i]. Isolated vertices contribute ||V[i]||.
+    """
+    if face is None or face.numel() == 0 or verts.size(0) == 0:
+        return verts.new_zeros(())
+    n = verts.size(0)
+    src, dst = _unique_undirected_edges(face, n)
+    ones = torch.ones(dst.size(0), device=verts.device, dtype=verts.dtype)
+    deg = verts.new_zeros(n).index_add(0, dst, ones)
+    nb = verts.new_zeros(n, verts.size(-1)).index_add(0, dst, verts[src])
+    lap = nb / deg.clamp_min(1.0).unsqueeze(-1) - verts
+    per = lap.norm(dim=-1)
+    counts = torch.bincount(batch, minlength=num_graphs).to(dtype=verts.dtype).clamp_min(1.0)
+    return (per * counts[batch].reciprocal()).sum() / float(num_graphs)
+
+
+def _adjacent_face_pairs(face, n_verts):
+    """Face-index pairs [2, P] that share an undirected edge."""
+    F = face.size(1)
+    if F == 0:
+        return face.new_zeros((2, 0))
+    edges, _ = _oriented_face_edges(face).sort(dim=1)
+    key = edges[:, 0] * int(n_verts) + edges[:, 1]
+    face_ids = torch.arange(F, device=face.device, dtype=torch.long).repeat(3)
+    order = torch.argsort(key)
+    key = key[order]
+    face_ids = face_ids[order]
+    same = key[1:] == key[:-1]
+    a = face_ids[:-1][same]
+    b = face_ids[1:][same]
+    ok = a != b
+    a, b = a[ok], b[ok]
+    if a.numel() == 0:
+        return face.new_zeros((2, 0))
+    return torch.stack((a, b), dim=0)
+
+
+def _mesh_normal_consistency(verts, face, batch, num_graphs):
+    """Mean `1 - cos(n_i, n_j)` over faces that share an edge, then over graphs.
+
+    GPU-only stand-in for pytorch3d `mesh_normal_consistency`. Adjacent faces on
+    this scaffold share winding, so both normals point outward and no extra
+    sign flip is applied.
+    """
+    if face is None or face.numel() == 0 or verts.size(0) == 0:
+        return verts.new_zeros(())
+    pairs = _adjacent_face_pairs(face, verts.size(0))
+    if pairs.size(1) == 0:
+        return verts.new_zeros(())
+    v0 = verts[face[0]]
+    v1 = verts[face[1]]
+    v2 = verts[face[2]]
+    normals = torch.cross(v1 - v0, v2 - v0, dim=-1)
+    loss = 1.0 - F.cosine_similarity(normals[pairs[0]], normals[pairs[1]], dim=-1, eps=1e-8)
+    pair_batch = batch[face[0, pairs[0]]]
+    counts = torch.bincount(pair_batch, minlength=num_graphs).to(dtype=verts.dtype).clamp_min(1.0)
+    return (loss * counts[pair_batch].reciprocal()).sum() / float(num_graphs)
 
 
 def compute_losses(
@@ -199,12 +261,9 @@ def compute_losses(
             else delta_x.new_zeros(())
         )
 
-    loss_lap = x_pred.new_zeros(())
-    loss_norm = x_pred.new_zeros(())
-    meshes = _meshes_from_batch(x_pred, face, batch_tube, num_graphs)
-    if meshes is not None:
-        loss_lap = mesh_laplacian_smoothing(meshes, method="uniform")
-        loss_norm = mesh_normal_consistency(meshes)
+    face = _as_face_index(face)
+    loss_lap = _uniform_laplacian_smoothing(x_pred, face, batch_tube, num_graphs)
+    loss_norm = _mesh_normal_consistency(x_pred, face, batch_tube, num_graphs)
 
     return {
         "recon": loss_recon,

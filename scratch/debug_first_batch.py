@@ -22,7 +22,7 @@ from aneuxai import stratified_split
 from config import FOLLOW_BATCH
 from dataset import AneurysmDataset
 from model import GraphVAE
-from ops import _pytorch3d_fps_ok, fps_indices
+from ops import fps_indices
 from train import _autocast, losses_from_output, weighted_total
 from config import DEFAULT_LOSS_WEIGHTS
 
@@ -68,7 +68,6 @@ def main() -> None:
     ei = batch.edge_index
     print("edge min/max", int(ei.min()), int(ei.max()), "n", batch.x.size(0), flush=True)
 
-    print("FPS probe", _pytorch3d_fps_ok(device), flush=True)
     idx = fps_indices(x, 1024)
     print("fps", idx.shape, int(idx.min()), int(idx.max()), flush=True)
 

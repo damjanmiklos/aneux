@@ -9,6 +9,7 @@ import torch
 from torch import Tensor
 
 from config import K_THETA, K_U
+from ops import fps_indices
 
 
 def harmonic_encoding_u(u: Tensor, k_u: int = K_U) -> Tensor:
@@ -159,11 +160,6 @@ def upsample_branch_concat(
     return torch.cat(pieces, dim=0)
 
 
-def _centroid_start_index(pts: np.ndarray) -> int:
-    c = pts.mean(axis=0)
-    return int(np.argmax(np.linalg.norm(pts - c, axis=1)))
-
-
 def fps_metric(points: np.ndarray, n_samples: int) -> np.ndarray:
     """Metric-space FPS starting at the point farthest from the centroid."""
     pts = np.asarray(points, dtype=np.float32)
@@ -171,36 +167,13 @@ def fps_metric(points: np.ndarray, n_samples: int) -> np.ndarray:
     if n == 0:
         raise ValueError("Cannot FPS an empty point set")
     k = min(int(n_samples), n)
-
-    start = _centroid_start_index(pts)
-    try:
-        from pytorch3d.ops import sample_farthest_points
-
-        swapped = pts.copy()
-        swapped[[0, start]] = swapped[[start, 0]]
-        sampled, _ = sample_farthest_points(
-            torch.from_numpy(swapped).unsqueeze(0), K=k, random_start_point=False
-        )
-        sampled = sampled.squeeze(0).numpy()
-    except Exception:
-        sampled = _fps_numpy(pts, k, start=start)
+    idx = fps_indices(torch.from_numpy(np.ascontiguousarray(pts)), k)
+    sampled = pts[idx.detach().cpu().numpy()]
 
     if sampled.shape[0] < n_samples:
         reps = int(math.ceil(n_samples / sampled.shape[0]))
         sampled = np.tile(sampled, (reps, 1))[:n_samples]
     return sampled.astype(np.float32)
-
-
-def _fps_numpy(pts: np.ndarray, k: int, start: int = 0) -> np.ndarray:
-    n = pts.shape[0]
-    selected = np.empty(k, dtype=np.int64)
-    selected[0] = int(start)
-    dist = np.full(n, np.inf, dtype=np.float64)
-    for i in range(1, k):
-        last = pts[selected[i - 1]]
-        dist = np.minimum(dist, np.linalg.norm(pts - last, axis=1))
-        selected[i] = int(np.argmax(dist))
-    return pts[selected]
 
 
 def point_to_polyline_dist(points: np.ndarray, polyline: np.ndarray) -> np.ndarray:

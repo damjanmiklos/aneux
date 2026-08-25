@@ -25,6 +25,48 @@ def _device_type(device):
     return str(device).split(":")[0]
 
 
+def _gib(nbytes):
+    return nbytes / float(1024 ** 3)
+
+
+def _cuda_index(device):
+    dev = torch.device(device)
+    if dev.index is not None:
+        return dev.index
+    return torch.cuda.current_device()
+
+
+def _print_vram(tag, device, model=None):
+    """Snapshot of live CUDA memory. Peak is since the last reset_peak_memory_stats."""
+    if _device_type(device) != "cuda":
+        return
+    idx = _cuda_index(device)
+    torch.cuda.synchronize(idx)
+    free_b, total_b = torch.cuda.mem_get_info(idx)
+    lines = [
+        f"VRAM {tag}:",
+        f"  GPU: {torch.cuda.get_device_name(idx)} (cuda:{idx})  {_gib(total_b):.2f} GiB total",
+    ]
+    if model is not None:
+        param_bytes = sum(
+            p.numel() * p.element_size() for p in model.parameters() if p.requires_grad
+        )
+        n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        lines.append(
+            f"  Parameters (fp32): {_gib(param_bytes):.3f} GiB  ({n_params:,} params)"
+        )
+    lines.extend(
+        [
+            f"  Current allocated: {_gib(torch.cuda.memory_allocated(idx)):.3f} GiB",
+            f"  Current reserved:  {_gib(torch.cuda.memory_reserved(idx)):.3f} GiB",
+            f"  Peak allocated:    {_gib(torch.cuda.max_memory_allocated(idx)):.3f} GiB",
+            f"  Peak reserved:     {_gib(torch.cuda.max_memory_reserved(idx)):.3f} GiB",
+            f"  Free (driver):     {_gib(free_b):.2f} / {_gib(total_b):.2f} GiB",
+        ]
+    )
+    tqdm.write("\n".join(lines))
+
+
 def _face_from_batch(batch):
     face = getattr(batch, "face", None)
     if face is not None and face.numel() > 0:
@@ -94,12 +136,19 @@ def _zero_meters():
     return {"loss": 0.0, "recon": 0.0, "kl": 0.0, "disp": 0.0, "lap": 0.0, "norm": 0.0}
 
 
-def train_epoch(model, dataloader, optimizer, weights, device, accum_steps=1, grad_clip=GRAD_CLIP):
+def train_epoch(
+    model, dataloader, optimizer, weights, device, accum_steps=1, grad_clip=GRAD_CLIP, vram_probe=False
+):
     model.train()
     totals = _zero_meters()
     total_samples = 0
     optimizer.zero_grad()
     n_batches = len(dataloader)
+    use_cuda = _device_type(device) == "cuda"
+    logged_first_batch = False
+    logged_first_step = False
+    if vram_probe and use_cuda:
+        torch.cuda.reset_peak_memory_stats(_cuda_index(device))
 
     for step, batch in enumerate(tqdm(dataloader, desc="Training")):
         batch = batch.to(device)
@@ -112,16 +161,25 @@ def train_epoch(model, dataloader, optimizer, weights, device, accum_steps=1, gr
         loss = _weighted_total(terms, weights) / window_len
 
         loss.backward()
+        if vram_probe and use_cuda and not logged_first_batch:
+            _print_vram("after first batch (forward+backward, no optimizer.step yet)", device, model)
+            logged_first_batch = True
 
         if (step + 1) % accum_steps == 0 or (step + 1) == n_batches:
             if grad_clip is not None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
             optimizer.zero_grad()
+            if vram_probe and use_cuda and not logged_first_step:
+                _print_vram("after first optimizer.step (AdamW moments allocated)", device, model)
+                logged_first_step = True
 
         totals["loss"] += loss.item() * window_len * batch_size
         for key in ("recon", "kl", "disp", "lap", "norm"):
             totals[key] += terms[key].item() * batch_size
+
+    if vram_probe and use_cuda:
+        _print_vram("end of epoch 1 (peak over all train batches)", device, model)
 
     if total_samples == 0:
         return _zero_meters()
@@ -241,7 +299,14 @@ def train_model(
         epoch_weights = dict(weights)
         epoch_weights["kl"] = kl_anneal_weight(epoch, max_weight=kl_max, warmup_epochs=kl_warmup_epochs)
         metrics = train_epoch(
-            model, train_loader, optimizer, epoch_weights, device, accum_steps, grad_clip=grad_clip
+            model,
+            train_loader,
+            optimizer,
+            epoch_weights,
+            device,
+            accum_steps,
+            grad_clip=grad_clip,
+            vram_probe=(use_cuda and epoch == 1),
         )
         scheduler.step()
         print(_format_metrics(metrics, epoch_weights, "TRAIN", epoch, epochs)
