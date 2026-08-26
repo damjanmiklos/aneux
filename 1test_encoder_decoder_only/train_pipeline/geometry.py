@@ -6,6 +6,7 @@ import math
 
 import numpy as np
 import torch
+from scipy.spatial import cKDTree
 from torch import Tensor
 
 from config import K_THETA, K_U
@@ -178,12 +179,14 @@ def fps_metric(points: np.ndarray, n_samples: int) -> np.ndarray:
 
 def point_to_polyline_dist(points: np.ndarray, polyline: np.ndarray) -> np.ndarray:
     """Nearest distance from each point to a concatenation of polyline vertices."""
-    pts = np.asarray(points, dtype=np.float64)
-    cl = np.asarray(polyline, dtype=np.float64)
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    cl = np.asarray(polyline, dtype=np.float64).reshape(-1, 3)
+    if pts.shape[0] == 0:
+        return np.zeros((0,), dtype=np.float64)
     if cl.shape[0] == 0:
         return np.full(pts.shape[0], np.inf, dtype=np.float64)
-    d = np.linalg.norm(pts[:, None, :] - cl[None, :, :], axis=2)
-    return d.min(axis=1)
+    dist, _ = cKDTree(cl).query(pts, k=1, workers=1)
+    return np.asarray(dist, dtype=np.float64).reshape(-1)
 
 
 def radial_bias_for_zero_init(r_margin: float) -> float:

@@ -7,6 +7,7 @@ import pandas as pd
 import pyvista as pv
 import torch
 from scipy.interpolate import splprep, splev
+from scipy.spatial import cKDTree
 from torch_geometric.data import Data
 from torch.utils.data import Dataset
 
@@ -244,13 +245,19 @@ def couple_ostium_edges(
     radius_mm=JUNCTION_COUPLE_RADIUS_MM,
     k=JUNCTION_COUPLE_K,
 ):
-    """Bidirectional parent–daughter edges near each ostium (not a watertight Boolean)."""
+    """Bidirectional parent–daughter edges near each ostium (not a watertight Boolean).
+
+    k-NN across tracts is a KD-tree query, not an (Na × Nb × 3) distance tensor.
+    Short compact tracts can put 10k–20k fine-grid vertices inside `radius_mm`;
+    the pairwise form was tens of GB per sample.
+    """
     pos = np.asarray(pos, dtype=np.float64).reshape(-1, 3)
     tract_id = np.asarray(tract_id, dtype=np.int64).reshape(-1)
     if pos.shape[0] == 0 or not junction_incidents:
         return np.zeros((0, 2), dtype=np.int64)
     radius_mm = float(radius_mm)
     k = max(1, int(k))
+    lim = radius_mm * 1.5
     pairs = []
     for nid, incident in junction_incidents.items():
         if nid not in junc_xyz:
@@ -275,19 +282,35 @@ def couple_ostium_edges(
                 b = near[tids[j]]
                 if a.size == 0 or b.size == 0:
                     continue
-                d = np.linalg.norm(pos[a][:, None, :] - pos[b][None, :, :], axis=2)
-                kk = min(k, b.size)
-                nn = np.argpartition(d, kk - 1, axis=1)[:, :kk]
-                lim = radius_mm * 1.5
-                for ia in range(a.size):
-                    for ib in nn[ia]:
-                        if d[ia, int(ib)] <= lim:
-                            ua, ub = int(a[ia]), int(b[int(ib)])
-                            pairs.append((ua, ub))
-                            pairs.append((ub, ua))
+                _append_knn_pairs(pairs, pos, a, b, k, lim)
     if not pairs:
         return np.zeros((0, 2), dtype=np.int64)
     return np.asarray(pairs, dtype=np.int64)
+
+
+def _append_knn_pairs(pairs, pos, a, b, k, lim):
+    """Add bidirectional edges from each point in `a` to its k nearest in `b` within `lim`."""
+    kk = min(int(k), int(b.size))
+    if kk < 1:
+        return
+    tree_b = cKDTree(pos[b])
+    dists, nn = tree_b.query(pos[a], k=kk, distance_upper_bound=float(lim), workers=1)
+    if kk == 1:
+        dists = np.asarray(dists, dtype=np.float64).reshape(-1, 1)
+        nn = np.asarray(nn, dtype=np.int64).reshape(-1, 1)
+    else:
+        dists = np.asarray(dists, dtype=np.float64)
+        nn = np.asarray(nn, dtype=np.int64)
+    n_b = int(b.size)
+    for ia in range(a.size):
+        for jb in range(kk):
+            jloc = int(nn[ia, jb])
+            dij = float(dists[ia, jb])
+            if jloc < 0 or jloc >= n_b or not np.isfinite(dij) or dij > lim:
+                continue
+            ua, ub = int(a[ia]), int(b[jloc])
+            pairs.append((ua, ub))
+            pairs.append((ub, ua))
 
 
 def allocate_token_counts(n_tokens, arc_lengths, n_junctions, min_per=MIN_TOKENS_PER_TRACT):
@@ -1175,11 +1198,33 @@ class AneurysmDataset(Dataset):
             del vessel_mesh, centerline_mesh
             gc.collect()
 
+    def _write_cache(self, idx):
+        """Build and save one sample, then drop it. Used by cache warmup."""
+        sample = self.samples[idx]
+        cache_path = self._cache_path(sample["dataset_id"])
+        if cache_path and os.path.isfile(cache_path):
+            return
+        data = self._build_data(sample)
+        try:
+            if cache_path:
+                tmp = f"{cache_path}.{os.getpid()}.tmp"
+                try:
+                    torch.save(data, tmp)
+                    os.replace(tmp, cache_path)
+                except OSError:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                    raise
+        finally:
+            del data
+            gc.collect()
+
     def warmup_cache(self, indices=None, num_workers=1):
         """Write missing `.pt` caches. Existing versioned files are left untouched.
 
         Raycast is one core per sample, so `num_workers>1` runs samples in
-        parallel processes. Training DataLoader workers are a separate setting.
+        parallel processes. Each process exits after one sample so VTK/PyTorch
+        heaps cannot accumulate. Training DataLoader workers are separate.
         """
         from tqdm import tqdm
 
@@ -1195,30 +1240,34 @@ class AneurysmDataset(Dataset):
         print(f"Tube cache: {n_hit} ready, {len(missing)} to build, {workers} process(es)")
         if workers == 1 or not getattr(self, "_init_kwargs", None):
             for i in tqdm(missing, desc="Tube cache"):
-                self[i]
-                gc.collect()
+                self._write_cache(i)
             return len(idxs)
 
-        from concurrent.futures import ProcessPoolExecutor, as_completed
+        import multiprocessing
 
         errors = []
-        pool_kw = dict(
-            max_workers=workers,
-            initializer=_warmup_pool_init,
-            initargs=(self._init_kwargs,),
-        )
+        ctx = multiprocessing.get_context("spawn")
+        prev_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+        os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
         try:
-            pool = ProcessPoolExecutor(max_tasks_per_child=8, **pool_kw)
-        except TypeError:
-            pool = ProcessPoolExecutor(**pool_kw)
-        with pool:
-            futs = {pool.submit(_warmup_pool_build, i): i for i in missing}
-            for fut in tqdm(as_completed(futs), total=len(futs), desc="Tube cache"):
-                idx = futs[fut]
-                try:
-                    fut.result()
-                except Exception as exc:
-                    errors.append((self.samples[idx]["dataset_id"], exc))
+            with ctx.Pool(
+                processes=workers,
+                initializer=_warmup_pool_init,
+                initargs=(self._init_kwargs,),
+                maxtasksperchild=1,
+            ) as pool:
+                for idx, err in tqdm(
+                    pool.imap_unordered(_warmup_pool_build, missing, chunksize=1),
+                    total=len(missing),
+                    desc="Tube cache",
+                ):
+                    if err:
+                        errors.append((self.samples[idx]["dataset_id"], err))
+        finally:
+            if prev_cvd is None:
+                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            else:
+                os.environ["CUDA_VISIBLE_DEVICES"] = prev_cvd
         if errors:
             detail = "; ".join(f"{did}: {err}" for did, err in errors[:8])
             raise RuntimeError(
@@ -1277,6 +1326,9 @@ def _warmup_pool_init(init_kwargs):
 
 
 def _warmup_pool_build(idx):
-    _WARMUP_DS[idx]
-    gc.collect()
-    return idx
+    try:
+        _WARMUP_DS._write_cache(idx)
+        gc.collect()
+        return idx, None
+    except Exception as exc:
+        return idx, f"{type(exc).__name__}: {exc}"

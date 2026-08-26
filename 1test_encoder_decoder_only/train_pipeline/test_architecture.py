@@ -50,6 +50,7 @@ from dataset import (
     AneurysmDataset,
     allocate_ring_counts,
     allocate_token_counts,
+    couple_ostium_edges,
     extract_unique_tracts,
 )
 from geometry import (
@@ -686,6 +687,32 @@ def test_junction_coupling_edges():
     _assert(int(data.n_tracts) >= 2, "Y-junction needs ≥2 tracts")
 
 
+def test_ostium_couple_linear_memory():
+    """Dense ostium neighborhoods must not allocate an (Na × Nb × 3) distance tensor."""
+    rng = np.random.default_rng(0)
+    n = 12000
+    pos = np.concatenate(
+        [rng.normal(scale=0.8, size=(n, 3)) + np.array([0.4, 0.0, 0.0]),
+         rng.normal(scale=0.8, size=(n, 3)) + np.array([-0.4, 0.0, 0.0])],
+        axis=0,
+    )
+    tract_id = np.concatenate(
+        [np.zeros(n, dtype=np.int64), np.ones(n, dtype=np.int64)]
+    )
+    extra = couple_ostium_edges(
+        pos,
+        tract_id,
+        {0: [0, 1]},
+        {0: np.zeros(3, dtype=np.float64)},
+        radius_mm=4.0,
+        k=2,
+    )
+    _assert(extra.ndim == 2 and extra.shape[1] == 2, extra.shape)
+    _assert(extra.shape[0] > 0, "expected coupling edges in a dense ostium ball")
+    _assert(int(extra.max()) < 2 * n, extra.max())
+    _assert(int(extra.min()) >= 0, extra.min())
+
+
 def test_pose_roundtrip():
     data = make_synthetic_data(sac=False)
     R = data.pose_R.numpy()
@@ -1250,6 +1277,7 @@ def main():
         test_unique_tracts_from_overlapping_paths,
         test_tree_token_mask,
         test_junction_coupling_edges,
+        test_ostium_couple_linear_memory,
         test_pose_roundtrip,
         test_hybrid_far_points,
         test_cache_hit,
