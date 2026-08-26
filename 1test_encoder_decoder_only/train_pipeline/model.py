@@ -53,6 +53,7 @@ from config import (
     COARSE_ATTN_GATE_MAX,
     COARSE_ATTN_OSTIUM_U,
     COARSE_ATTN_RINGS,
+    normalize_gradient_checkpointing,
 )
 from geometry import (
     clamp_residual_radial,
@@ -64,6 +65,12 @@ from geometry import (
     upsample_branch_concat,
 )
 from ops import ball_query_packed, fps_indices, make_spline_conv, radius_graph_packed
+
+
+def _ckpt_call(enabled, fn, *args):
+    if enabled:
+        return checkpoint(fn, *args, use_reentrant=False)
+    return fn(*args)
 
 
 def _num_graphs(batch: Tensor, n_graphs: int | None = None) -> int:
@@ -316,10 +323,12 @@ class PointNeXtEncoder(nn.Module):
         latent_len: int = LATENT_LEN,
         stem_dim: int = STEM_DIM,
         stages=SA_STAGES,
+        gradient_checkpointing: str = "off",
     ):
         super().__init__()
         self.latent_dim = int(latent_dim)
         self.latent_len = int(latent_len)
+        self.gradient_checkpointing = normalize_gradient_checkpointing(gradient_checkpointing)
         stages = tuple(stages)
         self.stem = nn.Sequential(
             nn.Linear(3, stem_dim),
@@ -353,10 +362,13 @@ class PointNeXtEncoder(nn.Module):
         for sa, inv_blocks in zip(self.sa_layers, self.inv_layers):
             h, pos, batch = sa(h, pos, batch, n_graphs=n_graphs)
             for blk in inv_blocks:
-                if self.training:
-                    h = checkpoint(blk, h, pos, batch, use_reentrant=False)
-                else:
-                    h = blk(h, pos, batch)
+                h = _ckpt_call(
+                    self.training and self.gradient_checkpointing == "all",
+                    blk,
+                    h,
+                    pos,
+                    batch,
+                )
         u_pts, tract_pts = nearest_centerline_attr(
             pos, batch, data.cl_dense, cl_batch, cl_tract, n_graphs=n_graphs
         )
@@ -730,11 +742,13 @@ class ProgressiveSplineDecoder(nn.Module):
         attn_dim: int = ATTN_DIM,
         r_margin: float = R_MARGIN_MM,
         s_max: float = SHEAR_MAX_MM,
+        gradient_checkpointing: str = "off",
     ):
         super().__init__()
         self.hidden_dim = int(hidden_dim)
         self.latent_len = int(latent_len)
         self.r_margin = float(r_margin)
+        self.gradient_checkpointing = normalize_gradient_checkpointing(gradient_checkpointing)
         self.cross_coarse = LatentCrossAttention(latent_dim, hidden_dim, attn_dim, latent_len)
         self.cross_mid = LatentCrossAttention(latent_dim, hidden_dim, attn_dim, latent_len)
         self.cross_fine = LatentCrossAttention(latent_dim, hidden_dim, attn_dim, latent_len)
@@ -756,12 +770,10 @@ class ProgressiveSplineDecoder(nn.Module):
         self.mid_head = DecoupledDisplacementHead(hidden_dim, r_margin=r_margin, s_max=s_max)
         self.head = DecoupledDisplacementHead(hidden_dim, r_margin=r_margin, s_max=s_max)
 
-    def _run_convs(self, h, edge_index, pseudo, convs):
+    def _run_convs(self, h, edge_index, pseudo, convs, checkpoint_ok):
+        use_ckpt = self.training and bool(checkpoint_ok)
         for conv in convs:
-            if self.training:
-                h = checkpoint(conv, h, edge_index, pseudo, use_reentrant=False)
-            else:
-                h = conv(h, edge_index, pseudo)
+            h = _ckpt_call(use_ckpt, conv, h, edge_index, pseudo)
         return h
 
     def _run_attn(self, h, u, theta, tract, batch, u_step, n_graphs):
@@ -770,9 +782,16 @@ class ProgressiveSplineDecoder(nn.Module):
         def _fn(h_in, u_in, th_in, tr_in, b_in, us_in):
             return attn(h_in, u_in, th_in, tr_in, b_in, us_in, n_graphs)
 
-        if self.training:
-            return checkpoint(_fn, h, u, theta, tract, batch, u_step, use_reentrant=False)
-        return attn(h, u, theta, tract, batch, u_step, n_graphs)
+        return _ckpt_call(
+            self.training and self.gradient_checkpointing == "all",
+            _fn,
+            h,
+            u,
+            theta,
+            tract,
+            batch,
+            u_step,
+        )
 
     def _cross(self, layer, z, u, theta, node_batch, tract, token_u, token_attend):
         return layer(z, u, theta, node_batch, tract, token_u, token_attend)
@@ -802,7 +821,10 @@ class ProgressiveSplineDecoder(nn.Module):
             data.u_coarse, data.theta_coarse, data.tract_id_coarse,
             data.edge_index_coarse, data.u_step_coarse,
         )
-        h_c = self._run_convs(h_c, data.edge_index_coarse, pseudo_c, self.coarse_convs)
+        h_c = self._run_convs(
+            h_c, data.edge_index_coarse, pseudo_c, self.coarse_convs,
+            self.gradient_checkpointing == "all",
+        )
         dr_c, ds_c = self.coarse_head(h_c)
         dx_c = decoupled_displacement(dr_c, ds_c, data.normal_coarse, data.tangent_coarse, data.binormal_coarse)
 
@@ -826,7 +848,10 @@ class ProgressiveSplineDecoder(nn.Module):
             data.u_mid, data.theta_mid, data.tract_id_mid,
             data.edge_index_mid, data.u_step_mid,
         )
-        h_m = self._run_convs(h_m, data.edge_index_mid, pseudo_m, self.mid_convs)
+        h_m = self._run_convs(
+            h_m, data.edge_index_mid, pseudo_m, self.mid_convs,
+            self.gradient_checkpointing == "all",
+        )
         dr_m, ds_m = self.mid_head(h_m)
         dr_m = clamp_residual_radial(dr_m, dx_m0, data.normal_mid, self.r_margin)
         dx_m = dx_m0 + decoupled_displacement(
@@ -852,7 +877,10 @@ class ProgressiveSplineDecoder(nn.Module):
         pseudo_f = intrinsic_spline_pseudo_coords(
             data.u, data.theta, data.tract_id, data.edge_index, data.u_step,
         )
-        h_f = self._run_convs(h_f, data.edge_index, pseudo_f, self.fine_convs)
+        h_f = self._run_convs(
+            h_f, data.edge_index, pseudo_f, self.fine_convs,
+            self.gradient_checkpointing in ("all", "fine"),
+        )
         delta_r, delta_s = self.head(h_f)
         delta_r = clamp_residual_radial(delta_r, dx_f0, data.normal, self.r_margin)
         dx_decoupled = decoupled_displacement(
@@ -888,21 +916,27 @@ class GraphVAE(nn.Module):
         tube_radius: float = TUBE_RADIUS_MM,
         r_margin: Optional[float] = None,
         sa_stages=None,
+        gradient_checkpointing=None,
         **kwargs,
     ):
         super().__init__()
         del k, kwargs
         self.latent_dim = int(latent_dim)
         self.latent_len = int(latent_len)
+        self.gradient_checkpointing = normalize_gradient_checkpointing(gradient_checkpointing)
         r_margin = float(tube_radius if r_margin is None else r_margin)
         self.encoder = PointNeXtEncoder(
-            latent_dim=latent_dim, latent_len=latent_len, stages=sa_stages or SA_STAGES
+            latent_dim=latent_dim,
+            latent_len=latent_len,
+            stages=sa_stages or SA_STAGES,
+            gradient_checkpointing=self.gradient_checkpointing,
         )
         self.decoder = ProgressiveSplineDecoder(
             latent_dim=latent_dim,
             latent_len=latent_len,
             hidden_dim=hidden_dim,
             r_margin=r_margin,
+            gradient_checkpointing=self.gradient_checkpointing,
         )
         self.z_attn = LatentTractSelfAttention(self.latent_dim)
 

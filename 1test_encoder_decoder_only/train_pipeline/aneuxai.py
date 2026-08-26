@@ -37,6 +37,7 @@ from config import (
     TUBE_RADIUS_MM,
     WEIGHT_DECAY,
     configure_stage2_precision,
+    normalize_gradient_checkpointing,
 )
 from dataset import AneurysmDataset
 from model import GraphVAE
@@ -66,6 +67,10 @@ SEED = 31
 NUM_WORKERS = 2
 CACHE_BUILD_WORKERS = 8
 TORCH_THREADS = 4
+
+# False = fully off (faster, more VRAM). True = checkpoint encoder + all decoder
+# blocks. "fine" = only the 64k-node SplineConvs if a fat graph OOMs with False.
+USE_GRADIENT_CHECKPOINTING = False
 
 LOSS_WEIGHTS = dict(DEFAULT_LOSS_WEIGHTS)
 
@@ -185,14 +190,17 @@ if __name__ == "__main__":
 
     # %%
     print("Initializing Graph VAE model...")
+    ckpt_mode = normalize_gradient_checkpointing(USE_GRADIENT_CHECKPOINTING)
     model = GraphVAE(
         latent_dim=LATENT_DIM,
         latent_len=LATENT_LEN,
         hidden_dim=DECODER_HIDDEN_DIM,
         tube_radius=TUBE_RADIUS,
+        gradient_checkpointing=ckpt_mode,
     )
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Trainable parameters: {n_params:,}")
+    print(f"Gradient checkpointing: {ckpt_mode}")
 
     # %% [markdown]
     # ## 4. Training Loop

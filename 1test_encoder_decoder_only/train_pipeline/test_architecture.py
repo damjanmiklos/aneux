@@ -185,13 +185,14 @@ def make_synthetic_data(
     return factory.build_scaffold(mesh, vessel_points=vessel)
 
 
-def _tiny_model(latent_len=8, latent_dim=8):
+def _tiny_model(latent_len=8, latent_dim=8, gradient_checkpointing="off"):
     return GraphVAE(
         latent_dim=latent_dim,
         latent_len=latent_len,
         hidden_dim=16,
         tube_radius=2.0,
         sa_stages=TINY_SA,
+        gradient_checkpointing=gradient_checkpointing,
     )
 
 
@@ -221,6 +222,16 @@ def test_config_contracts():
     _assert(Z_ATTN_RADIUS == 2, Z_ATTN_RADIUS)
     _assert(Z_ATTN_GATE_MAX <= 0.5 + 1e-12, Z_ATTN_GATE_MAX)
     _assert(BATCH_SIZE == 1, BATCH_SIZE)
+    from aneuxai import USE_GRADIENT_CHECKPOINTING
+    from config import normalize_gradient_checkpointing
+
+    _assert(
+        normalize_gradient_checkpointing(USE_GRADIENT_CHECKPOINTING) in ("off", "fine", "all"),
+        USE_GRADIENT_CHECKPOINTING,
+    )
+    _assert(normalize_gradient_checkpointing(False) == "off", "False -> off")
+    _assert(normalize_gradient_checkpointing(True) == "all", "True -> all")
+    _assert(normalize_gradient_checkpointing("fine") == "fine", "fine")
 
 
 def test_fourier_shapes():
@@ -794,6 +805,22 @@ def test_scaffold_decode_without_vessel():
     _assert(torch.isfinite(x).all(), "non-finite decode")
 
 
+def test_gradient_checkpointing_modes():
+    data = make_synthetic_data()
+    loader = DataLoader([data], batch_size=1, follow_batch=FOLLOW_BATCH)
+    batch = next(iter(loader))
+    for mode in ("off", "fine", "all"):
+        model = _tiny_model(gradient_checkpointing=mode)
+        _assert(model.gradient_checkpointing == mode, mode)
+        model.train()
+        out = model(batch)
+        loss = out.x_pred.float().pow(2).mean() + out.mu.float().pow(2).mean()
+        loss.backward()
+        _assert(torch.isfinite(loss), f"non-finite {mode}")
+        grads = [p.grad.abs().sum().item() for p in model.parameters() if p.grad is not None]
+        _assert(len(grads) > 0 and sum(grads) > 0, f"no grads {mode}")
+
+
 def test_forward_backward():
     data = make_synthetic_data()
     loader = DataLoader([data], batch_size=1, follow_batch=FOLLOW_BATCH)
@@ -1295,6 +1322,7 @@ def main():
         test_gated_hidden_upsample_shapes,
         test_ema_update_and_restore,
         test_full_capacity_model_forward,
+        test_gradient_checkpointing_modes,
         test_forward_backward,
     ]
     failed = 0

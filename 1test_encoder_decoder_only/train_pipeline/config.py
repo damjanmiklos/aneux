@@ -104,6 +104,28 @@ WEIGHT_DECAY = 1e-4
 GRAD_CLIP = 1.0
 KL_WARMUP_EPOCHS = 20
 EMA_DECAY = 0.999
+# "off" = no checkpointing (faster backward, more VRAM).
+# "fine" = only the 64k-node SplineConvs (OOM fallback).
+# "all" = encoder InvRes + every SplineConv + coarse attn (least VRAM).
+GRADIENT_CHECKPOINTING = "off"
+
+
+def normalize_gradient_checkpointing(value=None):
+    """Map a user flag to 'off' | 'fine' | 'all'."""
+    if value is None:
+        value = GRADIENT_CHECKPOINTING
+    if isinstance(value, bool):
+        return "all" if value else "off"
+    key = str(value).strip().lower()
+    if key in ("off", "false", "0", "no", "none"):
+        return "off"
+    if key in ("fine", "fine_only", "fine-only"):
+        return "fine"
+    if key in ("all", "true", "1", "yes", "on"):
+        return "all"
+    raise ValueError(
+        f"gradient_checkpointing must be False/'off', True/'all', or 'fine'; got {value!r}"
+    )
 
 LAMBDA_RECON = 1.0
 LAMBDA_KL = 5e-4
