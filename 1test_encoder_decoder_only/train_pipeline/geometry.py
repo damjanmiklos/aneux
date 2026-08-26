@@ -141,8 +141,8 @@ def upsample_branch_concat(
     """Upsample a concatenation of per-branch regular grids."""
     pieces = []
     offset = 0
-    nl_src = [int(v) for v in n_length_src.reshape(-1).tolist()]
-    nl_dst = [int(v) for v in n_length_dst.reshape(-1).tolist()]
+    nl_src = [int(v) for v in n_length_src.detach().cpu().reshape(-1).tolist()]
+    nl_dst = [int(v) for v in n_length_dst.detach().cpu().reshape(-1).tolist()]
     if len(nl_src) != len(nl_dst):
         raise ValueError(
             f"Branch count mismatch during upsample: {len(nl_src)} vs {len(nl_dst)}"

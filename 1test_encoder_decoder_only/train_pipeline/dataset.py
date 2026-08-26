@@ -1,3 +1,4 @@
+import gc
 import os
 from collections import defaultdict, deque
 
@@ -14,6 +15,8 @@ from config import (
     DENSE_CL_SPACING_MM,
     FAR_CL_MARGIN_MM,
     HIERARCHY_LEVELS,
+    JUNCTION_COUPLE_K,
+    JUNCTION_COUPLE_RADIUS_MM,
     LATENT_LEN,
     MAX_TRACTS,
     MIN_RINGS_PER_BRANCH,
@@ -23,6 +26,7 @@ from config import (
     TUBE_RADIUS_MM,
 )
 from geometry import fps_metric, point_to_polyline_dist
+from raycast import closest_cell_normals, compute_level_r_star, empty_r_star, transform_vessel_mesh
 
 
 def _dedup_polyline(pts):
@@ -65,7 +69,113 @@ def _as_aneurysm_data(data):
     keys = keys_attr() if callable(keys_attr) else keys_attr
     for key in list(keys):
         out[key] = data[key]
+    flag = getattr(data, "has_true_normal", None)
+    if flag is not None:
+        out.has_true_normal = bool(flag)
     return out
+
+
+def _load_cached_graph(path):
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def _infer_has_true_normal(data):
+    flag = getattr(data, "has_true_normal", None)
+    if flag is not None:
+        if torch.is_tensor(flag):
+            return bool((flag != 0).reshape(-1).any().item())
+        return bool(flag)
+    nrm = getattr(data, "x_true_normal", None)
+    x_true = getattr(data, "x_true", None)
+    if nrm is None or x_true is None or nrm.numel() == 0:
+        return False
+    if nrm.size(0) != x_true.size(0):
+        return False
+    nrm = nrm.float()
+    return bool(torch.isfinite(nrm).all() and nrm.norm(dim=-1).mean() > 0.5)
+
+
+def _finalize_item(data):
+    if getattr(data, "face", None) is None and getattr(data, "faces", None) is not None:
+        faces = data.faces
+        data.face = faces.t().contiguous() if faces.size(-1) == 3 else faces
+    if not isinstance(data, AneurysmData):
+        data = _as_aneurysm_data(data)
+    data = _ensure_fp32_data(data)
+    data.has_true_normal = torch.tensor(
+        1 if _infer_has_true_normal(data) else 0, dtype=torch.uint8
+    )
+    return data
+
+
+_CPU_TENSOR_KEYS = frozenset(
+    {
+        "n_radial_fine",
+        "n_radial_mid",
+        "n_radial_coarse",
+        "branch_nl_fine",
+        "branch_nl_mid",
+        "branch_nl_coarse",
+        "branch_nl_fine_batch",
+        "branch_nl_mid_batch",
+        "branch_nl_coarse_batch",
+        "cache_version",
+        "n_tracts",
+        "pose_R",
+        "origin_shift",
+        "has_true_normal",
+    }
+)
+
+
+class AneurysmData(Data):
+    """PyG Data with correct index offsets for the mid/coarse scaffold graphs."""
+
+    def __inc__(self, key, value, *args, **kwargs):
+        if key in ("edge_index", "face"):
+            return int(self.x.size(0))
+        if key in ("edge_index_mid", "face_mid"):
+            return int(self.pos_mid.size(0))
+        if key in ("edge_index_coarse", "face_coarse"):
+            return int(self.pos_coarse.size(0))
+        return super().__inc__(key, value, *args, **kwargs)
+
+    def __cat_dim__(self, key, value, *args, **kwargs):
+        if key in (
+            "edge_index",
+            "edge_index_mid",
+            "edge_index_coarse",
+            "face",
+            "face_mid",
+            "face_coarse",
+        ):
+            return -1
+        return super().__cat_dim__(key, value, *args, **kwargs)
+
+    def to(self, device=None, *args, **kwargs):
+        cpu_vals = {}
+        for key in _CPU_TENSOR_KEYS:
+            if key in self:
+                cpu_vals[key] = self[key]
+                del self[key]
+        try:
+            out = super().to(device, *args, **kwargs)
+        finally:
+            for key, value in cpu_vals.items():
+                self[key] = value
+        for key, value in cpu_vals.items():
+            if torch.is_tensor(value) and value.device.type != "cpu":
+                value = value.cpu()
+            out[key] = value
+        flag = getattr(self, "has_true_normal", None)
+        if flag is None:
+            flag = getattr(out, "has_true_normal", None)
+        if flag is not None:
+            out.has_true_normal = bool(flag)
+        return out
 
 
 def _arc_len(pts):
@@ -126,6 +236,60 @@ def _rebalance_counts(raw, target, min_len):
     return raw
 
 
+def couple_ostium_edges(
+    pos,
+    tract_id,
+    junction_incidents,
+    junc_xyz,
+    radius_mm=JUNCTION_COUPLE_RADIUS_MM,
+    k=JUNCTION_COUPLE_K,
+):
+    """Bidirectional parent–daughter edges near each ostium (not a watertight Boolean)."""
+    pos = np.asarray(pos, dtype=np.float64).reshape(-1, 3)
+    tract_id = np.asarray(tract_id, dtype=np.int64).reshape(-1)
+    if pos.shape[0] == 0 or not junction_incidents:
+        return np.zeros((0, 2), dtype=np.int64)
+    radius_mm = float(radius_mm)
+    k = max(1, int(k))
+    pairs = []
+    for nid, incident in junction_incidents.items():
+        if nid not in junc_xyz:
+            continue
+        jp = np.asarray(junc_xyz[nid], dtype=np.float64).reshape(3)
+        tids = sorted({int(t) for t in incident if 0 <= int(t) < MAX_TRACTS})
+        near = {}
+        for tid in tids:
+            idx = np.where(tract_id == tid)[0]
+            if idx.size == 0:
+                continue
+            dist = np.linalg.norm(pos[idx] - jp, axis=1)
+            keep = idx[dist <= radius_mm]
+            if keep.size == 0:
+                n_keep = min(idx.size, max(k * 4, 4))
+                keep = idx[np.argsort(dist)[:n_keep]]
+            near[tid] = keep
+        tids = [t for t in tids if t in near]
+        for i in range(len(tids)):
+            for j in range(i + 1, len(tids)):
+                a = near[tids[i]]
+                b = near[tids[j]]
+                if a.size == 0 or b.size == 0:
+                    continue
+                d = np.linalg.norm(pos[a][:, None, :] - pos[b][None, :, :], axis=2)
+                kk = min(k, b.size)
+                nn = np.argpartition(d, kk - 1, axis=1)[:, :kk]
+                lim = radius_mm * 1.5
+                for ia in range(a.size):
+                    for ib in nn[ia]:
+                        if d[ia, int(ib)] <= lim:
+                            ua, ub = int(a[ia]), int(b[int(ib)])
+                            pairs.append((ua, ub))
+                            pairs.append((ub, ua))
+    if not pairs:
+        return np.zeros((0, 2), dtype=np.int64)
+    return np.asarray(pairs, dtype=np.int64)
+
+
 def allocate_token_counts(n_tokens, arc_lengths, n_junctions, min_per=MIN_TOKENS_PER_TRACT):
     """Split a fixed token budget into per-tract tokens plus junction tokens."""
     n_tracts = len(arc_lengths)
@@ -139,31 +303,6 @@ def allocate_token_counts(n_tokens, arc_lengths, n_junctions, min_per=MIN_TOKENS
         alloc = [max(min_per, a) for a in alloc]
         alloc = _rebalance_counts(alloc, budget, min_per)
     return alloc, n_junc
-
-
-class AneurysmData(Data):
-    """PyG Data with correct index offsets for the mid/coarse scaffold graphs."""
-
-    def __inc__(self, key, value, *args, **kwargs):
-        if key in ("edge_index", "face"):
-            return int(self.x.size(0))
-        if key in ("edge_index_mid", "face_mid"):
-            return int(self.pos_mid.size(0))
-        if key in ("edge_index_coarse", "face_coarse"):
-            return int(self.pos_coarse.size(0))
-        return super().__inc__(key, value, *args, **kwargs)
-
-    def __cat_dim__(self, key, value, *args, **kwargs):
-        if key in (
-            "edge_index",
-            "edge_index_mid",
-            "edge_index_coarse",
-            "face",
-            "face_mid",
-            "face_coarse",
-        ):
-            return -1
-        return super().__cat_dim__(key, value, *args, **kwargs)
 
 
 def extract_unique_tracts(centerline_mesh, snap=1e-4):
@@ -371,8 +510,22 @@ class AneurysmDataset(Dataset):
         n_true=N_TRUE,
         hierarchy=HIERARCHY_LEVELS,
         latent_len=LATENT_LEN,
+        quiet=False,
     ):
         super().__init__()
+        self._init_kwargs = dict(
+            csv_path=csv_path,
+            vtp_vessel_dir=vtp_vessel_dir,
+            vtp_centerline_dir=vtp_centerline_dir,
+            tube_radius=tube_radius,
+            n_length=n_length,
+            n_radial=n_radial,
+            extra_centerline_dir=extra_centerline_dir,
+            cache_dir=cache_dir,
+            n_true=n_true,
+            hierarchy=tuple(tuple(lv) for lv in hierarchy),
+            latent_len=latent_len,
+        )
         self.tube_radius = float(tube_radius)
         self.n_true = int(n_true)
         self.latent_len = int(latent_len)
@@ -417,10 +570,11 @@ class AneurysmDataset(Dataset):
             else:
                 n_missing += 1
 
-        print(
-            f"AneurysmDataset: {len(df)} CSV rows, {len(df_filtered)} ICA-filtered, "
-            f"{len(self.samples)} with vessel+centerline, {n_missing} skipped (missing files)"
-        )
+        if not quiet:
+            print(
+                f"AneurysmDataset: {len(df)} CSV rows, {len(df_filtered)} ICA-filtered, "
+                f"{len(self.samples)} with vessel+centerline, {n_missing} skipped (missing files)"
+            )
 
     def _cache_path(self, dataset_id):
         if not self.cache_dir:
@@ -626,7 +780,15 @@ class AneurysmDataset(Dataset):
         edges = np.concatenate([edges, edges[:, ::-1]], axis=0)
         return edges, faces
 
-    def _generate_level(self, dense_tracts, n_length, n_radial, arc_lengths):
+    def _generate_level(
+        self,
+        dense_tracts,
+        n_length,
+        n_radial,
+        arc_lengths,
+        junction_incidents=None,
+        junc_xyz=None,
+    ):
         alloc = allocate_ring_counts(n_length, arc_lengths)
         node_chunks = []
         u_local_chunks = []
@@ -669,6 +831,16 @@ class AneurysmDataset(Dataset):
 
         if all_edges:
             edge_index = torch.from_numpy(np.concatenate(all_edges, axis=0).T.copy()).long()
+            extra = couple_ostium_edges(
+                np.concatenate(node_chunks, axis=0),
+                np.concatenate(tract_chunks),
+                junction_incidents or {},
+                junc_xyz or {},
+                radius_mm=max(2.0 * self.tube_radius, JUNCTION_COUPLE_RADIUS_MM),
+            )
+            if extra.shape[0] > 0:
+                extra_t = torch.from_numpy(np.ascontiguousarray(extra.T)).long()
+                edge_index = torch.cat([edge_index, extra_t], dim=1)
             edge_index = torch.unique(edge_index, dim=1)
         else:
             edge_index = torch.zeros((2, 0), dtype=torch.long)
@@ -734,6 +906,39 @@ class AneurysmDataset(Dataset):
             x_true = np.tile(x_true, (reps, 1))[: self.n_true]
             d_true = np.tile(d_true, reps)[: self.n_true]
         return _torch_f32(x_true), _torch_f32(d_true)
+
+    def _true_normals_at_points(self, query_pts, mesh_pts, mesh_normals):
+        query_pts = np.asarray(query_pts, dtype=np.float64).reshape(-1, 3)
+        mesh_pts = np.asarray(mesh_pts, dtype=np.float64).reshape(-1, 3)
+        mesh_normals = np.asarray(mesh_normals, dtype=np.float64).reshape(-1, 3)
+        if query_pts.shape[0] == 0:
+            return _torch_f32(np.zeros((0, 3)))
+        if mesh_pts.shape[0] == 0:
+            nrm = np.zeros_like(query_pts)
+            nrm[:, 2] = 1.0
+            return _torch_f32(nrm)
+        from scipy.spatial import cKDTree
+
+        _, idx = cKDTree(mesh_pts).query(query_pts, k=1)
+        nrm = mesh_normals[np.asarray(idx, dtype=np.int64)]
+        nrm = nrm / np.clip(np.linalg.norm(nrm, axis=1, keepdims=True), 1e-8, None)
+        return _torch_f32(nrm)
+
+    def _posed_mesh_normals(self, vessel_mesh, origin, R):
+        if vessel_mesh is None:
+            return None, None
+        mesh = vessel_mesh
+        try:
+            mesh = mesh.compute_normals(point_normals=True, cell_normals=False, inplace=False)
+        except Exception:
+            pass
+        pts = (_as_f64(mesh.points) - origin) @ R
+        nrm = getattr(mesh, "point_normals", None)
+        if nrm is None or len(nrm) != len(pts):
+            return pts, None
+        nrm = _as_f64(nrm) @ R
+        nrm = nrm / np.clip(np.linalg.norm(nrm, axis=1, keepdims=True), 1e-8, None)
+        return pts, nrm
 
     def _build_latent_tokens(self, dense_tracts, junction_incidents, junc_xyz, arc_lengths):
         n_junc_avail = len(junction_incidents)
@@ -815,7 +1020,33 @@ class AneurysmDataset(Dataset):
         junc_xyz = {k: v @ R for k, v in junc_xyz.items()}
         return tracts, junc_inc, junc_xyz, origin, R, inlet_i
 
-    def build_scaffold(self, centerline_mesh, vessel_points=None):
+    def _level_r_star(self, level, dense_tracts, gt_mesh):
+        if gt_mesh is None:
+            packed = empty_r_star(int(level["pos"].size(0)))
+        else:
+            packed = compute_level_r_star(
+                level["pos"].numpy(),
+                level["normal"].numpy(),
+                level["u"].numpy(),
+                level["tract_id"].numpy(),
+                level["branch_nl"].numpy(),
+                int(level["n_radial"].item()),
+                dense_tracts,
+                gt_mesh,
+                tube_radius=self.tube_radius,
+            )
+        return {
+            "r_star": _torch_f32(packed["r_star"]),
+            "valid": torch.from_numpy(np.ascontiguousarray(packed["valid"])).bool(),
+            "ambiguous": torch.from_numpy(
+                np.ascontiguousarray(packed.get("ambiguous", np.zeros(packed["valid"].shape, dtype=bool)))
+            ).bool(),
+            "dth": _torch_f32(packed["dth"]),
+            "du": _torch_f32(packed["du"]),
+            "ring_med": _torch_f32(packed["ring_med"]),
+        }
+
+    def build_scaffold(self, centerline_mesh, vessel_points=None, vessel_mesh=None):
         """Build tube / latent tensors from a centerline. `vessel_points` is optional (Stage-2 decode)."""
         tracts, junc_inc, junc_xyz, origin, R, _ = self._prepare_tracts(centerline_mesh)
         dense_tracts = [self._fit_dense_tract(t) for t in tracts]
@@ -824,19 +1055,41 @@ class AneurysmDataset(Dataset):
         names = ("coarse", "mid", "fine")
         levels = {}
         for name, (n_len, n_rad) in zip(names, self.hierarchy):
-            levels[name] = self._generate_level(dense_tracts, n_len, n_rad, arc_lengths)
+            levels[name] = self._generate_level(
+                dense_tracts, n_len, n_rad, arc_lengths, junc_inc, junc_xyz
+            )
 
         fine, mid, coarse = levels["fine"], levels["mid"], levels["coarse"]
         tokens = self._build_latent_tokens(dense_tracts, junc_inc, junc_xyz, arc_lengths)
         cl_xyz = fine["cl_dense"].numpy()
         cl_dense = torch.cat([fine["cl_dense"], fine["cl_dense_u"].unsqueeze(-1)], dim=-1)
+        gt_mesh = transform_vessel_mesh(vessel_mesh, origin, R) if vessel_mesh is not None else None
 
+        if vessel_mesh is not None:
+            vessel_points = np.asarray(vessel_mesh.points)
         if vessel_points is not None:
             vessel = (_as_f64(vessel_points) - origin) @ R
             x_true, x_true_cl_dist = self._hybrid_true_points(vessel, cl_xyz)
+            nrm = closest_cell_normals(gt_mesh, x_true.numpy()) if gt_mesh is not None else None
+            if nrm is not None and float(np.linalg.norm(nrm, axis=1).mean()) > 0.5:
+                x_true_normal = _torch_f32(nrm)
+            else:
+                posed_pts, posed_nrm = self._posed_mesh_normals(vessel_mesh, origin, R)
+                if posed_nrm is not None:
+                    x_true_normal = self._true_normals_at_points(x_true.numpy(), posed_pts, posed_nrm)
+                else:
+                    x_true_normal = torch.zeros_like(x_true)
         else:
             x_true = torch.zeros((1, 3), dtype=torch.float32)
             x_true_cl_dist = torch.zeros((1,), dtype=torch.float32)
+            x_true_normal = torch.zeros((1, 3), dtype=torch.float32)
+
+        try:
+            r_fine = self._level_r_star(fine, dense_tracts, gt_mesh)
+            r_mid = self._level_r_star(mid, dense_tracts, gt_mesh)
+        except Exception:
+            r_fine = self._level_r_star(fine, dense_tracts, None)
+            r_mid = self._level_r_star(mid, dense_tracts, None)
 
         data = AneurysmData(
             x=fine["pos"],
@@ -871,6 +1124,7 @@ class AneurysmDataset(Dataset):
             u_step_coarse=coarse["u_step"],
             x_true=x_true,
             x_true_cl_dist=x_true_cl_dist,
+            x_true_normal=x_true_normal,
             cl_dense=cl_dense,
             cl_tract_id=fine["cl_tract_id"],
             branch_nl_fine=fine["branch_nl"],
@@ -881,8 +1135,27 @@ class AneurysmDataset(Dataset):
             n_radial_coarse=coarse["n_radial"],
             origin_shift=_torch_f32(origin),
             pose_R=_torch_f32(R),
+            r_star=r_fine["r_star"],
+            r_star_valid=r_fine["valid"],
+            r_star_ambiguous=r_fine["ambiguous"],
+            r_dth=r_fine["dth"],
+            r_du=r_fine["du"],
+            r_ring_med=r_fine["ring_med"],
+            r_star_mid=r_mid["r_star"],
+            r_star_valid_mid=r_mid["valid"],
+            r_star_ambiguous_mid=r_mid["ambiguous"],
             cache_version=torch.tensor(CACHE_VERSION, dtype=torch.long),
             **tokens,
+        )
+        data.has_true_normal = torch.tensor(
+            1
+            if (
+                x_true_normal is not None
+                and x_true_normal.size(0) == x_true.size(0)
+                and float(x_true_normal.float().norm(dim=-1).mean()) > 0.5
+            )
+            else 0,
+            dtype=torch.uint8,
         )
         return data
 
@@ -896,7 +1169,67 @@ class AneurysmDataset(Dataset):
     def _build_data(self, sample):
         vessel_mesh = pv.read(sample["vessel_file"])
         centerline_mesh = pv.read(sample["centerline_file"])
-        return self.build_scaffold(centerline_mesh, vessel_points=vessel_mesh.points)
+        try:
+            return self.build_scaffold(centerline_mesh, vessel_mesh=vessel_mesh)
+        finally:
+            del vessel_mesh, centerline_mesh
+            gc.collect()
+
+    def warmup_cache(self, indices=None, num_workers=1):
+        """Write missing `.pt` caches. Existing versioned files are left untouched.
+
+        Raycast is one core per sample, so `num_workers>1` runs samples in
+        parallel processes. Training DataLoader workers are a separate setting.
+        """
+        from tqdm import tqdm
+
+        idxs = list(range(len(self)) if indices is None else indices)
+        missing = [i for i in idxs if not self._cache_file_ready(i)]
+        n_hit = len(idxs) - len(missing)
+        if not missing:
+            print(f"Tube cache already complete ({n_hit} files)")
+            return len(idxs)
+
+        workers = max(1, int(num_workers))
+        workers = min(workers, len(missing))
+        print(f"Tube cache: {n_hit} ready, {len(missing)} to build, {workers} process(es)")
+        if workers == 1 or not getattr(self, "_init_kwargs", None):
+            for i in tqdm(missing, desc="Tube cache"):
+                self[i]
+                gc.collect()
+            return len(idxs)
+
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
+        errors = []
+        pool_kw = dict(
+            max_workers=workers,
+            initializer=_warmup_pool_init,
+            initargs=(self._init_kwargs,),
+        )
+        try:
+            pool = ProcessPoolExecutor(max_tasks_per_child=8, **pool_kw)
+        except TypeError:
+            pool = ProcessPoolExecutor(**pool_kw)
+        with pool:
+            futs = {pool.submit(_warmup_pool_build, i): i for i in missing}
+            for fut in tqdm(as_completed(futs), total=len(futs), desc="Tube cache"):
+                idx = futs[fut]
+                try:
+                    fut.result()
+                except Exception as exc:
+                    errors.append((self.samples[idx]["dataset_id"], exc))
+        if errors:
+            detail = "; ".join(f"{did}: {err}" for did, err in errors[:8])
+            raise RuntimeError(
+                f"Tube cache failed for {len(errors)}/{len(missing)} samples ({detail})"
+            )
+        return len(idxs)
+
+    def _cache_file_ready(self, idx):
+        sample = self.samples[idx]
+        path = self._cache_path(sample["dataset_id"])
+        return bool(path and os.path.isfile(path))
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
@@ -904,17 +1237,9 @@ class AneurysmDataset(Dataset):
 
         if cache_path and os.path.exists(cache_path):
             try:
-                try:
-                    data = torch.load(cache_path, map_location="cpu", weights_only=False)
-                except TypeError:
-                    data = torch.load(cache_path, map_location="cpu")
+                data = _load_cached_graph(cache_path)
                 if int(getattr(data, "cache_version", torch.tensor(-1))) == CACHE_VERSION:
-                    if getattr(data, "face", None) is None and getattr(data, "faces", None) is not None:
-                        faces = data.faces
-                        data.face = faces.t().contiguous() if faces.size(-1) == 3 else faces
-                    if not isinstance(data, AneurysmData):
-                        data = _as_aneurysm_data(data)
-                    return _ensure_fp32_data(data)
+                    return _finalize_item(data)
             except Exception:
                 pass
 
@@ -934,5 +1259,24 @@ class AneurysmDataset(Dataset):
             except OSError:
                 if os.path.exists(tmp):
                     os.remove(tmp)
+            gc.collect()
 
-        return data
+        return _finalize_item(data)
+
+
+_WARMUP_DS = None
+
+
+def _warmup_pool_init(init_kwargs):
+    global _WARMUP_DS
+    torch.set_num_threads(1)
+    os.environ["OMP_NUM_THREADS"] = "1"
+    kw = dict(init_kwargs)
+    kw["quiet"] = True
+    _WARMUP_DS = AneurysmDataset(**kw)
+
+
+def _warmup_pool_build(idx):
+    _WARMUP_DS[idx]
+    gc.collect()
+    return idx

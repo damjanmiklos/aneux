@@ -58,13 +58,14 @@ N_RADIAL = HIERARCHY_LEVELS[-1][1]
 
 BATCH_SIZE = 1
 ACCUM_STEPS = 8
-EPOCHS = 100
+EPOCHS = 200
 VAL_SPLIT = 0.15
 VAL_EVERY = 5
 SEED = 31
 
-CPU_AFFINITY = [1, 2, 3]
-NUM_WORKERS = 0
+NUM_WORKERS = 2
+CACHE_BUILD_WORKERS = 8
+TORCH_THREADS = 4
 
 LOSS_WEIGHTS = dict(DEFAULT_LOSS_WEIGHTS)
 
@@ -115,9 +116,7 @@ if __name__ == "__main__":
     seed_everything(SEED)
     configure_stage2_precision()
 
-    if hasattr(os, "sched_setaffinity"):
-        os.sched_setaffinity(0, CPU_AFFINITY)
-        torch.set_num_threads(len(CPU_AFFINITY))
+    torch.set_num_threads(TORCH_THREADS)
 
     if torch.cuda.is_available():
         n_gpu = torch.cuda.device_count()
@@ -148,6 +147,9 @@ if __name__ == "__main__":
 
     train_dataset, val_dataset = stratified_split(dataset, VAL_SPLIT, SEED)
     print(f"Train: {len(train_dataset)} | Val: {len(val_dataset)}")
+    print("Warming tube cache (parallel raycast; not used as DataLoader workers)...")
+    n_cached = dataset.warmup_cache(num_workers=CACHE_BUILD_WORKERS)
+    print(f"Tube cache ready for {n_cached} samples")
 
     train_ids = [dataset.samples[i]["dataset_id"] for i in train_dataset.indices]
     val_ids = [dataset.samples[i]["dataset_id"] for i in val_dataset.indices]
@@ -166,6 +168,10 @@ if __name__ == "__main__":
         print(f"Sample face shape: {sample_data.face.shape}")
         print(f"Latent tokens: {sample_data.latent_pos.shape}  n_tracts={int(sample_data.n_tracts)}")
         print(f"pose_R: {tuple(sample_data.pose_R.shape)}  origin: {tuple(sample_data.origin_shift.shape)}")
+        n_r = int(sample_data.r_star.numel())
+        n_ok = int(sample_data.r_star_valid.sum().item()) if n_r else 0
+        n_amb = int(getattr(sample_data, "r_star_ambiguous", torch.zeros(0, dtype=torch.bool)).sum().item()) if n_r else 0
+        print(f"r_star valid: {n_ok}/{n_r} ({(n_ok / max(n_r, 1)):.3f})  ambiguous: {n_amb}")
         print(
             f"dtypes: x={sample_data.x.dtype} x_true={sample_data.x_true.dtype} "
             f"latent_pos={sample_data.latent_pos.dtype} "
@@ -175,7 +181,7 @@ if __name__ == "__main__":
 
     # %% [markdown]
     # ## 3. Model Initialization
-    # PointNeXt encoder → tree latent Z ∈ R^{64×64}; progressive SplineConv decoder (Stage 2).
+    # PointNeXt encoder → tree latent Z ∈ R^{96×128}; progressive SplineConv decoder (Stage 2).
 
     # %%
     print("Initializing Graph VAE model...")
@@ -243,9 +249,9 @@ if __name__ == "__main__":
         val_epochs = [i + 1 for i, h in enumerate(history) if "val_loss" in h]
         val_loss = [h["val_loss"] for h in history if "val_loss" in h]
 
-        plt.figure(figsize=(14, 10))
+        plt.figure(figsize=(14, 14))
 
-        plt.subplot(2, 3, 1)
+        plt.subplot(3, 3, 1)
         plt.plot(epochs_range, train_loss, label="Train Total")
         if val_loss:
             plt.plot(val_epochs, val_loss, "ro-", label="Val Total")
@@ -253,35 +259,42 @@ if __name__ == "__main__":
         plt.xlabel("Epoch")
         plt.legend()
 
-        plt.subplot(2, 3, 2)
+        plt.subplot(3, 3, 2)
         plt.plot(epochs_range, [h["recon"] for h in history], label="Train Recon")
         plt.plot(val_epochs, [h["val_recon"] for h in history if "val_recon" in h], "ro-", label="Val Recon")
         plt.title("Reconstruction (Chamfer)")
         plt.xlabel("Epoch")
         plt.legend()
 
-        plt.subplot(2, 3, 3)
+        plt.subplot(3, 3, 3)
+        plt.plot(epochs_range, [h.get("rad", 0.0) for h in history], label="Train Rad")
+        plt.plot(val_epochs, [h["val_rad"] for h in history if "val_rad" in h], "ro-", label="Val Rad")
+        plt.title("Radial Huber")
+        plt.xlabel("Epoch")
+        plt.legend()
+
+        plt.subplot(3, 3, 4)
         plt.plot(epochs_range, [h["kl"] for h in history], label="Train KL")
         plt.plot(val_epochs, [h["val_kl"] for h in history if "val_kl" in h], "ro-", label="Val KL")
         plt.title("KL Divergence")
         plt.xlabel("Epoch")
         plt.legend()
 
-        plt.subplot(2, 3, 4)
+        plt.subplot(3, 3, 5)
         plt.plot(epochs_range, [h["disp"] for h in history], label="Train Disp")
         plt.plot(val_epochs, [h["val_disp"] for h in history if "val_disp" in h], "ro-", label="Val Disp")
         plt.title("Displacement Dirichlet")
         plt.xlabel("Epoch")
         plt.legend()
 
-        plt.subplot(2, 3, 5)
+        plt.subplot(3, 3, 6)
         plt.plot(epochs_range, [h["lap"] for h in history], label="Train Lap")
         plt.plot(val_epochs, [h["val_lap"] for h in history if "val_lap" in h], "ro-", label="Val Lap")
         plt.title("Laplacian")
         plt.xlabel("Epoch")
         plt.legend()
 
-        plt.subplot(2, 3, 6)
+        plt.subplot(3, 3, 7)
         plt.plot(epochs_range, [h["norm"] for h in history], label="Train Norm")
         plt.plot(val_epochs, [h["val_norm"] for h in history if "val_norm" in h], "ro-", label="Val Norm")
         plt.title("Normal Consistency")

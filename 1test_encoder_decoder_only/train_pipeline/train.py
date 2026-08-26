@@ -8,6 +8,7 @@ from tqdm import tqdm
 
 from config import (
     DEFAULT_LOSS_WEIGHTS,
+    EMA_DECAY,
     FOLLOW_BATCH,
     GRAD_CLIP,
     KL_WARMUP_EPOCHS,
@@ -16,6 +17,7 @@ from config import (
     WEIGHT_DECAY,
     configure_stage2_precision,
 )
+from dataset import _CPU_TENSOR_KEYS
 from losses import compute_losses
 
 
@@ -67,6 +69,14 @@ def _print_vram(tag, device, model=None):
     tqdm.write("\n".join(lines))
 
 
+def _keep_meta_on_cpu(batch):
+    for key in _CPU_TENSOR_KEYS:
+        val = getattr(batch, key, None)
+        if torch.is_tensor(val) and val.device.type != "cpu":
+            setattr(batch, key, val.cpu())
+    return batch
+
+
 def _face_from_batch(batch):
     face = getattr(batch, "face", None)
     if face is not None and face.numel() > 0:
@@ -86,17 +96,63 @@ def kl_anneal_weight(epoch, max_weight=LAMBDA_KL, warmup_epochs=KL_WARMUP_EPOCHS
 
 
 def weighted_total(terms, weights):
-    return (
+    total = (
         weights["recon"] * terms["recon"]
         + weights["kl"] * terms["kl"]
         + weights["disp"] * terms["disp"]
         + weights["lap"] * terms["lap"]
         + weights["norm"] * terms["norm"]
     )
+    if "rad" in terms:
+        total = total + float(weights.get("rad", 0.0)) * terms["rad"]
+    return total
 
 
 def _weighted_total(terms, weights):
     return weighted_total(terms, weights)
+
+
+class ModelEMA:
+    """Exponential moving average of model weights for validation and export.
+
+    Shadows live on CPU so training does not keep a second 43M-parameter copy
+    in VRAM (Windows WDDM otherwise pages that into system RAM).
+    """
+
+    def __init__(self, model, decay=EMA_DECAY):
+        self.decay = float(decay)
+        self.shadow = {k: v.detach().to("cpu").clone() for k, v in model.state_dict().items()}
+        self._backup = None
+
+    @torch.no_grad()
+    def update(self, model):
+        decay = self.decay
+        msd = model.state_dict()
+        for key, shadow in self.shadow.items():
+            value = msd[key].detach()
+            if value.device != shadow.device:
+                value = value.to(device=shadow.device)
+            if shadow.dtype.is_floating_point:
+                shadow.mul_(decay).add_(value, alpha=1.0 - decay)
+            else:
+                shadow.copy_(value)
+
+    @torch.no_grad()
+    def copy_to(self, model):
+        model.load_state_dict(self.shadow, strict=True)
+
+    @torch.no_grad()
+    def store(self, model):
+        self._backup = {k: v.detach().to("cpu").clone() for k, v in model.state_dict().items()}
+
+    @torch.no_grad()
+    def restore(self, model):
+        if self._backup is not None:
+            model.load_state_dict(self._backup, strict=True)
+            self._backup = None
+
+    def state_dict(self):
+        return {"decay": self.decay, "shadow": self.shadow}
 
 
 def losses_from_output(out, batch):
@@ -124,6 +180,22 @@ def losses_from_output(out, batch):
         x_true_cl_dist=getattr(batch, "x_true_cl_dist", None),
         cl_dense=getattr(batch, "cl_dense", None),
         cl_dense_batch=cl_batch,
+        r_star=getattr(batch, "r_star", None),
+        r_star_valid=getattr(batch, "r_star_valid", None),
+        r_star_ambiguous=getattr(batch, "r_star_ambiguous", None),
+        r_dth=getattr(batch, "r_dth", None),
+        r_du=getattr(batch, "r_du", None),
+        r_ring_med=getattr(batch, "r_ring_med", None),
+        r_star_mid=getattr(batch, "r_star_mid", None),
+        r_star_valid_mid=getattr(batch, "r_star_valid_mid", None),
+        normal=getattr(batch, "normal", None),
+        normal_mid=getattr(batch, "normal_mid", None),
+        pos_mid=getattr(batch, "pos_mid", None),
+        x_true_normal=getattr(batch, "x_true_normal", None),
+        has_true_normal=getattr(batch, "has_true_normal", None),
+        tract_id=getattr(batch, "tract_id", None),
+        pos_coarse=getattr(batch, "pos_coarse", None),
+        normal_coarse=getattr(batch, "normal_coarse", None),
     )
 
 
@@ -133,16 +205,60 @@ def _accum_window_len(step, n_batches, accum_steps):
 
 
 def _zero_meters():
-    return {"loss": 0.0, "recon": 0.0, "kl": 0.0, "disp": 0.0, "lap": 0.0, "norm": 0.0}
+    return {
+        "loss": 0.0,
+        "recon": 0.0,
+        "kl": 0.0,
+        "disp": 0.0,
+        "lap": 0.0,
+        "norm": 0.0,
+        "rad": 0.0,
+    }
+
+
+def _add_meter(acc, key, value, scale):
+    v = value.detach() * scale
+    prev = acc[key]
+    acc[key] = v if prev is None else prev + v
+
+
+def _flush_meters(acc, total_samples):
+    if total_samples == 0:
+        return _zero_meters()
+    out = {}
+    for key, value in acc.items():
+        if value is None:
+            out[key] = 0.0
+        elif torch.is_tensor(value):
+            out[key] = float(value.item()) / total_samples
+        else:
+            out[key] = float(value) / total_samples
+    return out
+
+
+def _zero_tensor_meters():
+    return {k: None for k in _zero_meters()}
+
+
+def _worker_init(_worker_id):
+    torch.set_num_threads(1)
 
 
 def train_epoch(
-    model, dataloader, optimizer, weights, device, accum_steps=1, grad_clip=GRAD_CLIP, vram_probe=False
+    model,
+    dataloader,
+    optimizer,
+    weights,
+    device,
+    accum_steps=1,
+    grad_clip=GRAD_CLIP,
+    vram_probe=False,
+    ema=None,
 ):
     model.train()
-    totals = _zero_meters()
+    totals = _zero_tensor_meters()
     total_samples = 0
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)
     n_batches = len(dataloader)
     use_cuda = _device_type(device) == "cuda"
     logged_first_batch = False
@@ -151,8 +267,8 @@ def train_epoch(
         torch.cuda.reset_peak_memory_stats(_cuda_index(device))
 
     for step, batch in enumerate(tqdm(dataloader, desc="Training")):
-        batch = batch.to(device)
-        batch_size = batch.num_graphs
+        batch = _keep_meta_on_cpu(batch.to(device))
+        batch_size = int(batch.num_graphs)
         total_samples += batch_size
         window_len = _accum_window_len(step, n_batches, accum_steps)
 
@@ -169,55 +285,62 @@ def train_epoch(
             if grad_clip is not None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
+            if ema is not None:
+                ema.update(model)
             if vram_probe and use_cuda and not logged_first_step:
                 _print_vram("after first optimizer.step (AdamW moments allocated)", device, model)
                 logged_first_step = True
 
-        totals["loss"] += loss.item() * window_len * batch_size
-        for key in ("recon", "kl", "disp", "lap", "norm"):
-            totals[key] += terms[key].item() * batch_size
+        scale = float(window_len * batch_size)
+        _add_meter(totals, "loss", loss, scale)
+        for key in ("recon", "kl", "disp", "lap", "norm", "rad"):
+            if key in terms:
+                _add_meter(totals, key, terms[key], float(batch_size))
+        del out, terms, loss, batch
 
     if vram_probe and use_cuda:
         _print_vram("end of epoch 1 (peak over all train batches)", device, model)
 
-    if total_samples == 0:
-        return _zero_meters()
-    return {k: v / total_samples for k, v in totals.items()}
+    return _flush_meters(totals, total_samples)
 
 
 def evaluate_epoch(model, dataloader, weights, device):
     model.eval()
-    totals = _zero_meters()
+    totals = _zero_tensor_meters()
     total_samples = 0
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Validation"):
-            batch = batch.to(device)
-            batch_size = batch.num_graphs
+            batch = _keep_meta_on_cpu(batch.to(device))
+            batch_size = int(batch.num_graphs)
             total_samples += batch_size
             out = model(batch)
             terms = losses_from_output(out, batch)
             loss = _weighted_total(terms, weights)
-            totals["loss"] += loss.item() * batch_size
-            for key in ("recon", "kl", "disp", "lap", "norm"):
-                totals[key] += terms[key].item() * batch_size
+            _add_meter(totals, "loss", loss, float(batch_size))
+            for key in ("recon", "kl", "disp", "lap", "norm", "rad"):
+                if key in terms:
+                    _add_meter(totals, key, terms[key], float(batch_size))
+            del out, terms, loss, batch
 
-    if total_samples == 0:
-        return _zero_meters()
-    return {k: v / total_samples for k, v in totals.items()}
+    return _flush_meters(totals, total_samples)
 
 
 def _format_metrics(metrics, weights, tag, epoch, epochs):
+    rad = metrics.get("rad", 0.0)
+    w_rad = rad * float(weights.get("rad", 0.0))
     return (
         f"Epoch {epoch:03d}/{epochs:03d} [{tag}] | "
         f"Total: {metrics['loss']:.4f} | "
         f"Recon: {metrics['recon']:.4f} | "
+        f"Rad: {rad:.4f} | "
         f"KL: {metrics['kl']:.4f} | "
         f"Disp: {metrics['disp']:.4f} | "
         f"Lap: {metrics['lap']:.4f} | "
         f"Norm: {metrics['norm']:.4f} | "
         f"w_recon: {metrics['recon'] * weights['recon']:.4f} | "
+        f"w_rad: {w_rad:.4f} | "
         f"w_kl: {metrics['kl'] * weights['kl']:.4f} | "
         f"w_disp: {metrics['disp'] * weights['disp']:.4f} | "
         f"w_lap: {metrics['lap'] * weights['lap']:.4f} | "
@@ -242,6 +365,7 @@ def train_model(
     weight_decay=WEIGHT_DECAY,
     kl_max=LAMBDA_KL,
     kl_warmup_epochs=KL_WARMUP_EPOCHS,
+    ema_decay=EMA_DECAY,
 ):
     if weights is None:
         weights = dict(DEFAULT_LOSS_WEIGHTS)
@@ -256,7 +380,7 @@ def train_model(
     use_cuda = _device_type(device) == "cuda"
     loader_kwargs = dict(
         follow_batch=FOLLOW_BATCH,
-        pin_memory=use_cuda,
+        pin_memory=False,
     )
     train_loader = DataLoader(
         train_dataset,
@@ -264,7 +388,8 @@ def train_model(
         shuffle=True,
         num_workers=num_workers,
         persistent_workers=(num_workers > 0),
-        prefetch_factor=4 if num_workers > 0 else None,
+        prefetch_factor=2 if num_workers > 0 else None,
+        worker_init_fn=_worker_init if num_workers > 0 else None,
         **loader_kwargs,
     )
     val_loader = DataLoader(
@@ -284,6 +409,7 @@ def train_model(
         torch.cuda.synchronize()
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=max(lr * 1e-2, 1e-7))
+    ema = ModelEMA(model, decay=ema_decay) if ema_decay and ema_decay > 0.0 else None
 
     if ckpt_dir:
         os.makedirs(ckpt_dir, exist_ok=True)
@@ -307,27 +433,36 @@ def train_model(
             accum_steps,
             grad_clip=grad_clip,
             vram_probe=(use_cuda and epoch == 1),
+            ema=ema,
         )
         scheduler.step()
         print(_format_metrics(metrics, epoch_weights, "TRAIN", epoch, epochs)
               + f" | kl_lambda: {epoch_weights['kl']:.6f} | lr: {scheduler.get_last_lr()[0]:.2e}")
 
         if epoch % val_every == 0 or epoch == epochs:
+            if ema is not None:
+                ema.store(model)
+                ema.copy_to(model)
             val_metrics = evaluate_epoch(model, val_loader, epoch_weights, device)
+            if ema is not None:
+                ema.restore(model)
             print(_format_metrics(val_metrics, epoch_weights, "VAL  ", epoch, epochs))
             for key, value in val_metrics.items():
                 metrics[f"val_{key}"] = value
 
-            if ckpt_dir and val_metrics["recon"] < best_val:
-                best_val = val_metrics["recon"]
-                torch.save(model.state_dict(), os.path.join(ckpt_dir, "best.pt"))
-                print(f"  saved best checkpoint (val_recon {best_val:.4f})")
+            val_score = val_metrics["recon"] + float(epoch_weights.get("rad", 0.0)) * val_metrics.get("rad", 0.0)
+            if ckpt_dir and val_score < best_val:
+                best_val = val_score
+                to_save = ema.shadow if ema is not None else model.state_dict()
+                torch.save(to_save, os.path.join(ckpt_dir, "best.pt"))
+                print(f"  saved best checkpoint (val_recon+rad {best_val:.4f})")
 
         if ckpt_dir:
             torch.save(
                 {
                     "epoch": epoch,
                     "model": model.state_dict(),
+                    "ema": ema.state_dict() if ema is not None else None,
                     "optimizer": optimizer.state_dict(),
                     "scheduler": scheduler.state_dict(),
                     "metrics": metrics,

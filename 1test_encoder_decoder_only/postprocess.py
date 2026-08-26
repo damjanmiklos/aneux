@@ -185,6 +185,7 @@ def evaluate_all_samples():
                 'disp_loss': terms['disp'].item(),
                 'lap_loss': terms['lap'].item(),
                 'norm_loss': terms['norm'].item(),
+                'rad_loss': terms['rad'].item() if 'rad' in terms else 0.0,
             })
             
     df = pd.DataFrame(results)
