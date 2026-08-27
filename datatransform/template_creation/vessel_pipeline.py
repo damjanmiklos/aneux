@@ -42,6 +42,12 @@ DEFAULT_EXTENSION_LENGTH = 5.0
 DEFAULT_SAMPLE_SPACING = 0.1
 DEFAULT_GRID_SPACING = 0.08
 DEFAULT_MAX_GRID_SIZE = 250
+# Thin branches need more voxels than the default 250 cap. 420^3 stays
+# tractable with discrete spheres; beyond that the modeller AABB dominates.
+MAX_GRID_SIZE_HARD_CAP = 420
+MIN_VOXELS_ACROSS_DIAMETER = 4.5
+# Remesh edge <= this * local R so a small tube keeps ~11 triangles around.
+CIRCUMFERENTIAL_EDGE_OVER_RADIUS = 0.55
 DEFAULT_CAP_DISPLACEMENT = 0.1
 MISR_FLOOR_MM = 0.35
 # Voronoi MISR inside a sac can be tens of mm. Using that as a polyball radius
@@ -479,7 +485,32 @@ def clamp_misr_for_parent_tube(misr_array, r_cap, r_floor=MISR_FLOOR_MM):
         f"  MISR raw min/median/max={raw.min():.3f}/{np.median(raw):.3f}/{raw.max():.3f} mm; "
         f"parent-tube cap={r_cap:.3f} mm (floored {n_floor}, capped {n_cap} of {raw.size} points)"
     )
-    return max_r
+    r_min = float(min(_misr_values(misr_array)))
+    return max_r, r_min
+
+
+def modeller_sample_grid(extents, grid_spacing, max_grid_size, r_min):
+    """Isotropic voxel grid. Refine past max_grid_size when a thin branch would be <~4.5 voxels across."""
+    extents = [float(e) for e in extents]
+    max_ext = max(extents)
+    hard = int(MAX_GRID_SIZE_HARD_CAP)
+    requested = max(32, int(max_grid_size))
+    spacing = float(grid_spacing)
+    dims = [max(32, int(np.ceil(e / spacing)) + 1) for e in extents]
+    if max(dims) > requested:
+        spacing = max_ext / float(requested - 1)
+
+    r_min = max(float(r_min), MISR_FLOOR_MM)
+    needed_spacing = (2.0 * r_min) / float(MIN_VOXELS_ACROSS_DIAMETER)
+    if spacing > needed_spacing:
+        needed_n = int(np.ceil(max_ext / needed_spacing)) + 1
+        n_long = min(hard, max(requested, needed_n))
+        spacing = max_ext / float(n_long - 1)
+
+    dims = [max(32, int(round(e / spacing)) + 1) for e in extents]
+    dims = [min(d, hard) for d in dims]
+    voxels_across = (2.0 * r_min) / max(spacing, 1e-9)
+    return dims, spacing, voxels_across
 
 
 def generate_base_surface(
@@ -497,8 +528,9 @@ def generate_base_surface(
     if reference_bounds is None:
         reference_bounds = pv.wrap(branched_centerline).bounds
     r_cap = parent_tube_misr_cap(profiles, reference_bounds)
-    max_r = clamp_misr_for_parent_tube(misr_array, r_cap)
+    max_r, r_min = clamp_misr_for_parent_tube(misr_array, r_cap)
     vtk_cl = to_vtk_poly(branched_centerline)
+    misr_cl = _misr_array_or_raise(vtk_cl)
 
     pad = 2.0 * max(max_r, MISR_FLOOR_MM) + float(extension_length) + 1.0
     model_bounds = [
@@ -511,14 +543,31 @@ def generate_base_surface(
         model_bounds[3] - model_bounds[2],
         model_bounds[5] - model_bounds[4],
     ]
-    spacing = float(grid_spacing)
-    dims = [max(32, int(np.ceil(e / spacing)) + 1) for e in extents]
-    peak = max(dims)
-    if peak > int(max_grid_size):
-        spacing = max(extents) / float(int(max_grid_size) - 1)
-        dims = [max(32, int(round(e / spacing)) + 1) for e in extents]
-        dims = [min(d, int(max_grid_size)) for d in dims]
-    print(f"  CenterlineModeller grid dimensions: {dims} (isotropic spacing ~{spacing:.4f} mm)")
+    dims, spacing, voxels_across = modeller_sample_grid(
+        extents, grid_spacing, max_grid_size, r_min
+    )
+    # If the hard cap still leaves a branch thinner than ~3 voxels, inflate those
+    # spheres so marching cubes cannot collapse them to a sheet.
+    resolvable_r = 1.25 * spacing
+    n_inflate = 0
+    if r_min < resolvable_r:
+        for i in range(misr_cl.GetNumberOfTuples()):
+            r_val = float(misr_cl.GetComponent(i, 0))
+            if r_val < resolvable_r:
+                misr_cl.SetComponent(i, 0, resolvable_r)
+                n_inflate += 1
+        r_min = resolvable_r
+        voxels_across = (2.0 * r_min) / max(spacing, 1e-9)
+    print(
+        f"  CenterlineModeller grid dimensions: {dims} "
+        f"(isotropic spacing ~{spacing:.4f} mm, r_min={r_min:.3f} mm, "
+        f"{voxels_across:.1f} voxels across smallest diameter)"
+    )
+    if n_inflate:
+        print(
+            f"  Inflated {n_inflate} thin-branch MISR values to {resolvable_r:.3f} mm "
+            f"so the modeller grid can resolve them"
+        )
 
     modeller = vtkvmtk.vtkvmtkPolyBallModeller()
     modeller.SetInputData(vtk_cl)
@@ -990,10 +1039,13 @@ def compute_raycast_stretch_distances(template_mesh, ground_truth_mesh, r_templa
 
 
 def build_target_edge_array(template_mesh, distances, r_template, base_edge=0.50, min_edge=0.01):
+    """Stretch densifies aneurysms; local radius caps edge length so thin tubes stay round."""
     vtk_poly = to_vtk_poly(template_mesh)
     n_pts = vtk_poly.GetNumberOfPoints()
-    stretch_factors = 1.0 + (distances / np.maximum(R_TEMPLATE_FLOOR_MM, r_template))
-    target_edge_lengths = np.maximum(min_edge, base_edge / (stretch_factors ** 1.5))
+    r = np.maximum(R_TEMPLATE_FLOOR_MM, np.asarray(r_template, dtype=np.float64))
+    stretch_factors = 1.0 + (distances / r)
+    radius_limited = np.minimum(base_edge, np.maximum(min_edge, CIRCUMFERENTIAL_EDGE_OVER_RADIUS * r))
+    target_edge_lengths = np.maximum(min_edge, radius_limited / (stretch_factors ** 1.5))
 
     vtk_target_array = vtk.vtkDoubleArray()
     vtk_target_array.SetName("TargetEdgeLength")
@@ -1027,11 +1079,11 @@ def remesh_surface_isotropically(open_surface, target_edge_length=0.5, n_iter=10
 
 
 def uniform_edge_length_for_profiles(profiles, target_edge_length):
-    """Only refine globally when the smallest opening is smaller than the target edge."""
+    """Keep enough triangles around the smallest opening so it cannot flatten."""
     if not profiles:
         return float(target_edge_length)
     r_min = min(float(p["radius"]) for p in profiles)
-    return float(min(target_edge_length, max(0.15, r_min)))
+    return float(min(target_edge_length, max(0.15, CIRCUMFERENTIAL_EDGE_OVER_RADIUS * r_min)))
 
 
 def count_connected_regions(surface):
@@ -1312,13 +1364,21 @@ def process_variable_dataset(
         f"Step 8b: Building stretch metric k = 1 + d / R_template "
         f"(Base={target_edge_length} mm, Min={min_edge:.2f} mm)..."
     )
-    surface_with_array, _edge_lengths, stretch_factors = build_target_edge_array(
+    surface_with_array, edge_lengths, stretch_factors = build_target_edge_array(
         open_base_surface,
         stretch_distances,
         r_template,
         base_edge=target_edge_length,
         min_edge=min_edge,
     )
+    thin = np.asarray(r_template) < 0.7
+    if np.any(thin):
+        print(
+            f"  Thin-branch target edges (R<0.7 mm): "
+            f"min/median/max={edge_lengths[thin].min():.3f}/"
+            f"{np.median(edge_lengths[thin]):.3f}/{edge_lengths[thin].max():.3f} mm "
+            f"n={int(thin.sum())}"
+        )
     healthy = stretch_factors[stretch_distances < 0.3]
     stretched = stretch_factors[stretch_distances >= 0.3]
     mean_k_healthy = float(np.mean(healthy)) if healthy.size else 1.0
