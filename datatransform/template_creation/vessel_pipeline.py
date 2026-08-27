@@ -61,6 +61,33 @@ FILTER_LOCATIONS = ["ICA pcom", "ICA oph", "ICA cav", "ICA bif"]
 class TemplateQualityError(RuntimeError):
     """Raised when a case cannot be turned into a usable template."""
 
+    def __init__(self, message, dataset_id=None):
+        self.dataset_id = dataset_id
+        text = str(message)
+        if dataset_id:
+            prefix = f"{dataset_id}: "
+            if not text.startswith(prefix):
+                text = prefix + text
+        super().__init__(text)
+
+
+def with_dataset_id(func):
+    """Ensure every failure from a per-case entry point names the vessel."""
+
+    def wrapper(dataset_id, *args, **kwargs):
+        try:
+            return func(dataset_id, *args, **kwargs)
+        except TemplateQualityError as exc:
+            if getattr(exc, "dataset_id", None) is None:
+                raise TemplateQualityError(str(exc), dataset_id=dataset_id) from exc
+            raise
+        except Exception as exc:
+            raise TemplateQualityError(f"{type(exc).__name__}: {exc}", dataset_id=dataset_id) from exc
+
+    wrapper.__name__ = func.__name__
+    wrapper.__doc__ = func.__doc__
+    return wrapper
+
 
 def _unit(vec):
     arr = np.asarray(vec, dtype=np.float64).reshape(-1)
@@ -1038,6 +1065,7 @@ def build_parent_tube(
     sample_spacing=DEFAULT_SAMPLE_SPACING,
     grid_spacing=DEFAULT_GRID_SPACING,
     max_grid_size=DEFAULT_MAX_GRID_SIZE,
+    dataset_id=None,
 ):
     """Shared path: smooth -> extend -> cap -> centerline -> polyball tube -> uncap at anatomy."""
     print("Step 1: Applying Taubin surface smoothing...")
@@ -1090,7 +1118,10 @@ def build_parent_tube(
     )
     print(f"  -> Open base surface points: {open_base_surface.GetNumberOfPoints()}")
     if n_clipped < 2:
-        raise TemplateQualityError(f"Uncap opened only {n_clipped} ends; need at least inlet and one outlet.")
+        raise TemplateQualityError(
+            f"Uncap opened only {n_clipped} ends; need at least inlet and one outlet.",
+            dataset_id=dataset_id,
+        )
     return {
         "smoothed_vessel": smoothed_vessel,
         "anatomical_profiles": anatomical_profiles,
@@ -1100,6 +1131,7 @@ def build_parent_tube(
     }
 
 
+@with_dataset_id
 def process_variable_dataset(
     dataset_id,
     v_file,
@@ -1118,6 +1150,7 @@ def process_variable_dataset(
         sample_spacing=sample_spacing,
         grid_spacing=grid_spacing,
         max_grid_size=max_grid_size,
+        dataset_id=dataset_id,
     )
     open_base_surface = built["open_base_surface"]
     branched_centerline = built["branched_centerline"]
@@ -1180,6 +1213,7 @@ def process_variable_dataset(
     return out_file
 
 
+@with_dataset_id
 def process_uniform_dataset(
     dataset_id,
     v_file,
@@ -1198,6 +1232,7 @@ def process_uniform_dataset(
         sample_spacing=sample_spacing,
         grid_spacing=grid_spacing,
         max_grid_size=max_grid_size,
+        dataset_id=dataset_id,
     )
     open_base_surface = built["open_base_surface"]
     anatomical_profiles = built["anatomical_profiles"]
@@ -1234,6 +1269,7 @@ def process_uniform_dataset(
     return out_file
 
 
+@with_dataset_id
 def process_centerline_dataset(
     dataset_id,
     v_file,
@@ -1326,6 +1362,8 @@ def run_batch(script_path, process_one, args, extra_cli_flags):
         v_file = args.vessel_file or os.path.join(args.vessel_dir, f"{args.case}.vtp")
         if not os.path.exists(v_file):
             raise FileNotFoundError(f"Vessel file not found: {v_file}")
+        print(f"Running single case: {args.case}")
+        print(f"Vessel file: {v_file}")
         process_one(args.case, v_file, args)
         return
 
