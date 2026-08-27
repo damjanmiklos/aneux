@@ -64,9 +64,9 @@ VAL_SPLIT = 0.15
 VAL_EVERY = 5
 SEED = 31
 
-NUM_WORKERS = 2
+NUM_WORKERS = 3
 CACHE_BUILD_WORKERS = 8
-TORCH_THREADS = 4
+TORCH_THREADS = 6
 
 # False = fully off (faster, more VRAM). True = checkpoint encoder + all decoder
 # blocks. "fine" = only the 64k-node SplineConvs if a fat graph OOMs with False.
