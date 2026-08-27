@@ -53,7 +53,7 @@ R_TEMPLATE_FLOOR_MM = 0.30
 PINHOLE_HOLE_SIZE_MM = 0.12
 MIN_OPENING_RADIUS_MM = 0.08
 MIN_OPENING_LOOP_POINTS = 6
-MIN_EDGE_LENGTH_MM = 0.001
+MIN_EDGE_LENGTH_MM = 1e-4
 SLIVER_Q01_THRESHOLD = 0.3
 FILTER_LOCATIONS = ["ICA pcom", "ICA oph", "ICA cav", "ICA bif"]
 
@@ -141,6 +141,17 @@ def mesh_center(surface):
         [0.5 * (b[0] + b[1]), 0.5 * (b[2] + b[3]), 0.5 * (b[4] + b[5])],
         dtype=np.float64,
     )
+
+
+def mesh_body_point(surface):
+    """A point on the mesh, not the AABB center (which can sit in a siphon loop hole)."""
+    vtk_poly = to_vtk_poly(surface)
+    aabb = mesh_center(vtk_poly)
+    locator = vtk.vtkPointLocator()
+    locator.SetDataSet(vtk_poly)
+    locator.BuildLocator()
+    pid = locator.FindClosestPoint(_vec3(aabb))
+    return np.array(vtk_poly.GetPoint(pid), dtype=np.float64)
 
 
 def strip_all_arrays(surface):
@@ -315,13 +326,75 @@ def extract_voronoi_centerlines(closed_surface, source_points, target_points):
     centerlines.SourcePoints = [float(c) for pt in source_points for c in pt]
     centerlines.TargetPoints = [float(c) for pt in target_points for c in pt]
     centerlines.Interactive = 0
-    centerlines.AppendEndPoints = 1
+    centerlines.AppendEndPoints = 0
     centerlines.CapDisplacement = float(DEFAULT_CAP_DISPLACEMENT)
     centerlines.Execute()
     result = to_vtk_poly(centerlines.Centerlines)
     if result.GetNumberOfPoints() < 2 or result.GetNumberOfCells() < 1:
         raise TemplateQualityError("vmtkCenterlines returned an empty centerline.")
     return result
+
+
+def centerline_looks_valid(centerline, reference_bounds, max_edge_mm=10.0, pad_mm=15.0):
+    """Reject Voronoi spikes that leave the vessel (common on looping siphons)."""
+    vtk_cl = to_vtk_poly(centerline)
+    n_pts = vtk_cl.GetNumberOfPoints()
+    if n_pts < 20:
+        return False
+    b = np.asarray(reference_bounds, dtype=np.float64).reshape(-1)
+    lo = np.array([b[0] - pad_mm, b[2] - pad_mm, b[4] - pad_mm])
+    hi = np.array([b[1] + pad_mm, b[3] + pad_mm, b[5] + pad_mm])
+    n_out = 0
+    for i in range(n_pts):
+        p = np.asarray(vtk_cl.GetPoint(i), dtype=np.float64)
+        if np.any(p < lo) or np.any(p > hi):
+            n_out += 1
+    if n_out > 0.2 * n_pts:
+        return False
+    vtk_cl.BuildCells()
+    max_edge = 0.0
+    max_path = 0.0
+    n_ok = 0
+    for ci in range(vtk_cl.GetNumberOfCells()):
+        cell = vtk_cl.GetCell(ci)
+        n = cell.GetNumberOfPoints()
+        if n < 2:
+            continue
+        pts = np.array([vtk_cl.GetPoint(cell.GetPointId(j)) for j in range(n)], dtype=np.float64)
+        segs = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+        if segs.size == 0:
+            continue
+        max_edge = max(max_edge, float(segs.max()))
+        plen = float(segs.sum())
+        max_path = max(max_path, plen)
+        if plen >= 5.0:
+            n_ok += 1
+    if max_edge > max_edge_mm or n_ok < 1 or max_path < 5.0:
+        return False
+    return True
+
+
+def extract_centerlines_for_tube(extended_vessel, smoothed_vessel, anatomical_profiles, extended_profiles):
+    """Flow extensions help most cases; on looping siphons they can wreck Delaunay. Retry without them."""
+    source_ext, target_ext = seed_points_from_profiles(extended_profiles)
+    closed_extended = cap_surface(extended_vessel)
+    centerline = extract_voronoi_centerlines(closed_extended, source_ext, target_ext)
+    ref_bounds = smoothed_vessel.GetBounds()
+    if centerline_looks_valid(centerline, ref_bounds):
+        return centerline
+    print(
+        "  WARNING: centerline on the extended surface left the lumen "
+        "(runaway Voronoi tract). Retrying on the capped vessel without flow extensions."
+    )
+    source_anat, target_anat = seed_points_from_profiles(anatomical_profiles)
+    closed_anat = cap_surface(smoothed_vessel)
+    retry = extract_voronoi_centerlines(closed_anat, source_anat, target_anat)
+    if not centerline_looks_valid(retry, ref_bounds):
+        raise TemplateQualityError(
+            "Voronoi centerline left the vessel lumen; input openings were detected, "
+            "but VMTK could not trace a path inside the tube."
+        )
+    return retry
 
 
 def resample_centerline(centerline, sample_spacing=DEFAULT_SAMPLE_SPACING):
@@ -562,31 +635,93 @@ def _clip_origin_candidates(surface, profile, search_mm):
     return origins, inward
 
 
+def _cut_loops_near_profile(surface, origin, normal, bary):
+    """vtkCutter loops on a plane — used to score origins without TopologicalSeamFilter."""
+    plane = vtk.vtkPlane()
+    _set_vec3(plane.SetOrigin, origin)
+    _set_vec3(plane.SetNormal, normal)
+    cutter = vtk.vtkCutter()
+    cutter.SetInputData(surface)
+    cutter.SetCutFunction(plane)
+    cutter.Update()
+    cut = cutter.GetOutput()
+    if cut.GetNumberOfPoints() < 6:
+        return None
+    strips = vtk.vtkStripper()
+    strips.SetInputData(cut)
+    strips.JoinContiguousSegmentsOn()
+    strips.Update()
+    loops = strips.GetOutput()
+    best = None
+    best_dist = None
+    for i in range(loops.GetNumberOfCells()):
+        cell = loops.GetCell(i)
+        n = cell.GetNumberOfPoints()
+        if n < MIN_OPENING_LOOP_POINTS:
+            continue
+        pts = np.array([cell.GetPoints().GetPoint(j) for j in range(n)], dtype=np.float64)
+        center = pts.mean(axis=0)
+        radius = float(np.mean(np.linalg.norm(pts - center, axis=1)))
+        dist = float(np.linalg.norm(center - bary))
+        if best_dist is None or dist < best_dist:
+            best_dist = dist
+            best = {"radius": radius, "center": center, "n_points": n, "dist": dist}
+    return best
+
+
 def clip_one_profile(surface, profile, body_point, search_mm):
-    """Local seam clip at one opening. Never call TopologicalSeamFilter if the plane misses."""
+    """Local seam clip at one opening. Score planes with vtkCutter, then seam-clip once.
+
+    On a looping siphon the anatomical plane can cut the tube twice. The first
+    intersection is often a thin mid-vessel hole; a later fill then seals the real end.
+    """
     outward = _unit(profile["normal"])
     plane_normal = -outward
     origins, _inward = _clip_origin_candidates(surface, profile, search_mm)
     if not origins:
         return surface, False
-    origin = None
+
+    r_gt = float(profile["radius"])
+    min_r = max(MIN_OPENING_RADIUS_MM, 0.35 * r_gt)
+    max_r = max(4.0 * r_gt, r_gt + 2.5)
+    bary = np.asarray(profile["barycenter"], dtype=np.float64)
+
+    unique = []
     for cand in origins:
-        if _plane_has_sign_change(surface, cand, plane_normal):
-            origin = cand
-            break
-    if origin is None:
+        arr = np.asarray(cand, dtype=np.float64)
+        if any(np.linalg.norm(arr - kept) < 0.15 for kept in unique):
+            continue
+        unique.append(arr)
+
+    scored = []
+    for origin in unique:
+        if not _plane_has_sign_change(surface, origin, plane_normal):
+            continue
+        loop = _cut_loops_near_profile(surface, origin, plane_normal, bary)
+        if loop is None:
+            continue
+        if loop["radius"] < min_r or loop["radius"] > max_r:
+            continue
+        if loop["n_points"] < MIN_OPENING_LOOP_POINTS:
+            continue
+        score = abs(loop["radius"] - r_gt) + 0.15 * loop["dist"]
+        scored.append((score, origin, loop))
+    if not scored:
         print(
-            f"  [Uncap] Profile {profile['index']} plane does not intersect the tube "
-            f"(r={profile['radius']:.3f} mm). Skipping this end."
+            f"  [Uncap] Profile {profile['index']} found no loop matching r={r_gt:.3f} mm "
+            f"(accepted band {min_r:.3f}–{max_r:.3f} mm). Skipping this end."
         )
         return surface, False
+    scored.sort(key=lambda t: t[0])
+    origin = scored[0][1]
+    loop = scored[0][2]
 
     plane = vtk.vtkPlane()
     _set_vec3(plane.SetOrigin, origin)
     _set_vec3(plane.SetNormal, plane_normal)
 
     seam_filter = vtkvmtk.vtkvmtkTopologicalSeamFilter()
-    seam_filter.SetInputData(surface)
+    seam_filter.SetInputData(to_vtk_poly(surface))
     _set_vec3(seam_filter.SetClosestPoint, origin)
     seam_filter.SetSeamScalarsArrayName("SeamScalars")
     seam_filter.SetSeamFunction(plane)
@@ -623,32 +758,38 @@ def clip_one_profile(surface, profile, body_point, search_mm):
             f"({n_cand}/{n_prev} pts). Keeping previous surface."
         )
         return surface, False
+    openings = inspect_openings(candidate)
+    if not openings:
+        return surface, False
     matched = min(
-        inspect_openings(candidate) or [{"radius": 1e9, "center": origin}],
-        key=lambda op: float(np.linalg.norm(np.asarray(op["center"]) - np.asarray(profile["barycenter"]))),
+        openings,
+        key=lambda op: float(np.linalg.norm(np.asarray(op["center"]) - bary)),
     )
-    max_r = max(4.0 * float(profile["radius"]), float(profile["radius"]) + 2.5)
-    if float(matched.get("radius", 0.0)) > max_r:
+    r_open = float(matched.get("radius", 0.0))
+    if r_open < min_r or r_open > max_r or matched.get("n_points", 0) < MIN_OPENING_LOOP_POINTS:
         print(
-            f"  [Uncap] Profile {profile['index']} clip opened a too-large loop "
-            f"(r={matched['radius']:.3f} mm, cap {max_r:.3f} mm). Keeping previous surface."
+            f"  [Uncap] Profile {profile['index']} seam clip loop r={r_open:.3f} mm "
+            f"outside {min_r:.3f}–{max_r:.3f} mm. Skipping this end."
         )
         return surface, False
+    print(
+        f"  [Uncap] Profile {profile['index']} opened r={r_open:.3f} mm "
+        f"(GT r={r_gt:.3f} mm, cutter r={loop['radius']:.3f} mm)"
+    )
     return candidate, True
 
 
 def clip_flow_extensions_and_uncap(base_surface, profiles, extension_length=DEFAULT_EXTENSION_LENGTH):
     current = to_vtk_poly(base_surface)
-    body_pt = mesh_center(current)
+    body_pt = mesh_body_point(current)
     n_clipped = 0
     for profile in profiles:
         search_mm = float(extension_length) + 3.0 * max(float(profile["radius"]), 0.5)
         current, ok = clip_one_profile(current, profile, body_pt, search_mm)
         if ok:
             n_clipped += 1
-            body_pt = mesh_center(current)
+            body_pt = mesh_body_point(current)
     print(f"  Uncap: clipped {n_clipped}/{len(profiles)} openings")
-    current = fill_pinholes(current)
     current = clean_triangulate(current)
     post = inspect_openings(current)
     print(
@@ -1007,8 +1148,13 @@ def assert_template_quality(surface, n_expected_openings, context="template"):
     issues = []
     if n_regions != 1:
         issues.append(f"{n_regions} connected components")
-    if len(openings) != int(n_expected_openings):
-        issues.append(f"{len(openings)} openings (expected {n_expected_openings})")
+    n_open = len(openings)
+    if n_open < 2:
+        issues.append(f"{n_open} openings (need at least inlet and one outlet)")
+    if n_open > int(n_expected_openings):
+        issues.append(
+            f"{n_open} openings (more than the {n_expected_openings} ends that were uncap-clipped)"
+        )
     for op in openings:
         if op["radius"] < MIN_OPENING_RADIUS_MM or op["n_points"] < MIN_OPENING_LOOP_POINTS:
             issues.append(
@@ -1087,13 +1233,11 @@ def build_parent_tube(
             f"  WARNING: opening count changed after extensions "
             f"({len(anatomical_profiles)} -> {len(extended_profiles)}). Using extended ends as seeds."
         )
-    source_pts, target_pts = seed_points_from_profiles(extended_profiles)
-
-    print("Step 2c: Capping extended surface for Delaunay centerlines...")
-    closed_extended = cap_surface(extended_vessel)
 
     print("Step 3: Extracting Voronoi centerline and MISR...")
-    centerline = extract_voronoi_centerlines(closed_extended, source_pts, target_pts)
+    centerline = extract_centerlines_for_tube(
+        extended_vessel, smoothed_vessel, anatomical_profiles, extended_profiles
+    )
 
     print(f"Step 4: Spline resampling ({sample_spacing} mm) and trajectory smoothing...")
     resampled = resample_centerline(centerline, sample_spacing=sample_spacing)
@@ -1118,8 +1262,10 @@ def build_parent_tube(
     )
     print(f"  -> Open base surface points: {open_base_surface.GetNumberOfPoints()}")
     if n_clipped < 2:
+        n_in = len(anatomical_profiles)
         raise TemplateQualityError(
-            f"Uncap opened only {n_clipped} ends; need at least inlet and one outlet.",
+            f"Parent-tube uncap opened {n_clipped}/{n_in} ends "
+            f"(input vessel has {n_in} openings; this is a reconstructed-tube miss, not a sealed input).",
             dataset_id=dataset_id,
         )
     return {
@@ -1289,13 +1435,12 @@ def process_centerline_dataset(
     print("Step 2: Adding flow extensions on the open surface...")
     extended_vessel = add_flow_extensions(smoothed_vessel, extension_length=extension_length)
     extended_profiles = measure_open_profiles(extended_vessel)
-    source_pts, target_pts = seed_points_from_profiles(extended_profiles)
-
-    print("Step 2c: Capping extended surface for Delaunay centerlines...")
-    closed_extended = cap_surface(extended_vessel)
+    log_profiles(extended_profiles, label="Extended")
 
     print("Step 3: Extracting Voronoi centerline and MISR...")
-    centerline = extract_voronoi_centerlines(closed_extended, source_pts, target_pts)
+    centerline = extract_centerlines_for_tube(
+        extended_vessel, smoothed_vessel, anatomical_profiles, extended_profiles
+    )
     print(f"Step 4: Spline resampling ({sample_spacing} mm) and trajectory smoothing...")
     resampled = resample_centerline(centerline, sample_spacing=sample_spacing)
     smooth_centerline = smooth_centerline_preserve_misr(resampled)
