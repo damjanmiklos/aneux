@@ -31,7 +31,7 @@ def _process_one(dataset_id, v_file, args):
 
 def main():
     parser = argparse.ArgumentParser(description="AneuX variable (MISR-stretch) surface remeshing pipeline")
-    add_shared_cli_args(parser, DEFAULT_OUTPUT_DIR, default_workers=10, include_remesh_grid=True)
+    add_shared_cli_args(parser, DEFAULT_OUTPUT_DIR, default_workers=20, include_remesh_grid=True)
     args = parser.parse_args()
     extra = [
         "--target-edge-length", str(args.target_edge_length),

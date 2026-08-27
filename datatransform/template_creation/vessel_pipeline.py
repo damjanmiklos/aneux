@@ -23,6 +23,7 @@ import pandas as pd
 import pyvista as pv
 import vtk
 from tqdm import tqdm
+from vtk.util.numpy_support import numpy_to_vtk, numpy_to_vtkIdTypeArray, vtk_to_numpy
 
 try:
     from vmtk import vmtkscripts
@@ -42,12 +43,35 @@ DEFAULT_EXTENSION_LENGTH = 5.0
 DEFAULT_SAMPLE_SPACING = 0.1
 DEFAULT_GRID_SPACING = 0.08
 DEFAULT_MAX_GRID_SIZE = 250
-# Thin branches need more voxels than the default 250 cap. 420^3 stays
-# tractable with discrete spheres; beyond that the modeller AABB dominates.
-MAX_GRID_SIZE_HARD_CAP = 420
 MIN_VOXELS_ACROSS_DIAMETER = 4.5
 # Remesh edge <= this * local R so a small tube keeps ~11 triangles around.
 CIRCUMFERENTIAL_EDGE_OVER_RADIUS = 0.55
+# Fine enough for sub-mm branches. Sphere-stamping only writes voxels near the
+# centerline, so this cap is no longer a 4-minute AABB rasterizer.
+MAX_GRID_SIZE_HARD_CAP = 420
+# Marching-cubes tubes: drop this fraction of the voxel staircase, but never
+# collapse below MC_DECIMATE_MIN_POINTS (thin branches need samples for remesh).
+MC_DECIMATE_REDUCTION = 0.50
+MC_DECIMATE_MIN_POINTS = 20000
+# Original STLs are 5–8× denser and carry zero-length edges. Voronoi on that
+# tessellation misses thin outlets. Decimate a working copy for VMTK; keep the
+# caller's mesh as GT for stretch/raycast. Do NOT key this off point count:
+# large area-005 vessels (e.g. p460, 50k pts) look "dense" but already have
+# ~0.28 mm edges. Originals have min edge ~0 and median ~0.08 mm.
+SANITIZE_INPUT_REDUCTION = 0.85
+SANITIZE_INPUT_MIN_POINTS = 20000
+SANITIZE_MAX_MEDIAN_EDGE_MM = 0.22
+DEGENERATE_EDGE_MM = 1e-5
+# Extra triangles on a usage>2 edge are flaps if they are this small vs the two kept faces.
+NM_FLAP_AREA_RATIO = 0.35
+REMESH_MIN_EDGE_MM = 0.01
+# VMTK uses this count twice (split/collapse loop AND final relocation).
+# 4 is too few (degenerate tails, jagged rims). 6 matches 10 on tube shape,
+# thin-branch diameter, and faceting; the 1% quality tail is only slightly worse.
+REMESH_N_ITER = 6
+# Extra connectivity flips after each remesh iter. 10 vs 20 produced identical
+# meshes on p109/p505/p550; 20 just costs time.
+REMESH_CONNECTIVITY_ITER = 10
 DEFAULT_CAP_DISPLACEMENT = 0.1
 MISR_FLOOR_MM = 0.35
 # Voronoi MISR inside a sac can be tens of mm. Using that as a polyball radius
@@ -58,6 +82,9 @@ MISR_PARENT_EXTENT_FRACTION = 0.20
 R_TEMPLATE_FLOOR_MM = 0.30
 PINHOLE_HOLE_SIZE_MM = 0.12
 MIN_OPENING_RADIUS_MM = 0.08
+# DecimatePro on originals can leave sub-0.2 mm pinholes that look like ostia.
+# Real ICA ostia in this set are ≥ ~0.34 mm.
+MIN_SEED_OPENING_RADIUS_MM = 0.20
 MIN_OPENING_LOOP_POINTS = 6
 MIN_EDGE_LENGTH_MM = 1e-4
 SLIVER_Q01_THRESHOLD = 0.3
@@ -115,6 +142,14 @@ def _set_vec3(setter, xyz):
         setter(vals)
     except TypeError:
         setter(vals[0], vals[1], vals[2])
+
+
+def _poly_points(surface):
+    """Float64 vertex array without a DeepCopy when the input is already vtkPolyData."""
+    poly = surface if isinstance(surface, vtk.vtkPolyData) else to_vtk_poly(surface)
+    if poly.GetPoints() is None or poly.GetNumberOfPoints() == 0:
+        return poly, np.zeros((0, 3), dtype=np.float64)
+    return poly, np.ascontiguousarray(vtk_to_numpy(poly.GetPoints().GetData()), dtype=np.float64)
 
 
 def to_vtk_poly(mesh):
@@ -248,6 +283,20 @@ def measure_open_profiles(surface):
                 "radius": radius,
             }
         )
+    min_r = MIN_SEED_OPENING_RADIUS_MM
+    kept = [
+        p
+        for p in profiles
+        if p["radius"] >= min_r and float(np.linalg.norm(p["normal"])) >= 0.5
+    ]
+    if len(kept) >= 2:
+        n_drop = len(profiles) - len(kept)
+        if n_drop:
+            print(
+                f"  Ignored {n_drop} pinhole/degenerate boundary loops "
+                f"(r < {min_r:.3f} mm or missing normal)"
+            )
+        profiles = kept
     profiles.sort(key=lambda p: p["radius"], reverse=True)
     return profiles
 
@@ -380,25 +429,45 @@ def centerline_looks_valid(centerline, reference_bounds, max_edge_mm=10.0, pad_m
     return True
 
 
+def _centerline_reaches_targets(centerline, n_targets):
+    """vmtkCenterlines writes one polyline per inlet→outlet path."""
+    n_cells = int(to_vtk_poly(centerline).GetNumberOfCells())
+    return n_cells >= int(n_targets)
+
+
 def extract_centerlines_for_tube(extended_vessel, smoothed_vessel, anatomical_profiles, extended_profiles):
     """Flow extensions help most cases; on looping siphons they can wreck Delaunay. Retry without them."""
     source_ext, target_ext = seed_points_from_profiles(extended_profiles)
     closed_extended = cap_surface(extended_vessel)
     centerline = extract_voronoi_centerlines(closed_extended, source_ext, target_ext)
     ref_bounds = smoothed_vessel.GetBounds()
-    if centerline_looks_valid(centerline, ref_bounds):
+    n_targets = len(target_ext)
+    if centerline_looks_valid(centerline, ref_bounds) and _centerline_reaches_targets(centerline, n_targets):
         return centerline
     print(
         "  WARNING: centerline on the extended surface left the lumen "
-        "(runaway Voronoi tract). Retrying on the capped vessel without flow extensions."
+        "or missed outlets "
+        f"(cells={centerline.GetNumberOfCells()} targets={n_targets}). "
+        "Retrying on the capped vessel without flow extensions."
     )
     source_anat, target_anat = seed_points_from_profiles(anatomical_profiles)
-    closed_anat = cap_surface(smoothed_vessel)
+    try:
+        closed_anat = cap_surface(smoothed_vessel)
+    except TemplateQualityError as exc:
+        if centerline_looks_valid(centerline, ref_bounds):
+            print(f"  WARNING: anatomical cap failed ({exc}); keeping the extended-surface centerline.")
+            return centerline
+        raise
     retry = extract_voronoi_centerlines(closed_anat, source_anat, target_anat)
     if not centerline_looks_valid(retry, ref_bounds):
         raise TemplateQualityError(
             "Voronoi centerline left the vessel lumen; input openings were detected, "
             "but VMTK could not trace a path inside the tube."
+        )
+    if not _centerline_reaches_targets(retry, len(target_anat)):
+        print(
+            f"  WARNING: retry centerline still has {retry.GetNumberOfCells()} cells "
+            f"for {len(target_anat)} outlets; thin branches may be missing."
         )
     return retry
 
@@ -489,28 +558,342 @@ def clamp_misr_for_parent_tube(misr_array, r_cap, r_floor=MISR_FLOOR_MM):
     return max_r, r_min
 
 
-def modeller_sample_grid(extents, grid_spacing, max_grid_size, r_min):
-    """Isotropic voxel grid. Refine past max_grid_size when a thin branch would be <~4.5 voxels across."""
+def modeller_sample_grid(extents, grid_spacing, max_grid_size, r_min=None):
+    """Isotropic voxel grid. Optionally refine so the thinnest branch has ~4.5 voxels across."""
     extents = [float(e) for e in extents]
     max_ext = max(extents)
-    hard = int(MAX_GRID_SIZE_HARD_CAP)
     requested = max(32, int(max_grid_size))
+    hard = int(MAX_GRID_SIZE_HARD_CAP)
     spacing = float(grid_spacing)
     dims = [max(32, int(np.ceil(e / spacing)) + 1) for e in extents]
     if max(dims) > requested:
         spacing = max_ext / float(requested - 1)
 
-    r_min = max(float(r_min), MISR_FLOOR_MM)
-    needed_spacing = (2.0 * r_min) / float(MIN_VOXELS_ACROSS_DIAMETER)
-    if spacing > needed_spacing:
-        needed_n = int(np.ceil(max_ext / needed_spacing)) + 1
-        n_long = min(hard, max(requested, needed_n))
-        spacing = max_ext / float(n_long - 1)
+    if r_min is not None:
+        r_min = max(float(r_min), MISR_FLOOR_MM)
+        needed_spacing = (2.0 * r_min) / float(MIN_VOXELS_ACROSS_DIAMETER)
+        if spacing > needed_spacing:
+            needed_n = int(np.ceil(max_ext / needed_spacing)) + 1
+            n_long = min(hard, max(requested, needed_n))
+            spacing = max_ext / float(n_long - 1)
 
     dims = [max(32, int(round(e / spacing)) + 1) for e in extents]
     dims = [min(d, hard) for d in dims]
-    voxels_across = (2.0 * r_min) / max(spacing, 1e-9)
-    return dims, spacing, voxels_across
+    return dims, spacing
+
+
+def _centerline_xyz_r(vtk_cl):
+    n = vtk_cl.GetNumberOfPoints()
+    pts = np.empty((n, 3), dtype=np.float64)
+    for i in range(n):
+        pts[i] = vtk_cl.GetPoint(i)
+    return pts, _misr_values(_misr_array_or_raise(vtk_cl))
+
+
+def stamp_polyball_image(pts, radii, model_bounds, dims, spacing):
+    """Narrow-band discrete-sphere polyball. Same implicit function as vtkvmtkPolyBall.
+
+    VMTK's modeller evaluates every voxel against every sphere (empty AABB included).
+    Stamping only writes the cube around each sphere, which is the tube's actual support.
+    """
+    nx, ny, nz = int(dims[0]), int(dims[1]), int(dims[2])
+    spacing = float(spacing)
+    origin = (
+        float(model_bounds[0]),
+        float(model_bounds[2]),
+        float(model_bounds[4]),
+    )
+    field = np.full((nz, ny, nx), 1.0e6, dtype=np.float32)
+    pts = np.asarray(pts, dtype=np.float64)
+    radii = np.asarray(radii, dtype=np.float64)
+    n_stamped = 0
+    for p, r in zip(pts, radii):
+        r = float(r)
+        reach = r + 2.0 * spacing
+        i0 = max(0, int(np.floor((p[0] - reach - origin[0]) / spacing)))
+        i1 = min(nx, int(np.ceil((p[0] + reach - origin[0]) / spacing)) + 1)
+        j0 = max(0, int(np.floor((p[1] - reach - origin[1]) / spacing)))
+        j1 = min(ny, int(np.ceil((p[1] + reach - origin[1]) / spacing)) + 1)
+        k0 = max(0, int(np.floor((p[2] - reach - origin[2]) / spacing)))
+        k1 = min(nz, int(np.ceil((p[2] + reach - origin[2]) / spacing)) + 1)
+        if i1 <= i0 or j1 <= j0 or k1 <= k0:
+            continue
+        xs = origin[0] + np.arange(i0, i1, dtype=np.float32) * spacing
+        ys = origin[1] + np.arange(j0, j1, dtype=np.float32) * spacing
+        zs = origin[2] + np.arange(k0, k1, dtype=np.float32) * spacing
+        zz, yy, xx = np.meshgrid(zs, ys, xs, indexing="ij")
+        d2 = (xx - p[0]) ** 2 + (yy - p[1]) ** 2 + (zz - p[2]) ** 2
+        sl = field[k0:k1, j0:j1, i0:i1]
+        np.minimum(sl, (d2 - r * r).astype(np.float32, copy=False), out=sl)
+        n_stamped += 1
+    img = vtk.vtkImageData()
+    img.SetDimensions(nx, ny, nz)
+    img.SetOrigin(origin)
+    img.SetSpacing(spacing, spacing, spacing)
+    vtk_arr = numpy_to_vtk(np.ascontiguousarray(field.ravel(order="C")), deep=True)
+    vtk_arr.SetName("ImageScalars")
+    img.GetPointData().SetScalars(vtk_arr)
+    print(
+        f"  Narrow-band polyball stamp: {n_stamped} spheres into {nx}x{ny}x{nz} "
+        f"({spacing:.4f} mm)"
+    )
+    return img
+
+
+def _triangle_points_faces(surface):
+    """Point coordinates and triangle vertex ids after a clean triangulate."""
+    poly = clean_triangulate(surface)
+    pts = np.ascontiguousarray(vtk_to_numpy(poly.GetPoints().GetData()), dtype=np.float64)
+    polys = poly.GetPolys()
+    offsets = vtk_to_numpy(polys.GetOffsetsArray())
+    conn = vtk_to_numpy(polys.GetConnectivityArray())
+    sizes = np.diff(offsets)
+    if sizes.size == 0:
+        faces = np.zeros((0, 3), dtype=np.int64)
+    elif np.all(sizes == 3):
+        faces = np.ascontiguousarray(conn.reshape(-1, 3), dtype=np.int64)
+    else:
+        tri = sizes == 3
+        starts = offsets[:-1][tri]
+        faces = np.ascontiguousarray(
+            np.column_stack((conn[starts], conn[starts + 1], conn[starts + 2])),
+            dtype=np.int64,
+        )
+    return poly, pts, faces
+
+
+def _polydata_from_triangles(pts, faces):
+    out = vtk.vtkPolyData()
+    vtk_pts = vtk.vtkPoints()
+    vtk_pts.SetData(numpy_to_vtk(np.ascontiguousarray(pts, dtype=np.float64), deep=True))
+    out.SetPoints(vtk_pts)
+    n = int(len(faces))
+    if n == 0:
+        return out
+    offsets = np.arange(0, 3 * n + 1, 3, dtype=np.int64)
+    conn = np.ascontiguousarray(faces.reshape(-1), dtype=np.int64)
+    cells = vtk.vtkCellArray()
+    cells.SetData(
+        numpy_to_vtkIdTypeArray(offsets, deep=True),
+        numpy_to_vtkIdTypeArray(conn, deep=True),
+    )
+    out.SetPolys(cells)
+    return clean_triangulate(out)
+
+
+def _triangle_areas(pts, faces):
+    if faces.size == 0:
+        return np.zeros(0, dtype=np.float64)
+    a = pts[faces[:, 1]] - pts[faces[:, 0]]
+    b = pts[faces[:, 2]] - pts[faces[:, 0]]
+    return 0.5 * np.linalg.norm(np.cross(a, b), axis=1)
+
+
+def _drop_duplicate_triangles(faces):
+    if faces.size == 0:
+        return faces, 0
+    keys = np.sort(faces, axis=1)
+    collapsed = (keys[:, 0] == keys[:, 1]) | (keys[:, 1] == keys[:, 2]) | (keys[:, 0] == keys[:, 2])
+    _, first = np.unique(keys, axis=0, return_index=True)
+    keep = np.zeros(len(faces), dtype=bool)
+    keep[first] = True
+    keep &= ~collapsed
+    n_drop = int(len(faces) - keep.sum())
+    return faces[keep], n_drop
+
+
+def _drop_nonmanifold_flaps(pts, faces, area_ratio=NM_FLAP_AREA_RATIO):
+    """On edges used by >2 triangles, drop extras that are much smaller than the two kept faces.
+
+    Does not delete manifold slivers (usage==2); those must be remeshed, not punched out.
+    """
+    if faces.size == 0:
+        return faces, 0
+    n_dropped = 0
+    for _ in range(8):
+        areas = _triangle_areas(pts, faces)
+        edges = {}
+        for fi, (a, b, c) in enumerate(faces):
+            for e in (
+                (int(a), int(b)) if a <= b else (int(b), int(a)),
+                (int(b), int(c)) if b <= c else (int(c), int(b)),
+                (int(c), int(a)) if c <= a else (int(a), int(c)),
+            ):
+                edges.setdefault(e, []).append(fi)
+        drop = set()
+        for fis in edges.values():
+            if len(fis) <= 2:
+                continue
+            ranked = sorted(fis, key=lambda fi: areas[fi], reverse=True)
+            keep_min = min(areas[ranked[0]], areas[ranked[1]])
+            for fi in ranked[2:]:
+                if areas[fi] <= area_ratio * keep_min + 1e-18:
+                    drop.add(fi)
+        if not drop:
+            break
+        mask = np.ones(len(faces), dtype=bool)
+        mask[list(drop)] = False
+        faces = faces[mask]
+        n_dropped += len(drop)
+    return faces, n_dropped
+
+
+def _nonmanifold_edge_count_from_faces(faces):
+    if faces.size == 0:
+        return 0
+    counts = {}
+    for a, b, c in faces:
+        for e in (
+            (int(a), int(b)) if a <= b else (int(b), int(a)),
+            (int(b), int(c)) if b <= c else (int(c), int(b)),
+            (int(c), int(a)) if c <= a else (int(a), int(c)),
+        ):
+            counts[e] = counts.get(e, 0) + 1
+    return sum(1 for usage in counts.values() if usage > 2)
+
+
+def repair_nonmanifold_triangles(surface):
+    """Remove duplicate triangles and small non-manifold flaps. Leaves manifold slivers alone."""
+    poly = clean_triangulate(surface)
+    feat = vtk.vtkFeatureEdges()
+    feat.SetInputData(poly)
+    feat.BoundaryEdgesOff()
+    feat.FeatureEdgesOff()
+    feat.ManifoldEdgesOff()
+    feat.NonManifoldEdgesOn()
+    feat.ColoringOff()
+    feat.Update()
+    if feat.GetOutput().GetNumberOfCells() == 0:
+        return poly, 0
+
+    _, pts, faces = _triangle_points_faces(poly)
+    n0 = len(faces)
+    faces, n_dup = _drop_duplicate_triangles(faces)
+    faces, n_flap = _drop_nonmanifold_flaps(pts, faces)
+    n_nm = _nonmanifold_edge_count_from_faces(faces)
+    if n_dup == 0 and n_flap == 0:
+        return poly, n_nm
+    out = _polydata_from_triangles(pts, faces)
+    print(
+        f"  Topology repair: dropped {n_dup} duplicate and {n_flap} flap triangles "
+        f"({n0} -> {len(faces)}); remaining non-manifold edges={n_nm}"
+    )
+    return out, n_nm
+
+
+def _triangle_edge_lengths(pts, faces):
+    if faces.size == 0:
+        return np.zeros(0, dtype=np.float64)
+    return np.concatenate(
+        (
+            np.linalg.norm(pts[faces[:, 1]] - pts[faces[:, 0]], axis=1),
+            np.linalg.norm(pts[faces[:, 2]] - pts[faces[:, 1]], axis=1),
+            np.linalg.norm(pts[faces[:, 0]] - pts[faces[:, 2]], axis=1),
+        )
+    )
+
+
+def tessellation_looks_original(surface):
+    """True for raw STLs (tiny/short edges), false for area-005 (~0.28 mm)."""
+    _poly, pts, faces = _triangle_points_faces(surface)
+    edges = _triangle_edge_lengths(pts, faces)
+    if edges.size == 0:
+        return False
+    return float(np.median(edges)) < SANITIZE_MAX_MEDIAN_EDGE_MM
+
+
+def drop_degenerate_triangles(surface, min_edge=DEGENERATE_EDGE_MM):
+    """Remove zero-length / zero-area triangles that wreck vtkDelaunay3D."""
+    poly, pts, faces = _triangle_points_faces(surface)
+    if faces.size == 0:
+        return poly
+    e01 = np.linalg.norm(pts[faces[:, 1]] - pts[faces[:, 0]], axis=1)
+    e12 = np.linalg.norm(pts[faces[:, 2]] - pts[faces[:, 1]], axis=1)
+    e20 = np.linalg.norm(pts[faces[:, 0]] - pts[faces[:, 2]], axis=1)
+    keep = (e01 >= min_edge) & (e12 >= min_edge) & (e20 >= min_edge)
+    n_drop = int((~keep).sum())
+    if n_drop == 0:
+        return poly
+    out = _polydata_from_triangles(pts, faces[keep])
+    print(f"  Dropped {n_drop} degenerate triangles (min edge < {min_edge:g} mm)")
+    return out
+
+
+def sanitize_vessel_for_vmtk(
+    surface,
+    target_reduction=SANITIZE_INPUT_REDUCTION,
+    min_points=SANITIZE_INPUT_MIN_POINTS,
+):
+    """Working copy for centerlines/extensions. Originals stay as raycast GT.
+
+    Original STLs are 5–8× denser than area-005 and include zero-length edges.
+    Voronoi on that tessellation misses thin outlets. DecimatePro can punch
+    pinholes, so those are filled before opening detection.
+    """
+    poly = clean_triangulate(surface)
+    n0 = poly.GetNumberOfPoints()
+    poly = drop_degenerate_triangles(poly)
+    n_mid = poly.GetNumberOfPoints()
+    if tessellation_looks_original(poly):
+        poly = decimate_dense_mc(
+            poly, target_reduction=target_reduction, min_points=min_points
+        )
+    if poly.GetNumberOfPoints() < n_mid:
+        # DecimatePro can punch sub-mm pinholes; fill those but not real ostia (~0.3 mm+).
+        poly = fill_pinholes(poly, hole_size=0.25)
+        poly, _n_reg = drop_tiny_islands(poly)
+    n1 = poly.GetNumberOfPoints()
+    if n1 != n0:
+        print(f"  Sanitized vessel for VMTK: {n0} -> {n1} points")
+    return poly
+
+
+def decimate_dense_mc(
+    surface,
+    target_reduction=None,
+    min_points=None,
+):
+    """Collapse over-tessellated surfaces with vtkDecimatePro. Topology stays.
+
+    Reduction is a fraction of points to remove. Remaining count is never
+    forced below min_points, so small tubes are not flattened.
+    """
+    poly = to_vtk_poly(surface)
+    n = poly.GetNumberOfPoints()
+    if target_reduction is None:
+        target_reduction = MC_DECIMATE_REDUCTION
+        min_points = MC_DECIMATE_MIN_POINTS if min_points is None else min_points
+    reduction = float(target_reduction)
+    floor = int(min_points) if min_points is not None else 0
+    if n < 4 or reduction <= 0.0:
+        return poly
+    if floor > 0 and n <= floor:
+        return poly
+    target_n = int(round(n * (1.0 - reduction)))
+    if floor > 0:
+        target_n = max(floor, target_n)
+    if target_n >= n:
+        return poly
+    reduction = 1.0 - float(target_n) / float(n)
+    if reduction < 0.05:
+        return poly
+    dec = vtk.vtkDecimatePro()
+    dec.SetInputData(poly)
+    dec.SetTargetReduction(reduction)
+    dec.PreserveTopologyOn()
+    dec.SplittingOff()
+    if hasattr(dec, "BoundaryVertexDeletionOff"):
+        dec.BoundaryVertexDeletionOff()
+    # High feature angle: MC staircasing is not anatomy. 45 deg leaves fins that
+    # share edges with the wall (non-manifold) even with PreserveTopology on.
+    dec.SetFeatureAngle(90.0)
+    dec.Update()
+    out = clean_triangulate(dec.GetOutput())
+    print(
+        f"  Decimated surface {n} -> {out.GetNumberOfPoints()} points "
+        f"(target reduction {100.0 * reduction:.0f}%, PreserveTopology, openings kept)"
+    )
+    return out
 
 
 def generate_base_surface(
@@ -521,7 +904,7 @@ def generate_base_surface(
     profiles=None,
     extension_length=DEFAULT_EXTENSION_LENGTH,
 ):
-    """Polyball tube on an isotropic grid. Discrete spheres: PolyBallLine is too slow on large volumes."""
+    """Parent tube via a narrow-band polyball image + marching cubes."""
     if not isinstance(branched_centerline, vtk.vtkPolyData):
         branched_centerline = to_vtk_poly(branched_centerline)
     misr_array = _misr_array_or_raise(branched_centerline)
@@ -530,7 +913,7 @@ def generate_base_surface(
     r_cap = parent_tube_misr_cap(profiles, reference_bounds)
     max_r, r_min = clamp_misr_for_parent_tube(misr_array, r_cap)
     vtk_cl = to_vtk_poly(branched_centerline)
-    misr_cl = _misr_array_or_raise(vtk_cl)
+    pts, radii = _centerline_xyz_r(vtk_cl)
 
     pad = 2.0 * max(max_r, MISR_FLOOR_MM) + float(extension_length) + 1.0
     model_bounds = [
@@ -543,54 +926,30 @@ def generate_base_surface(
         model_bounds[3] - model_bounds[2],
         model_bounds[5] - model_bounds[4],
     ]
-    dims, spacing, voxels_across = modeller_sample_grid(
-        extents, grid_spacing, max_grid_size, r_min
-    )
-    # If the hard cap still leaves a branch thinner than ~3 voxels, inflate those
-    # spheres so marching cubes cannot collapse them to a sheet.
-    resolvable_r = 1.25 * spacing
-    n_inflate = 0
-    if r_min < resolvable_r:
-        for i in range(misr_cl.GetNumberOfTuples()):
-            r_val = float(misr_cl.GetComponent(i, 0))
-            if r_val < resolvable_r:
-                misr_cl.SetComponent(i, 0, resolvable_r)
-                n_inflate += 1
-        r_min = resolvable_r
-        voxels_across = (2.0 * r_min) / max(spacing, 1e-9)
+    dims, spacing = modeller_sample_grid(extents, grid_spacing, max_grid_size, r_min=r_min)
     print(
         f"  CenterlineModeller grid dimensions: {dims} "
         f"(isotropic spacing ~{spacing:.4f} mm, r_min={r_min:.3f} mm, "
-        f"{voxels_across:.1f} voxels across smallest diameter)"
+        f"{(2.0 * r_min) / max(spacing, 1e-9):.1f} voxels across smallest diameter)"
     )
-    if n_inflate:
-        print(
-            f"  Inflated {n_inflate} thin-branch MISR values to {resolvable_r:.3f} mm "
-            f"so the modeller grid can resolve them"
-        )
-
-    modeller = vtkvmtk.vtkvmtkPolyBallModeller()
-    modeller.SetInputData(vtk_cl)
-    modeller.SetRadiusArrayName("MaximumInscribedSphereRadius")
-    modeller.UsePolyBallLineOff()
-    try:
-        modeller.SetSampleDimensions(dims)
-    except TypeError:
-        modeller.SetSampleDimensions(int(dims[0]), int(dims[1]), int(dims[2]))
-    try:
-        modeller.SetModelBounds(model_bounds)
-    except TypeError:
-        modeller.SetModelBounds(*[float(v) for v in model_bounds])
-    modeller.SetNegateFunction(0)
-    modeller.Update()
-
+    image = stamp_polyball_image(pts, radii, model_bounds, dims, spacing)
     mc = vmtkscripts.vmtkMarchingCubes()
-    mc.Image = modeller.GetOutput()
+    mc.Image = image
     mc.Level = 0.0
     mc.Connectivity = 1
     mc.Execute()
     raw = to_vtk_poly(mc.Surface)
     kept = keep_largest_region(raw)
+    pre_decimate = kept
+    kept = decimate_dense_mc(kept)
+    kept, n_nm = repair_nonmanifold_triangles(kept)
+    if n_nm > 0 and kept.GetNumberOfPoints() < pre_decimate.GetNumberOfPoints():
+        print("  Decimate left non-manifold edges; keeping the full marching-cubes surface")
+        kept, n_nm = repair_nonmanifold_triangles(pre_decimate)
+    if n_nm > 0:
+        raise TemplateQualityError(
+            f"Parent-tube surface has {n_nm} non-manifold edges after marching cubes"
+        )
     if kept.GetNumberOfPoints() < 50:
         raise TemplateQualityError("Marching cubes produced a degenerate tube surface.")
     slack = float(extension_length) + 2.0 * max_r + 2.0
@@ -634,30 +993,21 @@ def fill_pinholes(surface, hole_size=PINHOLE_HOLE_SIZE_MM):
     return to_vtk_poly(filler.GetOutput())
 
 
-def _plane_has_sign_change(surface, origin, normal):
+def _plane_has_sign_change(surface, origin, normal, pts=None):
+    """True if the (triangle) surface meets the plane.
+
+    A planar triangle meets a plane iff its vertices are not all strictly on one
+    side, so the vertex-sign range is exact. False positives on disjoint
+    components only waste a cheap vtkCutter call.
+    """
     origin = np.asarray(origin, dtype=np.float64)
     normal = _unit(normal)
-    vtk_poly = to_vtk_poly(surface)
-    n_pts = vtk_poly.GetNumberOfPoints()
-    if n_pts == 0:
+    if pts is None:
+        _poly, pts = _poly_points(surface)
+    if pts.size == 0:
         return False
-    signs = np.empty(n_pts, dtype=np.float64)
-    for i in range(n_pts):
-        p = np.array(vtk_poly.GetPoint(i), dtype=np.float64)
-        signs[i] = float(np.dot(normal, p - origin))
-    vtk_poly.BuildCells()
-    for ci in range(vtk_poly.GetNumberOfCells()):
-        cell = vtk_poly.GetCell(ci)
-        n = cell.GetNumberOfPoints()
-        if n < 2:
-            continue
-        ids = [cell.GetPointId(j) for j in range(n)]
-        for a, b in zip(ids, ids[1:] + ids[:1]):
-            if signs[a] == 0.0 or signs[b] == 0.0:
-                return True
-            if signs[a] * signs[b] < 0.0:
-                return True
-    return False
+    signs = (pts - origin) @ normal
+    return bool(signs.min() <= 0.0 <= signs.max())
 
 
 def _clip_origin_candidates(surface, profile, search_mm):
@@ -742,9 +1092,10 @@ def clip_one_profile(surface, profile, body_point, search_mm):
             continue
         unique.append(arr)
 
+    _poly, pts = _poly_points(surface)
     scored = []
     for origin in unique:
-        if not _plane_has_sign_change(surface, origin, plane_normal):
+        if not _plane_has_sign_change(_poly, origin, plane_normal, pts=pts):
             continue
         loop = _cut_loops_near_profile(surface, origin, plane_normal, bary)
         if loop is None:
@@ -840,6 +1191,11 @@ def clip_flow_extensions_and_uncap(base_surface, profiles, extension_length=DEFA
             body_pt = mesh_body_point(current)
     print(f"  Uncap: clipped {n_clipped}/{len(profiles)} openings")
     current = clean_triangulate(current)
+    current, n_nm = repair_nonmanifold_triangles(current)
+    if n_nm > 0:
+        raise TemplateQualityError(
+            f"Uncapped parent tube has {n_nm} non-manifold edges; remesh would amplify them"
+        )
     post = inspect_openings(current)
     print(
         "  Openings after uncap/pinhole-fill: "
@@ -931,40 +1287,50 @@ def clip_centerline_at_profiles(centerline, profiles, extension_length=DEFAULT_E
 
 
 def compute_template_local_radii(template_mesh, branched_centerline):
-    """R_template from the polyball line (closest point on the polyline), not nearest vertex."""
+    """R_template from the closest point on the centerline polyline, not the nearest vertex."""
     vtk_template = to_vtk_poly(template_mesh)
     vtk_cl = to_vtk_poly(branched_centerline)
     n_pts = vtk_template.GetNumberOfPoints()
     r_template = np.full(n_pts, R_TEMPLATE_FLOOR_MM, dtype=np.float64)
-
-    if vtk_cl.GetNumberOfPoints() == 0:
+    if vtk_cl.GetNumberOfPoints() == 0 or n_pts == 0:
         return r_template
 
-    vtk_cl.BuildCells()
-    vtk_cl.BuildLinks()
-    polyball = vtkvmtk.vtkvmtkPolyBallLine()
-    try:
-        polyball.SetInput(vtk_cl)
-    except (TypeError, AttributeError):
-        polyball.SetInputData(vtk_cl)
-    polyball.SetPolyBallRadiusArrayName("MaximumInscribedSphereRadius")
-    polyball.UseRadiusInformationOn()
+    misr_arr = vtk_cl.GetPointData().GetArray("MaximumInscribedSphereRadius")
+    if misr_arr is None:
+        return r_template
+    misr = np.ascontiguousarray(vtk_to_numpy(misr_arr), dtype=np.float64)
+    query = np.ascontiguousarray(vtk_to_numpy(vtk_template.GetPoints().GetData()), dtype=np.float64)
 
-    locator = vtk.vtkPointLocator()
+    vtk_cl.BuildCells()
+    locator = vtk.vtkCellLocator()
     locator.SetDataSet(vtk_cl)
     locator.BuildLocator()
-    misr_arr = vtk_cl.GetPointData().GetArray("MaximumInscribedSphereRadius")
-
-    for i in range(n_pts):
-        p = vtk_template.GetPoint(i)
-        try:
-            polyball.EvaluateFunction(p)
-            r_val = float(polyball.GetLastPolyBallCenterRadius())
-        except Exception:
-            r_val = 0.0
-        if r_val <= 1e-6 and misr_arr is not None:
-            pid = locator.FindClosestPoint(p)
-            r_val = float(misr_arr.GetComponent(pid, 0))
+    closest = [0.0, 0.0, 0.0]
+    cell_id = vtk.mutable(0)
+    sub_id = vtk.mutable(0)
+    dist2 = vtk.mutable(0.0)
+    for i, p in enumerate(query):
+        locator.FindClosestPoint(_vec3(p), closest, cell_id, sub_id, dist2)
+        cell = vtk_cl.GetCell(int(cell_id.get()))
+        n = cell.GetNumberOfPoints()
+        if n < 2:
+            pid = cell.GetPointId(0) if n == 1 else 0
+            r_val = float(misr[pid]) if pid < misr.size else R_TEMPLATE_FLOOR_MM
+            r_template[i] = max(R_TEMPLATE_FLOOR_MM, r_val)
+            continue
+        sid = int(sub_id.get())
+        sid = max(0, min(sid, n - 2))
+        i0 = cell.GetPointId(sid)
+        i1 = cell.GetPointId(sid + 1)
+        p0 = np.asarray(vtk_cl.GetPoint(i0), dtype=np.float64)
+        p1 = np.asarray(vtk_cl.GetPoint(i1), dtype=np.float64)
+        seg = p1 - p0
+        denom = float(np.dot(seg, seg))
+        if denom < 1e-18:
+            t = 0.0
+        else:
+            t = float(np.clip(np.dot(np.asarray(closest, dtype=np.float64) - p0, seg) / denom, 0.0, 1.0))
+        r_val = (1.0 - t) * float(misr[i0]) + t * float(misr[i1])
         r_template[i] = max(R_TEMPLATE_FLOOR_MM, r_val)
     return r_template
 
@@ -983,8 +1349,6 @@ def compute_raycast_stretch_distances(template_mesh, ground_truth_mesh, r_templa
     template_normals_filter.Update()
     template_mesh_with_normals = to_vtk_poly(template_normals_filter.GetOutput())
 
-    pv_template = pv.wrap(template_mesh_with_normals)
-
     gt_normals_filter = vtk.vtkPolyDataNormals()
     gt_normals_filter.SetInputData(to_vtk_poly(ground_truth_mesh))
     gt_normals_filter.ComputeCellNormalsOn()
@@ -993,45 +1357,62 @@ def compute_raycast_stretch_distances(template_mesh, ground_truth_mesh, r_templa
     gt_normals_filter.SplittingOff()
     gt_normals_filter.Update()
     gt_mesh_with_normals = to_vtk_poly(gt_normals_filter.GetOutput())
-    gt_cell_normals = gt_mesh_with_normals.GetCellData().GetNormals()
+    gt_cell_normals_vtk = gt_mesh_with_normals.GetCellData().GetNormals()
+    gt_cell_normals = (
+        np.ascontiguousarray(vtk_to_numpy(gt_cell_normals_vtk), dtype=np.float64)
+        if gt_cell_normals_vtk is not None
+        else None
+    )
 
     locator = vtk.vtkCellLocator()
     locator.SetDataSet(gt_mesh_with_normals)
     locator.BuildLocator()
 
-    template_pts = pv_template.points
-    template_normals = pv_template.point_normals
-    n_pts = pv_template.n_points
+    template_pts = np.ascontiguousarray(
+        vtk_to_numpy(template_mesh_with_normals.GetPoints().GetData()), dtype=np.float64
+    )
+    nrm_vtk = template_mesh_with_normals.GetPointData().GetNormals()
+    if nrm_vtk is None:
+        return np.zeros(template_pts.shape[0], dtype=np.float64)
+    template_normals = np.ascontiguousarray(vtk_to_numpy(nrm_vtk), dtype=np.float64)
+    lens = np.linalg.norm(template_normals, axis=1, keepdims=True)
+    lens = np.maximum(lens, 1e-12)
+    outward = -template_normals / lens
+
+    n_pts = template_pts.shape[0]
     distances = np.zeros(n_pts, dtype=np.float64)
     t = vtk.mutable(0.0)
     x = [0.0, 0.0, 0.0]
     pcoords = [0.0, 0.0, 0.0]
-    subId = vtk.mutable(0)
-    cellId = vtk.mutable(0)
+    sub_id = vtk.mutable(0)
+    cell_id = vtk.mutable(0)
+    r_arr = None if r_template is None else np.asarray(r_template, dtype=np.float64)
 
     for i in range(n_pts):
         p = template_pts[i]
-        nrm = np.asarray(template_normals[i], dtype=np.float64)
-        n = -_unit(nrm)
-        r_local = r_template[i] if r_template is not None else 1.0
-
-        p_inward = p - n * 1.5
-        hit_inward = locator.IntersectWithLine(p, p_inward, tol, t, x, pcoords, subId, cellId)
+        n = outward[i]
+        r_local = 1.0 if r_arr is None else float(r_arr[i])
+        p0 = (float(p[0]), float(p[1]), float(p[2]))
+        p_inward = (float(p[0] - n[0] * 1.5), float(p[1] - n[1] * 1.5), float(p[2] - n[2] * 1.5))
+        hit_inward = locator.IntersectWithLine(p0, p_inward, tol, t, x, pcoords, sub_id, cell_id)
         if hit_inward:
-            d_inward = np.linalg.norm(np.array(x) - p)
+            d_inward = float(np.sqrt((x[0] - p[0]) ** 2 + (x[1] - p[1]) ** 2 + (x[2] - p[2]) ** 2))
             if d_inward < 0.4:
                 distances[i] = 0.0
                 continue
 
-        p_end = p + n * max_ray_length
-        hit = locator.IntersectWithLine(p, p_end, tol, t, x, pcoords, subId, cellId)
+        p_end = (
+            float(p[0] + n[0] * max_ray_length),
+            float(p[1] + n[1] * max_ray_length),
+            float(p[2] + n[2] * max_ray_length),
+        )
+        hit = locator.IntersectWithLine(p0, p_end, tol, t, x, pcoords, sub_id, cell_id)
         if hit:
-            d = np.linalg.norm(np.array(x) - p)
+            d = float(np.sqrt((x[0] - p[0]) ** 2 + (x[1] - p[1]) ** 2 + (x[2] - p[2]) ** 2))
             if 0.10 < d <= (3.5 * r_local):
-                cid = cellId.get()
-                if gt_cell_normals:
-                    cell_normal = np.array(gt_cell_normals.GetTuple(cid))
-                    if np.dot(n, cell_normal) > 0.2:
+                cid = int(cell_id.get())
+                if gt_cell_normals is not None and 0 <= cid < len(gt_cell_normals):
+                    if float(np.dot(n, gt_cell_normals[cid])) > 0.2:
                         distances[i] = d
                 else:
                     distances[i] = d
@@ -1056,24 +1437,38 @@ def build_target_edge_array(template_mesh, distances, r_template, base_edge=0.50
     return vtk_poly, target_edge_lengths, stretch_factors
 
 
-def remesh_surface_adaptively(open_surface_with_array, edge_array_name="TargetEdgeLength", n_iter=10):
+def remesh_surface_adaptively(
+    open_surface_with_array,
+    edge_array_name="TargetEdgeLength",
+    n_iter=REMESH_N_ITER,
+    connectivity_iter=REMESH_CONNECTIVITY_ITER,
+):
     remesher = vmtkscripts.vmtkSurfaceRemeshing()
     remesher.Surface = to_vtk_poly(open_surface_with_array)
     remesher.ElementSizeMode = "edgelengtharray"
     remesher.TargetEdgeLengthArrayName = edge_array_name
     remesher.PreserveBoundaryEdges = 1
-    remesher.NumberOfIterations = n_iter
+    remesher.NumberOfIterations = int(n_iter)
+    remesher.NumberOfConnectivityOptimizationIterations = int(connectivity_iter)
+    remesher.MinEdgeLength = float(REMESH_MIN_EDGE_MM)
     remesher.Execute()
     return to_vtk_poly(remesher.Surface)
 
 
-def remesh_surface_isotropically(open_surface, target_edge_length=0.5, n_iter=10):
+def remesh_surface_isotropically(
+    open_surface,
+    target_edge_length=0.5,
+    n_iter=REMESH_N_ITER,
+    connectivity_iter=REMESH_CONNECTIVITY_ITER,
+):
     remesher = vmtkscripts.vmtkSurfaceRemeshing()
     remesher.Surface = to_vtk_poly(open_surface)
     remesher.ElementSizeMode = "edgelength"
     remesher.TargetEdgeLength = float(target_edge_length)
     remesher.PreserveBoundaryEdges = 1
-    remesher.NumberOfIterations = n_iter
+    remesher.NumberOfIterations = int(n_iter)
+    remesher.NumberOfConnectivityOptimizationIterations = int(connectivity_iter)
+    remesher.MinEdgeLength = float(REMESH_MIN_EDGE_MM)
     remesher.Execute()
     return to_vtk_poly(remesher.Surface)
 
@@ -1111,44 +1506,39 @@ def inspect_openings(surface):
 
 def inspect_surface_topology(surface):
     """Edge usage, shortest edge, and triangle quality (radius-ratio)."""
-    vtk_poly = to_vtk_poly(surface)
-    vtk_poly.BuildCells()
-    edge_count = {}
-    min_edge = float("inf")
-    n_tri = 0
-    for ci in range(vtk_poly.GetNumberOfCells()):
-        cell = vtk_poly.GetCell(ci)
-        n = cell.GetNumberOfPoints()
-        if n < 2:
-            continue
-        ids = [cell.GetPointId(j) for j in range(n)]
-        pts = [np.asarray(vtk_poly.GetPoint(pid), dtype=np.float64) for pid in ids]
-        for a in range(n):
-            b = (a + 1) % n if n > 2 else a + 1
-            if b >= n:
-                continue
-            i0, i1 = ids[a], ids[b]
-            key = (i0, i1) if i0 < i1 else (i1, i0)
-            edge_count[key] = edge_count.get(key, 0) + 1
-            if n == 3:
-                min_edge = min(min_edge, float(np.linalg.norm(pts[a] - pts[b])))
-        if n == 3:
-            n_tri += 1
-    n_boundary = sum(1 for c in edge_count.values() if c == 1)
-    n_nonmanifold = sum(1 for c in edge_count.values() if c > 2)
-    if not np.isfinite(min_edge) or n_tri == 0:
-        min_edge = 0.0
+    poly, pts, faces = _triangle_points_faces(surface)
+    n_tri = int(len(faces))
+    if n_tri == 0 or pts.size == 0:
+        return {
+            "n_triangles": 0,
+            "n_boundary_edges": 0,
+            "n_nonmanifold": 0,
+            "min_edge": 0.0,
+            "median_q01": None,
+            "frac_sliver": None,
+        }
+    e01 = np.linalg.norm(pts[faces[:, 1]] - pts[faces[:, 0]], axis=1)
+    e12 = np.linalg.norm(pts[faces[:, 2]] - pts[faces[:, 1]], axis=1)
+    e20 = np.linalg.norm(pts[faces[:, 0]] - pts[faces[:, 2]], axis=1)
+    min_edge = float(np.min(np.minimum(np.minimum(e01, e12), e20)))
+    edges = np.concatenate(
+        (np.sort(faces[:, [0, 1]], axis=1), np.sort(faces[:, [1, 2]], axis=1), np.sort(faces[:, [2, 0]], axis=1)),
+        axis=0,
+    )
+    _uniq, counts = np.unique(edges, axis=0, return_counts=True)
+    n_boundary = int(np.sum(counts == 1))
+    n_nonmanifold = int(np.sum(counts > 2))
 
     med_q01 = None
     frac_sliver = None
     try:
         quality = vtk.vtkMeshQuality()
-        quality.SetInputData(vtk_poly)
+        quality.SetInputData(poly)
         quality.SetTriangleQualityMeasureToRadiusRatio()
         quality.Update()
         arr = quality.GetOutput().GetCellData().GetArray("Quality")
         if arr is not None and arr.GetNumberOfTuples() > 0:
-            rr = np.array([arr.GetValue(i) for i in range(arr.GetNumberOfTuples())], dtype=np.float64)
+            rr = np.ascontiguousarray(vtk_to_numpy(arr), dtype=np.float64)
             q01 = 1.0 / np.maximum(rr, 1e-12)
             med_q01 = float(np.median(q01))
             frac_sliver = float(np.mean(q01 < SLIVER_Q01_THRESHOLD))
@@ -1170,7 +1560,8 @@ def drop_tiny_islands(surface):
 
 
 def finalize_surface(surface):
-    cleaned = fill_pinholes(clean_triangulate(surface))
+    cleaned, _n_nm = repair_nonmanifold_triangles(clean_triangulate(surface))
+    cleaned = fill_pinholes(cleaned)
     cleaned = strip_all_arrays(cleaned)
     cleaned, n_regions = drop_tiny_islands(cleaned)
     cleaned = strip_all_arrays(cleaned)
@@ -1267,7 +1658,8 @@ def build_parent_tube(
 ):
     """Shared path: smooth -> extend -> cap -> centerline -> polyball tube -> uncap at anatomy."""
     print("Step 1: Applying Taubin surface smoothing...")
-    smoothed_vessel = apply_taubin_smoothing(vessel_mesh)
+    work_vessel = sanitize_vessel_for_vmtk(vessel_mesh)
+    smoothed_vessel = apply_taubin_smoothing(work_vessel)
 
     print("Step 1b: Detecting anatomical inlet/outlet boundaries...")
     anatomical_profiles = measure_open_profiles(smoothed_vessel)
@@ -1313,8 +1705,13 @@ def build_parent_tube(
         base_surface, anatomical_profiles, extension_length=extension_length
     )
     print(f"  -> Open base surface points: {open_base_surface.GetNumberOfPoints()}")
+    n_in = len(anatomical_profiles)
+    if n_clipped < n_in:
+        print(
+            f"  WARNING: uncap opened {n_clipped}/{n_in} anatomical ends; "
+            "a branch may be missing from the parent tube."
+        )
     if n_clipped < 2:
-        n_in = len(anatomical_profiles)
         raise TemplateQualityError(
             f"Parent-tube uncap opened {n_clipped}/{n_in} ends "
             f"(input vessel has {n_in} openings; this is a reconstructed-tube miss, not a sealed input).",
@@ -1359,7 +1756,7 @@ def process_variable_dataset(
     stretch_distances = compute_raycast_stretch_distances(
         open_base_surface, vessel_mesh, r_template=r_template
     )
-    min_edge = 0.01
+    min_edge = REMESH_MIN_EDGE_MM
     print(
         f"Step 8b: Building stretch metric k = 1 + d / R_template "
         f"(Base={target_edge_length} mm, Min={min_edge:.2f} mm)..."
@@ -1520,6 +1917,20 @@ def process_centerline_dataset(
     return out_file
 
 
+VESSEL_FILE_EXTENSIONS = (".vtp", ".stl", ".vtk", ".ply")
+
+
+def resolve_vessel_file(vessel_dir, dataset_id, explicit=None):
+    """Find a vessel mesh. Originals are STL; remeshed copies are VTP."""
+    if explicit:
+        return explicit
+    for ext in VESSEL_FILE_EXTENSIONS:
+        path = os.path.join(vessel_dir, f"{dataset_id}{ext}")
+        if os.path.exists(path):
+            return path
+    return os.path.join(vessel_dir, f"{dataset_id}.vtp")
+
+
 def load_valid_datasets(csv_path, vessel_dir, limit=None, case_ids=None):
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"Clinical CSV file not found at: {csv_path}")
@@ -1534,7 +1945,7 @@ def load_valid_datasets(csv_path, vessel_dir, limit=None, case_ids=None):
         dataset_id = str(row["dataset"])
         if wanted is not None and dataset_id not in wanted:
             continue
-        v_file = os.path.join(vessel_dir, f"{dataset_id}.vtp")
+        v_file = resolve_vessel_file(vessel_dir, dataset_id)
         if os.path.exists(v_file):
             valid.append((dataset_id, v_file))
     if limit is not None:
@@ -1544,12 +1955,12 @@ def load_valid_datasets(csv_path, vessel_dir, limit=None, case_ids=None):
 
 def add_shared_cli_args(parser, default_output_dir, default_workers, include_remesh_grid=True):
     parser.add_argument("--csv", type=str, default=DEFAULT_CSV_PATH, help="Path to clinical.csv")
-    parser.add_argument("--vessel-dir", type=str, default=DEFAULT_VESSEL_DIR, help="Directory of input vessel .vtp files")
+    parser.add_argument("--vessel-dir", type=str, default=DEFAULT_VESSEL_DIR, help="Directory of input vessel meshes (.vtp or .stl)")
     parser.add_argument("--output-dir", type=str, default=default_output_dir, help="Output directory")
     parser.add_argument("--limit", type=int, default=None, help="Maximum number of dataset meshes to process")
     parser.add_argument("--workers", type=int, default=default_workers, help="Number of parallel worker processes")
     parser.add_argument("--case", type=str, default=None, help="Process a single dataset id")
-    parser.add_argument("--vessel-file", type=str, default=None, help="Explicit input .vtp for --case")
+    parser.add_argument("--vessel-file", type=str, default=None, help="Explicit input mesh for --case (.vtp or .stl)")
     parser.add_argument("--skip-existing", action="store_true", help="Skip cases whose output .vtp already exists")
     parser.add_argument("--cases", type=str, nargs="*", default=None, help="Optional subset of dataset ids")
     parser.add_argument("--extension-length", type=float, default=DEFAULT_EXTENSION_LENGTH, help="Flow extension length in mm")
@@ -1564,7 +1975,7 @@ def add_shared_cli_args(parser, default_output_dir, default_workers, include_rem
 def run_batch(script_path, process_one, args, extra_cli_flags):
     os.makedirs(args.output_dir, exist_ok=True)
     if args.case:
-        v_file = args.vessel_file or os.path.join(args.vessel_dir, f"{args.case}.vtp")
+        v_file = resolve_vessel_file(args.vessel_dir, args.case, explicit=args.vessel_file)
         if not os.path.exists(v_file):
             raise FileNotFoundError(f"Vessel file not found: {v_file}")
         print(f"Running single case: {args.case}")
