@@ -1,0 +1,6 @@
+---
+description: hemoMesh personal copy — sync with supervisor, never touch his GitHub
+alwaysApply: true
+---
+
+`datatransform/hemoMesh` is Damján's private copy of sandorlevente/hemoMesh (`refactor/postproc-cleanup`). Edit only this copy, on `damjan/local`. Sync by fetching `upstream` and merging `upstream/refactor/postproc-cleanup` into `damjan/local`. Never push, PR, commit, or otherwise modify the supervisor's GitHub repo.

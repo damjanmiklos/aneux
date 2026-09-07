@@ -51,3 +51,6 @@ datatransform/template_creation/output*/
 
 # Local agent troubleshooting (never commit)
 scratch/
+
+# Nested personal copy of supervisor repo (own git remotes)
+datatransform/hemoMesh/
