@@ -33,13 +33,21 @@ TUBE_RADIUS_MM = 2.0
 N_TRUE = 16384
 N_TRUE_FAR_FRAC = 0.25
 FAR_CL_MARGIN_MM = 1.0
-CACHE_VERSION = 8
+CACHE_VERSION = 9
 
 # (n_length, n_radial) per hierarchy level
 LEVEL_COARSE = (40, 6)
 LEVEL_MID = (250, 12)
 LEVEL_FINE = (1000, 64)
 HIERARCHY_LEVELS = (LEVEL_COARSE, LEVEL_MID, LEVEL_FINE)
+
+# Template hierarchy is built at cache time by decimating template_mesh.
+# No coarse_remeshed folder: mid/coarse are derived from the same template.
+TEMPLATE_MID_KEEP = 0.25
+TEMPLATE_COARSE_KEEP = 0.08
+TEMPLATE_MIN_MID = 256
+TEMPLATE_MIN_COARSE = 64
+TEMPLATE_UPSAMPLE_K = 3
 
 JUNCTION_COUPLE_RADIUS_MM = 4.0
 JUNCTION_COUPLE_K = 2

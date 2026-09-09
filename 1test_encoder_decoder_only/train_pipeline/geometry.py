@@ -161,6 +161,42 @@ def upsample_branch_concat(
     return torch.cat(pieces, dim=0)
 
 
+def knn_upsample_tables(src_pts, dst_pts, k=3):
+    """kNN inverse-distance tables from a coarser point set onto a finer one."""
+    src = np.asarray(src_pts, dtype=np.float64).reshape(-1, 3)
+    dst = np.asarray(dst_pts, dtype=np.float64).reshape(-1, 3)
+    n_src = int(src.shape[0])
+    n_dst = int(dst.shape[0])
+    k = max(1, min(int(k), max(n_src, 1)))
+    if n_dst == 0 or n_src == 0:
+        return (
+            np.zeros((n_dst, k), dtype=np.int64),
+            np.zeros((n_dst, k), dtype=np.float64),
+        )
+    dist, idx = cKDTree(src).query(dst, k=k, workers=1)
+    if k == 1:
+        dist = np.asarray(dist, dtype=np.float64).reshape(-1, 1)
+        idx = np.asarray(idx, dtype=np.int64).reshape(-1, 1)
+    else:
+        dist = np.asarray(dist, dtype=np.float64)
+        idx = np.asarray(idx, dtype=np.int64)
+    dist = np.maximum(dist, 1e-8)
+    weight = 1.0 / dist
+    weight = weight / np.clip(weight.sum(axis=1, keepdims=True), 1e-12, None)
+    return idx.astype(np.int64, copy=False), weight.astype(np.float64, copy=False)
+
+
+def knn_weighted_upsample(field: Tensor, index: Tensor, weight: Tensor) -> Tensor:
+    """Gather `field[index]` and blend with inverse-distance weights."""
+    field = field.to(dtype=torch.float32)
+    index = index.long()
+    weight = weight.to(dtype=field.dtype, device=field.device)
+    if index.device != field.device:
+        index = index.to(device=field.device)
+    gathered = field[index]
+    return (gathered * weight.unsqueeze(-1)).sum(dim=1)
+
+
 def fps_metric(points: np.ndarray, n_samples: int) -> np.ndarray:
     """Metric-space FPS starting at the point farthest from the centroid."""
     pts = np.asarray(points, dtype=np.float32)

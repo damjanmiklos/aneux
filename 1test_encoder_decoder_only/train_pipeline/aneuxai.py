@@ -41,16 +41,16 @@ from train import train_model
 
 # %% [markdown]
 # ## 1. Configuration & Hyperparameters
-# Meshes and centerlines come from `cleandata/` (uniform GT, original centerline,
-# coarse remesh, variable template + its centerline). Nothing is read from rawdata.
+# Meshes and centerlines come from `cleandata/` (uniform GT, original
+# centerline, pregenerated template_mesh + template_centerline). Nothing is
+# read from rawdata. The decoder starts from template_mesh, not a Bishop tube.
 
 # %%
 OUTPUT_DIR = EXPERIMENT_OUTPUT
 CACHE_DIR = EXPERIMENT_CACHE
 CLEANDATA_ROOT = CLEANDATA
-# True only in vmtk_env: fill missing original/template centerlines and coarse
-# remeshes with centerline_creation.py / uniform remeshing. Default False assumes
-# those folders are already populated.
+# True only in vmtk_env: fill missing original/template centerlines with
+# centerline_creation.py. Default False assumes those folders are already filled.
 ENSURE_DERIVED = False
 
 TUBE_RADIUS = TUBE_RADIUS_MM
@@ -76,9 +76,9 @@ LOSS_WEIGHTS = dict(DEFAULT_LOSS_WEIGHTS)
 
 # %% [markdown]
 # ## 2. Data Preparation
-# Paired uniformly_remeshed GT + original_centerline from cleandata, GroupId
-# tracts from centerline_creation.py, Bishop tubes, hybrid far-from-centerline
-# FPS for x_true, canonical ICA pose (mm preserved).
+# Paired uniformly_remeshed GT + pregenerated template_mesh / template_centerline
+# from cleandata. Tokens and (u, θ) come from the template centerline. Hybrid
+# far-from-centerline FPS for x_true, canonical ICA pose (mm preserved).
 
 # %%
 def seed_everything(seed):

@@ -65,6 +65,7 @@ from geometry import (
     harmonic_encoding_theta,
     harmonic_encoding_u,
     intrinsic_spline_pseudo_coords,
+    knn_weighted_upsample,
     radial_bias_for_zero_init,
     upsample_branch_concat,
 )
@@ -215,7 +216,7 @@ def test_config_contracts():
     _assert(SA_STAGES[-1][0] == 64, f"last SA n_out {SA_STAGES[-1][0]}")
     _assert(LOGVAR_CLAMP == (-8.0, 2.0), LOGVAR_CLAMP)
     _assert(LAMBDA_CD_COARSE <= 0.05 + 1e-12, LAMBDA_CD_COARSE)
-    _assert(CACHE_VERSION >= 7, CACHE_VERSION)
+    _assert(CACHE_VERSION >= 9, CACHE_VERSION)
     _assert(LATENT_DIM == 128, LATENT_DIM)
     _assert(LATENT_LEN == 96, LATENT_LEN)
     _assert(DECODER_HIDDEN_DIM == 128, DECODER_HIDDEN_DIM)
@@ -300,6 +301,15 @@ def test_bilinear_identity_and_wrap():
 
     concat = upsample_branch_concat(field, torch.tensor([nl]), nr, torch.tensor([nl]), nr)
     _assert(torch.allclose(concat, field, atol=1e-5), "branch concat identity failed")
+
+
+def test_knn_weighted_upsample():
+    field = torch.tensor([[1.0, 0.0], [3.0, 0.0], [5.0, 0.0]], dtype=torch.float32)
+    index = torch.tensor([[0, 1], [1, 2]], dtype=torch.long)
+    weight = torch.tensor([[0.5, 0.5], [0.25, 0.75]], dtype=torch.float32)
+    out = knn_weighted_upsample(field, index, weight)
+    expect = torch.tensor([[2.0, 0.0], [4.5, 0.0]], dtype=torch.float32)
+    _assert(torch.allclose(out, expect, atol=1e-5), out)
 
 
 def test_bishop_frames_orthonormal():
@@ -743,7 +753,6 @@ def test_cleandata_discovery_and_complete():
     try:
         layout_dirs = {
             "uniformly_remeshed": os.path.join(root, "uniformly_remeshed"),
-            "coarse_remeshed": os.path.join(root, "coarse_remeshed"),
             "template_mesh": os.path.join(root, "template_mesh"),
             "original_centerline": os.path.join(root, "original_centerline"),
             "template_centerline": os.path.join(root, "template_centerline"),
@@ -768,8 +777,61 @@ def test_cleandata_discovery_and_complete():
         _assert(len(ds) == 1, len(ds))
         _assert(ds.samples[0]["dataset_id"] == "CASE01", ds.samples[0])
         _assert(ds.samples[0]["vessel_file"].endswith("CASE01.vtp"), ds.samples[0]["vessel_file"])
+        _assert("coarse_file" not in ds.samples[0], ds.samples[0])
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+def _template_cylinder_pair(radius_tpl=2.0, radius_gt=2.4, n_sides=20, n_len=40):
+    z = np.linspace(0.0, 20.0, n_len)
+    pts = np.stack([np.zeros(n_len), np.zeros(n_len), z], axis=1)
+    if hasattr(pv, "lines_from_points"):
+        line = pv.lines_from_points(pts)
+    else:
+        line = _polyline_mesh(pts)
+    tpl = line.tube(radius=radius_tpl, n_sides=n_sides, capping=True)
+    gt = line.tube(radius=radius_gt, n_sides=n_sides + 4, capping=True)
+    if not bool(tpl.is_all_triangles):
+        tpl = tpl.triangulate()
+    if not bool(gt.is_all_triangles):
+        gt = gt.triangulate()
+    return _polyline_mesh(pts), tpl, gt
+
+
+def test_template_scaffold_starts_from_mesh():
+    factory = _make_factory(n_true=64, latent_len=8)
+    cl, tpl, gt = _template_cylinder_pair()
+    data = factory.build_scaffold(cl, vessel_mesh=gt, template_mesh=tpl)
+    origin = data.origin_shift.detach().cpu().numpy().reshape(3)
+    rot = data.pose_R.detach().cpu().numpy().reshape(3, 3)
+    posed = (np.asarray(tpl.points, dtype=np.float64) - origin) @ rot
+    _assert(data.x.size(0) == posed.shape[0], (data.x.size(0), posed.shape[0]))
+    _assert(
+        float(np.linalg.norm(data.x.numpy() - posed, axis=1).max()) < 1e-3,
+        "fine scaffold must be the posed template_mesh",
+    )
+    _assert(hasattr(data, "upsample_idx_mid") and hasattr(data, "upsample_idx_fine"), "knn tables")
+    _assert(data.upsample_idx_mid.size(0) == data.pos_mid.size(0), data.upsample_idx_mid.shape)
+    _assert(data.upsample_idx_fine.size(0) == data.x.size(0), data.upsample_idx_fine.shape)
+    _assert(int(data.n_radial_fine.item()) == 1, data.n_radial_fine)
+    model = _tiny_model()
+    model.eval()
+    loader = DataLoader([data], batch_size=1, follow_batch=FOLLOW_BATCH)
+    batch = next(iter(loader))
+    with torch.no_grad():
+        out = model(batch)
+    _assert(out.x_pred.shape == batch.x.shape, out.x_pred.shape)
+    _assert(torch.isfinite(out.x_pred).all(), "template decoder non-finite")
+
+    d1 = factory.build_scaffold(cl, vessel_mesh=gt, template_mesh=tpl)
+    d2 = factory.build_scaffold(cl, vessel_mesh=gt, template_mesh=tpl)
+    batched = next(iter(DataLoader([d1, d2], batch_size=2, follow_batch=FOLLOW_BATCH)))
+    _assert(int(batched.upsample_idx_mid.max()) < batched.pos_coarse.size(0), "mid knn __inc__")
+    _assert(int(batched.upsample_idx_fine.max()) < batched.pos_mid.size(0), "fine knn __inc__")
+    with torch.no_grad():
+        bout = model(batched)
+    _assert(bout.x_pred.size(0) == batched.x.size(0), bout.x_pred.shape)
+    _assert(torch.isfinite(bout.x_pred).all(), "batched template decoder non-finite")
 
 
 def test_dataset_rejects_rawdata_dirs():
@@ -1417,6 +1479,7 @@ def main():
         test_kl_and_anneal,
         test_pseudo_coords_range,
         test_bilinear_identity_and_wrap,
+        test_knn_weighted_upsample,
         test_bishop_frames_orthonormal,
         test_fps_count,
         test_fps_cuda_path,
@@ -1440,6 +1503,7 @@ def main():
         test_groupid_skips_blanked_bifurcation,
         test_groupid_falls_back_without_arrays,
         test_cleandata_discovery_and_complete,
+        test_template_scaffold_starts_from_mesh,
         test_dataset_rejects_rawdata_dirs,
         test_tree_token_mask,
         test_junction_coupling_edges,

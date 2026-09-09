@@ -61,6 +61,7 @@ from geometry import (
     harmonic_encoding_theta,
     harmonic_encoding_u,
     intrinsic_spline_pseudo_coords,
+    knn_weighted_upsample,
     radial_bias_for_zero_init,
     upsample_branch_concat,
 )
@@ -704,6 +705,14 @@ def _graph_int(value, graph: int) -> int:
     return int(value[graph].item())
 
 
+def _upsample_tensor_names(nr_src_name: str):
+    if nr_src_name == "n_radial_coarse":
+        return "upsample_idx_mid", "upsample_w_mid"
+    if nr_src_name == "n_radial_mid":
+        return "upsample_idx_fine", "upsample_w_fine"
+    return None, None
+
+
 def _upsample_level(
     delta: Tensor,
     data,
@@ -715,6 +724,19 @@ def _upsample_level(
     dst_batch: Tensor,
     num_graphs: int,
 ) -> Tensor:
+    idx_name, w_name = _upsample_tensor_names(nr_src_name)
+    index = getattr(data, idx_name, None) if idx_name else None
+    weight = getattr(data, w_name, None) if w_name else None
+    n_dst = int(dst_batch.size(0))
+    if (
+        index is not None
+        and weight is not None
+        and torch.is_tensor(index)
+        and torch.is_tensor(weight)
+        and index.size(0) == n_dst
+        and weight.size(0) == n_dst
+    ):
+        return knn_weighted_upsample(delta, index, weight)
     if num_graphs == 1:
         nr_s = _graph_int(getattr(data, nr_src_name), 0)
         nr_d = _graph_int(getattr(data, nr_dst_name), 0)

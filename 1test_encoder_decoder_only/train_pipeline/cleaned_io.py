@@ -1,18 +1,14 @@
 """Stage-2 training data from `cleandata/` only.
 
-The five folders are filled offline with:
+Folders (each `{dataset_id}.vtp`):
 
-- uniformly_remeshed: `uniform_remeshing.py` on the original vessels (GT surface)
-- coarse_remeshed: coarser uniform remesh of those GT surfaces
-- template_mesh: `variable_remeshing.py` parent templates
+- uniformly_remeshed: original vessels remeshed finely (GT surface)
+- template_mesh: `variable_remeshing.py` parent templates (decoder baseline)
 - original_centerline: `centerline_creation.py` on uniformly_remeshed
 - template_centerline: `centerline_creation.py` on template_mesh
 
-Each folder contains `{dataset_id}.vtp` files. Training never reads `rawdata/`.
-
-If a derived centerline or coarse remesh is missing at cache time, this module
-calls the same VMTK helpers as `datatransform/template_creation/` (needs
-`vmtk_env`). Loading already-written VTPs does not import VMTK.
+Training never reads `rawdata/`. Missing centerlines can be filled with the
+VMTK helpers in `datatransform/template_creation/` (`vmtk_env`).
 """
 from __future__ import annotations
 
@@ -25,7 +21,6 @@ if _REPO_ROOT not in sys.path:
 
 from aneux_paths import (
     CLEANDATA,
-    CLEANDATA_COARSE,
     CLEANDATA_FOLDER_NAMES,
     CLEANDATA_ORIGINAL_CENTERLINE,
     CLEANDATA_TEMPLATE_CENTERLINE,
@@ -35,14 +30,10 @@ from aneux_paths import (
     ensure_cleandata_layout,
 )
 
-# Coarser isotropic remesh of uniformly_remeshed (mm). Matches the Stage-2
-# review's ~1.5 mm coarse hierarchy, not a second pass of build_parent_tube.
-COARSE_TARGET_EDGE_MM = 1.5
 SAMPLE_KEYS = (
     "dataset_id",
     "vessel_file",
     "centerline_file",
-    "coarse_file",
     "template_mesh_file",
     "template_centerline_file",
 )
@@ -80,12 +71,11 @@ def vtp_path(folder, dataset_id):
 
 
 def cleandata_layout(root=None):
-    """Absolute paths for the five training folders under `root`."""
+    """Absolute paths for the training folders under `root`."""
     base = CLEANDATA if root is None else os.path.abspath(root)
     return {
         "root": base,
         "uniform": os.path.join(base, "uniformly_remeshed"),
-        "coarse": os.path.join(base, "coarse_remeshed"),
         "template_mesh": os.path.join(base, "template_mesh"),
         "original_centerline": os.path.join(base, "original_centerline"),
         "template_centerline": os.path.join(base, "template_centerline"),
@@ -96,7 +86,6 @@ def default_layout():
     return {
         "root": CLEANDATA,
         "uniform": CLEANDATA_UNIFORM,
-        "coarse": CLEANDATA_COARSE,
         "template_mesh": CLEANDATA_TEMPLATE_MESH,
         "original_centerline": CLEANDATA_ORIGINAL_CENTERLINE,
         "template_centerline": CLEANDATA_TEMPLATE_CENTERLINE,
@@ -108,7 +97,6 @@ def sample_record(dataset_id, layout):
         "dataset_id": str(dataset_id),
         "vessel_file": vtp_path(layout["uniform"], dataset_id),
         "centerline_file": vtp_path(layout["original_centerline"], dataset_id),
-        "coarse_file": vtp_path(layout["coarse"], dataset_id),
         "template_mesh_file": vtp_path(layout["template_mesh"], dataset_id),
         "template_centerline_file": vtp_path(layout["template_centerline"], dataset_id),
     }
@@ -119,7 +107,7 @@ def _has_file(path):
 
 
 def sample_is_complete(sample, require_templates=True):
-    needed = ["vessel_file", "centerline_file", "coarse_file"]
+    needed = ["vessel_file", "centerline_file"]
     if require_templates:
         needed.extend(["template_mesh_file", "template_centerline_file"])
     return all(_has_file(sample.get(key)) for key in needed)
@@ -172,26 +160,10 @@ def write_centerline(dataset_id, vessel_vtp, output_dir):
     )
 
 
-def write_coarse_from_uniform(dataset_id, uniform_vtp, output_dir, target_edge_length=COARSE_TARGET_EDGE_MM):
-    """Coarser isotropic remesh of a uniformly_remeshed surface (not from rawdata)."""
-    import pyvista as pv
-
-    vp = _vessel_pipeline()
-    os.makedirs(output_dir, exist_ok=True)
-    mesh = pv.read(uniform_vtp)
-    remeshed = vp.remesh_surface_isotropically(
-        mesh, target_edge_length=float(target_edge_length)
-    )
-    final_surface, _n_regions = vp.finalize_surface(remeshed)
-    out_file = vtp_path(output_dir, dataset_id)
-    vp.save_polydata(final_surface, out_file)
-    return out_file
-
-
 def ensure_sample_derived(sample, overwrite=False):
-    """Fill missing original/template centerlines and coarse remesh in place.
+    """Fill missing original/template centerlines in place.
 
-    Sources must already live in cleandata (uniform GT, optional template mesh).
+    Sources must already live in cleandata (uniform GT and template mesh).
     Never reads rawdata.
     """
     reject_rawdata_paths(sample)
@@ -206,12 +178,6 @@ def ensure_sample_derived(sample, overwrite=False):
     cl_path = sample["centerline_file"]
     if overwrite or not _has_file(cl_path):
         write_centerline(dataset_id, sample["vessel_file"], os.path.dirname(cl_path))
-
-    coarse_path = sample.get("coarse_file")
-    if coarse_path and (overwrite or not _has_file(coarse_path)):
-        write_coarse_from_uniform(
-            dataset_id, sample["vessel_file"], os.path.dirname(coarse_path)
-        )
 
     tpl = sample.get("template_mesh_file")
     tpl_cl = sample.get("template_centerline_file")
@@ -229,8 +195,9 @@ def list_cleandata_samples(
     """Every `{id}.vtp` already present under `cleandata`.
 
     The folder is pre-curated; this does not filter by clinical location or CSV.
-    A sample is loadable when its required meshes exist (all five folders by
-    default). Incomplete ids are reported, not silently discarded as 'unwanted'.
+    A sample is loadable when GT, original centerline, template mesh and
+    template centerline all exist. Incomplete ids are reported, not dropped as
+    unwanted.
     """
     layout = cleandata_layout(root)
     ensure_cleandata_layout(layout["root"])
@@ -240,7 +207,6 @@ def list_cleandata_samples(
         candidate_ids |= list_vtp_ids(layout["template_mesh"])
     candidate_ids |= list_vtp_ids(layout["original_centerline"])
     candidate_ids |= list_vtp_ids(layout["template_centerline"])
-    candidate_ids |= list_vtp_ids(layout["coarse"])
 
     samples = []
     incomplete = []
@@ -261,7 +227,6 @@ def summarize_cleandata(root=None):
     layout = cleandata_layout(root)
     counts = {name: len(list_vtp_ids(layout[key])) for key, name in (
         ("uniform", "uniformly_remeshed"),
-        ("coarse", "coarse_remeshed"),
         ("template_mesh", "template_mesh"),
         ("original_centerline", "original_centerline"),
         ("template_centerline", "template_centerline"),
@@ -280,7 +245,6 @@ def assert_not_rawdata_dir(*paths):
 # Re-export folder names so callers do not hard-code the typo-prone layout.
 FOLDER_NAMES = CLEANDATA_FOLDER_NAMES
 __all__ = [
-    "COARSE_TARGET_EDGE_MM",
     "FOLDER_NAMES",
     "SAMPLE_KEYS",
     "assert_not_rawdata_dir",
@@ -297,5 +261,4 @@ __all__ = [
     "vtp_path",
     "vtp_stem",
     "write_centerline",
-    "write_coarse_from_uniform",
 ]

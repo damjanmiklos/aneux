@@ -204,6 +204,29 @@ def r_star_grid_stats(r_star, valid, branch_nl, n_radial):
     return dth, du, ring_med
 
 
+def nearest_normal_offset_r_star(pos, normal, gt_pts, tube_radius=TUBE_RADIUS_MM):
+    """r* = R + n · (nearest GT − scaffold). Matches `composed_radius` at identity."""
+    pos = np.asarray(pos, dtype=np.float64).reshape(-1, 3)
+    normal = np.asarray(normal, dtype=np.float64).reshape(-1, 3)
+    n = int(pos.shape[0])
+    out = empty_r_star(n)
+    if n == 0:
+        return out
+    gt_pts = np.asarray(gt_pts, dtype=np.float64).reshape(-1, 3) if gt_pts is not None else None
+    if gt_pts is None or gt_pts.shape[0] == 0:
+        return out
+    nn = np.linalg.norm(normal, axis=1, keepdims=True)
+    normal = normal / np.clip(nn, 1e-12, None)
+    _, idx = cKDTree(gt_pts).query(pos, k=1, workers=1)
+    idx = np.asarray(idx, dtype=np.int64).reshape(-1)
+    offset = ((gt_pts[idx] - pos) * normal).sum(axis=1)
+    r_star = float(tube_radius) + offset
+    out["r_star"] = r_star
+    out["valid"] = np.ones(n, dtype=bool)
+    out["ring_med"] = r_star.copy()
+    return out
+
+
 def transform_vessel_mesh(mesh, origin, rotation):
     """Apply the same COM-center + canonical rotation as the scaffold (in memory)."""
     import pyvista as pv
