@@ -237,8 +237,8 @@ def recompute_point_normals(surface, auto_orient=False):
     return to_vtk_poly(normals.GetOutput())
 
 
-def apply_taubin_smoothing(surface_mesh, pass_band=1.0, n_iter=15, feature_angle=45.0):
-    """Volume-preserving Taubin smoothing. Pass band 1.0 matches hemoMesh's vmtkSurfaceSmoothing default."""
+def apply_taubin_smoothing(surface_mesh, pass_band=0.1, n_iter=15, feature_angle=45.0):
+    """Volume-preserving Taubin smoothing. Pass band 0.1 is a strong low-pass (highly smoothed)."""
     smoother = vtk.vtkWindowedSincPolyDataFilter()
     smoother.SetInputData(to_vtk_poly(surface_mesh))
     smoother.SetNumberOfIterations(n_iter)
