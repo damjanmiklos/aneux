@@ -49,6 +49,11 @@ tensorboard/
 datatransform/cleaned_data/
 datatransform/template_creation/output*/
 
+# Training-ready cleaned meshes (keep folder placeholders)
+cleandata/**
+!cleandata/**/
+!cleandata/**/.gitkeep
+
 # Local agent troubleshooting (never commit)
 scratch/
 

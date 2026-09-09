@@ -2,7 +2,7 @@
 
 Resolves against this file's location so scripts do not depend on cwd,
 OneDrive copies, or the Linux nested `rawdata/rawdata` layout.
-`rawdata/` is read-only input.
+`rawdata/` is read-only input. Stage-2 training reads only `cleandata/`.
 """
 import os
 
@@ -44,3 +44,40 @@ EXPERIMENT_DIR = os.path.join(REPO_ROOT, "1test_encoder_decoder_only")
 EXPERIMENT_OUTPUT = os.path.join(EXPERIMENT_DIR, "output")
 EXPERIMENT_CACHE = os.path.join(EXPERIMENT_DIR, "tube_cache")
 EXTRA_CENTERLINES = os.path.join(EXPERIMENT_DIR, "centerlines")
+
+# Training-ready meshes. Each subfolder holds only `{dataset_id}.vtp` files.
+# uniformly_remeshed: original vessels remeshed finely (GT surface).
+# coarse_remeshed: coarser uniform remesh of those GT surfaces.
+# template_mesh: parent templates from variable_remeshing.py.
+# original_centerline: centerline_creation.py on uniformly_remeshed.
+# template_centerline: centerline_creation.py on template_mesh.
+CLEANDATA = os.path.join(REPO_ROOT, "cleandata")
+CLEANDATA_UNIFORM = os.path.join(CLEANDATA, "uniformly_remeshed")
+CLEANDATA_COARSE = os.path.join(CLEANDATA, "coarse_remeshed")
+CLEANDATA_TEMPLATE_MESH = os.path.join(CLEANDATA, "template_mesh")
+CLEANDATA_ORIGINAL_CENTERLINE = os.path.join(CLEANDATA, "original_centerline")
+CLEANDATA_TEMPLATE_CENTERLINE = os.path.join(CLEANDATA, "template_centerline")
+CLEANDATA_SUBDIRS = (
+    CLEANDATA_UNIFORM,
+    CLEANDATA_COARSE,
+    CLEANDATA_TEMPLATE_MESH,
+    CLEANDATA_ORIGINAL_CENTERLINE,
+    CLEANDATA_TEMPLATE_CENTERLINE,
+)
+CLEANDATA_FOLDER_NAMES = (
+    "uniformly_remeshed",
+    "coarse_remeshed",
+    "template_mesh",
+    "original_centerline",
+    "template_centerline",
+)
+
+
+def ensure_cleandata_layout(root=None):
+    """Create the five training data folders if they are missing."""
+    base = CLEANDATA if root is None else os.path.abspath(root)
+    os.makedirs(base, exist_ok=True)
+    folders = [os.path.join(base, name) for name in CLEANDATA_FOLDER_NAMES]
+    for path in folders:
+        os.makedirs(path, exist_ok=True)
+    return base

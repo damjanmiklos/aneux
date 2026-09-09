@@ -33,7 +33,7 @@ TUBE_RADIUS_MM = 2.0
 N_TRUE = 16384
 N_TRUE_FAR_FRAC = 0.25
 FAR_CL_MARGIN_MM = 1.0
-CACHE_VERSION = 7
+CACHE_VERSION = 8
 
 # (n_length, n_radial) per hierarchy level
 LEVEL_COARSE = (40, 6)

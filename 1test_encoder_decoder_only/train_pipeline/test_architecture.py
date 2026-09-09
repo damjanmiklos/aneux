@@ -51,7 +51,12 @@ from dataset import (
     allocate_ring_counts,
     allocate_token_counts,
     couple_ostium_edges,
+    extract_groupid_tracts,
     extract_unique_tracts,
+)
+from cleaned_io import (
+    list_cleandata_samples,
+    sample_is_complete,
 )
 from geometry import (
     bilinear_cylindrical_upsample,
@@ -111,6 +116,9 @@ def _make_factory(radius=2.0, n_true=64, hierarchy=TINY_HIERARCHY, latent_len=8)
     ds.n_radial = int(ds.hierarchy[-1][1])
     ds.samples = []
     ds.cache_dir = None
+    ds.ensure_derived = False
+    ds.require_templates = False
+    ds.cleandata_root = None
     return ds
 
 
@@ -660,6 +668,130 @@ def test_unique_tracts_from_overlapping_paths():
     _assert(len(junctions) >= 1, "expected a junction node")
 
 
+def _polyline_with_groups(pts, group_ids, blanking=None):
+    mesh = _polyline_mesh(pts)
+    n = int(mesh.n_points)
+    gids = np.asarray(group_ids, dtype=np.float64).reshape(-1)
+    _assert(len(gids) == n, f"GroupIds {len(gids)} vs points {n}")
+    mesh.point_data["GroupIds"] = gids
+    if blanking is None:
+        blanking = np.zeros(n, dtype=np.float64)
+    mesh.point_data["Blanking"] = np.asarray(blanking, dtype=np.float64).reshape(-1)
+    return mesh
+
+
+def test_groupid_tracts_one_polyline_per_group():
+    parent, child_a, child_b = (
+        np.stack([np.zeros(12), np.zeros(12), np.linspace(0.0, 12.0, 12)], axis=1),
+        np.stack([np.linspace(0.0, 8.0, 10), np.zeros(10), np.full(10, 12.0)], axis=1),
+        np.stack([np.zeros(10), np.linspace(0.0, 8.0, 10), np.full(10, 12.0)], axis=1),
+    )
+    meshes = [
+        _polyline_with_groups(parent, np.zeros(len(parent))),
+        _polyline_with_groups(child_a, np.ones(len(child_a))),
+        _polyline_with_groups(child_b, np.full(len(child_b), 2.0)),
+    ]
+    mesh = meshes[0]
+    for extra in meshes[1:]:
+        mesh = mesh.merge(extra)
+    tracts, endpoints, junctions = extract_groupid_tracts(mesh)
+    _assert(len(tracts) == 3, f"expected 3 GroupId tracts, got {len(tracts)}")
+    _assert(len(endpoints) == 3, endpoints)
+    _assert(len(junctions) >= 1, "expected a snapped junction")
+
+
+def test_groupid_tracts_collapses_duplicate_parent():
+    path1, path2 = _y_paths()
+    n_parent = 12
+    g1 = np.concatenate([np.zeros(n_parent), np.ones(len(path1) - n_parent)])
+    g2 = np.concatenate([np.zeros(n_parent), np.full(len(path2) - n_parent, 2.0)])
+    mesh = _polyline_with_groups(path1, g1).merge(_polyline_with_groups(path2, g2))
+    tracts, endpoints, junctions = extract_groupid_tracts(mesh)
+    _assert(len(tracts) == 3, f"duplicate parent GroupId should collapse, got {len(tracts)}")
+    _assert(len(junctions) >= 1, "expected a junction after endpoint snap")
+
+
+def test_groupid_skips_blanked_bifurcation():
+    parent = np.stack([np.zeros(8), np.zeros(8), np.linspace(0.0, 8.0, 8)], axis=1)
+    blank = np.stack([np.zeros(4), np.zeros(4), np.linspace(8.0, 8.4, 4)], axis=1)
+    child = np.stack([np.linspace(0.0, 6.0, 8), np.zeros(8), np.full(8, 8.4)], axis=1)
+    mesh = (
+        _polyline_with_groups(parent, np.zeros(len(parent)))
+        .merge(_polyline_with_groups(blank, np.full(len(blank), 9.0), blanking=np.ones(len(blank))))
+        .merge(_polyline_with_groups(child, np.ones(len(child))))
+    )
+    tracts, endpoints, _junctions = extract_groupid_tracts(mesh)
+    _assert(len(tracts) == 2, f"blanked group should be dropped, got {len(tracts)}")
+    _assert(len(endpoints) == 2, endpoints)
+
+
+def test_groupid_falls_back_without_arrays():
+    mesh = _polylines_mesh(list(_y_paths()))
+    tracts_g, _, _ = extract_groupid_tracts(mesh)
+    tracts_u, _, _ = extract_unique_tracts(mesh)
+    _assert(len(tracts_g) == len(tracts_u), (len(tracts_g), len(tracts_u)))
+
+
+def _write_dummy_vtp(path, n=6):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    rng = np.random.RandomState(0)
+    pv.PolyData(rng.randn(n, 3)).save(path)
+
+
+def test_cleandata_discovery_and_complete():
+    root = tempfile.mkdtemp(prefix="aneux_cleandata_")
+    try:
+        layout_dirs = {
+            "uniformly_remeshed": os.path.join(root, "uniformly_remeshed"),
+            "coarse_remeshed": os.path.join(root, "coarse_remeshed"),
+            "template_mesh": os.path.join(root, "template_mesh"),
+            "original_centerline": os.path.join(root, "original_centerline"),
+            "template_centerline": os.path.join(root, "template_centerline"),
+        }
+        for folder in layout_dirs.values():
+            os.makedirs(folder, exist_ok=True)
+        for folder in layout_dirs.values():
+            _write_dummy_vtp(os.path.join(folder, "CASE01.vtp"))
+        _write_dummy_vtp(os.path.join(layout_dirs["uniformly_remeshed"], "CASE02.vtp"))
+        complete = list_cleandata_samples(root=root, require_templates=True)
+        _assert([s["dataset_id"] for s in complete] == ["CASE01"], complete)
+        rec = complete[0]
+        _assert(sample_is_complete(rec, require_templates=True), rec)
+        _assert(os.path.basename(os.path.dirname(rec["vessel_file"])) == "uniformly_remeshed", rec["vessel_file"])
+        _assert(os.path.basename(os.path.dirname(rec["centerline_file"])) == "original_centerline", rec["centerline_file"])
+        _assert(os.path.basename(os.path.dirname(rec["template_mesh_file"])) == "template_mesh", rec["template_mesh_file"])
+        ds = AneurysmDataset(
+            cleandata_root=root,
+            cache_dir=os.path.join(root, "cache"),
+            quiet=True,
+        )
+        _assert(len(ds) == 1, len(ds))
+        _assert(ds.samples[0]["dataset_id"] == "CASE01", ds.samples[0])
+        _assert(ds.samples[0]["vessel_file"].endswith("CASE01.vtp"), ds.samples[0]["vessel_file"])
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_dataset_rejects_rawdata_dirs():
+    tmp = tempfile.mkdtemp(prefix="aneux_raw_reject_")
+    try:
+        vessel = os.path.join(tmp, "rawdata", "vessels")
+        centerline = os.path.join(tmp, "rawdata", "centerlines")
+        raised = False
+        try:
+            AneurysmDataset(
+                vtp_vessel_dir=vessel,
+                vtp_centerline_dir=centerline,
+                cache_dir=os.path.join(tmp, "cache"),
+                quiet=True,
+            )
+        except ValueError as exc:
+            raised = "rawdata" in str(exc).lower()
+        _assert(raised, "explicit rawdata dirs must be rejected")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_tree_token_mask():
     factory = _make_factory(latent_len=16)
     paths = _y_paths()
@@ -933,19 +1065,20 @@ def test_synthetic_data_fp32():
     _assert(not hasattr(data, "cl_pos") or getattr(data, "cl_pos") is None, "cl_pos should be gone")
 
 
-def test_stratified_split_keeps_train():
-    from aneuxai import stratified_split
+def test_train_val_split_covers_all():
+    from aneuxai import train_val_split
 
     class Dummy:
-        samples = [{"location": "ICA pcom"}] * 4 + [{"location": "ICA oph"}]
+        samples = [{"dataset_id": f"c{i}"} for i in range(5)]
 
         def __len__(self):
             return len(self.samples)
 
-    train, val = stratified_split(Dummy(), 0.15, 0)
-    _assert(len(train) >= 1 and len(val) >= 1, (len(train), len(val)))
-    oph = [i for i, s in enumerate(Dummy.samples) if s["location"] == "ICA oph"][0]
-    _assert(oph in train.indices, "singleton location should stay in train")
+    train, val = train_val_split(Dummy(), 0.2, 0)
+    _assert(len(train) + len(val) == 5, (len(train), len(val)))
+    _assert(len(val) >= 1 and len(train) >= 1, (len(train), len(val)))
+    _assert(set(train.indices).isdisjoint(val.indices), (train.indices, val.indices))
+    _assert(set(train.indices) | set(val.indices) == set(range(5)), (train.indices, val.indices))
 
 
 def test_chamfer_weight_cap():
@@ -1302,6 +1435,12 @@ def main():
         test_spline_conv_backend,
         test_dirichlet_zero_on_rigid,
         test_unique_tracts_from_overlapping_paths,
+        test_groupid_tracts_one_polyline_per_group,
+        test_groupid_tracts_collapses_duplicate_parent,
+        test_groupid_skips_blanked_bifurcation,
+        test_groupid_falls_back_without_arrays,
+        test_cleandata_discovery_and_complete,
+        test_dataset_rejects_rawdata_dirs,
         test_tree_token_mask,
         test_junction_coupling_edges,
         test_ostium_couple_linear_memory,
@@ -1310,7 +1449,7 @@ def main():
         test_cache_hit,
         test_batch_inc,
         test_scaffold_decode_without_vessel,
-        test_stratified_split_keeps_train,
+        test_train_val_split_covers_all,
         test_chamfer_weight_cap,
         test_huber_and_radial_loss,
         test_smoothness_edge_weights,

@@ -17,10 +17,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..")))
 sys.path.insert(0, os.path.join(_HERE, "train_pipeline"))
 
 from aneux_paths import (
-    CSV_PATH,
-    VESSELS_AREA005,
-    CENTERLINES,
-    EXTRA_CENTERLINES,
+    CLEANDATA,
     EXPERIMENT_OUTPUT,
     EXPERIMENT_CACHE,
 )
@@ -42,9 +39,7 @@ from train import losses_from_output, weighted_total
 # --- CONFIGURATION ---
 OUTPUT_DIR = EXPERIMENT_OUTPUT
 CACHE_DIR = EXPERIMENT_CACHE
-VESSEL_DIR = VESSELS_AREA005
-CENTERLINE_DIR = CENTERLINES
-EXTRA_CENTERLINE_DIR = EXTRA_CENTERLINES
+CLEANDATA_ROOT = CLEANDATA
 TUBE_RADIUS = TUBE_RADIUS_MM
 N_LENGTH = HIERARCHY_LEVELS[-1][0]
 N_RADIAL = HIERARCHY_LEVELS[-1][1]
@@ -129,15 +124,13 @@ def tensor_to_vtp(x_pred_tensor, original_faces, output_filepath):
 def evaluate_all_samples():
     print("Loading dataset...")
     dataset = AneurysmDataset(
-        csv_path=CSV_PATH,
-        vtp_vessel_dir=VESSEL_DIR,
-        vtp_centerline_dir=CENTERLINE_DIR,
         tube_radius=TUBE_RADIUS,
         n_length=N_LENGTH,
         n_radial=N_RADIAL,
-        extra_centerline_dir=EXTRA_CENTERLINE_DIR,
         cache_dir=CACHE_DIR,
         n_true=N_TRUE,
+        cleandata_root=CLEANDATA_ROOT,
+        require_templates=True,
     )
     
     print(f"Loading split from {SPLIT_FILE}...")
@@ -208,15 +201,13 @@ def generate_vtp_for_sample(target_patient_id, output_filename=None):
         
     print(f"Loading dataset to find {target_patient_id}...")
     dataset = AneurysmDataset(
-        csv_path=CSV_PATH,
-        vtp_vessel_dir=VESSEL_DIR,
-        vtp_centerline_dir=CENTERLINE_DIR,
         tube_radius=TUBE_RADIUS,
         n_length=N_LENGTH,
         n_radial=N_RADIAL,
-        extra_centerline_dir=EXTRA_CENTERLINE_DIR,
         cache_dir=CACHE_DIR,
         n_true=N_TRUE,
+        cleandata_root=CLEANDATA_ROOT,
+        require_templates=True,
     )
     
     # Find the index of the requested patient

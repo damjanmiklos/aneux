@@ -3,7 +3,6 @@ import os
 from collections import defaultdict, deque
 
 import numpy as np
-import pandas as pd
 import pyvista as pv
 import torch
 from scipy.interpolate import splprep, splev
@@ -26,8 +25,23 @@ from config import (
     N_TRUE_FAR_FRAC,
     TUBE_RADIUS_MM,
 )
+from cleaned_io import (
+    assert_not_rawdata_dir,
+    ensure_sample_derived,
+    list_cleandata_samples,
+    list_vtp_ids,
+    reject_rawdata_paths,
+    sample_has_sources,
+    sample_is_complete,
+    summarize_cleandata,
+    vtp_path,
+)
 from geometry import fps_metric, point_to_polyline_dist
 from raycast import closest_cell_normals, compute_level_r_star, empty_r_star, transform_vessel_mesh
+
+# Endpoint merge distance for one-polyline-per-GroupId tracts. VMTK blanked
+# bifurcation blobs are dropped, so daughter ends sit ~1 MISR apart.
+GROUPID_ENDPOINT_SNAP_MM = 1.0
 
 
 def _dedup_polyline(pts):
@@ -424,6 +438,189 @@ def extract_unique_tracts(centerline_mesh, snap=1e-4):
     return list(xyz_tracts), endpoints, junctions
 
 
+def _point_data_array(mesh, name):
+    pdata = getattr(mesh, "point_data", None)
+    if pdata is not None and name in pdata:
+        arr = np.asarray(pdata[name])
+        if arr.size == 0:
+            return None
+        return arr.reshape(arr.shape[0], -1)[:, 0]
+    getter = getattr(mesh, "GetPointData", None)
+    if getter is None:
+        return None
+    vtk_arr = getter().GetArray(name)
+    if vtk_arr is None:
+        return None
+    n = int(vtk_arr.GetNumberOfTuples())
+    if n <= 0:
+        return None
+    out = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        out[i] = float(vtk_arr.GetComponent(i, 0))
+    return out
+
+
+def _cell_data_array(mesh, name):
+    cdata = getattr(mesh, "cell_data", None)
+    if cdata is not None and name in cdata:
+        arr = np.asarray(cdata[name])
+        if arr.size == 0:
+            return None
+        return arr.reshape(arr.shape[0], -1)[:, 0]
+    getter = getattr(mesh, "GetCellData", None)
+    if getter is None:
+        return None
+    vtk_arr = getter().GetArray(name)
+    if vtk_arr is None:
+        return None
+    n = int(vtk_arr.GetNumberOfTuples())
+    if n <= 0:
+        return None
+    out = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        out[i] = float(vtk_arr.GetComponent(i, 0))
+    return out
+
+
+def _iter_polyline_point_ids(mesh):
+    n_cells = int(getattr(mesh, "n_cells", 0) or 0)
+    if n_cells == 0 and hasattr(mesh, "GetNumberOfCells"):
+        n_cells = int(mesh.GetNumberOfCells())
+    for ci in range(n_cells):
+        cell = mesh.GetCell(ci)
+        n_pts = int(cell.GetNumberOfPoints())
+        if n_pts < 2:
+            continue
+        yield ci, [int(cell.GetPointId(j)) for j in range(n_pts)]
+
+
+def _longest_unique_polyline(pieces, snap=5e-2):
+    """Collapse duplicate VMTK copies of one GroupId into a single polyline."""
+    chunks = []
+    line_ids = []
+    offset = 0
+    for piece in pieces:
+        pts = _dedup_polyline(piece)
+        if len(pts) < 2:
+            continue
+        n = len(pts)
+        chunks.append(pts)
+        line_ids.append(np.concatenate(([n], np.arange(offset, offset + n, dtype=np.int64))))
+        offset += n
+    if not chunks:
+        return None
+    points = np.concatenate(chunks, axis=0)
+    lines = np.concatenate(line_ids)
+    mesh = pv.PolyData(points, lines=lines)
+    tracts, _, _ = extract_unique_tracts(mesh, snap=snap)
+    if not tracts:
+        return None
+    return max(tracts, key=_arc_len)
+
+
+def _snap_tract_endpoints(tracts, snap_mm=GROUPID_ENDPOINT_SNAP_MM):
+    """Assign shared node ids to tract ends that lie within snap_mm."""
+    snap_mm = float(snap_mm)
+    clusters = []
+    endpoints = []
+    for pts in tracts:
+        ids = []
+        for xyz in (pts[0], pts[-1]):
+            xyz = np.asarray(xyz, dtype=np.float64).reshape(3)
+            assigned = None
+            for cid, cxyz in enumerate(clusters):
+                if float(np.linalg.norm(xyz - cxyz)) <= snap_mm:
+                    assigned = cid
+                    clusters[cid] = 0.5 * (cxyz + xyz)
+                    break
+            if assigned is None:
+                assigned = len(clusters)
+                clusters.append(xyz.copy())
+            ids.append(assigned)
+        endpoints.append((int(ids[0]), int(ids[1])))
+    deg = defaultdict(int)
+    for a, b in endpoints:
+        deg[a] += 1
+        deg[b] += 1
+    junctions = [n for n, d in deg.items() if d > 2]
+    return endpoints, junctions
+
+
+def extract_groupid_tracts(centerline_mesh, snap=1e-4, endpoint_snap_mm=GROUPID_ENDPOINT_SNAP_MM):
+    """One representative polyline per VMTK GroupId from centerline_creation.py.
+
+    `vmtkBranchExtractor` tags every point with GroupIds / Blanking. Parent
+    segments still appear once per source→target path, but they share a GroupId.
+    Blanking==1 groups are bifurcation blobs and are dropped. Endpoints of the
+    remaining groups are snapped so `_orient_tracts` can rebuild the tree.
+
+    Meshes without GroupIds (synthetic tests) fall back to `extract_unique_tracts`.
+    """
+    group_pt = _point_data_array(centerline_mesh, "GroupIds")
+    group_cell = _cell_data_array(centerline_mesh, "GroupIds")
+    if group_pt is None and group_cell is None:
+        return extract_unique_tracts(centerline_mesh, snap=snap)
+
+    blank_pt = _point_data_array(centerline_mesh, "Blanking")
+    blank_cell = _cell_data_array(centerline_mesh, "Blanking")
+    points = _as_f64(centerline_mesh.points)
+    by_group = defaultdict(list)
+
+    polylines = list(_iter_polyline_point_ids(centerline_mesh))
+    if not polylines:
+        compact = list(range(len(points)))
+        polylines = [(0, compact)] if len(compact) >= 2 else []
+
+    for ci, ids in polylines:
+        runs = []
+        if group_pt is not None:
+            run_ids = []
+            run_gid = None
+            run_blank = False
+            for pid in ids:
+                gid = int(round(float(group_pt[pid])))
+                blanked = False
+                if blank_pt is not None:
+                    blanked = float(blank_pt[pid]) > 0.5
+                if run_ids and (gid != run_gid or blanked != run_blank):
+                    runs.append((run_gid, run_blank, run_ids))
+                    run_ids = []
+                run_gid = gid
+                run_blank = blanked
+                run_ids.append(pid)
+            if run_ids:
+                runs.append((run_gid, run_blank, run_ids))
+        elif group_cell is not None and ci < len(group_cell):
+            gid = int(round(float(group_cell[ci])))
+            blanked = False
+            if blank_cell is not None and ci < len(blank_cell):
+                blanked = float(blank_cell[ci]) > 0.5
+            runs.append((gid, blanked, ids))
+        else:
+            continue
+        for gid, blanked, run_ids in runs:
+            if blanked or len(run_ids) < 2:
+                continue
+            pts = _dedup_polyline(points[np.asarray(run_ids, dtype=np.int64)])
+            if len(pts) < 2:
+                continue
+            by_group[gid].append(pts)
+
+    if not by_group:
+        return extract_unique_tracts(centerline_mesh, snap=snap)
+
+    tracts = []
+    for gid in sorted(by_group):
+        pts = _longest_unique_polyline(by_group[gid])
+        if pts is not None and len(pts) >= 2:
+            tracts.append(pts)
+    if not tracts:
+        return extract_unique_tracts(centerline_mesh, snap=snap)
+
+    endpoints, junctions = _snap_tract_endpoints(tracts, snap_mm=endpoint_snap_mm)
+    return tracts, endpoints, junctions
+
+
 def _choose_inlet(tracts, endpoints):
     """Parent tract = longest arm of the highest-degree node; inlet is that arm's leaf."""
     counts = defaultdict(int)
@@ -522,9 +719,8 @@ def _canonical_pose(inlet_pts):
 class AneurysmDataset(Dataset):
     def __init__(
         self,
-        csv_path,
-        vtp_vessel_dir,
-        vtp_centerline_dir,
+        vtp_vessel_dir=None,
+        vtp_centerline_dir=None,
         tube_radius=TUBE_RADIUS_MM,
         n_length=None,
         n_radial=None,
@@ -534,20 +730,30 @@ class AneurysmDataset(Dataset):
         hierarchy=HIERARCHY_LEVELS,
         latent_len=LATENT_LEN,
         quiet=False,
+        cleandata_root=None,
+        require_templates=True,
+        ensure_derived=False,
     ):
         super().__init__()
+        if extra_centerline_dir:
+            raise ValueError(
+                "extra_centerline_dir is removed; Stage 2 reads original_centerline "
+                "from cleandata/ (or generates it with centerline_creation.py)."
+            )
         self._init_kwargs = dict(
-            csv_path=csv_path,
             vtp_vessel_dir=vtp_vessel_dir,
             vtp_centerline_dir=vtp_centerline_dir,
             tube_radius=tube_radius,
             n_length=n_length,
             n_radial=n_radial,
-            extra_centerline_dir=extra_centerline_dir,
+            extra_centerline_dir=None,
             cache_dir=cache_dir,
             n_true=n_true,
             hierarchy=tuple(tuple(lv) for lv in hierarchy),
             latent_len=latent_len,
+            cleandata_root=cleandata_root,
+            require_templates=require_templates,
+            ensure_derived=ensure_derived,
         )
         self.tube_radius = float(tube_radius)
         self.n_true = int(n_true)
@@ -562,6 +768,9 @@ class AneurysmDataset(Dataset):
             self.hierarchy = self.hierarchy[:-1] + (tuple(fine),)
         self.n_length = int(self.hierarchy[-1][0])
         self.n_radial = int(self.hierarchy[-1][1])
+        self.cleandata_root = cleandata_root
+        self.require_templates = bool(require_templates)
+        self.ensure_derived = bool(ensure_derived)
 
         if cache_dir is None:
             cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tube_cache")
@@ -569,35 +778,86 @@ class AneurysmDataset(Dataset):
         if self.cache_dir:
             os.makedirs(self.cache_dir, exist_ok=True)
 
-        df = pd.read_csv(csv_path)
-        locations = ["ICA pcom", "ICA oph", "ICA cav", "ICA bif"]
-        df_filtered = df[df["location"].isin(locations)]
+        self.samples = self._discover_samples(
+            vtp_vessel_dir=vtp_vessel_dir,
+            vtp_centerline_dir=vtp_centerline_dir,
+            quiet=quiet,
+        )
 
-        self.samples = []
-        n_missing = 0
-        for _, row in df_filtered.iterrows():
-            dataset_id = row["dataset"]
-            vessel_file = os.path.join(vtp_vessel_dir, f"{dataset_id}.vtp")
-            centerline_file = os.path.join(vtp_centerline_dir, f"{dataset_id}.vtp")
-
-            if not os.path.exists(centerline_file) and extra_centerline_dir:
-                centerline_file = os.path.join(extra_centerline_dir, f"{dataset_id}.vtp")
-
-            if os.path.exists(vessel_file) and os.path.exists(centerline_file):
-                self.samples.append({
-                    "dataset_id": dataset_id,
-                    "location": row["location"],
-                    "vessel_file": vessel_file,
-                    "centerline_file": centerline_file,
-                })
-            else:
-                n_missing += 1
-
-        if not quiet:
-            print(
-                f"AneurysmDataset: {len(df)} CSV rows, {len(df_filtered)} ICA-filtered, "
-                f"{len(self.samples)} with vessel+centerline, {n_missing} skipped (missing files)"
+    def _discover_samples(self, vtp_vessel_dir, vtp_centerline_dir, quiet=False):
+        if (vtp_vessel_dir is None) ^ (vtp_centerline_dir is None):
+            raise ValueError("Pass both vtp_vessel_dir and vtp_centerline_dir, or neither.")
+        if vtp_vessel_dir is not None:
+            assert_not_rawdata_dir(vtp_vessel_dir, vtp_centerline_dir)
+            return self._discover_from_dirs(
+                vtp_vessel_dir, vtp_centerline_dir, quiet=quiet
             )
+        complete, incomplete = list_cleandata_samples(
+            root=self.cleandata_root,
+            require_templates=self.require_templates,
+            include_incomplete=True,
+        )
+        if self.ensure_derived:
+            usable = []
+            skipped = []
+            for rec in complete + incomplete:
+                if sample_has_sources(rec, require_templates=self.require_templates):
+                    usable.append(rec)
+                else:
+                    skipped.append(rec["dataset_id"])
+            samples = usable
+            n_incomplete = len(incomplete)
+        else:
+            samples = complete
+            n_incomplete = len(incomplete)
+            skipped = [rec["dataset_id"] for rec in incomplete]
+        if not quiet:
+            _, counts = summarize_cleandata(self.cleandata_root)
+            count_txt = ", ".join(f"{k}={v}" for k, v in counts.items())
+            extra = ""
+            if n_incomplete:
+                extra = (
+                    f", {n_incomplete} incomplete file sets"
+                    + (
+                        " (will run centerline_creation / uniform remesh at cache time)"
+                        if self.ensure_derived
+                        else " (pass ensure_derived=True under vmtk_env to fill them)"
+                    )
+                )
+            print(
+                f"AneurysmDataset: cleandata ({count_txt}); "
+                f"{len(samples)} samples{extra}"
+            )
+            if skipped and not self.ensure_derived and n_incomplete <= 12:
+                print("  incomplete ids: " + ", ".join(skipped))
+        return samples
+
+    def _discover_from_dirs(self, vtp_vessel_dir, vtp_centerline_dir, quiet=False):
+        """Explicit GT+centerline folders (tests / debug). Still rejects rawdata."""
+        ids = list_vtp_ids(vtp_vessel_dir) | list_vtp_ids(vtp_centerline_dir)
+        samples = []
+        missing = []
+        for dataset_id in sorted(ids):
+            rec = {
+                "dataset_id": dataset_id,
+                "vessel_file": vtp_path(vtp_vessel_dir, dataset_id),
+                "centerline_file": vtp_path(vtp_centerline_dir, dataset_id),
+                "coarse_file": None,
+                "template_mesh_file": None,
+                "template_centerline_file": None,
+            }
+            reject_rawdata_paths(rec)
+            if os.path.isfile(rec["vessel_file"]) and os.path.isfile(rec["centerline_file"]):
+                samples.append(rec)
+            else:
+                missing.append(dataset_id)
+        if not quiet:
+            extra = f", {len(missing)} missing a vessel or centerline file" if missing else ""
+            print(
+                f"AneurysmDataset: {len(samples)} samples from explicit dirs{extra} "
+                f"(vessel={vtp_vessel_dir}, centerline={vtp_centerline_dir})"
+            )
+        return samples
 
     def _cache_path(self, dataset_id):
         if not self.cache_dir:
@@ -1025,7 +1285,7 @@ class AneurysmDataset(Dataset):
         }
 
     def _prepare_tracts(self, centerline_mesh):
-        tracts, endpoints, _ = extract_unique_tracts(centerline_mesh)
+        tracts, endpoints, _ = extract_groupid_tracts(centerline_mesh)
         if len(tracts) > MAX_TRACTS:
             order = np.argsort([-_arc_len(t) for t in tracts])[:MAX_TRACTS]
             tracts = [tracts[i] for i in order]
@@ -1190,6 +1450,22 @@ class AneurysmDataset(Dataset):
         return len(self.samples)
 
     def _build_data(self, sample):
+        sample = dict(sample)
+        if getattr(self, "ensure_derived", False) and not sample_is_complete(
+            sample, require_templates=getattr(self, "require_templates", True)
+        ):
+            sample = ensure_sample_derived(sample)
+        reject_rawdata_paths(sample)
+        if not os.path.isfile(sample["vessel_file"]):
+            raise FileNotFoundError(
+                f"{sample['dataset_id']}: GT mesh missing ({sample['vessel_file']})"
+            )
+        if not os.path.isfile(sample["centerline_file"]):
+            raise FileNotFoundError(
+                f"{sample['dataset_id']}: original_centerline missing "
+                f"({sample['centerline_file']}). Run centerline_creation.py or "
+                "construct AneurysmDataset(ensure_derived=True) under vmtk_env."
+            )
         vessel_mesh = pv.read(sample["vessel_file"])
         centerline_mesh = pv.read(sample["centerline_file"])
         try:

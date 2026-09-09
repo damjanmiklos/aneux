@@ -7,7 +7,6 @@ import json
 import os
 import random
 import sys
-from collections import defaultdict
 
 import numpy as np
 import torch
@@ -15,10 +14,7 @@ from torch.utils.data import Subset
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 from aneux_paths import (
-    CSV_PATH,
-    VESSELS_AREA005,
-    CENTERLINES,
-    EXTRA_CENTERLINES,
+    CLEANDATA,
     EXPERIMENT_OUTPUT,
     EXPERIMENT_CACHE,
 )
@@ -45,13 +41,17 @@ from train import train_model
 
 # %% [markdown]
 # ## 1. Configuration & Hyperparameters
+# Meshes and centerlines come from `cleandata/` (uniform GT, original centerline,
+# coarse remesh, variable template + its centerline). Nothing is read from rawdata.
 
 # %%
 OUTPUT_DIR = EXPERIMENT_OUTPUT
 CACHE_DIR = EXPERIMENT_CACHE
-VESSEL_DIR = VESSELS_AREA005
-CENTERLINE_DIR = CENTERLINES
-EXTRA_CENTERLINE_DIR = EXTRA_CENTERLINES
+CLEANDATA_ROOT = CLEANDATA
+# True only in vmtk_env: fill missing original/template centerlines and coarse
+# remeshes with centerline_creation.py / uniform remeshing. Default False assumes
+# those folders are already populated.
+ENSURE_DERIVED = False
 
 TUBE_RADIUS = TUBE_RADIUS_MM
 N_LENGTH = HIERARCHY_LEVELS[-1][0]
@@ -76,8 +76,9 @@ LOSS_WEIGHTS = dict(DEFAULT_LOSS_WEIGHTS)
 
 # %% [markdown]
 # ## 2. Data Preparation
-# ICA-filtered paired vessel/centerline meshes, unique-tract Bishop tubes,
-# hybrid far-from-centerline FPS for x_true, canonical ICA pose (mm preserved).
+# Paired uniformly_remeshed GT + original_centerline from cleandata, GroupId
+# tracts from centerline_creation.py, Bishop tubes, hybrid far-from-centerline
+# FPS for x_true, canonical ICA pose (mm preserved).
 
 # %%
 def seed_everything(seed):
@@ -88,32 +89,18 @@ def seed_everything(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def stratified_split(dataset, val_fraction, seed):
-    """Split indices by clinical location so each ICA site appears in both sets when possible."""
-    by_loc = defaultdict(list)
-    for i, sample in enumerate(dataset.samples):
-        by_loc[sample.get("location", "unknown")].append(i)
-
+def train_val_split(dataset, val_fraction, seed):
+    """Random train/val split. Every cleandata sample is eligible; none are dropped."""
+    n = len(dataset)
     rng = np.random.RandomState(seed)
-    train_idx, val_idx = [], []
-    for idxs in by_loc.values():
-        idxs = list(idxs)
-        rng.shuffle(idxs)
-        if len(idxs) >= 2:
-            n_val = max(1, int(len(idxs) * val_fraction))
-            n_val = min(n_val, len(idxs) - 1)
-        else:
-            n_val = 0
-        val_idx.extend(idxs[:n_val])
-        train_idx.extend(idxs[n_val:])
-
-    if not train_idx or not val_idx:
-        n = len(dataset)
-        n_val = max(1, int(n * val_fraction)) if n > 1 else 0
-        perm = rng.permutation(n).tolist()
-        val_idx = perm[:n_val]
-        train_idx = perm[n_val:]
-
+    if n <= 1:
+        idxs = list(range(n))
+        return Subset(dataset, idxs), Subset(dataset, [])
+    n_val = max(1, int(n * val_fraction))
+    n_val = min(n_val, n - 1)
+    perm = rng.permutation(n).tolist()
+    val_idx = perm[:n_val]
+    train_idx = perm[n_val:]
     return Subset(dataset, train_idx), Subset(dataset, val_idx)
 
 
@@ -137,20 +124,19 @@ if __name__ == "__main__":
 
     print("Initializing dataset...")
     dataset = AneurysmDataset(
-        csv_path=CSV_PATH,
-        vtp_vessel_dir=VESSEL_DIR,
-        vtp_centerline_dir=CENTERLINE_DIR,
         tube_radius=TUBE_RADIUS,
         n_length=N_LENGTH,
         n_radial=N_RADIAL,
-        extra_centerline_dir=EXTRA_CENTERLINE_DIR,
         cache_dir=CACHE_DIR,
         n_true=N_TRUE,
+        cleandata_root=CLEANDATA_ROOT,
+        require_templates=True,
+        ensure_derived=ENSURE_DERIVED,
     )
 
-    print(f"Dataset loaded. Total paired and filtered samples: {len(dataset)}")
+    print(f"Dataset loaded. Total samples: {len(dataset)}")
 
-    train_dataset, val_dataset = stratified_split(dataset, VAL_SPLIT, SEED)
+    train_dataset, val_dataset = train_val_split(dataset, VAL_SPLIT, SEED)
     print(f"Train: {len(train_dataset)} | Val: {len(val_dataset)}")
     print("Warming tube cache (parallel raycast; not used as DataLoader workers)...")
     n_cached = dataset.warmup_cache(num_workers=CACHE_BUILD_WORKERS)
@@ -230,7 +216,7 @@ if __name__ == "__main__":
         )
         print("Training complete.")
     else:
-        print("No samples found! Please verify data paths and locations in the CSV.")
+        print("No samples found in cleandata/. Fill the five .vtp folders first.")
         trained_model, history = None, []
 
     # %% [markdown]
