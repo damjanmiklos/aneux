@@ -86,6 +86,15 @@ MIN_OPENING_RADIUS_MM = 0.08
 # Real ICA ostia in this set are ≥ ~0.34 mm.
 MIN_SEED_OPENING_RADIUS_MM = 0.20
 MIN_OPENING_LOOP_POINTS = 6
+# Outboard constant-R polyball + finite cylinder clip (hemoMesh removal endings).
+# Interior Voronoi/remesh is unchanged; only the ostium neighbourhood is a pipe section.
+OPENING_EXTENSION_LENGTH_FACTOR = 2.0
+OPENING_EXTENSION_SPACING_FACTOR = 0.25
+OPENING_CLIP_RADIUS_FACTOR = 1.5
+OPENING_CLIP_HEIGHT_FACTOR = 5.0
+OPENING_CLIP_INWARD_OVERLAP_MM = 0.05
+OPENING_CLIP_INSET_STEP_MM = 0.1
+OPENING_CLIP_INSET_MAX_MM = 0.5
 MIN_EDGE_LENGTH_MM = 1e-4
 SLIVER_Q01_THRESHOLD = 0.3
 FILTER_LOCATIONS = ["ICA pcom", "ICA oph", "ICA cav", "ICA bif"]
@@ -228,8 +237,8 @@ def recompute_point_normals(surface, auto_orient=False):
     return to_vtk_poly(normals.GetOutput())
 
 
-def apply_taubin_smoothing(surface_mesh, pass_band=0.1, n_iter=15, feature_angle=45.0):
-    """Volume-preserving smoothing to reduce Voronoi jitter without collapsing the wall."""
+def apply_taubin_smoothing(surface_mesh, pass_band=1.0, n_iter=15, feature_angle=45.0):
+    """Volume-preserving Taubin smoothing. Pass band 1.0 matches hemoMesh's vmtkSurfaceSmoothing default."""
     smoother = vtk.vtkWindowedSincPolyDataFilter()
     smoother.SetInputData(to_vtk_poly(surface_mesh))
     smoother.SetNumberOfIterations(n_iter)
@@ -903,6 +912,7 @@ def generate_base_surface(
     reference_bounds=None,
     profiles=None,
     extension_length=DEFAULT_EXTENSION_LENGTH,
+    extra_spheres=None,
 ):
     """Parent tube via a narrow-band polyball image + marching cubes."""
     if not isinstance(branched_centerline, vtk.vtkPolyData):
@@ -914,6 +924,14 @@ def generate_base_surface(
     max_r, r_min = clamp_misr_for_parent_tube(misr_array, r_cap)
     vtk_cl = to_vtk_poly(branched_centerline)
     pts, radii = _centerline_xyz_r(vtk_cl)
+    if extra_spheres is not None:
+        extra_pts, extra_r = extra_spheres
+        extra_pts = np.asarray(extra_pts, dtype=np.float64).reshape(-1, 3)
+        extra_r = np.asarray(extra_r, dtype=np.float64).reshape(-1)
+        if extra_pts.size and extra_r.size:
+            pts = np.vstack((pts, extra_pts))
+            radii = np.concatenate((radii, extra_r))
+            print(f"  Added {len(extra_r)} constant-R opening spheres for pipe-section cuts")
 
     pad = 2.0 * max(max_r, MISR_FLOOR_MM) + float(extension_length) + 1.0
     model_bounds = [
@@ -1179,13 +1197,237 @@ def clip_one_profile(surface, profile, body_point, search_mm):
     return candidate, True
 
 
-def clip_flow_extensions_and_uncap(base_surface, profiles, extension_length=DEFAULT_EXTENSION_LENGTH):
+def _n_boundary_loops(surface):
+    return int(extract_boundary_loops(surface).GetNumberOfCells())
+
+
+def _centerline_tangent_at_id(vtk_cl, pid):
+    vtk_cl.BuildLinks()
+    cell_ids = vtk.vtkIdList()
+    vtk_cl.GetPointCells(int(pid), cell_ids)
+    if cell_ids.GetNumberOfIds() == 0:
+        return None
+    cell = vtk_cl.GetCell(cell_ids.GetId(0))
+    n = cell.GetNumberOfPoints()
+    idx = None
+    for j in range(n):
+        if int(cell.GetPointId(j)) == int(pid):
+            idx = j
+            break
+    if idx is None or n < 2:
+        return None
+    p = np.asarray(vtk_cl.GetPoint(int(pid)), dtype=np.float64)
+    if idx == 0:
+        q = np.asarray(vtk_cl.GetPoint(cell.GetPointId(1)), dtype=np.float64)
+        tangent = p - q
+    elif idx == n - 1:
+        q = np.asarray(vtk_cl.GetPoint(cell.GetPointId(n - 2)), dtype=np.float64)
+        tangent = p - q
+    else:
+        a = np.asarray(vtk_cl.GetPoint(cell.GetPointId(idx - 1)), dtype=np.float64)
+        b = np.asarray(vtk_cl.GetPoint(cell.GetPointId(idx + 1)), dtype=np.float64)
+        tangent = b - a
+    if float(np.linalg.norm(tangent)) < 1e-12:
+        return None
+    return _unit(tangent)
+
+
+def opening_clip_frames(centerline, profiles):
+    """Anatomical ostium origin, outward centerline tangent, local MISR."""
+    vtk_cl = to_vtk_poly(centerline)
+    if vtk_cl.GetNumberOfPoints() < 2:
+        raise TemplateQualityError("Centerline too short to build opening clip frames.")
+    locator = vtk.vtkPointLocator()
+    locator.SetDataSet(vtk_cl)
+    locator.BuildLocator()
+    misr = vtk_cl.GetPointData().GetArray("MaximumInscribedSphereRadius")
+    frames = []
+    for profile in profiles:
+        origin = np.asarray(profile["barycenter"], dtype=np.float64)
+        profile_n = _unit(profile["normal"])
+        profile_r = max(float(profile["radius"]), MIN_OPENING_RADIUS_MM)
+        pid = locator.FindClosestPoint(_vec3(origin))
+        closest = np.asarray(vtk_cl.GetPoint(pid), dtype=np.float64)
+        if np.linalg.norm(closest - origin) > 8.0 * max(profile_r, 0.5):
+            tangent = profile_n
+            radius = profile_r
+        else:
+            tangent = _centerline_tangent_at_id(vtk_cl, pid)
+            if tangent is None or float(np.linalg.norm(tangent)) < 0.5:
+                tangent = profile_n
+            if float(np.dot(tangent, profile_n)) < 0.0:
+                tangent = -tangent
+            radius = profile_r
+            if misr is not None:
+                radius = max(float(misr.GetComponent(pid, 0)), 0.5 * profile_r, MIN_OPENING_RADIUS_MM)
+        frames.append((origin, _unit(tangent), float(radius)))
+    return frames
+
+
+def extra_opening_spheres(centerline, profiles):
+    """Constant-R balls along the outward tangent, starting just past each ostium."""
+    extra_pts = []
+    extra_r = []
+    for origin, outward, radius in opening_clip_frames(centerline, profiles):
+        radius = max(float(radius), 1e-3)
+        length = OPENING_EXTENSION_LENGTH_FACTOR * radius
+        spacing = max(OPENING_EXTENSION_SPACING_FACTOR * radius, 0.1)
+        n_steps = max(int(np.ceil(length / spacing)), 2)
+        for i in range(1, n_steps + 1):
+            extra_pts.append(origin + i * spacing * outward)
+            extra_r.append(radius)
+    if not extra_pts:
+        return np.zeros((0, 3), dtype=np.float64), np.zeros((0,), dtype=np.float64)
+    return np.asarray(extra_pts, dtype=np.float64), np.asarray(extra_r, dtype=np.float64)
+
+
+def _opening_clip_radius(radius):
+    return max(float(radius) * OPENING_CLIP_RADIUS_FACTOR, float(radius) + 0.2)
+
+
+def _opening_clip_height(radius):
+    r = float(radius)
+    return max(r * OPENING_CLIP_HEIGHT_FACTOR, 2.0) + r * OPENING_EXTENSION_LENGTH_FACTOR
+
+
+def _outboard_cap_implicit(origin, outward, radius):
+    origin = np.asarray(origin, dtype=np.float64)
+    outward = _unit(outward)
+    clip_radius = _opening_clip_radius(radius)
+    height = _opening_clip_height(radius)
+    p_in = origin - OPENING_CLIP_INWARD_OVERLAP_MM * outward
+    p_far = origin + height * outward
+
+    cylinder = vtk.vtkCylinder()
+    _set_vec3(cylinder.SetCenter, origin)
+    _set_vec3(cylinder.SetAxis, outward)
+    cylinder.SetRadius(clip_radius)
+
+    plane_near = vtk.vtkPlane()
+    _set_vec3(plane_near.SetOrigin, p_in)
+    _set_vec3(plane_near.SetNormal, -outward)
+
+    plane_far = vtk.vtkPlane()
+    _set_vec3(plane_far.SetOrigin, p_far)
+    _set_vec3(plane_far.SetNormal, outward)
+
+    region = vtk.vtkImplicitBoolean()
+    region.SetOperationTypeToIntersection()
+    region.AddFunction(cylinder)
+    region.AddFunction(plane_near)
+    region.AddFunction(plane_far)
+    return region
+
+
+def _drop_small_fragments(surface, min_fraction=0.05):
+    """Keep every large branch; drop tiny cut-off caps."""
+    mesh = pv.wrap(to_vtk_poly(surface))
+    if mesh.n_points == 0:
+        return to_vtk_poly(surface)
+    connected = mesh.connectivity(extraction_mode="all")
+    if "RegionId" not in connected.point_data:
+        return to_vtk_poly(surface)
+    region_ids, counts = np.unique(connected.point_data["RegionId"], return_counts=True)
+    threshold = max(int(min_fraction * connected.n_points), 3)
+    keep_ids = region_ids[counts >= threshold]
+    if keep_ids.size == 0:
+        return keep_largest_region(surface)
+    mask = np.isin(connected.point_data["RegionId"], keep_ids)
+    kept = connected.extract_points(mask, adjacent_cells=True)
+    if not isinstance(kept, pv.PolyData):
+        kept = pv.wrap(kept).extract_surface(algorithm="dataset_surface")
+    return to_vtk_poly(kept.triangulate().clean())
+
+
+def _delete_outboard_leftover(surface, origin, outward, radius, outboard_mm=0.15):
+    poly, pts, faces = _triangle_points_faces(surface)
+    if faces.size == 0:
+        return poly
+    origin = np.asarray(origin, dtype=np.float64)
+    outward = _unit(outward)
+    centroids = pts[faces].mean(axis=1)
+    rel = centroids - origin
+    proj = rel @ outward
+    radial = np.linalg.norm(rel - np.outer(proj, outward), axis=1)
+    bad = (proj > outboard_mm) & (radial < _opening_clip_radius(radius))
+    if not np.any(bad):
+        return poly
+    return _polydata_from_triangles(pts, faces[~bad])
+
+
+def _clip_opening_cap_locally(surface, origin, outward, radius):
+    """Delete the outboard stub of one opening with a bounded cylinder."""
+    region = _outboard_cap_implicit(origin, outward, radius)
+    clipper = vtk.vtkClipPolyData()
+    clipper.SetInputData(to_vtk_poly(surface))
+    clipper.SetClipFunction(region)
+    clipper.InsideOutOff()
+    clipper.GenerateClippedOutputOff()
+    clipper.Update()
+    clipped = clean_triangulate(clipper.GetOutput())
+    if clipped.GetNumberOfPoints() == 0:
+        return to_vtk_poly(surface)
+    return _delete_outboard_leftover(clipped, origin, outward, radius)
+
+
+def clip_one_opening_pipe_section(surface, origin, outward, radius, _body_point):
+    """Open one ostium with a pipe-section cut; inset slightly if the cutter misses."""
+    origin0 = np.asarray(origin, dtype=np.float64)
+    outward = _unit(outward)
+    radius = max(float(radius), 1e-3)
+    before = _n_boundary_loops(surface)
+    n_prev = surface.GetNumberOfPoints()
+    inset = 0.0
+    while inset <= OPENING_CLIP_INSET_MAX_MM + 1e-12:
+        origin_i = origin0 - inset * outward
+        clipped = _clip_opening_cap_locally(surface, origin_i, outward, radius)
+        clipped = _drop_small_fragments(clipped)
+        n_cand = clipped.GetNumberOfPoints()
+        if n_cand < 50 or n_cand < 0.45 * n_prev:
+            inset += OPENING_CLIP_INSET_STEP_MM
+            continue
+        loops_after = _n_boundary_loops(clipped)
+        near = any(
+            float(np.linalg.norm(np.asarray(op["center"]) - origin_i)) < 2.0 * radius
+            for op in inspect_openings(clipped)
+        )
+        if loops_after > before or (near and n_cand < n_prev):
+            if inset > 0:
+                print(f"  [Uncap] Pipe-section clip inset {inset:.1f} mm to create a hole")
+            return clipped, True
+        inset += OPENING_CLIP_INSET_STEP_MM
+    return surface, False
+
+
+def clip_flow_extensions_and_uncap(
+    base_surface,
+    profiles,
+    extension_length=DEFAULT_EXTENSION_LENGTH,
+    centerline=None,
+):
     current = to_vtk_poly(base_surface)
     body_pt = mesh_body_point(current)
     n_clipped = 0
-    for profile in profiles:
+    frames = opening_clip_frames(centerline, profiles) if centerline is not None else None
+    for i, profile in enumerate(profiles):
         search_mm = float(extension_length) + 3.0 * max(float(profile["radius"]), 0.5)
-        current, ok = clip_one_profile(current, profile, body_pt, search_mm)
+        ok = False
+        if frames is not None:
+            origin, outward, radius = frames[i]
+            current, ok = clip_one_opening_pipe_section(
+                current, origin, outward, radius, body_pt
+            )
+            if ok:
+                print(
+                    f"  [Uncap] Profile {profile['index']} pipe-section cut "
+                    f"r={radius:.3f} mm at {np.round(origin, 2)}"
+                )
+        if not ok:
+            current, ok = clip_one_profile(current, profile, body_pt, search_mm)
+            if ok:
+                print(
+                    f"  [Uncap] Profile {profile['index']} fell back to anatomical plane clip"
+                )
         if ok:
             n_clipped += 1
             body_pt = mesh_body_point(current)
@@ -1690,6 +1932,9 @@ def build_parent_tube(
     print("Step 5: Extracting branches...")
     branched_centerline = extract_branches(smooth_centerline)
 
+    print("Step 5b: Constant-radius polyball stubs past anatomical openings...")
+    extra_pts, extra_r = extra_opening_spheres(branched_centerline, anatomical_profiles)
+
     print("Step 6: Generating multi-branch base surface (vmtkCenterlineModeller)...")
     base_surface = generate_base_surface(
         branched_centerline,
@@ -1698,11 +1943,15 @@ def build_parent_tube(
         reference_bounds=smoothed_vessel.GetBounds(),
         profiles=anatomical_profiles,
         extension_length=extension_length,
+        extra_spheres=(extra_pts, extra_r),
     )
 
-    print("Step 7: Uncapping open boundaries and removing flow extensions...")
+    print("Step 7: Uncapping open boundaries with pipe-section cuts...")
     open_base_surface, n_clipped = clip_flow_extensions_and_uncap(
-        base_surface, anatomical_profiles, extension_length=extension_length
+        base_surface,
+        anatomical_profiles,
+        extension_length=extension_length,
+        centerline=branched_centerline,
     )
     print(f"  -> Open base surface points: {open_base_surface.GetNumberOfPoints()}")
     n_in = len(anatomical_profiles)
