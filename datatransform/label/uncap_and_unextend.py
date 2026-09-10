@@ -1,5 +1,13 @@
 import os
 import sys
+
+os.environ.setdefault("VTK_OFFSCREEN", "1")
+os.environ.setdefault("EGL_PLATFORM", "surfaceless")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("VTK_NUMBER_OF_THREADS", "1")
+
 import pandas as pd
 import numpy as np
 import pyvista as pv
@@ -10,7 +18,14 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import gc
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
-from aneux_paths import CSV_PATH, VESSELS_AREA001, CENTERLINES, CLEANED_VESSELS, LABEL_OUTPUT_DIR, HASEXTENSION_CSV
+from aneux_paths import (
+    CSV_PATH,
+    VESSELS_AREA001,
+    CLEANED_VESSELS,
+    LABEL_OUTPUT_DIR,
+    HASEXTENSION_CSV,
+    TEMPLATE_DIR,
+)
 
 
 class UnrealisticMeshError(ValueError):
@@ -19,8 +34,9 @@ class UnrealisticMeshError(ValueError):
 
 # --- CONFIGURATION ---
 VESSEL_DIR = VESSELS_AREA001
-CENTERLINE_DIR = CENTERLINES
 OUTPUT_DIR = CLEANED_VESSELS
+# Voronoi in workers is memory-heavy; centerline_creation.py uses 2.
+MAX_VMTK_WORKERS = 4
 
 DISTANCE_THRESHOLD = 0.5  # in mm, to classify boundary as extension vs native
 SMOOTHING_ITERATIONS = 5  # localized Laplacian iterations for boundary smoothing
@@ -478,31 +494,36 @@ def clean_vessel_extensions(vessel, centerline, has_extension_label=None, datase
     return cleaned_vessel, len(extensions_to_cut), integrity_passed
 
 
-def process_patient_worker(dataset_id, location, vessel_file, centerline_file, output_file, has_extension_label=None):
+def _runtime_centerline(vessel, dataset_id):
+    """Trace a Voronoi centerline on the uncapped mesh. Not written to disk."""
+    if TEMPLATE_DIR not in sys.path:
+        sys.path.insert(0, TEMPLATE_DIR)
+    from vessel_pipeline import compute_centerline_from_mesh, to_vtk_poly
+
+    print(f"[{dataset_id}] Runtime centerline (centerline_creation pipeline)...", flush=True)
+    cl = compute_centerline_from_mesh(to_vtk_poly(vessel))
+    wrapped = pv.wrap(cl)
+    if wrapped.n_points < 2 or wrapped.n_cells < 1:
+        raise RuntimeError("runtime centerline is empty")
+    return wrapped
+
+
+def process_patient_worker(dataset_id, location, vessel_file, output_file, has_extension_label=None):
     """
     Worker function to process a single patient. First uncaps if capped, then decaps extensions.
     Always saves the mesh (modified or unmodified) to output_file if input files exist.
     """
     import gc
     v_exists = os.path.exists(vessel_file)
-    c_exists = os.path.exists(centerline_file)
     
-    if not v_exists or not c_exists:
-        if not v_exists and not c_exists:
-            reason = "Vessel and centerline files missing"
-        elif not v_exists:
-            reason = "Vessel file missing"
-        else:
-            reason = "Centerline file missing"
-            
+    if not v_exists:
         return {
-            'dataset_id': dataset_id, 'location': location, 'status': 'Skipped', 'reason': reason,
+            'dataset_id': dataset_id, 'location': location, 'status': 'Skipped', 'reason': "Vessel file missing",
             'cuts_made': 0, 'integrity_check': 'N/A', 'uncapped': False, 'cap_faces_deleted': 0
         }
         
     try:
         vessel = pv.read(vessel_file)
-        centerline = pv.read(centerline_file)
         
         # 1. ALWAYS run uncapping. The new geometric algorithm is safe to run on all meshes.
         # It will gracefully return 0 if no caps are found.
@@ -522,15 +543,18 @@ def process_patient_worker(dataset_id, location, vessel_file, centerline_file, o
                 
             # Memory Cleanup (Prevents multiprocessing NoneType errors)
             del vessel
-            del centerline
             gc.collect()
             
             return {
                 'dataset_id': dataset_id, 'location': location, 'status': 'Saved', 'reason': reason,
                 'cuts_made': 0, 'integrity_check': 'Passed', 'uncapped': is_originally_capped, 'cap_faces_deleted': num_cap_faces_deleted
             }
+
+        # 3. Centerline on the uncapped surface, then cut CFD flow extensions.
+        # Clean training centerlines are computed later on the cleaned mesh.
+        centerline = _runtime_centerline(vessel, dataset_id)
                 
-        # 3. Run extension decapping
+        # 4. Run extension decapping
         # print(f"[{dataset_id}] Starting clean_vessel_extensions...", flush=True)
         cleaned_mesh, cuts_made, passed_check = clean_vessel_extensions(vessel, centerline, has_extension_label, dataset_id)
         
@@ -612,13 +636,12 @@ def main():
         dataset_id = row['dataset']
         location = row['location']
         vessel_file = os.path.join(VESSEL_DIR, f"{dataset_id}.vtp")
-        centerline_file = os.path.join(CENTERLINE_DIR, f"{dataset_id}.vtp")
         output_file = os.path.join(OUTPUT_DIR, f"{dataset_id}.vtp")
         
         label = has_ext_map.get(dataset_id, None)
-        tasks.append((dataset_id, location, vessel_file, centerline_file, output_file, label))
+        tasks.append((dataset_id, location, vessel_file, output_file, label))
         
-    num_workers = min(os.cpu_count() or 1, 20)
+    num_workers = min(os.cpu_count() or 1, MAX_VMTK_WORKERS)
     print(f"Starting multiprocessing pool with {num_workers} workers...")
     
     with ProcessPoolExecutor(max_workers=num_workers) as executor:

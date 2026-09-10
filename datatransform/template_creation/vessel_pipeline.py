@@ -95,6 +95,12 @@ OPENING_CLIP_HEIGHT_FACTOR = 5.0
 OPENING_CLIP_INWARD_OVERLAP_MM = 0.05
 OPENING_CLIP_INSET_STEP_MM = 0.1
 OPENING_CLIP_INSET_MAX_MM = 0.5
+# Disconnected flow-extension stubs can be >5% of the mesh (thin outlets, 5 mm
+# extensions). Drop anything small relative to the largest component.
+FRAGMENT_RELATIVE_TO_LARGEST = 0.15
+# Match a capped hole to an expected ostium; leftover rims sit farther away.
+SPURIOUS_OPENING_MATCH_FACTOR = 4.0
+SPURIOUS_OPENING_MATCH_FLOOR_MM = 3.0
 MIN_EDGE_LENGTH_MM = 1e-4
 SLIVER_Q01_THRESHOLD = 0.3
 FILTER_LOCATIONS = ["ICA pcom", "ICA oph", "ICA cav", "ICA bif"]
@@ -237,15 +243,28 @@ def recompute_point_normals(surface, auto_orient=False):
     return to_vtk_poly(normals.GetOutput())
 
 
-def apply_taubin_smoothing(surface_mesh, pass_band=0.1, n_iter=15, feature_angle=45.0):
-    """Volume-preserving Taubin smoothing. Pass band 0.1 is a strong low-pass (highly smoothed)."""
+def apply_taubin_smoothing(
+    surface_mesh,
+    pass_band=0.1,
+    n_iter=15,
+    feature_angle=45.0,
+    boundary_smoothing=True,
+):
+    """Volume-preserving Taubin smoothing (vtkWindowedSincPolyDataFilter).
+
+    PassBand is in [0, 2]: 0 is strongest, 2 is none. VTK's default 0.1 is
+    a strong low-pass (template path). Values near 1.5–2.0 barely filter.
+    """
     smoother = vtk.vtkWindowedSincPolyDataFilter()
     smoother.SetInputData(to_vtk_poly(surface_mesh))
     smoother.SetNumberOfIterations(n_iter)
     smoother.SetPassBand(pass_band)
     smoother.SetFeatureAngle(feature_angle)
     smoother.FeatureEdgeSmoothingOff()
-    smoother.BoundarySmoothingOn()
+    if boundary_smoothing:
+        smoother.BoundarySmoothingOn()
+    else:
+        smoother.BoundarySmoothingOff()
     smoother.NonManifoldSmoothingOn()
     smoother.NormalizeCoordinatesOn()
     smoother.Update()
@@ -1285,16 +1304,25 @@ def _opening_clip_radius(radius):
     return max(float(radius) * OPENING_CLIP_RADIUS_FACTOR, float(radius) + 0.2)
 
 
-def _opening_clip_height(radius):
+def _opening_clip_height(radius, extension_length=None):
+    """Finite cylinder length along the outward tangent.
+
+    ``7R`` is enough for the short polyball stubs on the parent tube. GT remesh
+    adds a fixed-length flow extension; on thin outlets ``7R`` is shorter than
+    that extension and the far stub survives as a leftover fragment.
+    """
     r = float(radius)
-    return max(r * OPENING_CLIP_HEIGHT_FACTOR, 2.0) + r * OPENING_EXTENSION_LENGTH_FACTOR
+    by_radius = max(r * OPENING_CLIP_HEIGHT_FACTOR, 2.0) + r * OPENING_EXTENSION_LENGTH_FACTOR
+    if extension_length is None:
+        return by_radius
+    return max(by_radius, float(extension_length) + 2.0 * r)
 
 
-def _outboard_cap_implicit(origin, outward, radius):
+def _outboard_cap_implicit(origin, outward, radius, extension_length=None):
     origin = np.asarray(origin, dtype=np.float64)
     outward = _unit(outward)
     clip_radius = _opening_clip_radius(radius)
-    height = _opening_clip_height(radius)
+    height = _opening_clip_height(radius, extension_length=extension_length)
     p_in = origin - OPENING_CLIP_INWARD_OVERLAP_MM * outward
     p_far = origin + height * outward
 
@@ -1320,7 +1348,7 @@ def _outboard_cap_implicit(origin, outward, radius):
 
 
 def _drop_small_fragments(surface, min_fraction=0.05):
-    """Keep every large branch; drop tiny cut-off caps."""
+    """Keep the main vessel; drop cut-off caps and leftover extension stubs."""
     mesh = pv.wrap(to_vtk_poly(surface))
     if mesh.n_points == 0:
         return to_vtk_poly(surface)
@@ -1328,7 +1356,12 @@ def _drop_small_fragments(surface, min_fraction=0.05):
     if "RegionId" not in connected.point_data:
         return to_vtk_poly(surface)
     region_ids, counts = np.unique(connected.point_data["RegionId"], return_counts=True)
-    threshold = max(int(min_fraction * connected.n_points), 3)
+    largest = int(counts.max())
+    threshold = max(
+        int(min_fraction * connected.n_points),
+        int(FRAGMENT_RELATIVE_TO_LARGEST * largest),
+        3,
+    )
     keep_ids = region_ids[counts >= threshold]
     if keep_ids.size == 0:
         return keep_largest_region(surface)
@@ -1339,7 +1372,7 @@ def _drop_small_fragments(surface, min_fraction=0.05):
     return to_vtk_poly(kept.triangulate().clean())
 
 
-def _delete_outboard_leftover(surface, origin, outward, radius, outboard_mm=0.15):
+def _delete_outboard_leftover(surface, origin, outward, radius, outboard_mm=0.0):
     poly, pts, faces = _triangle_points_faces(surface)
     if faces.size == 0:
         return poly
@@ -1355,9 +1388,11 @@ def _delete_outboard_leftover(surface, origin, outward, radius, outboard_mm=0.15
     return _polydata_from_triangles(pts, faces[~bad])
 
 
-def _clip_opening_cap_locally(surface, origin, outward, radius):
+def _clip_opening_cap_locally(surface, origin, outward, radius, extension_length=None):
     """Delete the outboard stub of one opening with a bounded cylinder."""
-    region = _outboard_cap_implicit(origin, outward, radius)
+    region = _outboard_cap_implicit(
+        origin, outward, radius, extension_length=extension_length
+    )
     clipper = vtk.vtkClipPolyData()
     clipper.SetInputData(to_vtk_poly(surface))
     clipper.SetClipFunction(region)
@@ -1370,7 +1405,9 @@ def _clip_opening_cap_locally(surface, origin, outward, radius):
     return _delete_outboard_leftover(clipped, origin, outward, radius)
 
 
-def clip_one_opening_pipe_section(surface, origin, outward, radius, _body_point):
+def clip_one_opening_pipe_section(
+    surface, origin, outward, radius, _body_point, extension_length=None
+):
     """Open one ostium with a pipe-section cut; inset slightly if the cutter misses."""
     origin0 = np.asarray(origin, dtype=np.float64)
     outward = _unit(outward)
@@ -1380,7 +1417,9 @@ def clip_one_opening_pipe_section(surface, origin, outward, radius, _body_point)
     inset = 0.0
     while inset <= OPENING_CLIP_INSET_MAX_MM + 1e-12:
         origin_i = origin0 - inset * outward
-        clipped = _clip_opening_cap_locally(surface, origin_i, outward, radius)
+        clipped = _clip_opening_cap_locally(
+            surface, origin_i, outward, radius, extension_length=extension_length
+        )
         clipped = _drop_small_fragments(clipped)
         n_cand = clipped.GetNumberOfPoints()
         if n_cand < 50 or n_cand < 0.45 * n_prev:
@@ -1399,6 +1438,122 @@ def clip_one_opening_pipe_section(surface, origin, outward, radius, _body_point)
     return surface, False
 
 
+def _cap_surface_with_entity_ids(surface, displacement):
+    capper = vtkvmtk.vtkvmtkCapPolyData()
+    capper.SetInputData(to_vtk_poly(surface))
+    capper.SetDisplacement(float(displacement))
+    capper.SetInPlaneDisplacement(0.0)
+    capper.SetCellEntityIdsArrayName("CellEntityIds")
+    capper.Update()
+    capped = vtk.vtkPolyData()
+    capped.DeepCopy(capper.GetOutput())
+    return capper, capped
+
+
+def _polydata_from_kept_cells(poly, keep_cell_ids):
+    keep = vtk.vtkIdList()
+    for cid in keep_cell_ids:
+        keep.InsertNextId(int(cid))
+    extractor = vtk.vtkExtractCells()
+    extractor.SetInputData(poly)
+    extractor.SetCellList(keep)
+    extractor.Update()
+    geom = vtk.vtkGeometryFilter()
+    geom.SetInputConnection(extractor.GetOutputPort())
+    geom.Update()
+    return clean_triangulate(geom.GetOutput())
+
+
+def remove_spurious_openings(surface, profiles):
+    """Fill leftover rims / wall tears that are not the expected ostia.
+
+    Caps every boundary loop, then deletes the cap that matches each anatomical
+    profile so true ostia stay open. Extra loops (clip leftovers, nicked walls)
+    remain capped. Does nothing when there are no extra openings.
+    """
+    poly = clean_triangulate(surface)
+    openings = inspect_openings(poly)
+    n_expected = len(profiles)
+    if n_expected < 1 or len(openings) <= n_expected:
+        return poly, 0
+
+    capper = None
+    capped = None
+    for displacement in (0.0, DEFAULT_CAP_DISPLACEMENT):
+        capper, capped = _cap_surface_with_entity_ids(poly, displacement)
+        n_left = extract_boundary_loops(capped).GetNumberOfCells()
+        if n_left == 0:
+            break
+    if capped is None or extract_boundary_loops(capped).GetNumberOfCells() != 0:
+        print("  WARNING: could not cap leftover openings; leaving them in place")
+        return poly, 0
+
+    ids = capped.GetCellData().GetArray("CellEntityIds")
+    center_ids = capper.GetCapCenterIds()
+    if ids is None or center_ids is None or center_ids.GetNumberOfIds() == 0:
+        print("  WARNING: capper produced no CellEntityIds; skipping leftover fill")
+        return poly, 0
+
+    offset = int(capper.GetCellEntityIdOffset())
+    n_caps = int(center_ids.GetNumberOfIds())
+    cap_centers = []
+    cap_eids = []
+    for i in range(n_caps):
+        cap_centers.append(np.array(capped.GetPoint(center_ids.GetId(i)), dtype=np.float64))
+        cap_eids.append(offset + 1 + i)
+
+    remaining = list(range(n_caps))
+    reopen = []
+    for profile in profiles:
+        bary = np.asarray(profile["barycenter"], dtype=np.float64)
+        r_p = max(float(profile["radius"]), MIN_OPENING_RADIUS_MM)
+        best = None
+        best_d = None
+        for i in remaining:
+            dist = float(np.linalg.norm(cap_centers[i] - bary))
+            if best_d is None or dist < best_d:
+                best_d = dist
+                best = i
+        max_d = max(SPURIOUS_OPENING_MATCH_FACTOR * r_p, SPURIOUS_OPENING_MATCH_FLOOR_MM)
+        if best is None or best_d > max_d:
+            print(
+                f"  WARNING: no cap within {max_d:.2f} mm of profile {profile['index']} "
+                f"(best d={best_d if best_d is not None else float('inf'):.2f} mm); "
+                "skipping leftover fill"
+            )
+            return poly, 0
+        reopen.append(cap_eids[best])
+        remaining.remove(best)
+
+    n_filled = len(remaining)
+    if n_filled == 0:
+        return poly, 0
+
+    reopen_set = set(reopen)
+    keep_cells = [
+        ci
+        for ci in range(capped.GetNumberOfCells())
+        if int(ids.GetComponent(ci, 0)) not in reopen_set
+    ]
+    if not keep_cells:
+        return poly, 0
+    filled = _polydata_from_kept_cells(capped, keep_cells)
+    filled, _n_nm = repair_nonmanifold_triangles(filled)
+    filled = drop_degenerate_triangles(filled, min_edge=MIN_EDGE_LENGTH_MM)
+    filled, _n_reg = drop_tiny_islands(filled)
+    n_after = len(inspect_openings(filled))
+    print(
+        f"  Filled {n_filled} leftover opening(s) "
+        f"({len(openings)} -> {n_after} loops; expected {n_expected})"
+    )
+    if n_after < n_expected or n_after < 2:
+        print("  WARNING: leftover fill closed a true ostium; keeping pre-fill surface")
+        return poly, 0
+    filled = strip_all_arrays(filled)
+    filled = recompute_point_normals(filled, auto_orient=False)
+    return filled, n_filled
+
+
 def clip_flow_extensions_and_uncap(
     base_surface,
     profiles,
@@ -1415,7 +1570,12 @@ def clip_flow_extensions_and_uncap(
         if frames is not None:
             origin, outward, radius = frames[i]
             current, ok = clip_one_opening_pipe_section(
-                current, origin, outward, radius, body_pt
+                current,
+                origin,
+                outward,
+                radius,
+                body_pt,
+                extension_length=extension_length,
             )
             if ok:
                 print(
@@ -1438,10 +1598,13 @@ def clip_flow_extensions_and_uncap(
         raise TemplateQualityError(
             f"Uncapped parent tube has {n_nm} non-manifold edges; remesh would amplify them"
         )
+    current, _n_regions = drop_tiny_islands(current)
+    current, n_filled = remove_spurious_openings(current, profiles)
     post = inspect_openings(current)
     print(
         "  Openings after uncap/pinhole-fill: "
         + ", ".join(f"r={op['radius']:.3f}mm n={op['n_points']}" for op in post)
+        + (f" (filled {n_filled} leftover)" if n_filled else "")
     )
     return current, n_clipped
 
@@ -2121,16 +2284,16 @@ def process_uniform_dataset(
     return out_file
 
 
-@with_dataset_id
-def process_centerline_dataset(
-    dataset_id,
-    v_file,
-    output_dir,
+def compute_centerline_from_mesh(
+    vessel_mesh,
     extension_length=DEFAULT_EXTENSION_LENGTH,
     sample_spacing=DEFAULT_SAMPLE_SPACING,
 ):
-    print(f"\n=========================================\nProcessing Centerline Case: {dataset_id}")
-    vessel_mesh = pv.read(v_file)
+    """Voronoi centerline for an in-memory surface. Same steps as centerline_creation.py.
+
+    Does not read or write files. Callers that need a ``.vtp`` should use
+    ``process_centerline_dataset``.
+    """
     print("Step 1: Applying Taubin surface smoothing...")
     smoothed_vessel = apply_taubin_smoothing(vessel_mesh)
     print("Step 1b: Detecting anatomical inlet/outlet boundaries...")
@@ -2158,7 +2321,24 @@ def process_centerline_dataset(
     )
     if final_centerline.GetNumberOfCells() < 1:
         raise TemplateQualityError("Clipped centerline has no cells.")
+    return final_centerline
 
+
+@with_dataset_id
+def process_centerline_dataset(
+    dataset_id,
+    v_file,
+    output_dir,
+    extension_length=DEFAULT_EXTENSION_LENGTH,
+    sample_spacing=DEFAULT_SAMPLE_SPACING,
+):
+    print(f"\n=========================================\nProcessing Centerline Case: {dataset_id}")
+    vessel_mesh = pv.read(v_file)
+    final_centerline = compute_centerline_from_mesh(
+        vessel_mesh,
+        extension_length=extension_length,
+        sample_spacing=sample_spacing,
+    )
     os.makedirs(output_dir, exist_ok=True)
     out_file = os.path.join(output_dir, f"{dataset_id}.vtp")
     save_polydata(final_centerline, out_file)

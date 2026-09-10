@@ -25,6 +25,7 @@ CSV_PATH = os.path.join(RAWDATA, "data-v1.0", "data", "clinical.csv")
 VESSELS_ORIGINAL = os.path.join(RAWDATA, "models-v1.0", "models", "vessels", "original")
 VESSELS_AREA001 = os.path.join(RAWDATA, "models-v1.0", "models", "vessels", "remeshed", "area-001")
 VESSELS_AREA005 = os.path.join(RAWDATA, "models-v1.0", "models", "vessels", "remeshed", "area-005")
+# AneuX-provided centerlines. Read-only archive; do not use in pipelines.
 CENTERLINES = os.path.join(RAWDATA, "models-v1.0", "models", "centerlines")
 
 DATATRANSFORM = os.path.join(REPO_ROOT, "datatransform")
