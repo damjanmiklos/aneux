@@ -14,8 +14,8 @@ import pyvista as pv
 from scipy.spatial import KDTree
 from collections import defaultdict, deque
 from tqdm import tqdm
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import gc
+import argparse
+import multiprocessing
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 from aneux_paths import (
@@ -37,6 +37,8 @@ VESSEL_DIR = VESSELS_AREA001
 OUTPUT_DIR = CLEANED_VESSELS
 # Voronoi in workers is memory-heavy; centerline_creation.py uses 2.
 MAX_VMTK_WORKERS = 4
+# If False, labeled no-extension cases are skipped (not copied into OUTPUT_DIR).
+COPY_UNEXTENDED = False
 
 DISTANCE_THRESHOLD = 0.5  # in mm, to classify boundary as extension vs native
 SMOOTHING_ITERATIONS = 5  # localized Laplacian iterations for boundary smoothing
@@ -331,7 +333,14 @@ def _runtime_centerline(vessel, dataset_id):
     return wrapped
 
 
-def process_patient_worker(dataset_id, location, vessel_file, output_file, has_extension_label=None):
+def process_patient_worker(
+    dataset_id,
+    location,
+    vessel_file,
+    output_file,
+    has_extension_label=None,
+    copy_unextended=False,
+):
     """Cut CFD flow extensions. Caps must already be removed."""
     import gc
     if not os.path.exists(vessel_file):
@@ -341,10 +350,16 @@ def process_patient_worker(dataset_id, location, vessel_file, output_file, has_e
         }
 
     try:
-        vessel = pv.read(vessel_file)
         has_extension = (has_extension_label in [1, 2]) if has_extension_label is not None else False
 
         if not has_extension:
+            if not copy_unextended:
+                return {
+                    'dataset_id': dataset_id, 'location': location, 'status': 'Skipped',
+                    'reason': 'No extension (copy-unextended is off)',
+                    'cuts_made': 0, 'integrity_check': 'N/A'
+                }
+            vessel = pv.read(vessel_file)
             vessel.save(output_file)
             del vessel
             gc.collect()
@@ -354,6 +369,7 @@ def process_patient_worker(dataset_id, location, vessel_file, output_file, has_e
                 'cuts_made': 0, 'integrity_check': 'Passed'
             }
 
+        vessel = pv.read(vessel_file)
         centerline = _runtime_centerline(vessel, dataset_id)
         cleaned_mesh, cuts_made, passed_check = clean_vessel_extensions(
             vessel, centerline, has_extension_label, dataset_id
@@ -394,8 +410,48 @@ def process_patient_worker(dataset_id, location, vessel_file, output_file, has_e
         }
 
 
+def _run_task(task):
+    """Top-level Pool target so spawn workers can pickle the call."""
+    return process_patient_worker(*task)
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser(description="Remove CFD flow extensions from open vessels.")
+    parser.add_argument(
+        "--copy-unextended",
+        action=argparse.BooleanOptionalAction,
+        default=COPY_UNEXTENDED,
+        help="Copy vessels with no extension label into the output folder (default: off).",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=MAX_VMTK_WORKERS,
+        help="Parallel spawn processes. Each case gets a fresh interpreter (VMTK isolation).",
+    )
+    return parser.parse_args()
+
+
+def _consume_record(record, log_records, counts):
+    log_records.append(record)
+    if record['status'] == 'Saved':
+        counts['saved'] += 1
+        counts['cuts'].append(record['cuts_made'])
+        if record['integrity_check'] == 'Failed':
+            counts['integrity_failed'] += 1
+            print(f"\nWarning: Integrity check failed (boundary count mismatch) for {record['dataset_id']}")
+    elif record['status'] == 'Skipped':
+        counts['skipped'] += 1
+        if record['reason'].startswith("Error:"):
+            print(f"\nError processing patient {record['dataset_id']}: {record['reason']}")
+
+
 def main():
     import shutil
+
+    args = _parse_args()
+    copy_unextended = bool(args.copy_unextended)
+
     if os.path.exists(OUTPUT_DIR):
         print(f"Deleting existing directory: {OUTPUT_DIR}")
         shutil.rmtree(OUTPUT_DIR)
@@ -407,13 +463,9 @@ def main():
     df_filtered = df[df['location'].isin(locations)]
 
     print(f"Loaded CSV. Total filtered dataset rows: {len(df_filtered)}")
+    print(f"Copy unextended vessels: {copy_unextended}")
 
-    processed_count = 0
-    skipped_count = 0
-    saved_count = 0
-    integrity_failed_count = 0
-    cut_counts = []
-
+    counts = {'saved': 0, 'skipped': 0, 'integrity_failed': 0, 'cuts': []}
     log_records = []
 
     has_ext_csv = HASEXTENSION_CSV
@@ -431,37 +483,35 @@ def main():
         location = row['location']
         vessel_file = os.path.join(VESSEL_DIR, f"{dataset_id}.vtp")
         output_file = os.path.join(OUTPUT_DIR, f"{dataset_id}.vtp")
-
         label = has_ext_map.get(dataset_id, None)
-        tasks.append((dataset_id, location, vessel_file, output_file, label))
+        has_extension = (label in [1, 2]) if label is not None else False
+        if not has_extension and not copy_unextended:
+            log_records.append({
+                'dataset_id': dataset_id, 'location': location, 'status': 'Skipped',
+                'reason': 'No extension (copy-unextended is off)',
+                'cuts_made': 0, 'integrity_check': 'N/A',
+            })
+            counts['skipped'] += 1
+            continue
+        tasks.append((dataset_id, location, vessel_file, output_file, label, copy_unextended))
 
-    num_workers = min(os.cpu_count() or 1, MAX_VMTK_WORKERS)
-    print(f"Starting multiprocessing pool with {num_workers} workers...")
+    num_workers = max(1, min(int(args.workers), os.cpu_count() or 1, len(tasks) or 1))
+    print(f"Cases to run: {len(tasks)} | spawn workers: {num_workers} (maxtasksperchild=1)")
 
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        futures = {
-            executor.submit(process_patient_worker, *task): task
-            for task in tasks
-        }
-
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Removing flow extensions"):
-            try:
-                record = future.result()
-                log_records.append(record)
-
-                if record['status'] == 'Saved':
-                    saved_count += 1
-                    processed_count += 1
-                    cut_counts.append(record['cuts_made'])
-                    if record['integrity_check'] == 'Failed':
-                        integrity_failed_count += 1
-                        print(f"\nWarning: Integrity check failed (boundary count mismatch) for {record['dataset_id']}")
-                elif record['status'] == 'Skipped':
-                    skipped_count += 1
-                    if record['reason'].startswith("Error:"):
-                        print(f"\nError processing patient {record['dataset_id']}: {record['reason']}")
-            except Exception as e:
-                print(f"\nWorker crashed with exception: {e}")
+    if not tasks:
+        print("No extension cases to process.")
+    elif num_workers == 1:
+        for task in tqdm(tasks, desc="Removing flow extensions"):
+            _consume_record(_run_task(task), log_records, counts)
+    else:
+        ctx = multiprocessing.get_context("spawn")
+        with ctx.Pool(processes=num_workers, maxtasksperchild=1) as pool:
+            for record in tqdm(
+                pool.imap_unordered(_run_task, tasks),
+                total=len(tasks),
+                desc="Removing flow extensions",
+            ):
+                _consume_record(record, log_records, counts)
 
     log_df = pd.DataFrame(log_records)
     log_xlsx = os.path.join(LABEL_OUTPUT_DIR, "unextend_log.xlsx")
@@ -482,14 +532,12 @@ def main():
     print("\n" + "=" * 50)
     print("CFD EXTENSION REMOVAL SUMMARY")
     print("=" * 50)
-    print(f"Total Saved: {saved_count}")
-    print(f"  Total Cuts Made: {sum(cut_counts)}")
-    print(f"Total Skipped (no changes or missing): {skipped_count}")
-    print(f"Failed Integrity Checks: {integrity_failed_count}")
+    print(f"Total Saved: {counts['saved']}")
+    print(f"  Total Cuts Made: {sum(counts['cuts'])}")
+    print(f"Total Skipped: {counts['skipped']}")
+    print(f"Failed Integrity Checks: {counts['integrity_failed']}")
     print(f"Unextended meshes saved to: {OUTPUT_DIR}")
 
 
 if __name__ == "__main__":
-    import multiprocessing
-    multiprocessing.set_start_method('spawn', force=True)
     main()
