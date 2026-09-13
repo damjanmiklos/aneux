@@ -1,22 +1,28 @@
-import os
 import csv
+import importlib.util
+import os
 import sys
+import types
 from concurrent.futures import ThreadPoolExecutor
 
-import pandas as pd
+# VTK 9.2 in vmtk_env has no vtkRenderingMatplotlib; PyVista 0.48 imports it
+# only for optional LaTeX math text.
+if importlib.util.find_spec("vtkmodules.vtkRenderingMatplotlib") is None:
+    sys.modules["vtkmodules.vtkRenderingMatplotlib"] = types.ModuleType(
+        "vtkmodules.vtkRenderingMatplotlib"
+    )
+
 import pyvista as pv
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
-from aneux_paths import VESSELS_ORIGINAL, HASCAP_CSV, CSV_PATH
+from aneux_paths import VESSELS_ORIGINAL, HASCAPOREXTENSION_CSV
 
 # --- CONFIGURATION ---
 FOLDER_PATH = VESSELS_ORIGINAL
-OUTPUT_CSV_PATH = HASCAP_CSV
-METADATA_CSV_PATH = CSV_PATH
+OUTPUT_CSV_PATH = HASCAPOREXTENSION_CSV
 
 SUPPORTED_EXTENSIONS = ('.vtp', '.stl')
-FILTER_LOCATIONS = ['ICA pcom', 'ICA oph', 'ICA cav', 'ICA bif']
 LOAD_WORKERS = min(8, os.cpu_count() or 4)
 # ---------------------
 
@@ -137,31 +143,23 @@ def _record(label):
 
 
 def main():
-    print("Loading metadata and filtering datasets...")
-    df = pd.read_csv(METADATA_CSV_PATH)
-    df['location'] = df['location'].astype(str).str.strip()
-    df_filtered = df[df['location'].isin(FILTER_LOCATIONS)]
-
-    expected_ids = df_filtered['dataset'].astype(str).str.strip().tolist()
-    expected_ids_lower = [eid.lower() for eid in expected_ids]
-
-    all_files = os.listdir(FOLDER_PATH)
-    for f in all_files:
-        if f.lower().endswith(SUPPORTED_EXTENSIONS):
-            name_without_ext = os.path.splitext(f)[0]
-            name_lower = name_without_ext.lower()
-            is_match = any(
-                eid.startswith(name_lower) or name_lower.startswith(eid)
-                for eid in expected_ids_lower
-            )
-            if is_match:
-                state['files'].append(os.path.join(FOLDER_PATH, f))
-
-    if not state['files']:
-        print(f"No .vtp or .stl files found in {FOLDER_PATH} that match the target locations.")
+    print(f"Loading all meshes from {FOLDER_PATH}...")
+    if not os.path.isdir(FOLDER_PATH):
+        print(f"Folder not found: {FOLDER_PATH}")
         return
 
-    print(f"Found {len(state['files'])} valid files.")
+    names = [
+        f for f in os.listdir(FOLDER_PATH)
+        if f.lower().endswith(SUPPORTED_EXTENSIONS)
+    ]
+    names.sort(key=str.casefold)
+    state['files'] = [os.path.join(FOLDER_PATH, f) for f in names]
+
+    if not state['files']:
+        print(f"No .vtp or .stl files found in {FOLDER_PATH}.")
+        return
+
+    print(f"Found {len(state['files'])} files.")
     preload_meshes(state['files'])
     print("Opening interactive window...")
 

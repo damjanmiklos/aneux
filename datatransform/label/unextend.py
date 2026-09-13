@@ -8,23 +8,24 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("VTK_NUMBER_OF_THREADS", "1")
 
-import pandas as pd
-import numpy as np
-import pyvista as pv
-from scipy.spatial import KDTree
-from collections import defaultdict, deque
-from tqdm import tqdm
 import argparse
 import multiprocessing
+from collections import defaultdict, deque
+
+import numpy as np
+import pandas as pd
+import pyvista as pv
+import vtk
+from scipy.spatial import KDTree
+from tqdm import tqdm
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 from aneux_paths import (
-    CSV_PATH,
-    VESSELS_AREA001,
     CLEANED_VESSELS,
+    CSV_PATH,
+    HASCAPOREXTENSION_CSV,
     LABEL_OUTPUT_DIR,
-    HASEXTENSION_CSV,
-    TEMPLATE_DIR,
+    VESSELS_ORIGINAL,
 )
 
 
@@ -33,27 +34,59 @@ class UnrealisticMeshError(ValueError):
 
 
 # --- CONFIGURATION ---
-VESSEL_DIR = VESSELS_AREA001
+VESSEL_DIR = VESSELS_ORIGINAL
 OUTPUT_DIR = CLEANED_VESSELS
-# Voronoi in workers is memory-heavy; centerline_creation.py uses 2.
-MAX_VMTK_WORKERS = 4
-# If False, labeled no-extension cases are skipped (not copied into OUTPUT_DIR).
+MAX_WORKERS = 16
+# If False, cases that are not label "2" are skipped (not copied into OUTPUT_DIR).
 COPY_UNEXTENDED = False
+EXTENSION_LABEL = "2"
 
-DISTANCE_THRESHOLD = 0.5  # in mm, to classify boundary as extension vs native
-SMOOTHING_ITERATIONS = 5  # localized Laplacian iterations for boundary smoothing
-SMOOTHING_FACTOR = 0.5    # alpha parameter for smoothing
+SMOOTHING_ITERATIONS = 5
+SMOOTHING_FACTOR = 0.5
 
-# --- EXTENSION CUT PARAMETERS ---
-NORMALS_THRESHOLD = 0.05  # threshold of mean_dot to classify native vessel transition
-MIN_DETECTION_DIST = 0.5  # in mm, to skip initial boundary normals transient
+# A CFD extension is a straight constant-R tube. Native ostia flare or curve
+# within a couple of millimetres. Thresholds are from labeled area-001 probes.
+MIN_EXT_LENGTH_MM = 3.0
+MIN_EXT_LENGTH_RADII = 2.0
+CYL_RADIUS_TOL = 0.18
+CYL_NORMAL_DOT = 0.22
+CYL_AXIS_OFFSET = 0.35
+MIN_DETECTION_DIST = 0.75
+MAX_WALK_MM = 28.0
+MAX_WALK_STEPS = 240
+CUT_SLACK_MM = 0.25
+CLIP_RADIUS_FACTOR = 2.2
+MIN_LOOP_POINTS = 8
+MIN_LOOP_RADIUS_MM = 0.25
+# ---------------------
+
+
+def _norm_label(value):
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return ""
+    text = str(value).strip()
+    if text.endswith(".0"):
+        text = text[:-2]
+    return text
+
+
+def _unit(vec):
+    vec = np.asarray(vec, dtype=np.float64)
+    nrm = float(np.linalg.norm(vec))
+    if nrm < 1e-12:
+        return vec
+    return vec / nrm
+
+
+def resolve_vessel_file(folder, dataset_id):
+    for ext in (".vtp", ".stl", ".vtk"):
+        path = os.path.join(folder, f"{dataset_id}{ext}")
+        if os.path.exists(path):
+            return path
+    return os.path.join(folder, f"{dataset_id}.vtp")
 
 
 def build_adjacency(vessel):
-    """
-    Builds a vertex adjacency list from a triangulated PolyData mesh.
-    Returns a defaultdict mapping vertex index -> list of unique neighbor indices.
-    """
     faces = vessel.faces.reshape(-1, 4)[:, 1:]
     adj = defaultdict(list)
     for face in faces:
@@ -66,271 +99,390 @@ def build_adjacency(vessel):
     return adj, faces
 
 
-def clean_vessel_extensions(vessel, centerline, has_extension_label=None, dataset_id=""):
-    """Cut CFD flow extensions from an already-open vessel mesh."""
-    if not vessel.is_all_triangles:
-        vessel = vessel.triangulate()
-
-    adj, faces = build_adjacency(vessel)
-
-    vessel_with_normals = vessel.compute_normals(cell_normals=False, point_normals=True)
-    normals = vessel_with_normals.point_data['Normals']
-    verts_np = np.array(vessel.points)
-
-    # -------------------------------------------------------------
-    # Phase 1: Extension Detection & Endpoint Extraction
-    # -------------------------------------------------------------
+def _boundary_loops(vessel):
     boundary_mesh = vessel.extract_feature_edges(
         boundary_edges=True,
         non_manifold_edges=False,
         feature_edges=False,
-        manifold_edges=False
+        manifold_edges=False,
     )
+    if boundary_mesh.n_points == 0:
+        return [], boundary_mesh
+    loops = []
+    for loop in boundary_mesh.split_bodies():
+        if loop is None or loop.n_points < MIN_LOOP_POINTS:
+            continue
+        loops.append(loop)
+    return loops, boundary_mesh
 
+
+def _loop_frame(loop_points, vessel_points):
+    centroid = np.mean(loop_points, axis=0)
+    centered = loop_points - centroid
+    _, _, vh = np.linalg.svd(centered, full_matrices=False)
+    normal = _unit(vh[2, :])
+    if np.mean(np.dot(vessel_points - centroid, normal)) > 0:
+        normal = -normal
+    radius = float(np.mean(np.linalg.norm(loop_points - centroid, axis=1)))
+    return centroid, normal, radius
+
+
+def _grow_cylinder(adj, verts, normals, seed_ids, centroid, outward, radius):
+    """Walk inward from an opening. Return cylindrical length and corrected outward."""
+    inward = -outward
+    visited = set(int(i) for i in seed_ids)
+    current = [int(i) for i in seed_ids]
+    flipped = False
+    cyl_len = 0.0
+    fail_streak = 0
+    last_cyl_center = None
+
+    for _ in range(MAX_WALK_STEPS):
+        nxt = []
+        for v in current:
+            for neighbor in adj.get(v, ()):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    nxt.append(neighbor)
+        if not nxt:
+            break
+
+        coords = verts[nxt]
+        ring_c = np.mean(coords, axis=0)
+        s = float(np.dot(ring_c - centroid, inward))
+        if not flipped and abs(s) > 0.15:
+            if s < 0.0:
+                inward = -inward
+                outward = -outward
+                s = -s
+            flipped = True
+        if s > MAX_WALK_MM:
+            break
+
+        radial = np.linalg.norm(np.cross(coords - centroid, inward), axis=1)
+        ring_r = float(np.mean(radial))
+        offset = float(np.linalg.norm(np.cross(ring_c - centroid, inward)))
+        mean_dot = float(np.mean(np.abs(np.dot(normals[nxt], inward))))
+        still_cyl = (
+            s > 0.0
+            and abs(ring_r - radius) <= CYL_RADIUS_TOL * max(radius, 1e-3)
+            and mean_dot <= CYL_NORMAL_DOT
+            and offset <= CYL_AXIS_OFFSET * max(radius, 1e-3)
+        )
+        if still_cyl:
+            cyl_len = s
+            fail_streak = 0
+            last_cyl_center = ring_c
+        elif s > MIN_DETECTION_DIST:
+            fail_streak += 1
+            if fail_streak >= 2:
+                break
+        current = nxt
+
+    if last_cyl_center is not None:
+        inward_fit = last_cyl_center - centroid
+        if float(np.linalg.norm(inward_fit)) > 0.5:
+            outward = -_unit(inward_fit)
+    return cyl_len, outward
+
+
+def is_extension_length(cyl_len, radius):
+    return cyl_len >= max(MIN_EXT_LENGTH_MM, MIN_EXT_LENGTH_RADII * radius)
+
+
+def detect_extensions(vessel, dataset_id=""):
+    """Find openings whose first stretch is a straight constant-R tube."""
+    if not vessel.is_all_triangles:
+        vessel = vessel.triangulate()
+
+    adj, faces = build_adjacency(vessel)
+    vessel_with_normals = vessel.compute_normals(cell_normals=False, point_normals=True)
+    normals = np.asarray(vessel_with_normals.point_data["Normals"])
+    verts = np.asarray(vessel.points)
+
+    loops, boundary_mesh = _boundary_loops(vessel)
     if boundary_mesh.n_points == 0:
         raise UnrealisticMeshError("Mesh has 0 open boundaries (completely closed)")
+    if len(loops) <= 1:
+        raise UnrealisticMeshError(
+            f"Mesh has only {len(loops)} open boundary loop(s) (unrealistic)"
+        )
 
-    loops = boundary_mesh.split_bodies()
-    surf_tree = KDTree(vessel.points)
-
-    boundary_loops = []
+    tree = KDTree(verts)
+    detected = []
     for loop in loops:
-        if loop is None or loop.n_points == 0:
+        _, surf_idx = tree.query(loop.points)
+        centroid, outward, radius = _loop_frame(loop.points, verts)
+        if radius < MIN_LOOP_RADIUS_MM:
             continue
-        _, surf_indices = surf_tree.query(loop.points)
-
-        centroid = np.mean(loop.points, axis=0)
-        centered = loop.points - centroid
-        _, _, vh = np.linalg.svd(centered)
-        normal = vh[2, :]
-
-        v_centered = vessel.points - centroid
-        projs = np.dot(v_centered, normal)
-        if np.mean(projs) > 0:
-            normal = -normal
-
-        loop_radius = np.mean(np.linalg.norm(loop.points - centroid, axis=1))
-        boundary_loops.append({
-            'mesh_indices': surf_indices,
-            'points': loop.points,
-            'centroid': centroid,
-            'normal': normal,
-            'radius': loop_radius
+        cyl_len, outward = _grow_cylinder(
+            adj, verts, normals, surf_idx, centroid, outward, radius
+        )
+        if not is_extension_length(cyl_len, radius):
+            continue
+        cut_len = max(cyl_len - CUT_SLACK_MM, 0.85 * cyl_len)
+        detected.append({
+            "centroid": centroid,
+            "outward": outward,
+            "radius": radius,
+            "length": cut_len,
+            "cyl_len": cyl_len,
+            "loop_indices": surf_idx,
         })
+        print(
+            f"[{dataset_id}] extension R={radius:.2f} mm  cyl={cyl_len:.2f} mm "
+            f"({cyl_len / max(radius, 1e-3):.1f}R)",
+            flush=True,
+        )
+    return vessel, faces, detected, len(loops)
 
-    if len(boundary_loops) <= 1:
-        raise UnrealisticMeshError(f"Mesh has only {len(boundary_loops)} open boundary loop(s) (unrealistic)")
 
-    centerline_endpoints = []
-    for i in range(centerline.n_cells):
-        cell = centerline.GetCell(i)
-        n_pts = cell.GetNumberOfPoints()
-        if n_pts >= 2:
-            cell_pt_ids = [cell.GetPointId(j) for j in range(n_pts)]
-            centerline_endpoints.append(centerline.points[cell_pt_ids[0]])
-            centerline_endpoints.append(centerline.points[cell_pt_ids[-1]])
+def _vtk_xyz(fn, pt):
+    fn(float(pt[0]), float(pt[1]), float(pt[2]))
 
-    loop_candidates = []
-    loop_distances = []
-    for loop in boundary_loops:
-        min_dist = float('inf')
-        for endpoint in centerline_endpoints:
-            dist = np.linalg.norm(loop['centroid'] - endpoint)
-            if dist < min_dist:
-                min_dist = dist
-        loop_distances.append(min_dist)
-        loop_candidates.append((loop, min_dist))
 
-    if has_extension_label is not None:
-        has_extensions = (has_extension_label in [1, 2])
-    else:
-        has_extensions = np.median(loop_distances) > DISTANCE_THRESHOLD
+def _n_loops(mesh):
+    loops, boundary = _boundary_loops(mesh)
+    return len(loops) if boundary.n_points > 0 else 0
 
-    extensions_to_cut = []
-    if has_extensions:
-        for loop, min_dist in loop_candidates:
-            if min_dist > DISTANCE_THRESHOLD:
-                visited = set(loop['mesh_indices'])
-                current_ring = list(loop['mesh_indices'])
 
-                detected_len = 0.0
-                inward_normal = -loop['normal']
+def _remove_cylindrical_stub(mesh, centroid, outward, radius, length, radius_factor=CLIP_RADIUS_FACTOR):
+    """Delete the finite cylinder from the cut plane out through the opening.
 
-                for step in range(120):
-                    next_ring = []
-                    for v in current_ring:
-                        for neighbor in adj[v]:
-                            if neighbor not in visited:
-                                visited.add(neighbor)
-                                next_ring.append(neighbor)
-                    if not next_ring:
-                        break
+    VTK treats implicit-function < 0 as inside. The clip keeps the outside of
+    that region, so the region itself must be exactly the extension stub.
+    """
+    outward = _unit(outward)
+    centroid = np.asarray(centroid, dtype=np.float64)
+    origin = centroid - outward * float(length)
+    far = centroid + outward * max(0.5 * float(radius), 0.3)
+    cyl_r = max(float(radius) * float(radius_factor), float(radius) + 0.4)
 
-                    if step % 20 == 0:
-                        print(f"[{dataset_id}] Phase 1 growing ring {step}...", flush=True)
+    cylinder = vtk.vtkCylinder()
+    _vtk_xyz(cylinder.SetCenter, origin)
+    _vtk_xyz(cylinder.SetAxis, outward)
+    cylinder.SetRadius(float(cyl_r))
 
-                    ring_coords = verts_np[next_ring]
-                    ring_centroid = np.mean(ring_coords, axis=0)
-                    dist = np.dot(ring_centroid - loop['centroid'], inward_normal)
+    near_plane = vtk.vtkPlane()
+    _vtk_xyz(near_plane.SetOrigin, origin)
+    _vtk_xyz(near_plane.SetNormal, -outward)
 
-                    ring_normals = normals[next_ring]
-                    mean_dot = np.mean(np.abs(np.dot(ring_normals, inward_normal)))
+    far_plane = vtk.vtkPlane()
+    _vtk_xyz(far_plane.SetOrigin, far)
+    _vtk_xyz(far_plane.SetNormal, outward)
 
-                    if dist > MIN_DETECTION_DIST:
-                        if mean_dot > NORMALS_THRESHOLD:
-                            detected_len = dist
-                            break
+    region = vtk.vtkImplicitBoolean()
+    region.SetOperationTypeToIntersection()
+    region.AddFunction(cylinder)
+    region.AddFunction(near_plane)
+    region.AddFunction(far_plane)
 
-                    detected_len = dist
-                    current_ring = next_ring
+    poly = mesh.cast_to_unstructured_grid().extract_surface() if not isinstance(mesh, pv.PolyData) else mesh
+    clipper = vtk.vtkClipPolyData()
+    clipper.SetInputData(poly)
+    clipper.SetClipFunction(region)
+    clipper.InsideOutOff()
+    clipper.Update()
+    clipped = pv.wrap(clipper.GetOutput())
+    if clipped.n_points == 0:
+        return mesh
+    return clipped.clean()
 
-                extensions_to_cut.append({
-                    'loop': loop,
-                    'length': detected_len,
-                    'radius': loop['radius']
-                })
 
-    if not extensions_to_cut:
-        return vessel, 0, True
+def _remove_stub_bfs(mesh, centroid, outward, radius, length):
+    """Vertex flood-fill fallback when the implicit cylinder nicks the wall."""
+    if not mesh.is_all_triangles:
+        mesh = mesh.triangulate()
+    adj, faces = build_adjacency(mesh)
+    verts = np.asarray(mesh.points)
+    loops, _ = _boundary_loops(mesh)
+    if not loops:
+        return mesh
+    tree = KDTree(verts)
+    best = None
+    best_d = float("inf")
+    for loop in loops:
+        dist = float(np.linalg.norm(np.mean(loop.points, axis=0) - centroid))
+        if dist < best_d:
+            best_d = dist
+            best = loop
+    if best is None or best_d > 3.0 * max(float(radius), 0.5):
+        return mesh
 
-    # -------------------------------------------------------------
-    # Phase 2: Define Cutting Planes
-    # -------------------------------------------------------------
-    cutting_planes = []
-    for ext in extensions_to_cut:
-        normal = ext['loop']['normal']
-        origin = ext['loop']['centroid'] - normal * ext['length']
-        cutting_planes.append({
-            'origin': origin,
-            'normal': normal,
-            'loop_indices': ext['loop']['mesh_indices'],
-            'loop_centroid': ext['loop']['centroid'],
-            'length': ext['length'],
-            'radius': ext['radius']
-        })
+    _, surf_idx = tree.query(best.points)
+    origin = np.asarray(centroid, dtype=np.float64) - _unit(outward) * float(length)
+    max_dist = float(length) + 2.5 * float(radius)
+    queue = deque(int(i) for i in np.atleast_1d(surf_idx))
+    selected = set(queue)
+    while queue:
+        curr = queue.popleft()
+        for neighbor in adj.get(curr, ()):
+            if neighbor in selected:
+                continue
+            pt = verts[neighbor]
+            if np.linalg.norm(pt - centroid) > max_dist:
+                continue
+            if np.dot(pt - origin, outward) > 0.0:
+                selected.add(neighbor)
+                queue.append(neighbor)
 
-    # -------------------------------------------------------------
-    # Phase 3: Region Growing & Cell Deletion
-    # -------------------------------------------------------------
-    all_verts_to_delete = set()
-    for plane_idx, plane in enumerate(cutting_planes):
-        queue = deque(plane['loop_indices'])
-        selected_verts = set(plane['loop_indices'])
+    keep = np.array([not any(v in selected for v in face) for face in faces], dtype=bool)
+    kept = faces[keep]
+    if len(kept) < 20:
+        return mesh
+    padded = np.hstack((np.full((len(kept), 1), 3, dtype=kept.dtype), kept)).ravel()
+    return pv.PolyData(mesh.points, padded).clean()
 
-        max_bfs_dist = plane['length'] + 2.0 * plane['radius']
 
-        step = 0
-        while queue:
-            curr = queue.popleft()
-            step += 1
-            if step % 10000 == 0:
-                print(f"[{dataset_id}] Phase 3 plane {plane_idx} growing: visited {step} vertices, queue size {len(queue)}", flush=True)
-            for neighbor in adj[curr]:
-                if neighbor not in selected_verts:
-                    v_coord = verts_np[neighbor]
+def _keep_largest(mesh):
+    if mesh.n_points == 0:
+        return mesh
+    try:
+        bodies = mesh.split_bodies()
+    except Exception:
+        return mesh
+    if bodies.n_blocks <= 1:
+        return mesh
+    largest = max(bodies, key=lambda b: 0 if b is None else b.n_points)
+    return pv.wrap(largest).clean() if largest is not None else mesh
 
-                    if np.linalg.norm(v_coord - plane['loop_centroid']) > max_bfs_dist:
-                        continue
 
-                    dot_prod = np.dot(v_coord - plane['origin'], plane['normal'])
-                    if dot_prod > 0:
-                        selected_verts.add(neighbor)
-                        queue.append(neighbor)
-        all_verts_to_delete.update(selected_verts)
-
-    faces_to_delete = []
-    for idx, face in enumerate(faces):
-        if any(v in all_verts_to_delete for v in face):
-            faces_to_delete.append(idx)
-
-    keep_mask = np.ones(len(faces), dtype=bool)
-    keep_mask[faces_to_delete] = False
-    kept_faces = faces[keep_mask]
-
-    num_faces = kept_faces.shape[0]
-    padding = np.full((num_faces, 1), 3, dtype=kept_faces.dtype)
-    padded_faces = np.hstack((padding, kept_faces)).flatten()
-
-    cleaned_vessel_raw = pv.PolyData(vessel.points, padded_faces)
-    cleaned_vessel = cleaned_vessel_raw.clean()
-
-    # -------------------------------------------------------------
-    # Phase 4: Localized Smoothing and Integrity Check
-    # -------------------------------------------------------------
+def _smooth_cut_rims(cleaned_vessel, cutting_planes):
     new_boundary_mesh = cleaned_vessel.extract_feature_edges(
         boundary_edges=True,
         non_manifold_edges=False,
         feature_edges=False,
-        manifold_edges=False
+        manifold_edges=False,
     )
+    if new_boundary_mesh.n_points == 0:
+        return cleaned_vessel
 
-    if new_boundary_mesh.n_points > 0:
-        new_tree = KDTree(cleaned_vessel.points)
-        b_to_mesh_idx = new_tree.query(new_boundary_mesh.points)[1]
+    new_tree = KDTree(cleaned_vessel.points)
+    b_to_mesh_idx = new_tree.query(new_boundary_mesh.points)[1]
+    b_lines = new_boundary_mesh.lines.reshape(-1, 3)[:, 1:]
+    b_adj = defaultdict(list)
+    for line in b_lines:
+        pt0 = new_boundary_mesh.points[line[0]]
+        pt1 = new_boundary_mesh.points[line[1]]
+        near = False
+        for plane in cutting_planes:
+            if (
+                np.linalg.norm(pt0 - plane["origin"]) < 5.0
+                and np.linalg.norm(pt1 - plane["origin"]) < 5.0
+                and abs(np.dot(pt0 - plane["origin"], plane["normal"])) < 1.0
+                and abs(np.dot(pt1 - plane["origin"], plane["normal"])) < 1.0
+            ):
+                near = True
+                break
+        if not near:
+            continue
+        u_mesh = int(b_to_mesh_idx[line[0]])
+        v_mesh = int(b_to_mesh_idx[line[1]])
+        b_adj[u_mesh].append(v_mesh)
+        b_adj[v_mesh].append(u_mesh)
 
-        b_lines = new_boundary_mesh.lines.reshape(-1, 3)[:, 1:]
-        b_lines_mesh_idx = []
-        for line in b_lines:
-            pt0_coord = new_boundary_mesh.points[line[0]]
-            pt1_coord = new_boundary_mesh.points[line[1]]
+    if not b_adj:
+        return cleaned_vessel
 
-            is_near_cut = False
-            for plane in cutting_planes:
-                dist0 = np.linalg.norm(pt0_coord - plane['origin'])
-                dist1 = np.linalg.norm(pt1_coord - plane['origin'])
-                if dist0 < 5.0 and dist1 < 5.0:
-                    d_plane0 = np.abs(np.dot(pt0_coord - plane['origin'], plane['normal']))
-                    d_plane1 = np.abs(np.dot(pt1_coord - plane['origin'], plane['normal']))
-                    if d_plane0 < 1.0 and d_plane1 < 1.0:
-                        is_near_cut = True
-                        break
+    new_points = np.asarray(cleaned_vessel.points).copy()
+    for _ in range(SMOOTHING_ITERATIONS):
+        temp_points = new_points.copy()
+        for v_mesh, neighbors in b_adj.items():
+            if len(neighbors) == 2:
+                n1, n2 = neighbors
+                temp_points[v_mesh] = (
+                    (1.0 - SMOOTHING_FACTOR) * new_points[v_mesh]
+                    + SMOOTHING_FACTOR * (new_points[n1] + new_points[n2]) / 2.0
+                )
+        new_points = temp_points
+    cleaned_vessel.points = new_points
+    return cleaned_vessel
 
-            if is_near_cut:
-                u_mesh = b_to_mesh_idx[line[0]]
-                v_mesh = b_to_mesh_idx[line[1]]
-                b_lines_mesh_idx.append((u_mesh, v_mesh))
 
-        b_adj = defaultdict(list)
-        for u, v in b_lines_mesh_idx:
-            b_adj[u].append(v)
-            b_adj[v].append(u)
+def _apply_extension_cuts(mesh, extensions, dataset_id=""):
+    cleaned = mesh
+    cutting_planes = []
+    applied = []
+    for ext in sorted(extensions, key=lambda e: e["length"], reverse=True):
+        n_before = cleaned.n_points
+        loops_before = _n_loops(cleaned)
+        accepted = None
+        for factor in (CLIP_RADIUS_FACTOR, 3.0, 3.8):
+            candidate = _remove_cylindrical_stub(
+                cleaned,
+                ext["centroid"],
+                ext["outward"],
+                ext["radius"],
+                ext["length"],
+                radius_factor=factor,
+            )
+            candidate = _keep_largest(candidate)
+            if candidate.n_points < 50 or candidate.n_points < 0.70 * n_before:
+                continue
+            if _n_loops(candidate) != loops_before:
+                continue
+            accepted = candidate
+            break
+        if accepted is None:
+            candidate = _keep_largest(
+                _remove_stub_bfs(
+                    cleaned, ext["centroid"], ext["outward"], ext["radius"], ext["length"]
+                )
+            )
+            if (
+                candidate.n_points >= 50
+                and candidate.n_points >= 0.70 * n_before
+                and _n_loops(candidate) == loops_before
+            ):
+                accepted = candidate
+        if accepted is None:
+            print(
+                f"[{dataset_id}] skipped a cut that punched an extra hole or "
+                f"removed too much (R={ext['radius']:.2f} L={ext['length']:.2f})",
+                flush=True,
+            )
+            continue
+        cleaned = accepted
+        origin = ext["centroid"] - ext["outward"] * ext["length"]
+        cutting_planes.append({"origin": origin, "normal": ext["outward"]})
+        applied.append(ext)
+    return cleaned, cutting_planes, applied
 
-        new_points = cleaned_vessel.points.copy()
-        for _ in range(SMOOTHING_ITERATIONS):
-            temp_points = new_points.copy()
-            for v_mesh, neighbors in b_adj.items():
-                if len(neighbors) == 2:
-                    n1, n2 = neighbors
-                    temp_points[v_mesh] = (1.0 - SMOOTHING_FACTOR) * new_points[v_mesh] + SMOOTHING_FACTOR * (new_points[n1] + new_points[n2]) / 2.0
-            new_points = temp_points
-        cleaned_vessel.points = new_points
 
-    final_boundary_mesh = cleaned_vessel.extract_feature_edges(
-        boundary_edges=True,
-        non_manifold_edges=False,
-        feature_edges=False,
-        manifold_edges=False
+def clean_vessel_extensions(vessel, dataset_id=""):
+    """Cut CFD flow extensions from an already-open vessel mesh."""
+    vessel, _faces, extensions_to_cut, orig_num_loops = detect_extensions(
+        vessel, dataset_id=dataset_id
     )
-    final_num_loops = len(final_boundary_mesh.split_bodies()) if final_boundary_mesh.n_points > 0 else 0
-    orig_num_loops = len(loops)
+    if not extensions_to_cut:
+        return vessel, 0, True, []
 
-    integrity_passed = (final_num_loops == orig_num_loops)
+    cleaned, cutting_planes, applied = _apply_extension_cuts(
+        vessel, extensions_to_cut, dataset_id
+    )
+    if not applied:
+        return vessel, 0, True, []
 
-    return cleaned_vessel, len(extensions_to_cut), integrity_passed
+    try:
+        _, _, leftovers, _ = detect_extensions(cleaned, dataset_id)
+    except UnrealisticMeshError:
+        leftovers = []
+    if leftovers:
+        print(f"[{dataset_id}] second pass on {len(leftovers)} leftover tube(s)", flush=True)
+        cleaned, extra_planes, extra = _apply_extension_cuts(
+            cleaned, leftovers, dataset_id
+        )
+        cutting_planes.extend(extra_planes)
+        applied.extend(extra)
 
+    if not cleaned.is_all_triangles:
+        cleaned = cleaned.triangulate()
+    cleaned = _smooth_cut_rims(cleaned, cutting_planes)
 
-def _runtime_centerline(vessel, dataset_id):
-    """Trace a Voronoi centerline on the open mesh. Not written to disk."""
-    if TEMPLATE_DIR not in sys.path:
-        sys.path.insert(0, TEMPLATE_DIR)
-    from vessel_pipeline import compute_centerline_from_mesh, to_vtk_poly
-
-    print(f"[{dataset_id}] Runtime centerline (centerline_creation pipeline)...", flush=True)
-    cl = compute_centerline_from_mesh(to_vtk_poly(vessel))
-    wrapped = pv.wrap(cl)
-    if wrapped.n_points < 2 or wrapped.n_cells < 1:
-        raise RuntimeError("runtime centerline is empty")
-    return wrapped
+    final_loops, final_boundary = _boundary_loops(cleaned)
+    final_num_loops = len(final_loops) if final_boundary.n_points > 0 else 0
+    integrity_passed = final_num_loops == orig_num_loops
+    return cleaned, len(applied), integrity_passed, applied
 
 
 def process_patient_worker(
@@ -343,70 +495,90 @@ def process_patient_worker(
 ):
     """Cut CFD flow extensions. Caps must already be removed."""
     import gc
+
     if not os.path.exists(vessel_file):
         return {
-            'dataset_id': dataset_id, 'location': location, 'status': 'Skipped', 'reason': "Vessel file missing",
-            'cuts_made': 0, 'integrity_check': 'N/A'
+            "dataset_id": dataset_id,
+            "location": location,
+            "status": "Skipped",
+            "reason": "Vessel file missing",
+            "cuts_made": 0,
+            "integrity_check": "N/A",
         }
 
     try:
-        has_extension = (has_extension_label in [1, 2]) if has_extension_label is not None else False
-
-        if not has_extension:
+        is_extension_case = _norm_label(has_extension_label) == EXTENSION_LABEL
+        if not is_extension_case:
             if not copy_unextended:
                 return {
-                    'dataset_id': dataset_id, 'location': location, 'status': 'Skipped',
-                    'reason': 'No extension (copy-unextended is off)',
-                    'cuts_made': 0, 'integrity_check': 'N/A'
+                    "dataset_id": dataset_id,
+                    "location": location,
+                    "status": "Skipped",
+                    "reason": "Not label 2 (copy-unextended is off)",
+                    "cuts_made": 0,
+                    "integrity_check": "N/A",
                 }
             vessel = pv.read(vessel_file)
             vessel.save(output_file)
             del vessel
             gc.collect()
             return {
-                'dataset_id': dataset_id, 'location': location, 'status': 'Saved',
-                'reason': 'Saved as-is (no extensions)',
-                'cuts_made': 0, 'integrity_check': 'Passed'
+                "dataset_id": dataset_id,
+                "location": location,
+                "status": "Saved",
+                "reason": "Saved as-is (not an extension case)",
+                "cuts_made": 0,
+                "integrity_check": "Passed",
             }
 
         vessel = pv.read(vessel_file)
-        centerline = _runtime_centerline(vessel, dataset_id)
-        cleaned_mesh, cuts_made, passed_check = clean_vessel_extensions(
-            vessel, centerline, has_extension_label, dataset_id
+        cleaned_mesh, cuts_made, passed_check, applied = clean_vessel_extensions(
+            vessel, dataset_id
         )
         cleaned_mesh.save(output_file)
 
+        lengths = ", ".join(f"{ext['cyl_len']:.1f}" for ext in applied)
         if not passed_check:
-            reason = f"Saved (Warning: boundary mismatch, cuts: {cuts_made})"
+            reason = f"Saved (Warning: boundary mismatch, cuts: {cuts_made} @ {lengths} mm)"
             chk_status = "Failed"
         elif cuts_made > 0:
-            reason = f"Saved successfully (cuts: {cuts_made})"
+            reason = f"Saved successfully (cuts: {cuts_made} @ {lengths} mm)"
             chk_status = "Passed"
         else:
-            reason = "Saved as-is (no extensions cut)"
+            reason = "Saved as-is (no cylindrical extensions found)"
             chk_status = "Passed"
 
         del vessel
-        del centerline
         del cleaned_mesh
         gc.collect()
-
         return {
-            'dataset_id': dataset_id, 'location': location, 'status': 'Saved', 'reason': reason,
-            'cuts_made': cuts_made, 'integrity_check': chk_status
+            "dataset_id": dataset_id,
+            "location": location,
+            "status": "Saved",
+            "reason": reason,
+            "cuts_made": cuts_made,
+            "integrity_check": chk_status,
         }
 
     except UnrealisticMeshError as ume:
         gc.collect()
         return {
-            'dataset_id': dataset_id, 'location': location, 'status': 'Skipped', 'reason': str(ume),
-            'cuts_made': 0, 'integrity_check': 'N/A'
+            "dataset_id": dataset_id,
+            "location": location,
+            "status": "Skipped",
+            "reason": str(ume),
+            "cuts_made": 0,
+            "integrity_check": "N/A",
         }
-    except Exception as e:
+    except Exception as exc:
         gc.collect()
         return {
-            'dataset_id': dataset_id, 'location': location, 'status': 'Skipped', 'reason': f"Error: {str(e)}",
-            'cuts_made': 0, 'integrity_check': 'Error'
+            "dataset_id": dataset_id,
+            "location": location,
+            "status": "Skipped",
+            "reason": f"Error: {exc}",
+            "cuts_made": 0,
+            "integrity_check": "Error",
         }
 
 
@@ -416,34 +588,59 @@ def _run_task(task):
 
 
 def _parse_args():
-    parser = argparse.ArgumentParser(description="Remove CFD flow extensions from open vessels.")
+    parser = argparse.ArgumentParser(
+        description="Remove CFD flow extensions from open vessels labeled 2."
+    )
     parser.add_argument(
         "--copy-unextended",
         action=argparse.BooleanOptionalAction,
         default=COPY_UNEXTENDED,
-        help="Copy vessels with no extension label into the output folder (default: off).",
+        help="Copy vessels that are not label 2 into the output folder (default: off).",
     )
     parser.add_argument(
         "--workers",
         type=int,
-        default=MAX_VMTK_WORKERS,
-        help="Parallel spawn processes. Each case gets a fresh interpreter (VMTK isolation).",
+        default=MAX_WORKERS,
+        help="Parallel spawn processes.",
+    )
+    parser.add_argument(
+        "--ids",
+        nargs="*",
+        default=None,
+        help="Optional dataset ids to process (still must be label 2 unless --copy-unextended).",
     )
     return parser.parse_args()
 
 
 def _consume_record(record, log_records, counts):
     log_records.append(record)
-    if record['status'] == 'Saved':
-        counts['saved'] += 1
-        counts['cuts'].append(record['cuts_made'])
-        if record['integrity_check'] == 'Failed':
-            counts['integrity_failed'] += 1
-            print(f"\nWarning: Integrity check failed (boundary count mismatch) for {record['dataset_id']}")
-    elif record['status'] == 'Skipped':
-        counts['skipped'] += 1
-        if record['reason'].startswith("Error:"):
+    if record["status"] == "Saved":
+        counts["saved"] += 1
+        counts["cuts"].append(record["cuts_made"])
+        if record["integrity_check"] == "Failed":
+            counts["integrity_failed"] += 1
+            print(
+                f"\nWarning: Integrity check failed (boundary count mismatch) "
+                f"for {record['dataset_id']}"
+            )
+    elif record["status"] == "Skipped":
+        counts["skipped"] += 1
+        if record["reason"].startswith("Error:"):
             print(f"\nError processing patient {record['dataset_id']}: {record['reason']}")
+
+
+def _location_map():
+    if not os.path.exists(CSV_PATH):
+        return {}
+    clinical = pd.read_csv(CSV_PATH)
+    if "dataset" not in clinical.columns or "location" not in clinical.columns:
+        return {}
+    return dict(
+        zip(
+            clinical["dataset"].astype(str).str.strip(),
+            clinical["location"].astype(str).str.strip(),
+        )
+    )
 
 
 def main():
@@ -452,46 +649,52 @@ def main():
     args = _parse_args()
     copy_unextended = bool(args.copy_unextended)
 
+    if not os.path.exists(HASCAPOREXTENSION_CSV):
+        print(f"Label CSV not found: {HASCAPOREXTENSION_CSV}")
+        return
+
+    labels = pd.read_csv(HASCAPOREXTENSION_CSV)
+    if "Filename" not in labels.columns or "Label" not in labels.columns:
+        print(f"{HASCAPOREXTENSION_CSV} must have Filename and Label columns.")
+        return
+    labels["Filename"] = labels["Filename"].astype(str).str.strip()
+    labels["Label"] = labels["Label"].map(_norm_label)
+
+    if args.ids:
+        wanted = set(args.ids)
+        labels = labels[labels["Filename"].isin(wanted)]
+
+    n_ext = int((labels["Label"] == EXTENSION_LABEL).sum())
+    print(f"Loaded {HASCAPOREXTENSION_CSV}: {len(labels)} rows, {n_ext} labeled {EXTENSION_LABEL}")
+    print(f"Copy non-extension vessels: {copy_unextended}")
+
     if os.path.exists(OUTPUT_DIR):
         print(f"Deleting existing directory: {OUTPUT_DIR}")
         shutil.rmtree(OUTPUT_DIR)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     os.makedirs(LABEL_OUTPUT_DIR, exist_ok=True)
 
-    df = pd.read_csv(CSV_PATH)
-    locations = ['ICA pcom', 'ICA oph', 'ICA cav', 'ICA bif']
-    df_filtered = df[df['location'].isin(locations)]
-
-    print(f"Loaded CSV. Total filtered dataset rows: {len(df_filtered)}")
-    print(f"Copy unextended vessels: {copy_unextended}")
-
-    counts = {'saved': 0, 'skipped': 0, 'integrity_failed': 0, 'cuts': []}
+    locations = _location_map()
+    counts = {"saved": 0, "skipped": 0, "integrity_failed": 0, "cuts": []}
     log_records = []
-
-    has_ext_csv = HASEXTENSION_CSV
-    has_ext_map = {}
-    if os.path.exists(has_ext_csv):
-        has_ext_df = pd.read_csv(has_ext_csv)
-        has_ext_map = dict(zip(has_ext_df['Filename'], has_ext_df['Label']))
-        print(f"Loaded hasextension.csv. Found {len(has_ext_map)} mappings.")
-    else:
-        print(f"Warning: {has_ext_csv} not found, defaulting to old behavior")
-
     tasks = []
-    for _, row in df_filtered.iterrows():
-        dataset_id = row['dataset']
-        location = row['location']
-        vessel_file = os.path.join(VESSEL_DIR, f"{dataset_id}.vtp")
+
+    for _, row in labels.iterrows():
+        dataset_id = row["Filename"]
+        label = row["Label"]
+        location = locations.get(dataset_id, "")
+        vessel_file = resolve_vessel_file(VESSEL_DIR, dataset_id)
         output_file = os.path.join(OUTPUT_DIR, f"{dataset_id}.vtp")
-        label = has_ext_map.get(dataset_id, None)
-        has_extension = (label in [1, 2]) if label is not None else False
-        if not has_extension and not copy_unextended:
+        if label != EXTENSION_LABEL and not copy_unextended:
             log_records.append({
-                'dataset_id': dataset_id, 'location': location, 'status': 'Skipped',
-                'reason': 'No extension (copy-unextended is off)',
-                'cuts_made': 0, 'integrity_check': 'N/A',
+                "dataset_id": dataset_id,
+                "location": location,
+                "status": "Skipped",
+                "reason": "Not label 2 (copy-unextended is off)",
+                "cuts_made": 0,
+                "integrity_check": "N/A",
             })
-            counts['skipped'] += 1
+            counts["skipped"] += 1
             continue
         tasks.append((dataset_id, location, vessel_file, output_file, label, copy_unextended))
 
@@ -520,14 +723,14 @@ def main():
     try:
         log_df.to_excel(log_xlsx, index=False)
         print(f"Saved Excel log to: {log_xlsx}")
-    except Exception as ex:
-        print(f"Failed to write Excel file (openpyxl might be missing): {ex}")
+    except Exception as exc:
+        print(f"Failed to write Excel file (openpyxl might be missing): {exc}")
 
     try:
         log_df.to_csv(log_csv, index=False)
         print(f"Saved CSV log to: {log_csv}")
-    except Exception as ex:
-        print(f"Failed to write CSV file: {ex}")
+    except Exception as exc:
+        print(f"Failed to write CSV file: {exc}")
 
     print("\n" + "=" * 50)
     print("CFD EXTENSION REMOVAL SUMMARY")
