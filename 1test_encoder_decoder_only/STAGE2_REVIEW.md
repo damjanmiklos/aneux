@@ -7,8 +7,9 @@ What changed between the previous review (`d0fdc1b`) and this one:
 - `remeshing.py` is new: a ground-truth generator that remeshes the *original* vessel (aneurysm kept) at a constant 0.15 mm edge length, cuts the ostia perpendicular to the centerline, and gates the result on area. It is verified below on two real cases (§2.2). This closes item 1 of the previous P0 list.
 - `vessel_pipeline.py`: `apply_taubin_smoothing` default `pass_band` changed from 1.0 to 0.1 (stronger smoothing, silently affecting `build_parent_tube` and `compute_centerline_from_mesh`, measured in §2.6); new `remove_spurious_openings`, extension-length-aware `_opening_clip_height`, `clip_flow_extensions_and_uncap` now also drops islands and fills leftover rims; `compute_centerline_from_mesh` extracted from `process_centerline_dataset`.
 - Nothing in `train_pipeline/` changed. `clip_centerline_at_profiles` (cell arrays dropped) and `compute_raycast_stretch_distances` (orientation-dependent) are unchanged, so P0 items 2 and 3 of the previous list are still open, and everything the previous review measured about the training side still holds and was re-verified where a fresh file made that possible.
+- §5 (latent) is rewritten: the encoding decision is examined against the literature and taken (§5.3) — a stochastic encoder kept as a rate-controlled channel, with the specification in §5.3.6 and the measurements that set its free parameters in §5.3.7. The rest of the document is aligned to it.
 
-Decisions taken (Damján, 9 Sep) that this review builds on: training reads only `cleandata/`; `uniformly_remeshed/` is the *original vessel with the aneurysm*, finely remeshed, and is the GT for everything; templates come from `variable_remeshing.py` and are the decoder's identity surface; there is no `coarse_remeshed` — mid/coarse are decimations of the template; Stage 1 will emit the centerline at **1 mm** with a texture token every **2 mm**, along the *entire* tree; output must be a single watertight manifold with open outlets (CFD), outlet position/planarity fixed in post; HPC wall-time effectively unlimited, accuracy over speed; manual per-case work acceptable; aneurysm removal (hemoMesh) is a later topic and is not treated here.
+Decisions taken (Damján, 9 Sep) that this review builds on: training reads only `cleandata/`; `uniformly_remeshed/` is the *original vessel with the aneurysm*, finely remeshed, and is the GT for everything; templates come from `variable_remeshing.py` and are the decoder's identity surface; there is no `coarse_remeshed` — mid/coarse are decimations of the template; Stage 1 will emit the centerline at **1 mm** with a texture token every **2 mm**, along the *entire* tree; output must be a single watertight manifold with open outlets (CFD), outlet position/planarity fixed in post; HPC wall-time effectively unlimited, accuracy over speed; manual per-case work acceptable; aneurysm removal (hemoMesh) is a later topic and is not treated here. Encoding (13 Sep): keep a stochastic encoder, but as a rate-controlled channel with explicit standardisation rather than as a generative prior (option C of §5.3.4); strong regularisation toward N(0, I) is not a goal.
 
 How to read this document. Each finding is written in four parts: *what the code does* (with the function names and, where it matters, the exact lines), *what was measured* (the probe, the case, the number), *why it matters for the model that will be trained*, and *what to change*. Everything that is a number was measured on real files produced by the current generators. The main case is **SNF00000100** (an ICA segment, 3 openings, one lateral aneurysm of roughly 25 mm outward extent, 22 076 original vertices, 1 320.6 mm² of wall); **C0002** (7 openings, one of which leaves the sac) is used where a second case is informative. All artifacts are under `scratch/uniform_probe/` (see Appendix A for the file list and the script that produced each number).
 
@@ -26,7 +27,7 @@ How to read this document. Each finding is written in four parts: *what the code
    - `template_centerline` is measurably the same curve as `original_centerline` (Hausdorff 0.12 mm, MISR within 0.06 mm); the training code reads the original and then ignores it in favour of the template's.
    Measured and good: the fine level *is* the posed template (identity displacement 0.0 at init); decimation kept 3 boundary loops, 1 component, 0 non-manifold edges at every level (7 909 / 1 980 / 638 vertices at 0.41 / 0.89 / 1.56 mm); kNN upsampling has no opposite-wall mixing (0.0 % / 0.04 %); template normals point outward on 99.8 % of vertices (by luck of winding, not by construction).
 5. **The Taubin default change is benign but should be known.** Windowed-sinc smoothing at pass band 0.1 × 15 iterations moves the SNF00000100 wall by 0.041 mm median / 0.178 mm max versus 0.032 / 0.092 mm at the old pass band 1.0 (§2.6). The regenerated centerline differs from the old one by ≤ 0.14 mm and the MISR by ≤ 0.06 mm; the regenerated template by ≤ 0.29 mm (mostly remesh noise). Because the GT uses an even lighter setting (1.5 × 5 iterations), the "should the GT be smoothed like the template" question of the previous review (§15.1) is answered by measurement: the two smoothing levels differ by less than one GT edge length.
-6. **Latent, decoder kernel and training hygiene findings carry over unchanged** (§4–§8): 96 × 128 = 12 288-dim near-autoencoder latent with a KL weight that contributes 0.3 % of the objective; θ-blind SplineConv pseudo-coordinates on the template (ring neighbours land at `e_th = 0.5 ± 0.035`); `aggr="add"` without normalisation; no augmentation, no resume, `print` logging, EMA horizon 47 epochs. With the 2 mm token contract now fixed, `LATENT_LEN = 96` *fixed* slots contradicts it — on this 95 mm case the spacing is 2.02–2.04 mm by coincidence, on a 50 mm vessel it would be 1 mm.
+6. **Latent: decision taken; decoder kernel and training hygiene findings carry over unchanged** (§4–§8). The 96 × 128 = 12 288-dim latent is a near-autoencoder with a KL weight that contributes 0.3 % of the objective — but the weight is not the main defect: validation never samples, the log-variance clamp allows σ = 0.018, the latent mixer runs after sampling and can average the noise away, and tokens are not local (§5.1). Neither Stage-1 diffusion nor latent interpolation needs a latent pushed to N(0, I) (§5.3.1–5.3.2); the real regularisation problem is ~20 latent dimensions per training case (§5.3.3). Decision: a light, rate-controlled VAE — `LATENT_DIM` 128 → 24 (set by a rate–distortion sweep), soft σ floor 0.1, per-token rate target with an adaptive β, mixer before sampling, sampling at evaluation, post-training standardisation, and a noise-robustness curve as the Stage-1 contract (§5.3.6–5.3.7). Other carried-over findings: θ-blind SplineConv pseudo-coordinates on the template (ring neighbours land at `e_th = 0.5 ± 0.035`); `aggr="add"` without normalisation; no augmentation, no resume, `print` logging, EMA horizon 47 epochs. With the 2 mm token contract now fixed, `LATENT_LEN = 96` *fixed* slots contradicts it — on this 95 mm case the spacing is 2.02–2.04 mm by coincidence, on a 50 mm vessel it would be 1 mm.
 
 Good and worth keeping: the centerline-intrinsic design, the template as identity surface, kNN inter-level tables with `__inc__`, the decoupled radial/shear head with identity init, multi-scale point-to-plane Chamfer, cache/warm-up infrastructure and the rawdata guard, FP32/TF32, the smoke-test culture (55/55 pass), and now a GT generator with hard quality gates.
 
@@ -474,9 +475,9 @@ After stage 4 there are 64 tokens of 512 features, one per ~1.5 mm of centerline
 ### 4.2 Findings
 
 1. **The input is coordinates only.** GT normals are cached (`x_true_normal`) and not fed to the encoder; nor is the one feature that would make the encoder's job explicit now that a template exists — the **signed distance of each GT point to the template** (positive outside the healthy tube = sac). Both are free: concatenate to the stem input (3 → 7 channels). The encoder's task is precisely "describe the residual"; giving it the residual as a feature removes the need to infer the tube from 16 k points.
-2. **The latent head is thin.** One head, one layer, no feed-forward block, no LayerNorm, positional queries only (the query knows *where* it is, `γ(u)` and tract, but not *what* is there until the softmax has mixed the 64 values). Angular information (θ) is not in the query or key at all — it can only arrive through the content of `h`. On a 2 mm-token contract with ~50 tokens per case, the head should be a small transformer: assign each of the 64 (or more) centres to its nearest token along the tree, pool per token (attention or max), then 2–4 self-attention layers over the token *tree* with arc-length and branch-depth positional encodings (§5.4).
-3. **Capacity is in the wrong place.** 12.6 M parameters process 64 points at stage 4; the head that has to produce 96 × 128 latent values has 1.2 M. Halve stage 4 (256 wide) and give the head the difference.
-4. **`logvar.clamp(-8, 2)`** is a hard clamp: outside the range the gradient to `logvar_head` is exactly zero, so a token whose log-variance drifts past −8 (posterior collapsed to a point) or 2 stops learning its variance. A soft bound (`-8 + 10·sigmoid(·)`) or simply a wider range with the free-bits KL of §5.3 avoids it.
+2. **The latent head is thin.** One head, one layer, no feed-forward block, no LayerNorm, positional queries only (the query knows *where* it is, `γ(u)` and tract, but not *what* is there until the softmax has mixed the 64 values). Angular information (θ) is not in the query or key at all — it can only arrive through the content of `h`. On a 2 mm-token contract with ~50 tokens per case, the head should be a small transformer: assign each of the 64 (or more) centres to its nearest token along the tree, pool per token (attention or max), then 2–4 self-attention layers over the token *tree* with arc-length and branch-depth positional encodings (§5.4). This is what makes tokens local, which §5.2 requires and no KL setting provides (§5.1 item 4).
+3. **Capacity is in the wrong place.** 12.6 M parameters process 64 points at stage 4; the head that has to produce 96 × 128 latent values has 1.2 M (~40–70 × 24 under §5.4 and §5.3.6). Halve stage 4 (256 wide) and give the head the difference.
+4. **`logvar.clamp(-8, 2)`** is a hard clamp: outside the range the gradient to `logvar_head` is exactly zero, so a token whose log-variance drifts past −8 (posterior collapsed to a point) or 2 stops learning its variance. Replace it with the soft bound of §5.3.6 item 2, `log σ²_min + (log σ²_max − log σ²_min) · sigmoid(·)` with σ_min = 0.1 and σ_max = e: the gradient never dies, and the floor stops the posterior collapsing to a deterministic code (§5.1 item 2).
 5. **Batching.** With `n_graphs > 1` the head loops over graphs in Python (`for g in range(n_graphs)`); fine at batch 4–8, but the per-graph GEMM pattern means batching does not buy throughput in this module.
 
 ---
@@ -485,24 +486,160 @@ After stage 4 there are 64 tokens of 512 features, one per ~1.5 mm of centerline
 
 ### 5.1 As built
 
-96 tokens × 128 dims = **12 288** latent dimensions per case. `vae_kl_loss` sums the KL over the 128 dims and averages over tokens (and batch); at init on the real sample KL = 7.13 → weighted by `LAMBDA_KL = 5e-4` (after a 20-epoch linear warm-up) → **0.0036** in the objective against recon 1.315. That is 0.3 % of the loss: the posterior is free to be arbitrarily sharp and the latent to have any scale — functionally an autoencoder with a noise term that vanishes as training proceeds. `LatentTractSelfAttention` (window ±2 tokens along `u`, ALiBi penalty `8·|Δu|`, gate ≤ 0.5, zero-initialised output) mixes neighbouring tokens after sampling — a mild smoothing of the code along the tree, but on the training path only (it is also inside `decode`, so it does apply at inference; it is the *encoder's* posterior that is not regularised toward smoothness).
+96 tokens × 128 dims = **12 288** latent dimensions per case (`config.py` 67–69: `LATENT_LEN = 96`, `LATENT_DIM = 128`, `LOGVAR_CLAMP = (-8.0, 2.0)`). `vae_kl_loss` (losses.py 35–43) sums the KL over the 128 dims and averages over tokens (and batch); at init on the real sample KL = 7.13 → weighted by `LAMBDA_KL = 5e-4` (after a 20-epoch linear warm-up, `kl_anneal_weight`, train.py 90) → **0.0036** in the objective against recon 1.315. That is 0.3 % of the loss: the posterior is free to be arbitrarily sharp and the latent to have any scale — functionally an autoencoder with a noise term whose strength nobody chose and nothing measures.
+
+The weight is not the main problem. Five properties of the code decide what the latent becomes, and none of them is a hyperparameter:
+
+1. **Validation never samples.** `reparameterize` (model.py 965–969) returns `mu` whenever `self.training` is False, and `evaluate_epoch` (train.py 308) calls `model.eval()`. Validation recon, `best.pt` selection (val recon + rad) and the EMA evaluation therefore all run on the deterministic path. The one property the posterior noise exists to buy — that a *neighbourhood* of each code decodes to a sensible wall, i.e. robustness to Stage-1 error — is never observed, so no setting of λ can be validated against it.
+2. **The log-variance clamp permits a deterministic code.** `LOGVAR_CLAMP[0] = −8` means σ can reach e⁻⁴ = 0.018. At small σ the per-dimension KL grows by ≈ 1 nat per nat of `log σ`; summed over 128 dims and weighted by 5e-4 that is **0.064 of objective per nat of `log σ`**. Sharpening every dimension from σ = 1 to the clamp (Δ`log σ` = −4) costs ≈ 0.26 against a recon of 1.315 — a price the reconstruction gradient will pay on ~620 cases with 12 288 latent dimensions. Preventing it by λ alone needs λ ≈ 2e-3, at which point merely *using* the latent at unit scale (mean μ² = 1) costs 2e-3 × 128 × ½ = 0.13, ~10 % of recon: the steep β-VAE trade. The clamp is also hard, so the gradient to `logvar_head` is exactly zero outside it (§4.2 item 4).
+3. **The latent mixer runs after sampling.** `forward` (model.py 980–983) is `mu, logvar = encode(data); z = reparameterize(mu, logvar); z_dec = z_attn(z, data)`, and `decode` (974–978) applies `z_attn` too. `LatentTractSelfAttention` (model.py 560) mixes ±2 tokens (`Z_ATTN_RADIUS = 2`) with an ALiBi penalty `8·|Δu|` on the *normalised* arc fraction — on a 48-token tract that is 0.17 for adjacent and 0.34 for ±2 tokens, i.e. a near-uniform five-token window. Over a signal that is smooth in `u` and noise that is i.i.d. per token, that window is a denoiser. The gate (`Z_ATTN_GATE_MAX = 0.5`, zero-initialised output) bounds how much of it the model can use but does not remove the path: **the σ the KL prices is not the σ the decoder faces.**
+4. **Tokens are not local by construction.** `CenterlineLatentHead` (model.py 272–317) computes each token as `softmax(q·kᵀ/√d)·v` over all 64 encoder centres of the case, with a query built from `γ(u)` and the tract embedding only (line 301). Nothing stops the token at `u = 0.2` from summarising the wall at `u = 0.9`. A KL shapes each token's marginal; it says nothing about *which part of the surface* the token describes. Locality is an architecture property (§4.2 item 2, §5.4).
+5. **The logged rate is per token, not per case.** Because the KL is averaged over tokens, 7.13 nats is one token's share; the per-case rate at init is 7.13 × 96 = 685 nats ≈ **988 bits**, and nobody logs it.
+
+On top of these, the coincident-tract layout of §2.4 splits the 96 tokens 48/48 over two copies of the same parent and hides each half from half the vertices, so the latent currently encodes the same wall twice: any rate measured today is ≈ 2× inflated, and any λ calibrated today is calibrated against a token layout that has to change.
 
 ### 5.2 What Stage 1 needs from the latent
 
-Stage 1 emits, per centerline sample at 1 mm, `[x, y, z, r]` and, on every second sample, a texture token `z_1 … z_D`, along the whole tree. For that to be learnable and for Stage 2 to decode it faithfully, the latent should be: a tree-structured sequence of **local** tokens (each token describes the wall near its position, so Stage 1 can predict it from local conditions); of **fixed per-dimension scale** (so Stage 1's regression loss is meaningful); **smooth** (a Stage-1 prediction near the training codes should decode to a sensible wall, which requires the decoder to have seen a neighbourhood around each code — that is what the posterior noise provides); with a **known null code for healthy wall** (so Stage 1 only has to model where the sac is and what it looks like, and the rest of the tree can emit the prior mean); and the decoder should be **robust to Stage 1 error** (the noise-robustness curve below is the contract).
+Stage 1 emits, per centerline sample at 1 mm, `[x, y, z, r]` and, on every second sample, a texture token `z_1 … z_D`, along the whole tree, generated by a conditional diffusion model. Two downstream uses are planned for the latent: that generation, and sweeping the latent — in particular interpolating between a healthy and an aneurysmal wall. For both to work and for Stage 2 to decode the result faithfully, the latent should be:
 
-### 5.3 VAE vs autoencoder + noise — trade-off and recommendation
+- a tree-structured sequence of **local** tokens — each token describes the wall near its position, so Stage 1 can predict it from local conditions;
+- of **fixed, known per-dimension scale** — so Stage 1's diffusion/regression loss is well conditioned and isotropic;
+- **low-dimensional relative to the data** — so a diffusion model trained on ~620 cases generalises instead of retrieving training cases;
+- **smooth in the decoder's sense** — codes near the training codes decode to sensible walls, which requires the decoder to have been trained on a neighbourhood around each code;
+- with a **known null code for healthy wall** — so Stage 1 only models where the sac is and what it looks like, the rest of the tree emits the null code, and "healthy" is a fixed endpoint for interpolation;
+- **robust to Stage-1 error**, with that robustness *measured* (the noise-robustness curve of §5.3.7 is the contract).
 
-| | β-VAE with a meaningful β | AE + fixed-σ noise + standardisation | **Light per-token KL-VAE with free bits (recommended)** |
+Note what is *not* on the list: that the aggregate posterior equal N(0, I). §5.3 argues that neither diffusion nor interpolation needs it, and that paying for it costs reconstruction and diffusion capacity.
+
+### 5.3 Encoding choice: VAE, autoencoder, or something else — trade-off and recommendation
+
+The VAE was chosen for two reasons: with this few samples a diffusion model in Stage 1 should find a regularised latent easier to model, and a well-regularised latent was thought necessary for latent sweeps (healthy ↔ aneurysmal interpolation). Both reasons are examined below, because the encoding is one of the decisions everything downstream inherits. The conclusion is to **keep a stochastic encoder, but as a rate-controlled channel rather than as a generative prior** (option C) — for a reason specific to this architecture (§5.3.5), not for either of the two original ones.
+
+#### 5.3.1 Does a diffusion model need a strongly regularised latent?
+
+No — and taken literally the argument works against itself. If the KL really made the aggregate posterior N(0, I), Stage 1 would have nothing to learn: sampling the prior would already be the generator. Every nat of structure the KL removes is structure the diffusion model exists to model, bought with reconstruction error.
+
+This is also where latent-diffusion practice has converged. Rombach et al. (LDM) regularise their autoencoder with a "slight KL-penalty towards a standard normal", with a weight of 1e-6 in the released configurations, explicitly *to avoid arbitrarily high-variance latent spaces* — not to make the latent Gaussian — and then rescale the latent by a fixed factor so the diffusion model sees roughly unit variance. At such weights the KL constrains the *scale* of the latent and has no meaningful effect on its *shape*; an unscaled KL severely limits capacity and degrades reconstruction (Dieleman 2025). What a diffusion model needs from a latent is bounded and standardised scale, smoothness/structure along the latent's own index, and a dimensionality it can model with the data it has.
+
+For this project those translate into:
+
+- **scale** — an explicit post-training standardisation pass (§5.3.6 item 7). Cheap, exact, and independent of the KL weight;
+- **structure** — the tokens sit at 2 mm along a centerline and describe overlapping wall, so neighbouring tokens are correlated by construction; locality is enforced by the encoder head and decoder cross-attention (§4.2 item 2, §5.4), not by the KL;
+- **dimensionality** — §5.3.3.
+
+The first original reason therefore reduces to requirements a *light* KL plus standardisation satisfies; a strong KL adds nothing to them and removes capacity.
+
+#### 5.3.2 Does interpolation need a strongly regularised latent?
+
+Also no, for three reasons — and the architecture offers a better instrument for the specific sweep that motivated it.
+
+**(a) Linear interpolation leaves a high-dimensional Gaussian shell no matter how well the latent is regularised.** For z₁, z₂ ~ N(0, I_D) the midpoint has variance ½ per dimension, so its norm concentrates at ≈ √(D/2) while typical codes concentrate at ≈ √D, with a shell thickness of ≈ 0.71 (arithmetic, not measured):
+
+| D | E‖z‖ | ‖midpoint‖ | midpoint distance below the shell |
 |---|---|---|---|
-| reconstruction accuracy | costs accuracy; the trade-off is steep with ~200–680 samples | maximal | near-AE: the free-bits floor means KL only bites on dimensions that carry no information |
-| latent scale | unit by construction | must be standardised explicitly after training | near unit; a final standardisation pass is cheap insurance |
-| healthy segments | collapse to the prior — **desired**: the template already explains them | no pressure toward a null code; healthy tokens are arbitrary points in R^128 | same desirable collapse; the per-token KL along the tree becomes a diagnostic of where the template fails |
-| robustness to Stage 1 error | built in (decoder trained on the posterior spread) | σ controls it directly; must be tuned by hand | built in at the learned posterior width; add extra noise if it narrows |
-| sampling without Stage 1 | yes | no | healthy tokens yes; sac tokens from the aggregate posterior |
-| failure mode | global posterior collapse → blurry sacs | σ mis-set → brittle (too small) or blurry (too large) | two knobs (β, free bits) with a wide safe range |
+| 8 | 2.74 | 1.87 | 1.2 σ |
+| 16 | 3.94 | 2.74 | 1.7 σ |
+| 24 | 4.85 | 3.39 | 2.1 σ |
+| 32 | 5.61 | 3.94 | 2.4 σ |
+| **128 (as built)** | **11.29** | **7.97** | **4.7 σ** |
 
-Recommendation, concretely: per-token KL to N(0, I) with **free bits** ≈ 0.1–0.25 nats per dimension (KL below the floor costs nothing, so the model is not punished for using a dimension a little); β such that the total KL is **2–5 % of the reconstruction term at convergence** (start around 1e-2 on a per-dimension-averaged KL and adjust); the existing 20-epoch warm-up. Log three things: **active units** (dimensions whose KL exceeds the floor), separately for healthy and sac tokens; the **per-token KL profile along the tree** (should be ≈ 0 on healthy wall, large under the sac — if it is flat, the latent is not local); and a **noise-robustness curve** — reconstruction error when decoding `μ + σ·ε` for `σ ∈ {0, 0.25, 0.5, 1}`, as the published contract with Stage 1. Fall back to AE + fixed σ ≈ 0.2–0.3 only if β proves untunable on this data. Once Stage 1 exists, fine-tune the decoder on Stage 1 samples.
+At D = 128 the midpoint of a lerp between two *perfectly* Gaussian codes lies 4.7 shell widths inside the region the decoder was trained on. A stronger KL does not fix this; spherical interpolation (slerp, White 2016) and a smaller D do.
+
+**(b) Interpolation quality is a property of the decoder.** A sweep is meaningful when the latent support is connected and the decoder varies smoothly over it. The second condition comes from training the decoder on a neighbourhood of each code — the posterior noise — and is the same property as robustness to Stage-1 error. It is set by σ, not by KL(q(z) ‖ p(z)).
+
+**(c) Healthy wall is already a fixed point of the model.** The template is the healthy vessel; the healthy wall corresponds to the identity displacement, which a null code must produce. "Healthy → aneurysmal" is therefore the ray `z(t) = t · z_case`, t ∈ [0, 1], anchored at a known endpoint. That requires the **null-code** property (a rate property: tokens that carry nothing sit at the prior mean) and decoder smoothness — not a Gaussian aggregate posterior. For figures of a sac "growing" out of a healthy ICA there is a more direct instrument still: interpolate the decoded displacement field, `t · (Δr, Δs)`, which is monotone, physically interpretable and watertight by construction because the template connectivity never changes.
+
+**(d) Case-to-case interpolation needs a shared scaffold.** Two vessels have different trees and different token counts, so `z_A → z_B` is defined only after the tokens of B are expressed on A's scaffold — resampled by arc position relative to a common landmark (the bifurcation, or the neck centre). This is a correspondence problem, not a regularisation problem, and it must be solved whatever the KL.
+
+The second original reason therefore survives in a reduced form: it requires a null code, decoder smoothness, and a moderate D — all of which option C provides.
+
+#### 5.3.3 The real regularisation problem: dimensionality
+
+The regularisation concern behind the VAE choice is legitimate; the KL is the wrong instrument for it. With ~620 usable cases (from `clinical.csv` and the vessel models: every anterior-circulation location tag has the ICA in the model, while `BA`, `BA tip`, `SCA`, `PICA`, `VA V4` and the single `ACA dist` case do not, and `PCA P1-P2` / `MCA M2` are mixed — ~686 of 750 rows on ~620 unique meshes):
+
+| latent layout | dims per case | dims per training case |
+|---|---|---|
+| **96 × 128 (as built)** | **12 288** | **19.8** |
+| 64 × 32 | 2 048 | 3.3 |
+| **64 × 24 (proposed start)** | **1 536** | **2.5** |
+| 64 × 16 | 1 024 | 1.7 |
+| 50 × 8 | 400 | 0.6 |
+
+Diffusion models trained on few examples relative to their target dimensionality reproduce training examples (Carlini et al. 2023; Somepalli et al. 2023), and here the conditioning — a full centerline and a condition vector — is so informative that nearest-training-case retrieval is close to optimal for most of the tree. A 12 288-dimensional Stage-1 target invites exactly that. The instruments that regularise, in order of effect:
+
+1. **reduce `LATENT_DIM`** (§5.3.6 item 1) — it improves reconstruction per parameter, interpolation (table above), diffusion tractability and memorisation resistance at once;
+2. **augmentation** — absent today (§8); left/right mirroring (the `side` column), rigid pose jitter, mild centerline perturbation;
+3. **the template-plus-residual decomposition itself** — by far the strongest regulariser in the design, since calibre, course and topology never enter the learning problem;
+4. **the geometric losses** once they are actually active (§7.1, §7.2).
+
+Rate control (option C) is the fifth item, and its value is less "regularisation" than *making the channel's capacity a chosen, logged quantity*. No achievable rate prevents a latent from carrying enough information to identify a training case (that needs only log₂ 620 ≈ 9.3 bits); memorisation is guarded by D, augmentation, and held-out evaluation (§5.3.7), not by the KL.
+
+#### 5.3.4 The options compared
+
+| | A. as built (vestigial KL) | B. β-VAE, meaningful β | **C. light, rate-controlled VAE + standardisation (recommended)** | D. AE + fixed σ + standardisation | E. VQ latent + discrete prior | F. analytic cross-section descriptors |
+|---|---|---|---|---|---|---|
+| reconstruction | maximal | costs accuracy; steep with ~620 cases | near-maximal: rate goes where recon needs it | maximal | good; quantisation error | limited by basis order |
+| latent scale | uncontrolled, unlogged | unit by construction | unit after the standardisation pass | unit after the pass | n/a (indices) | exact, physical |
+| null code for healthy wall | none | yes | yes, and the per-token KL profile localises the sac | no pressure toward one | one codebook entry, if learned | exact: all coefficients 0 |
+| robustness to Stage-1 error | unmeasured; collapses toward σ = 0.018 | built in | learned per token, floored, **measured** | one hand-tuned σ for all tokens | discrete: robust to small errors, brittle to wrong indices | analytic: decoder is the basis |
+| fit for Stage-1 diffusion | poorly conditioned, 12 288 dims | wastes diffusion capacity | well conditioned, structure preserved | well conditioned | needs discrete diffusion / autoregression | best conditioned |
+| interpolation | undefined scale | good (slerp) | good (slerp; ray from null code) | σ-dependent | poor (discrete) | exact, interpretable |
+| tuning burden | — | β (steep) | one rate target (dual variable adapts β) + σ floor | σ | codebook size, commitment, dead codes | basis order only |
+| main failure mode | silent collapse to an AE | blurry sacs | rate target set too low → blurry sacs (visible in the sweep) | σ too small → brittle; too large → blurry | codebook collapse | non-star-shaped sacs not representable |
+
+Option F — each 2 mm token a truncated Fourier series of the local cross-section radius in θ (≈ 17 numbers at order 8) — is attractive for a dataset this size: exactly local, fixed scale, exact null code, interpretable, and no learned encoder to memorise. Its limit is that a large sac with a narrow neck is not single-valued in `r(θ)` about the centerline. The current decoder makes a related commitment (Δr along the template normal plus ≤ 3 mm shear, §6.7), so F is only moderately more restrictive; §5.3.8 gives the measurement that decides whether it should replace or complement C.
+
+#### 5.3.5 Why a stochastic encoder is still the right choice here
+
+The decisive argument is not generic. In a template-plus-residual model **the information carried by a token varies by an order of magnitude along the token index**:
+
+- over healthy wall the template already explains the geometry; the token carries essentially nothing, and the right posterior is *wide* (σ ≈ 1, centred at the prior mean) — a large region of codes all decoding to "template, unchanged", which is what makes the null code and Stage 1's job on most of the tree easy;
+- under the sac the token carries the outward displacement — 4.1 / 11.8 / 24.9 mm (p50 / p90 / max of the outward ray to the GT over the 304 sac vertices of SNF00000100, §7.1) — and the posterior must be *narrow* or the sac blurs.
+
+A fixed σ (option D) cannot serve both: σ = 0.3 blurs sacs, σ = 0.05 gives healthy tokens no coverage and no null code. A learned per-token, per-dimension σ with a floor is the right instrument for a latent whose informativeness is this heterogeneous. As a by-product the per-token KL along the tree becomes a diagnostic of where the template fails — ≈ 0 on healthy wall, large under the sac — which is independently useful for the private patient data, where dome annotations will not exist.
+
+#### 5.3.6 Option C, specified
+
+The recipe is the latent-diffusion one — weak KL for scale, explicit standardisation for the diffusion model — plus what this architecture needs: a σ floor, a rate that is controlled rather than inherited, a null code, and a mixer that cannot launder the noise.
+
+1. **`LATENT_DIM` 128 → 24** as the starting point, to be fixed by the rate–distortion sweep of §5.3.7 over D ∈ {8, 16, 24, 32}. With ~40–70 tokens per case under the 2 mm contract (§5.4) the Stage-1 target becomes ~1 000–1 700 dimensions.
+2. **Soft σ floor.** Replace the hard `clamp(-8, 2)` in `CenterlineLatentHead` with a smooth bound, `logvar = log σ²_min + (log σ²_max − log σ²_min) · sigmoid(raw)`, with σ_min = 0.1 (log σ² = −4.61) and σ_max = e (log σ² = 2). The floor keeps noise in the channel however strong the reconstruction pull, which decouples "keep a neighbourhood around every code" from "squeeze μ"; the smooth bound removes the dead gradient of §4.2 item 4. The KL of a dimension sitting at the floor with μ = 0 is ½(0.01 − 1 + 4.61) = 1.81 nats — the model will only go there on dimensions that pay for it in reconstruction.
+3. **Controlled rate instead of a fixed λ.** Keep the per-token KL sum over dimensions, and control its mean over valid tokens with a Lagrangian multiplier (GECO-style, Rezende & Viola 2018, with the constraint on rate instead of distortion): `β ← clip(β · exp(η · (KL̄_raw − R*)), β_min, β_max)`, updated once per optimiser step, with `R*` the target rate in nats per token. Because the constraint is on the *mean*, the model is free to spend ≈ 0 on healthy tokens and much more on sac tokens — the distribution §5.3.5 asks for. Starting target: `R* ≈ 8–16` nats/token at D = 24, set finally by the sweep. The existing 20-epoch warm-up is kept (it now ramps β_max).
+   *Why not per-dimension free bits, as the previous edition of this section recommended.* A per-dimension floor λ lets every dimension sit anywhere with KL < λ at zero cost: at λ = 0.25 nats that is |μ| ≤ 0.71 at σ = 1, or σ ∈ [0.55, 1.54] at μ = 0, and 128 × 0.25 = 32 nats ≈ 46 bits per token for free. The null code becomes a ball rather than a point, and the per-token KL profile is clamped from below at D·λ on every token, so the "≈ 0 on healthy wall" diagnostic reads flat by construction. A floor is still useful as insurance against posterior collapse during warm-up; if used, apply it **per token** and small, `max(λ_tok, Σ_j KL_j)` with λ_tok ≈ 0.5 nats, and apply the `max` to the accumulated batch (`bs 1 × accum 8`), not per step. Posterior collapse is a lesser risk here than in autoregressive VAEs: the decoder cannot place the sac without the latent.
+4. **Mask and normalise the KL by valid tokens** (`latent_valid` from §5.4), so β and `R*` mean the same thing on a 50 mm and a 130 mm tree.
+5. **Move the mixer to the encoder side.** Apply `LatentTractSelfAttention` to μ (and, if wanted, to `logvar`) *before* reparameterisation, compute the KL on the mixed posterior, and feed the sampled code directly to the decoder. The smoothing along the tree is kept, the noise the KL prices is the noise the decoder sees, and Stage 1 generates exactly the codes the decoder consumes. If the mixer is kept after sampling for any reason, log the code scale before/after it and the gate value, and read the noise-robustness curve with that path in mind.
+6. **Sample at evaluation, report both paths.** `reparameterize` gains an explicit `sample` flag; `evaluate_epoch` reports recon at σ = 0 (the μ path, kept for `best.pt` selection and comparability) *and* at the learned σ. The difference between the two is the first indicator of whether the decoder has learned a neighbourhood.
+7. **Standardise after training.** Run the encoder over the training split, compute the per-dimension mean and standard deviation of μ over valid tokens, store both in the checkpoint. Stage 1 is trained on standardised codes (preferably on posterior samples `μ + σ·ε`, which is free augmentation for Stage 1); Stage 2 de-standardises before decoding. Report the statistics separately for healthy and sac tokens: healthy tokens dominate the count and will pull the mean toward the null code, which is correct for the diffusion target but should be visible.
+8. **Define the null code and the sweeps explicitly.** The null code is the prior mean in raw (un-standardised) space, 0 per dimension. Healthy → aneurysmal sweeps use `t · z_case` on the case's own scaffold; case → case sweeps use slerp per token after resampling B's tokens onto A's scaffold by arc position (§5.3.2 d). For publication-grade "growth" figures prefer the displacement-field interpolation of §5.3.2 (c).
+9. **Once Stage 1 exists, fine-tune the decoder on Stage-1 samples**, with the Stage-1 error distribution replacing the Gaussian posterior noise.
+
+#### 5.3.7 Instrumentation and acceptance
+
+These are logged per epoch as structured records (CSV/TensorBoard, §8), because without them a well-tuned latent cannot be told apart from a collapsed one:
+
+- **raw per-token KL** (unclamped, before β), its mean over valid tokens, and **bits per case** (`Σ_tokens KL / ln 2`);
+- **β** (the dual variable) and the gap `KL̄_raw − R*`;
+- **active units** — dimensions whose mean raw KL exceeds 0.01 nats — separately for tokens over healthy wall and tokens over the sac (sac tokens: those whose wall neighbourhood intersects the AneuX dome segmentation, `aneurysms/original/{id}_dome`);
+- **per-token KL profile along the tree** for a fixed set of validation cases — expected ≈ 0 on healthy wall with a peak under the sac; a flat profile means the latent is not local, and no rate setting fixes that;
+- **noise-robustness curve** — reconstruction error (Chamfer and the §12 surface metrics) when decoding `μ + s·ε` in *standardised* units for s ∈ {0, 0.25, 0.5, 1}. This is the published interface contract with Stage 1: Stage 1's expected error in standardised units must lie on the flat part of this curve;
+- **train/validation gap** on both the μ path and the sampled path, and, once Stage 1 exists, a nearest-training-case retrieval check on generated codes (memorisation test).
+
+Two experiments set the free parameters before the full HPC run, both on a 50-case subset on the local 3080 Ti:
+
+1. **Rate–distortion sweep**: D ∈ {8, 16, 24, 32} × `R*` ∈ {2, 8, 16, 32} nats/token. Plot sac-region and healthy-region reconstruction against measured rate (Alemi et al. 2018). Choose the smallest D and rate at which sac reconstruction stops improving materially.
+2. **Noise-robustness curve** at the chosen point, recorded in the repository as the Stage-1 contract.
+
+Acceptance for the chosen configuration: sampled-path recon within a few percent of μ-path recon; the KL profile peaked at the sac on the validation cases; decoding the null code on a case's scaffold reproduces the template to within remesh noise; every mesh along `t · z_case`, t ∈ {0, 0.25, 0.5, 0.75, 1}, has one component, three boundary loops and no non-manifold edges.
+
+Because the §2.4 tract fix, the §5.4 token layout and the §7.1 `r*` fix all change how much the latent must carry, the sweep is run after the first two and re-checked after the third.
+
+#### 5.3.8 What would change this decision
+
+- **Option F replaces or complements C** if a per-token truncated Fourier fit of the GT cross-section radius about the centerline reaches sub-edge accuracy (≲ 0.2 mm) on the sac region at order K ≈ 8–12 on ~20 cases. That test needs no training. If it holds, a hybrid — analytic low orders (calibre, eccentricity) plus a small learned residual code (8–16 dims) under the same rate control — keeps interpretability and the exact null code while retaining capacity for difficult sacs.
+- **Option D replaces C** only if the rate controller proves unstable on this data (β oscillating or pinned at a bound across the sweep); then use a fixed σ ≈ 0.2–0.3 in standardised units, accept the loss of the per-token σ and the KL profile, and tune σ against the noise-robustness curve.
+- **Option B** is not recommended at this sample size; it would be reconsidered only if unconditional sampling from the prior became a requirement.
+
+References for §5.3: Rombach et al., *High-Resolution Image Synthesis with Latent Diffusion Models*, CVPR 2022 ([arXiv:2112.10752](https://arxiv.org/abs/2112.10752)); S. Dieleman, *Generative modelling in latent space* (2025, [sander.ai](https://sander.ai/2025/04/15/latents.html)); Kingma et al., *Improved Variational Inference with Inverse Autoregressive Flow* — free bits ([arXiv:1606.04934](https://arxiv.org/abs/1606.04934)); Chen et al., *Variational Lossy Autoencoder* ([arXiv:1611.02731](https://arxiv.org/abs/1611.02731)); Hoffman & Johnson, *ELBO surgery* (NIPS 2016 Workshop on Advances in Approximate Bayesian Inference) — the average KL decomposes into I(x; z) plus KL(q(z) ‖ p(z)); Alemi et al., *Fixing a Broken ELBO* ([arXiv:1711.00464](https://arxiv.org/abs/1711.00464)); Rezende & Viola, *Taming VAEs* — GECO ([arXiv:1810.00597](https://arxiv.org/abs/1810.00597)); White, *Sampling Generative Networks* — slerp ([arXiv:1609.04468](https://arxiv.org/abs/1609.04468)); Carlini et al., *Extracting Training Data from Diffusion Models* ([arXiv:2301.13188](https://arxiv.org/abs/2301.13188)); Somepalli et al., *Diffusion Art or Digital Forgery?* ([arXiv:2212.03860](https://arxiv.org/abs/2212.03860)).
 
 ### 5.4 Token geometry under the 1 mm / 2 mm decision
 
@@ -514,7 +651,7 @@ Recommendation, concretely: per-token KL to N(0, I) with **free bits** ≈ 0.1�
 
 Given the decision, the changes are:
 
-- `TOKEN_SPACING_MM = 2.0` and `CL_SAMPLE_MM = 1.0` as shared constants of both stages; per branch `n_tok = floor(L / 2) + 1` tokens at arc positions `k · 2 mm` (first token at the branch start). The daughter's first token *is* the junction — no separate junction tokens; the tree gives adjacency. `LATENT_LEN` becomes the padding maximum (e.g. 128) with a validity mask, not the count. `allocate_token_counts` and the fixed-slot logic go.
+- `TOKEN_SPACING_MM = 2.0` and `CL_SAMPLE_MM = 1.0` as shared constants of both stages; per branch `n_tok = floor(L / 2) + 1` tokens at arc positions `k · 2 mm` (first token at the branch start). The daughter's first token *is* the junction — no separate junction tokens; the tree gives adjacency. `LATENT_LEN` becomes the padding maximum (e.g. 128) with a validity mask (`latent_valid`, used by the head, the mixer, the decoder cross-attention and the KL, §5.3.6), not the count. `allocate_token_counts` and the fixed-slot logic go.
 - Tokens on the **original / Stage-1 centerline** (§2.5), not on `template_centerline`.
 - Encoder head as in §4.2 item 2.
 - Decoder cross-attention (§6.4) restricted to the ~5 nearest tokens along the vertex's branch (plus the neighbouring branch's tokens within ~4 mm of an ostium), instead of softmax over all of a tract's slots — with 40–70 tokens and a positional query this is what the softmax converges to anyway, and the restriction makes the latent provably local.
@@ -630,10 +767,10 @@ A **triangle-stretch / edge-length-ratio** regulariser and a **normal-flip penal
 | batch | bs 1 × accum 8 → ~21 steps/epoch on ~170 train cases, **4.3 k steps in 200 epochs** | plan 2–5 · 10⁴ steps; real bs 4–8 now fits easily (0.74 GiB/sample) |
 | optimizer / schedule | AdamW 2e-4, wd 1e-4 on everything, cosine, no warm-up | exclude LayerNorms, biases and gates from wd; 200–500-step LR warm-up |
 | EMA | 0.999 per step | horizon `1 / (1 − 0.999) = 1 000` steps ≈ **47 epochs** at 21 steps/epoch: early `best.pt` selection uses near-initial weights. 0.99–0.995 with a warm-up `min(d, (1 + n) / (10 + n))` |
-| validation | every 5 epochs, EMA only, ~15 % random split | also log non-EMA val; k-fold (§9) |
+| validation | every 5 epochs, EMA only, ~15 % random split, deterministic μ path only (`reparameterize` returns μ in eval) | also log non-EMA val; report recon at σ = 0 *and* with posterior sampling (§5.3.6 item 6); k-fold (§9) |
 | augmentation | none | L/R mirror (before scaffold build — flips Bishop handedness consistently), per-epoch resampling of `x_true` from the full GT (cache all vertices, not 16 384 — 3 099 of the 16 384 are duplicates on the 22 k-vertex stand-in), θ-phase and ±5° pose jitter |
 | resume | `last.pt` is written, never read | load model / EMA / opt / sched / epoch / RNG |
-| logging | `print`, history at the end | per-epoch CSV / TensorBoard (the KL profile and noise-robustness curve of §5.3 live here) |
+| logging | `print`, history at the end | per-epoch CSV / TensorBoard: raw per-token KL, bits per case, β and rate gap, active units (healthy / sac), KL profile along the tree, noise-robustness curve (§5.3.7) |
 | device | `gpu_index = 1 if n_gpu > 1 else 0` | `CUDA_VISIBLE_DEVICES` or an argument |
 | multi-GPU | none | 4 × A100 as 4 independent configs / folds |
 | precision | FP32 tensors, TF32 matmuls | correct; keep it |
@@ -653,7 +790,8 @@ HPC wall-time is effectively unlimited; VRAM on the 3080 Ti already has headroom
 | augmentation set of §8 | largest single generalisation gain on ~200–680 samples | free |
 | 5–10× more optimisation steps | nowhere near convergence at 4.3 k steps | time, now cheap (0.79 s/step → 2–5 · 10⁴ steps is 4–11 GPU-hours per fold) |
 | decoder depth (6–8 residual convs/level, pre-norm) and multi-head cross-attention + FFN instead of the 5³ kernel | capacity where it is used (§6.2, §6.4) | modest |
-| local-pooling transformer latent head (§5.4) | better latent, less overfitting | small |
+| rate–distortion sweep, D ∈ {8, 16, 24, 32} × R* ∈ {2, 8, 16, 32} nats/token on 50 cases (§5.3.7) | fixes `LATENT_DIM` and the rate before the full run; the decision everything in Stage 1 inherits | 16 short runs, local GPU |
+| local-pooling transformer latent head (§4.2, §5.4) | local tokens, better latent, less overfitting | small |
 | normals + template signed distance into the encoder (§4.2) | cheap accuracy | free |
 | densified templates under the sac (§2.3 fix) | fine resolution where the residual lives | regenerate templates |
 | curriculum: radial-only warm-start on the parent, then unlock sac terms | stable convergence against the currently opposing radial Huber | free |
@@ -676,6 +814,7 @@ HPC wall-time is effectively unlimited; VRAM on the 3080 Ti already has headroom
 | smoothness weights | edge-based | **disabled**: dth/du zero (§7.2) |
 | `R_local` per vertex | MISR interpolation | **cached** (`r_local`, `r_local_mid`, `r_local_coarse`) but **unused** by model and losses |
 | tokens at 2 mm on the original centerline | to do | fixed 96 slots on the template centerline (§5.4, §2.5) |
+| latent channel | VAE vs AE open | **decided, not implemented**: rate-controlled VAE (§5.3.6); code is still the near-autoencoder of §5.1 |
 | pseudo-coords in physical units | to do | u yes (`u_step`), θ no (§6.2) |
 | displacement bounds `r_local`-relative, free 3-D at coarse | to do | constants (§6.7) |
 | GT generator | parent tube | **done**: `remeshing.py`, verified on SNF00000100 and C0002 (§2.2) |
@@ -686,7 +825,7 @@ HPC wall-time is effectively unlimited; VRAM on the 3080 Ti already has headroom
 1. **Data first.** Cell arrays through the clip + `extract_groupid_tracts` rule (§2.4); orientation-agnostic stretch test and regenerated templates (§2.3); parametrise from `original_centerline` (§2.5). Generate the three products of one case in one process so they share one centerline and one set of ostium frames (§2.9); export `R_template` and `StretchDistance` on the final template vertices.
 2. **Normals.** Orient every level's normals outward by the radial direction from the nearest centerline sample (one dot product; the sign of `r*`, the head floor and the Chamfer weights all depend on it). Today it is correct on 99.8 % of SNF00000100's vertices only because of how that file happens to be wound.
 3. **`r*` and weights** as in §7; **`r_local`** in `composed_radius`, Chamfer weights, head bounds; θ pseudo-coordinate in physical units.
-4. **Tokens** per §5.4 with arc-length-driven counts and a mask.
+4. **Tokens** per §5.4 with arc-length-driven counts and a mask; then the **latent channel** of §5.3.6 and the rate–distortion sweep of §5.3.7 (after the tract fix and the tokens, since both change how much the latent carries; re-check after the `r*` fix of step 3).
 5. **Cache the full GT** (vertices + normals) and a mirrored copy; cache-time gates: openings = `n_profiles` at every level, one component, no non-manifold edges, GT→template p99 *outside the sac* ≤ 0.5 · `r_local`, every GT vertex within a few millimetres of the centerline.
 6. **Inference path** = Stage-1 centerline (1 mm, MISR) → `generate_base_surface` + uncap → remesh → Stage 2 decode. Variable remeshing needs the GT for its stretch field; at inference only a uniform remesh (or a stretch predicted from the tokens) is available. Train with both densities, or train on uniform templates and let the final remesh (§11) handle density — decide before regenerating.
 
@@ -713,7 +852,8 @@ Held-out folds, millimetre units, non-Huber (the training Chamfer's Huber δ = 1
 - **Sac-specific** versions of the same, using a sac mask. Two equivalent definitions, both already measurable: template vertices whose outward ray to the GT exceeds 1 mm (304 of 7 909 on SNF00000100), or GT points farther than `r_local + 1 mm` from the centerline. Report both so a model that grows the sac in the wrong place cannot hide in the global Chamfer.
 - **Neck-plane error and sac volume error** — the two numbers a clinician actually looks at.
 - **The mesh-validity counts of §11** (self-intersections, loops, components, min angle).
-- **The noise-robustness curve of §5.3** (`μ + σ·ε` for σ ∈ {0, 0.25, 0.5, 1}) — the interface contract with Stage 1.
+- **The noise-robustness curve of §5.3.7** (decode `μ + s·ε` in standardised units for s ∈ {0, 0.25, 0.5, 1}) — the interface contract with Stage 1.
+- **Latent sanity (§5.3.7)**: the null code decodes to the template within remesh noise; every mesh along `t · z_case`, t ∈ {0, 0.25, 0.5, 0.75, 1}, passes the validity counts of §11; the per-token KL profile peaks under the sac.
 
 The current validation score (`val_recon + λ_rad · val_rad`) stays for model selection only; it is not the number that is reported.
 
@@ -727,6 +867,7 @@ The current validation score (`val_recon + λ_rad · val_rad`) stays for model s
 - Both synthetic meshes are wound **outward**; nothing asserts that scaffold normals point *away* from the centerline.
 - Every centerline test uses point-data arrays with identical copies and a 0.4 mm blank. Real files have cell arrays (dropped), near-coincident copies and ~1.6 mm blanks. A fixture from `scratch/uniform_probe/original_centerline/SNF00000100.vtp` (or `scratch/cl_probe/SNF00000100_branched_unclipped.vtp`) asserting 3 tracts / 1 junction would have caught §2.4 twice.
 - `smoothness_edge_weights` returning all ones; token spacing ≈ 2 mm independently of vessel length; `e_th` of a ring neighbour ≈ 0 or 1; decimation keeping `n_profiles` loops at mid and coarse.
+- Latent (§5.3.6): KL masked to valid tokens and invariant to padding; `reparameterize(sample=True)` in eval mode actually samples; log-variance never below log 0.01; the mixer is applied before sampling; decoding the null code returns the template.
 - Sac preservation on a real GT remesh (the probe of §2.2): area ratio ∈ [0.88, 1.20], openings = profiles, original→output fraction > 1 mm below a small threshold. The synthetic scale gates already exist; they do not replace one fixture case.
 
 Earlier scratch probes still relevant: `analyze_stage2_pipeline.py`, `scan_tract_quality.py`, `probe_variable_templates.py`, `time_stage2_step.py`, `profile_stage2_step.py`, `probe_branch_arrays.py`, `probe_groupid_tracts.py`, `prototype_branch_tracts.py`, and from this pass `probe_gt_remesh.py`, `probe_smoothing_change.py`, `probe_template_scaffold.py`, `probe_template_rstar.py`, `probe_stretch_orientation.py`, `scan_gt_winding.py`.
@@ -751,7 +892,7 @@ Earlier scratch probes still relevant: `analyze_stage2_pipeline.py`, `scan_tract
 
 **P1 — model**
 
-9. Tokens at 2 mm with arc-length-driven counts and a mask; local-pooling transformer latent head; light per-token KL with free bits; noise-robustness curve at validation (§5).
+9. Tokens at 2 mm with arc-length-driven counts and a mask; local-pooling transformer latent head (§4.2, §5.4). Latent as a rate-controlled channel (§5.3.6): `LATENT_DIM` 128 → 24 pending the rate–distortion sweep, soft σ floor 0.1, per-token rate target with an adaptive β (a small per-token floor only as warm-up insurance — no per-dimension free bits), mixer before sampling, sampling at evaluation, post-training standardisation; instrumentation and noise-robustness curve (§5.3.7).
 10. θ pseudo-coordinate in physical units; kernel `(5, 5, 2)` or a separate cross-branch conv; `aggr="mean"`, pre-norm, `root_weight=True`; 6–8 convs/level (§6).
 11. Free 3-D displacement at coarse; fold and stretch penalties (§6.7, §11); face-sampled Chamfer on the full GT; robust Dirichlet with GT-driven weights (§7).
 12. Encoder: normals + template signed distance in; stage-3/4 width down; node features `r_local`, curvature, torsion, ostium distance (§4, §6.6).
@@ -770,6 +911,8 @@ Earlier scratch probes still relevant: `analyze_stage2_pipeline.py`, `scan_tract
 2. **Template density at inference.** Variable remeshing needs the GT's stretch field, which Stage 1 cannot provide. Train on uniform templates only (simplest, matches inference exactly), or on variable templates and accept a train/inference density mismatch, or predict a stretch field from the tokens and remesh with it? Decide before regenerating templates after the §2.3 fix.
 3. **`template_centerline`.** Drop the folder, or keep it as a per-case consistency check against `original_centerline` (Hausdorff < 0.5 mm)?
 4. **GT remesh target edge.** 0.15 mm on SNF00000100 gives 96 918 vertices (C0002: 121 426), 12× the template, 6× `N_TRUE`, 999 s / 570 s per case. Anything finer mostly costs cache size, encoder FPS time and generation wall-time; 0.25 mm was the previous estimate (~30–40 k vertices) and would still be denser than the template. Confirm 0.15 mm is the number so `N_TRUE` and the encoder input can be sized to it (§2.2.3). A 10-iteration remesh (VMTK default) is the obvious time/quality trade if 0.15 mm is kept.
+5. **Analytic cross-section descriptors.** Does a per-token truncated Fourier fit of the GT radius in θ reach ≲ 0.2 mm on the sac at order 8–12 (§5.3.8)? If so, option F replaces or complements the learned code; the test needs no training.
+6. **Case-to-case interpolation landmark.** Latent sweeps between two vessels need B's tokens resampled onto A's scaffold (§5.3.2 d). Anchor on the bifurcation, the neck centre, or both?
 
 ---
 
