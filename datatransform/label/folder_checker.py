@@ -15,10 +15,10 @@ import pyvista as pv
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
-from aneux_paths import UNCAPPED_VESSELS, VESSELS_ORIGINAL
+from aneux_paths import CLEANED_VESSELS, VESSELS_ORIGINAL
 
 # --- CONFIGURATION ---
-FOLDER_1 = UNCAPPED_VESSELS
+FOLDER_1 = CLEANED_VESSELS
 FOLDER_2 = VESSELS_ORIGINAL
 
 SUPPORTED_EXTENSIONS = ('.vtp', '.stl', '.vtk')
@@ -66,29 +66,77 @@ def preload_meshes(paths):
     return [mesh for mesh, _ in loaded], [bounds for _, bounds in loaded]
 
 
-def _set_mesh(col, actor_key, mesh, bounds):
+def _union_bounds(a, b):
+    return (
+        min(a[0], b[0]), max(a[1], b[1]),
+        min(a[2], b[2]), max(a[3], b[3]),
+        min(a[4], b[4]), max(a[5], b[5]),
+    )
+
+
+def _bounds_center(bounds):
+    return (
+        0.5 * (bounds[0] + bounds[1]),
+        0.5 * (bounds[2] + bounds[3]),
+        0.5 * (bounds[4] + bounds[5]),
+    )
+
+
+def _shift_bounds(bounds, origin):
+    ox, oy, oz = origin
+    return (
+        bounds[0] - ox, bounds[1] - ox,
+        bounds[2] - oy, bounds[3] - oy,
+        bounds[4] - oz, bounds[5] - oz,
+    )
+
+
+def _set_mesh(col, actor_key, mesh, origin):
     plotter = state['plotter']
     plotter.subplot(0, col)
     actor = state[actor_key]
     if actor is None:
-        state[actor_key] = plotter.add_mesh(
+        actor = plotter.add_mesh(
             mesh,
             name=actor_key,
             show_scalar_bar=False,
             reset_camera=False,
             render=False,
         )
+        state[actor_key] = actor
+    else:
+        actor.mapper.dataset = mesh
+        actor.visibility = True
+    # Same offset on both panes so the pair stays aligned at the origin.
+    actor.position = (-origin[0], -origin[1], -origin[2])
+
+
+def _frame_pair(bounds, first):
+    """Fit both linked viewers to the current pair without letting them drift."""
+    plotter = state['plotter']
+    plotter.subplot(0, 0)
+    if first:
         plotter.view_isometric(render=False, bounds=bounds)
-        return
-    actor.mapper.dataset = mesh
-    actor.visibility = True
-    plotter.reset_camera(bounds=bounds, render=False)
+        plotter.link_views()
+    else:
+        plotter.reset_camera(bounds=bounds, render=False)
+    # view_isometric leaves camera_set False, and show() then ResetCamera's
+    # each pane separately — that both recenters badly and unsyncs the right view.
+    plotter.camera_set = True
+    plotter.reset_camera_clipping_range()
+
+
+def _frame_current(first=False):
+    idx = state['index']
+    bounds = _union_bounds(state['bounds1'][idx], state['bounds2'][idx])
+    origin = _bounds_center(bounds)
+    _frame_pair(_shift_bounds(bounds, origin), first=first)
 
 
 def _overlay_text(index, name1, name2):
     progress = f"[{index + 1}/{len(state['files'])}]"
     left = (
-        f"FOLDER 1 (Uncapped)\n{progress} {name1}\n"
+        f"FOLDER 1 (Unextended)\n{progress} {name1}\n"
         "< Left Arrow (Back) | Right Arrow (Next) >"
     )
     right = f"FOLDER 2 (Original)\n{progress} {name2}"
@@ -106,13 +154,17 @@ def load_current_file():
         os.path.basename(state['paths2'][stem]),
     )
 
-    _set_mesh(0, 'actor1', state['meshes1'][idx], state['bounds1'][idx])
+    first = state['actor1'] is None
+    bounds = _union_bounds(state['bounds1'][idx], state['bounds2'][idx])
+    origin = _bounds_center(bounds)
+
+    _set_mesh(0, 'actor1', state['meshes1'][idx], origin)
     plotter.add_text(left_text, name="text1", font_size=10, position="upper_left", render=False)
 
-    _set_mesh(1, 'actor2', state['meshes2'][idx], state['bounds2'][idx])
+    _set_mesh(1, 'actor2', state['meshes2'][idx], origin)
     plotter.add_text(right_text, name="text2", font_size=10, position="upper_left", render=False)
 
-    plotter.link_views()
+    _frame_current(first=first)
     plotter.render()
 
 
@@ -160,6 +212,15 @@ def main():
 
     plotter.add_key_event("Right", lambda: _step(1))
     plotter.add_key_event("Left", lambda: _step(-1))
+
+    def _reframe_after_window(_pl):
+        if state.get('window_ready'):
+            return
+        state['window_ready'] = True
+        _frame_current(first=False)
+        plotter.render()
+
+    plotter.add_on_render_callback(_reframe_after_window, render_event=True)
     plotter.show()
 
 

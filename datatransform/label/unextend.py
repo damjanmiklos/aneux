@@ -51,11 +51,17 @@ MIN_EXT_LENGTH_RADII = 2.0
 CYL_RADIUS_TOL = 0.18
 CYL_NORMAL_DOT = 0.22
 CYL_AXIS_OFFSET = 0.35
+RING_COLLAPSE = 0.60
+RING_COLLAPSE_MIN_SEED = 16
 MIN_DETECTION_DIST = 0.75
 MAX_WALK_MM = 28.0
 MAX_WALK_STEPS = 240
-CUT_SLACK_MM = 0.25
+CUT_SLACK_MM = 0.50
+CUT_SLACK_RADII = 0.40
 CLIP_RADIUS_FACTOR = 2.2
+CLIP_FACTORS = (1.3, 1.8, 2.2, 3.0)
+LENGTH_BACKOFF = (1.0, 0.85, 0.70, 0.55)
+MIN_KEEP_FRAC = 0.40
 MIN_LOOP_POINTS = 8
 MIN_LOOP_RADIUS_MM = 0.25
 # ---------------------
@@ -118,12 +124,16 @@ def _boundary_loops(vessel):
 
 def _loop_frame(loop_points, vessel_points):
     centroid = np.mean(loop_points, axis=0)
-    centered = loop_points - centroid
-    _, _, vh = np.linalg.svd(centered, full_matrices=False)
-    normal = _unit(vh[2, :])
-    if np.mean(np.dot(vessel_points - centroid, normal)) > 0:
+    centered = np.asarray(loop_points, dtype=np.float64) - centroid
+    cov = centered.T @ centered
+    _evals, evecs = np.linalg.eigh(cov)
+    normal = _unit(evecs[:, 0])
+    sample = np.asarray(vessel_points, dtype=np.float64)
+    if sample.shape[0] > 4000:
+        sample = sample[:: max(1, sample.shape[0] // 4000)]
+    if np.mean(np.dot(sample - centroid, normal)) > 0:
         normal = -normal
-    radius = float(np.mean(np.linalg.norm(loop_points - centroid, axis=1)))
+    radius = float(np.mean(np.linalg.norm(centered, axis=1)))
     return centroid, normal, radius
 
 
@@ -136,6 +146,9 @@ def _grow_cylinder(adj, verts, normals, seed_ids, centroid, outward, radius):
     cyl_len = 0.0
     fail_streak = 0
     last_cyl_center = None
+    early_dots = []
+    early_n = None
+    min_ext = max(MIN_EXT_LENGTH_MM, MIN_EXT_LENGTH_RADII * radius)
 
     for _ in range(MAX_WALK_STEPS):
         nxt = []
@@ -163,16 +176,53 @@ def _grow_cylinder(adj, verts, normals, seed_ids, centroid, outward, radius):
         ring_r = float(np.mean(radial))
         offset = float(np.linalg.norm(np.cross(ring_c - centroid, inward)))
         mean_dot = float(np.mean(np.abs(np.dot(normals[nxt], inward))))
+        n_seed = max(len(seed_ids), 1)
+        r_ref = max(radius, 1e-3)
+        ring_collapsed = (
+            n_seed >= RING_COLLAPSE_MIN_SEED
+            and len(nxt) < RING_COLLAPSE * n_seed
+        )
+        geom_drift = (
+            abs(ring_r - radius) > 0.08 * r_ref
+            or offset > 0.15 * r_ref
+        )
+        # A thin tube can drop to ~half the rim vertices and stay cylindrical.
+        # Count ring collapse as the transition only when the tube also drifts.
         still_cyl = (
             s > 0.0
-            and abs(ring_r - radius) <= CYL_RADIUS_TOL * max(radius, 1e-3)
+            and abs(ring_r - radius) <= CYL_RADIUS_TOL * r_ref
             and mean_dot <= CYL_NORMAL_DOT
-            and offset <= CYL_AXIS_OFFSET * max(radius, 1e-3)
+            and offset <= CYL_AXIS_OFFSET * r_ref
+            and not (ring_collapsed and geom_drift)
+        )
+        if still_cyl and fail_streak == 0 and 0.2 < s < 2.8:
+            early_dots.append(mean_dot)
+            if early_n is None:
+                early_n = len(nxt)
+        early_dot = float(np.median(early_dots)) if early_dots else 0.0
+        flare = ring_r > radius * 1.08
+        dot_rise = mean_dot > max(0.10, early_dot + 0.06)
+        n_shrink = early_n is not None and len(nxt) < 0.90 * early_n
+        # Parent ostium: the ring is still loosely cylindrical, but the wall
+        # tilts and the ring thins, or the radius starts to flare.
+        if (
+            cyl_len >= min_ext
+            and s > MIN_DETECTION_DIST
+            and (flare or (dot_rise and n_shrink))
+        ):
+            break
+        tight_recovery = (
+            abs(ring_r - radius) <= 0.08 * r_ref
+            and offset <= 0.20 * r_ref
         )
         if still_cyl:
-            cyl_len = s
-            fail_streak = 0
-            last_cyl_center = ring_c
+            if fail_streak == 0 or tight_recovery:
+                cyl_len = s
+                fail_streak = 0
+                last_cyl_center = ring_c
+            else:
+                # A looser tube after a fail is usually the parent branch.
+                break
         elif s > MIN_DETECTION_DIST:
             fail_streak += 1
             if fail_streak >= 2:
@@ -220,7 +270,8 @@ def detect_extensions(vessel, dataset_id=""):
         )
         if not is_extension_length(cyl_len, radius):
             continue
-        cut_len = max(cyl_len - CUT_SLACK_MM, 0.85 * cyl_len)
+        slack = max(CUT_SLACK_MM, CUT_SLACK_RADII * radius)
+        cut_len = max(cyl_len - slack, 0.80 * cyl_len)
         detected.append({
             "centroid": centroid,
             "outward": outward,
@@ -310,8 +361,10 @@ def _remove_stub_bfs(mesh, centroid, outward, radius, length):
         return mesh
 
     _, surf_idx = tree.query(best.points)
-    origin = np.asarray(centroid, dtype=np.float64) - _unit(outward) * float(length)
-    max_dist = float(length) + 2.5 * float(radius)
+    outward = _unit(outward)
+    origin = np.asarray(centroid, dtype=np.float64) - outward * float(length)
+    max_dist = float(length) + 1.25 * float(radius)
+    max_radial = 1.4 * float(radius)
     queue = deque(int(i) for i in np.atleast_1d(surf_idx))
     selected = set(queue)
     while queue:
@@ -321,6 +374,8 @@ def _remove_stub_bfs(mesh, centroid, outward, radius, length):
                 continue
             pt = verts[neighbor]
             if np.linalg.norm(pt - centroid) > max_dist:
+                continue
+            if float(np.linalg.norm(np.cross(pt - centroid, outward))) > max_radial:
                 continue
             if np.dot(pt - origin, outward) > 0.0:
                 selected.add(neighbor)
@@ -399,6 +454,36 @@ def _smooth_cut_rims(cleaned_vessel, cutting_planes):
     return cleaned_vessel
 
 
+def _cut_is_safe(candidate, n_before, loops_before):
+    return (
+        candidate.n_points >= 50
+        and candidate.n_points >= MIN_KEEP_FRAC * n_before
+        and _n_loops(candidate) == loops_before
+    )
+
+
+def _try_one_cut(mesh, ext, length, n_before, loops_before):
+    for factor in CLIP_FACTORS:
+        candidate = _keep_largest(
+            _remove_cylindrical_stub(
+                mesh,
+                ext["centroid"],
+                ext["outward"],
+                ext["radius"],
+                length,
+                radius_factor=factor,
+            )
+        )
+        if _cut_is_safe(candidate, n_before, loops_before):
+            return candidate
+    candidate = _keep_largest(
+        _remove_stub_bfs(mesh, ext["centroid"], ext["outward"], ext["radius"], length)
+    )
+    if _cut_is_safe(candidate, n_before, loops_before):
+        return candidate
+    return None
+
+
 def _apply_extension_cuts(mesh, extensions, dataset_id=""):
     cleaned = mesh
     cutting_planes = []
@@ -407,34 +492,19 @@ def _apply_extension_cuts(mesh, extensions, dataset_id=""):
         n_before = cleaned.n_points
         loops_before = _n_loops(cleaned)
         accepted = None
-        for factor in (CLIP_RADIUS_FACTOR, 3.0, 3.8):
-            candidate = _remove_cylindrical_stub(
-                cleaned,
-                ext["centroid"],
-                ext["outward"],
-                ext["radius"],
-                ext["length"],
-                radius_factor=factor,
-            )
-            candidate = _keep_largest(candidate)
-            if candidate.n_points < 50 or candidate.n_points < 0.70 * n_before:
-                continue
-            if _n_loops(candidate) != loops_before:
-                continue
-            accepted = candidate
-            break
-        if accepted is None:
-            candidate = _keep_largest(
-                _remove_stub_bfs(
-                    cleaned, ext["centroid"], ext["outward"], ext["radius"], ext["length"]
-                )
-            )
-            if (
-                candidate.n_points >= 50
-                and candidate.n_points >= 0.70 * n_before
-                and _n_loops(candidate) == loops_before
-            ):
-                accepted = candidate
+        used_length = None
+        for frac in LENGTH_BACKOFF:
+            length = float(ext["length"]) * frac
+            accepted = _try_one_cut(cleaned, ext, length, n_before, loops_before)
+            if accepted is not None:
+                used_length = length
+                if frac < 1.0:
+                    print(
+                        f"[{dataset_id}] shortened cut to {length:.2f} mm "
+                        f"(R={ext['radius']:.2f})",
+                        flush=True,
+                    )
+                break
         if accepted is None:
             print(
                 f"[{dataset_id}] skipped a cut that punched an extra hole or "
@@ -443,9 +513,9 @@ def _apply_extension_cuts(mesh, extensions, dataset_id=""):
             )
             continue
         cleaned = accepted
-        origin = ext["centroid"] - ext["outward"] * ext["length"]
+        origin = ext["centroid"] - ext["outward"] * used_length
         cutting_planes.append({"origin": origin, "normal": ext["outward"]})
-        applied.append(ext)
+        applied.append({**ext, "length": used_length})
     return cleaned, cutting_planes, applied
 
 
