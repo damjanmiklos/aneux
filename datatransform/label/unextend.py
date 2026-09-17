@@ -45,8 +45,9 @@ SMOOTHING_ITERATIONS = 5
 SMOOTHING_FACTOR = 0.5
 
 # A CFD extension is a straight constant-R tube. Native ostia flare or curve
-# within a couple of millimetres. Thresholds are from labeled area-001 probes.
-MIN_EXT_LENGTH_MM = 3.0
+# within a couple of millimetres. Thin tubes are judged in radii; the millimetre
+# floor only rejects sub-millimetre noise, not 2 mm / 5 R perforators.
+MIN_EXT_LENGTH_MM = 1.5
 MIN_EXT_LENGTH_RADII = 2.0
 CYL_RADIUS_TOL = 0.18
 CYL_NORMAL_DOT = 0.22
@@ -56,14 +57,20 @@ RING_COLLAPSE_MIN_SEED = 16
 MIN_DETECTION_DIST = 0.75
 MAX_WALK_MM = 28.0
 MAX_WALK_STEPS = 240
-CUT_SLACK_MM = 0.50
-CUT_SLACK_RADII = 0.40
 CLIP_RADIUS_FACTOR = 2.2
 CLIP_FACTORS = (1.3, 1.8, 2.2, 3.0)
-LENGTH_BACKOFF = (1.0, 0.85, 0.70, 0.55)
+LENGTH_BACKOFF = (1.0, 0.94, 0.88, 0.80, 0.70)
 MIN_KEEP_FRAC = 0.40
 MIN_LOOP_POINTS = 8
 MIN_LOOP_RADIUS_MM = 0.25
+# Same cylinder walk used to report leftover %. Cut until that leftover is a
+# short cuff, not until it is ~0 (that last millimetre is already native ostium).
+KEEP_CUFF_MM = 0.80
+KEEP_CUFF_RADII = 0.30
+LEFTOVER_RECUT_MM = 1.40
+LEFTOVER_RECUT_RADII = 0.70
+LEFTOVER_SHRINK_MM = 0.25
+MAX_CUT_PASSES = 2
 # ---------------------
 
 
@@ -76,12 +83,63 @@ def _norm_label(value):
     return text
 
 
+def keep_cuff(radius):
+    """Leftover cylinder length we want to keep at a cut opening, in mm."""
+    return max(KEEP_CUFF_MM, KEEP_CUFF_RADII * float(radius))
+
+
+def leftover_too_long(cyl_len, radius):
+    """True if the reported leftover is still a CFD remnant, not just the cuff."""
+    return float(cyl_len) >= max(LEFTOVER_RECUT_MM, LEFTOVER_RECUT_RADII * float(radius))
+
+
+def leftover_overcut(cyl_len, radius):
+    """True if leftover cylinder is shorter than half the intended cuff."""
+    return float(cyl_len) < 0.50 * keep_cuff(radius)
+
+
 def _unit(vec):
     vec = np.asarray(vec, dtype=np.float64)
     nrm = float(np.linalg.norm(vec))
     if nrm < 1e-12:
         return vec
     return vec / nrm
+
+
+def _as_surface(mesh):
+    """Return a PolyData surface.
+
+    Clip, split_bodies, and some VTK filters yield UnstructuredGrid. The rest
+    of this pipeline (faces, is_all_triangles, .vtp save) requires PolyData.
+    """
+    if mesh is None:
+        return mesh
+    if isinstance(mesh, pv.PolyData):
+        return mesh
+    if getattr(mesh, "n_points", 0) == 0:
+        return pv.PolyData()
+    try:
+        surf = mesh.extract_surface(
+            pass_pointid=False,
+            pass_cellid=False,
+            algorithm="dataset_surface",
+        )
+    except TypeError:
+        surf = mesh.extract_surface()
+    except Exception:
+        surf = pv.wrap(mesh).extract_surface()
+    if not isinstance(surf, pv.PolyData):
+        surf = pv.PolyData(np.asarray(surf.points), getattr(surf, "faces", None))
+    return surf
+
+
+def _as_triangles(mesh):
+    mesh = _as_surface(mesh)
+    if mesh is None or mesh.n_points == 0:
+        return mesh
+    if not mesh.is_all_triangles:
+        mesh = mesh.triangulate()
+    return _as_surface(mesh)
 
 
 def resolve_vessel_file(folder, dataset_id):
@@ -137,7 +195,7 @@ def _loop_frame(loop_points, vessel_points):
     return centroid, normal, radius
 
 
-def _grow_cylinder(adj, verts, normals, seed_ids, centroid, outward, radius):
+def _grow_cylinder(adj, verts, normals, seed_ids, centroid, outward, radius, stub=False):
     """Walk inward from an opening. Return cylindrical length and corrected outward."""
     inward = -outward
     visited = set(int(i) for i in seed_ids)
@@ -145,10 +203,11 @@ def _grow_cylinder(adj, verts, normals, seed_ids, centroid, outward, radius):
     flipped = False
     cyl_len = 0.0
     fail_streak = 0
-    last_cyl_center = None
     early_dots = []
     early_n = None
     min_ext = max(MIN_EXT_LENGTH_MM, MIN_EXT_LENGTH_RADII * radius)
+    # Leftover cuffs are shorter than 2R, so ostium stop cannot wait for min_ext.
+    min_stop = keep_cuff(radius) if stub else min_ext
 
     for _ in range(MAX_WALK_STEPS):
         nxt = []
@@ -183,8 +242,8 @@ def _grow_cylinder(adj, verts, normals, seed_ids, centroid, outward, radius):
             and len(nxt) < RING_COLLAPSE * n_seed
         )
         geom_drift = (
-            abs(ring_r - radius) > 0.08 * r_ref
-            or offset > 0.15 * r_ref
+            abs(ring_r - radius) > max(0.08 * r_ref, 0.08)
+            or offset > max(0.15 * r_ref, 0.15)
         )
         # A thin tube can drop to ~half the rim vertices and stay cylindrical.
         # Count ring collapse as the transition only when the tube also drifts.
@@ -206,7 +265,7 @@ def _grow_cylinder(adj, verts, normals, seed_ids, centroid, outward, radius):
         # Parent ostium: the ring is still loosely cylindrical, but the wall
         # tilts and the ring thins, or the radius starts to flare.
         if (
-            cyl_len >= min_ext
+            cyl_len >= min_stop
             and s > MIN_DETECTION_DIST
             and (flare or (dot_rise and n_shrink))
         ):
@@ -219,7 +278,6 @@ def _grow_cylinder(adj, verts, normals, seed_ids, centroid, outward, radius):
             if fail_streak == 0 or tight_recovery:
                 cyl_len = s
                 fail_streak = 0
-                last_cyl_center = ring_c
             else:
                 # A looser tube after a fail is usually the parent branch.
                 break
@@ -229,21 +287,19 @@ def _grow_cylinder(adj, verts, normals, seed_ids, centroid, outward, radius):
                 break
         current = nxt
 
-    if last_cyl_center is not None:
-        inward_fit = last_cyl_center - centroid
-        if float(np.linalg.norm(inward_fit)) > 0.5:
-            outward = -_unit(inward_fit)
     return cyl_len, outward
 
 
-def is_extension_length(cyl_len, radius):
-    return cyl_len >= max(MIN_EXT_LENGTH_MM, MIN_EXT_LENGTH_RADII * radius)
+def is_extension_length(cyl_len, radius, stub=False):
+    min_full = max(MIN_EXT_LENGTH_MM, MIN_EXT_LENGTH_RADII * radius)
+    if stub:
+        return leftover_too_long(cyl_len, radius)
+    return cyl_len >= min_full
 
 
-def detect_extensions(vessel, dataset_id=""):
+def detect_extensions(vessel, dataset_id="", stub=False):
     """Find openings whose first stretch is a straight constant-R tube."""
-    if not vessel.is_all_triangles:
-        vessel = vessel.triangulate()
+    vessel = _as_triangles(vessel)
 
     adj, faces = build_adjacency(vessel)
     vessel_with_normals = vessel.compute_normals(cell_normals=False, point_normals=True)
@@ -266,12 +322,11 @@ def detect_extensions(vessel, dataset_id=""):
         if radius < MIN_LOOP_RADIUS_MM:
             continue
         cyl_len, outward = _grow_cylinder(
-            adj, verts, normals, surf_idx, centroid, outward, radius
+            adj, verts, normals, surf_idx, centroid, outward, radius, stub=False
         )
-        if not is_extension_length(cyl_len, radius):
+        if not is_extension_length(cyl_len, radius, stub=stub):
             continue
-        slack = max(CUT_SLACK_MM, CUT_SLACK_RADII * radius)
-        cut_len = max(cyl_len - slack, 0.80 * cyl_len)
+        cut_len = max(cyl_len - keep_cuff(radius), 0.0)
         detected.append({
             "centroid": centroid,
             "outward": outward,
@@ -334,16 +389,15 @@ def _remove_cylindrical_stub(mesh, centroid, outward, radius, length, radius_fac
     clipper.SetClipFunction(region)
     clipper.InsideOutOff()
     clipper.Update()
-    clipped = pv.wrap(clipper.GetOutput())
+    clipped = _as_surface(pv.wrap(clipper.GetOutput()))
     if clipped.n_points == 0:
-        return mesh
-    return clipped.clean()
+        return _as_surface(mesh)
+    return _as_surface(clipped.clean())
 
 
 def _remove_stub_bfs(mesh, centroid, outward, radius, length):
     """Vertex flood-fill fallback when the implicit cylinder nicks the wall."""
-    if not mesh.is_all_triangles:
-        mesh = mesh.triangulate()
+    mesh = _as_triangles(mesh)
     adj, faces = build_adjacency(mesh)
     verts = np.asarray(mesh.points)
     loops, _ = _boundary_loops(mesh)
@@ -386,10 +440,11 @@ def _remove_stub_bfs(mesh, centroid, outward, radius, length):
     if len(kept) < 20:
         return mesh
     padded = np.hstack((np.full((len(kept), 1), 3, dtype=kept.dtype), kept)).ravel()
-    return pv.PolyData(mesh.points, padded).clean()
+    return _as_surface(pv.PolyData(mesh.points, padded).clean())
 
 
 def _keep_largest(mesh):
+    mesh = _as_surface(mesh)
     if mesh.n_points == 0:
         return mesh
     try:
@@ -399,7 +454,9 @@ def _keep_largest(mesh):
     if bodies.n_blocks <= 1:
         return mesh
     largest = max(bodies, key=lambda b: 0 if b is None else b.n_points)
-    return pv.wrap(largest).clean() if largest is not None else mesh
+    if largest is None:
+        return mesh
+    return _as_surface(pv.wrap(largest).clean())
 
 
 def _smooth_cut_rims(cleaned_vessel, cutting_planes):
@@ -484,6 +541,57 @@ def _try_one_cut(mesh, ext, length, n_before, loops_before):
     return None
 
 
+def _same_branch(ext, prev):
+    """True if `ext` is the leftover rim of a previous cut."""
+    prev_c = np.asarray(prev["centroid"], dtype=np.float64)
+    prev_n = _unit(prev["outward"])
+    pred = prev_c - prev_n * float(prev["length"])
+    cur = np.asarray(ext["centroid"], dtype=np.float64)
+    r_ok = abs(float(ext["radius"]) - float(prev["radius"])) <= max(
+        0.40, 0.30 * float(prev["radius"])
+    )
+    reach = max(
+        3.0,
+        2.5 * float(prev["radius"]),
+        0.6 * float(prev.get("cyl_len", prev["length"])),
+    )
+    return r_ok and min(
+        float(np.linalg.norm(cur - pred)),
+        float(np.linalg.norm(cur - prev_c)),
+    ) <= reach
+
+
+def _opening_cyl_near(mesh, point, radius):
+    """Cylindrical length of the opening nearest to `point` with similar radius."""
+    mesh = _as_triangles(mesh)
+    loops, boundary = _boundary_loops(mesh)
+    if boundary.n_points == 0 or not loops:
+        return None
+    adj, _ = build_adjacency(mesh)
+    normals = np.asarray(
+        mesh.compute_normals(cell_normals=False, point_normals=True).point_data["Normals"]
+    )
+    verts = np.asarray(mesh.points)
+    tree = KDTree(verts)
+    point = np.asarray(point, dtype=np.float64)
+    best = None
+    best_score = float("inf")
+    for loop in loops:
+        centroid, outward, r = _loop_frame(loop.points, verts)
+        score = float(np.linalg.norm(centroid - point)) + 2.0 * abs(r - radius)
+        if score < best_score:
+            best_score = score
+            _, idx = tree.query(loop.points)
+            best = (idx, centroid, outward, r)
+    if best is None:
+        return None
+    idx, centroid, outward, r = best
+    cyl, _ = _grow_cylinder(
+        adj, verts, normals, idx, centroid, outward, r, stub=False
+    )
+    return cyl
+
+
 def _apply_extension_cuts(mesh, extensions, dataset_id=""):
     cleaned = mesh
     cutting_planes = []
@@ -493,18 +601,31 @@ def _apply_extension_cuts(mesh, extensions, dataset_id=""):
         loops_before = _n_loops(cleaned)
         accepted = None
         used_length = None
+        overcut_fallback = None
+        overcut_fallback_len = None
         for frac in LENGTH_BACKOFF:
             length = float(ext["length"]) * frac
-            accepted = _try_one_cut(cleaned, ext, length, n_before, loops_before)
-            if accepted is not None:
-                used_length = length
-                if frac < 1.0:
-                    print(
-                        f"[{dataset_id}] shortened cut to {length:.2f} mm "
-                        f"(R={ext['radius']:.2f})",
-                        flush=True,
-                    )
-                break
+            candidate = _try_one_cut(cleaned, ext, length, n_before, loops_before)
+            if candidate is None:
+                continue
+            origin = ext["centroid"] - ext["outward"] * length
+            after = _opening_cyl_near(candidate, origin, ext["radius"])
+            if after is not None and leftover_overcut(after, ext["radius"]):
+                overcut_fallback = candidate
+                overcut_fallback_len = length
+                continue
+            accepted = candidate
+            used_length = length
+            if frac < 1.0:
+                print(
+                    f"[{dataset_id}] shortened cut to {length:.2f} mm "
+                    f"(R={ext['radius']:.2f})",
+                    flush=True,
+                )
+            break
+        if accepted is None and overcut_fallback is not None:
+            accepted = overcut_fallback
+            used_length = overcut_fallback_len
         if accepted is None:
             print(
                 f"[{dataset_id}] skipped a cut that punched an extra hole or "
@@ -519,34 +640,103 @@ def _apply_extension_cuts(mesh, extensions, dataset_id=""):
     return cleaned, cutting_planes, applied
 
 
+def _apply_leftover_cuts(mesh, extensions, previous, dataset_id=""):
+    """Recut leftover CFD tube, but not native cylinder exposed by the first cut."""
+    pending = [ext for ext in extensions if any(_same_branch(ext, prev) for prev in previous)]
+    cleaned = mesh
+    cutting_planes = []
+    applied = []
+    for ext in sorted(pending, key=lambda e: e["length"], reverse=True):
+        n_before = cleaned.n_points
+        loops_before = _n_loops(cleaned)
+        accepted = None
+        used_length = None
+        grew = False
+        nicked = False
+        for frac in LENGTH_BACKOFF:
+            length = float(ext["length"]) * frac
+            candidate = _try_one_cut(cleaned, ext, length, n_before, loops_before)
+            if candidate is None:
+                continue
+            origin = ext["centroid"] - ext["outward"] * length
+            after = _opening_cyl_near(candidate, origin, ext["radius"])
+            if after is not None and leftover_overcut(after, ext["radius"]):
+                nicked = True
+                continue
+            if after is not None and after > ext["cyl_len"] - LEFTOVER_SHRINK_MM:
+                grew = True
+                continue
+            accepted = candidate
+            used_length = length
+            if frac < 1.0:
+                print(
+                    f"[{dataset_id}] shortened leftover cut to {length:.2f} mm "
+                    f"(R={ext['radius']:.2f})",
+                    flush=True,
+                )
+            break
+        if accepted is None:
+            if nicked or grew:
+                print(
+                    f"[{dataset_id}] skipped leftover cut into native vessel "
+                    f"(R={ext['radius']:.2f} L={ext['cyl_len']:.2f})",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[{dataset_id}] skipped a cut that punched an extra hole or "
+                    f"removed too much (R={ext['radius']:.2f} L={ext['length']:.2f})",
+                    flush=True,
+                )
+            continue
+        cleaned = accepted
+        origin = ext["centroid"] - ext["outward"] * used_length
+        cutting_planes.append({"origin": origin, "normal": ext["outward"]})
+        applied.append({**ext, "length": used_length})
+    return cleaned, cutting_planes, applied
+
+
 def clean_vessel_extensions(vessel, dataset_id=""):
     """Cut CFD flow extensions from an already-open vessel mesh."""
-    vessel, _faces, extensions_to_cut, orig_num_loops = detect_extensions(
+    vessel, _faces, pending, orig_num_loops = detect_extensions(
         vessel, dataset_id=dataset_id
     )
-    if not extensions_to_cut:
+    if not pending:
         return vessel, 0, True, []
 
-    cleaned, cutting_planes, applied = _apply_extension_cuts(
-        vessel, extensions_to_cut, dataset_id
-    )
+    cleaned = vessel
+    cutting_planes = []
+    applied = []
+    for pass_i in range(MAX_CUT_PASSES):
+        if not pending:
+            break
+        if pass_i:
+            print(
+                f"[{dataset_id}] pass {pass_i + 1} on {len(pending)} leftover tube(s)",
+                flush=True,
+            )
+            cleaned, planes, extra = _apply_leftover_cuts(
+                cleaned, pending, applied, dataset_id
+            )
+        else:
+            cleaned, planes, extra = _apply_extension_cuts(
+                cleaned, pending, dataset_id
+            )
+        cutting_planes.extend(planes)
+        applied.extend(extra)
+        if not extra:
+            break
+        try:
+            _, _, pending, _ = detect_extensions(
+                cleaned, dataset_id=dataset_id, stub=True
+            )
+        except UnrealisticMeshError:
+            pending = []
+
     if not applied:
         return vessel, 0, True, []
 
-    try:
-        _, _, leftovers, _ = detect_extensions(cleaned, dataset_id)
-    except UnrealisticMeshError:
-        leftovers = []
-    if leftovers:
-        print(f"[{dataset_id}] second pass on {len(leftovers)} leftover tube(s)", flush=True)
-        cleaned, extra_planes, extra = _apply_extension_cuts(
-            cleaned, leftovers, dataset_id
-        )
-        cutting_planes.extend(extra_planes)
-        applied.extend(extra)
-
-    if not cleaned.is_all_triangles:
-        cleaned = cleaned.triangulate()
+    cleaned = _as_triangles(cleaned)
     cleaned = _smooth_cut_rims(cleaned, cutting_planes)
 
     final_loops, final_boundary = _boundary_loops(cleaned)
@@ -605,6 +795,7 @@ def process_patient_worker(
         cleaned_mesh, cuts_made, passed_check, applied = clean_vessel_extensions(
             vessel, dataset_id
         )
+        cleaned_mesh = _as_triangles(cleaned_mesh)
         cleaned_mesh.save(output_file)
 
         lengths = ", ".join(f"{ext['cyl_len']:.1f}" for ext in applied)

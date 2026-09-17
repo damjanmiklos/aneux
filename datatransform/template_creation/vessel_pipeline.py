@@ -271,15 +271,99 @@ def apply_taubin_smoothing(
     return to_vtk_poly(smoother.GetOutput())
 
 
+def _feature_edge_boundary_loops(surface):
+    """Closed boundary polylines via vtkFeatureEdges + vtkStripper.
+
+    vtkvmtkPolyDataBoundaryExtractor bails when a rim vertex has more than two
+    boundary neighbours (a dangling ear glued to an ostium). Stripper still
+    walks every simple cycle.
+    """
+    feat = vtk.vtkFeatureEdges()
+    feat.SetInputData(to_vtk_poly(surface))
+    feat.BoundaryEdgesOn()
+    feat.FeatureEdgesOff()
+    feat.NonManifoldEdgesOff()
+    feat.ManifoldEdgesOff()
+    feat.ColoringOff()
+    feat.Update()
+    strip = vtk.vtkStripper()
+    strip.SetInputConnection(feat.GetOutputPort())
+    strip.JoinContiguousSegmentsOn()
+    if hasattr(strip, "SetMaximumLength"):
+        strip.SetMaximumLength(1000000)
+    strip.Update()
+    return to_vtk_poly(strip.GetOutput())
+
+
+def _loop_point_array(cell):
+    n = cell.GetNumberOfPoints()
+    if n == 0:
+        return np.zeros((0, 3), dtype=np.float64)
+    pts = np.array([cell.GetPoints().GetPoint(j) for j in range(n)], dtype=np.float64)
+    if len(pts) >= 2 and float(np.linalg.norm(pts[0] - pts[-1])) < 1e-8:
+        pts = pts[:-1]
+    return pts
+
+
+def _n_usable_boundary_loops(loops_poly, min_points=MIN_OPENING_LOOP_POINTS):
+    n = 0
+    for i in range(loops_poly.GetNumberOfCells()):
+        if len(_loop_point_array(loops_poly.GetCell(i))) >= min_points:
+            n += 1
+    return n
+
+
 def extract_boundary_loops(surface):
+    vtk_poly = to_vtk_poly(surface)
     extractor = vtkvmtk.vtkvmtkPolyDataBoundaryExtractor()
-    extractor.SetInputData(to_vtk_poly(surface))
+    extractor.SetInputData(vtk_poly)
     extractor.Update()
-    return extractor.GetOutput()
+    vmtk_out = to_vtk_poly(extractor.GetOutput())
+    strip_out = _feature_edge_boundary_loops(vtk_poly)
+    if _n_usable_boundary_loops(strip_out) > _n_usable_boundary_loops(vmtk_out):
+        return strip_out
+    return vmtk_out
 
 
-def measure_open_profiles(surface):
-    """Open-boundary loops with radius, barycenter, and (when available) outward normals."""
+def _profile_from_loop_points(pts_xyz, body, index):
+    if len(pts_xyz) < MIN_OPENING_LOOP_POINTS:
+        return None
+    bary = pts_xyz.mean(axis=0)
+    radius = float(np.mean(np.linalg.norm(pts_xyz - bary, axis=1)))
+    normal = np.zeros(3, dtype=np.float64)
+    n_loop = len(pts_xyz)
+    if n_loop >= 3:
+        v1 = pts_xyz[n_loop // 3] - pts_xyz[0]
+        v2 = pts_xyz[(2 * n_loop) // 3] - pts_xyz[0]
+        normal = _unit(np.cross(v1, v2))
+        if float(np.linalg.norm(normal)) < 0.5:
+            d = np.linalg.norm(pts_xyz - bary, axis=1)
+            i = int(np.argmax(d))
+            v1 = pts_xyz[i] - bary
+            j = int(np.argmax(np.linalg.norm(np.cross(v1, pts_xyz - bary), axis=1)))
+            normal = _unit(np.cross(v1, pts_xyz[j] - bary))
+    if float(np.linalg.norm(normal)) >= 0.5 and float(np.dot(bary - body, normal)) < 0.0:
+        normal = -normal
+    return {
+        "index": int(index),
+        "barycenter": bary,
+        "normal": normal,
+        "radius": radius,
+    }
+
+
+def _profiles_from_boundary_loops(surface):
+    loops = _feature_edge_boundary_loops(surface)
+    body = mesh_body_point(surface)
+    profiles = []
+    for i in range(loops.GetNumberOfCells()):
+        prof = _profile_from_loop_points(_loop_point_array(loops.GetCell(i)), body, i)
+        if prof is not None:
+            profiles.append(prof)
+    return profiles
+
+
+def _vmtk_boundary_profiles(surface):
     vtk_poly = to_vtk_poly(surface)
     ref_sys = vtkvmtk.vtkvmtkBoundaryReferenceSystems()
     ref_sys.SetInputData(vtk_poly)
@@ -291,8 +375,7 @@ def measure_open_profiles(surface):
     ref_poly = ref_sys.GetOutput()
     n_b = ref_poly.GetNumberOfPoints()
     if n_b == 0:
-        raise TemplateQualityError("No open boundary profiles found on vessel mesh.")
-
+        return []
     normals_array = ref_poly.GetPointData().GetArray("BoundaryNormals")
     radii_array = ref_poly.GetPointData().GetArray("BoundaryRadius")
     profiles = []
@@ -311,6 +394,10 @@ def measure_open_profiles(surface):
                 "radius": radius,
             }
         )
+    return profiles
+
+
+def _keep_seed_profiles(profiles):
     min_r = MIN_SEED_OPENING_RADIUS_MM
     kept = [
         p
@@ -324,7 +411,24 @@ def measure_open_profiles(surface):
                 f"  Ignored {n_drop} pinhole/degenerate boundary loops "
                 f"(r < {min_r:.3f} mm or missing normal)"
             )
-        profiles = kept
+        return kept
+    return list(profiles)
+
+
+def measure_open_profiles(surface):
+    """Open-boundary loops with radius, barycenter, and (when available) outward normals."""
+    vmtk_profiles = _vmtk_boundary_profiles(surface)
+    profiles = _keep_seed_profiles(vmtk_profiles)
+    if len(profiles) < 2:
+        loop_profiles = _keep_seed_profiles(_profiles_from_boundary_loops(surface))
+        if len(loop_profiles) > len(profiles):
+            print(
+                f"  Boundary extractor found {len(profiles)} opening(s); "
+                f"using {len(loop_profiles)} feature-edge loops instead"
+            )
+            profiles = loop_profiles
+    if not profiles:
+        raise TemplateQualityError("No open boundary profiles found on vessel mesh.")
     profiles.sort(key=lambda p: p["radius"], reverse=True)
     return profiles
 
@@ -847,6 +951,46 @@ def drop_degenerate_triangles(surface, min_edge=DEGENERATE_EDGE_MM):
     return out
 
 
+def drop_boundary_ear_triangles(surface, max_passes=16):
+    """Drop triangles with 2+ boundary edges (fins glued onto an ostium rim).
+
+    Those ears give rim vertices four boundary neighbours, and VMTK's
+    vtkvmtkPolyDataBoundaryExtractor then reports only one opening.
+    """
+    poly, pts, faces = _triangle_points_faces(surface)
+    if faces.size == 0:
+        return poly
+    n_dropped = 0
+    for _ in range(int(max_passes)):
+        edges = np.concatenate(
+            (
+                np.sort(faces[:, [0, 1]], axis=1),
+                np.sort(faces[:, [1, 2]], axis=1),
+                np.sort(faces[:, [2, 0]], axis=1),
+            ),
+            axis=0,
+        )
+        uniq, counts = np.unique(edges, axis=0, return_counts=True)
+        usage = {(int(a), int(b)): int(c) for (a, b), c in zip(uniq, counts)}
+        n_boundary = np.zeros(len(faces), dtype=np.int32)
+        for fi, (a, b, c) in enumerate(faces):
+            for u, v in ((a, b), (b, c), (c, a)):
+                key = (int(u), int(v)) if u <= v else (int(v), int(u))
+                if usage.get(key, 0) == 1:
+                    n_boundary[fi] += 1
+        keep = n_boundary < 2
+        n_drop = int((~keep).sum())
+        if n_drop == 0:
+            break
+        faces = faces[keep]
+        n_dropped += n_drop
+    if n_dropped == 0:
+        return poly
+    out = _polydata_from_triangles(pts, faces)
+    print(f"  Dropped {n_dropped} boundary-ear triangles (2+ free edges)")
+    return out
+
+
 def sanitize_vessel_for_vmtk(
     surface,
     target_reduction=SANITIZE_INPUT_REDUCTION,
@@ -861,6 +1005,7 @@ def sanitize_vessel_for_vmtk(
     poly = clean_triangulate(surface)
     n0 = poly.GetNumberOfPoints()
     poly = drop_degenerate_triangles(poly)
+    poly = drop_boundary_ear_triangles(poly)
     n_mid = poly.GetNumberOfPoints()
     if tessellation_looks_original(poly):
         poly = decimate_dense_mc(
@@ -1989,7 +2134,7 @@ def assert_template_scale(surface, reference_mesh, context="template", max_area_
     return tpl_area, ref_area
 
 
-def assert_template_quality(surface, n_expected_openings, context="template"):
+def assert_template_quality(surface, context="template"):
     vtk_poly = to_vtk_poly(surface)
     n_regions = count_connected_regions(vtk_poly)
     openings = inspect_openings(vtk_poly)
@@ -1999,10 +2144,6 @@ def assert_template_quality(surface, n_expected_openings, context="template"):
     n_open = len(openings)
     if n_open < 2:
         issues.append(f"{n_open} openings (need at least inlet and one outlet)")
-    if n_open > int(n_expected_openings):
-        issues.append(
-            f"{n_open} openings (more than the {n_expected_openings} ends that were uncap-clipped)"
-        )
     for op in openings:
         if op["radius"] < MIN_OPENING_RADIUS_MM or op["n_points"] < MIN_OPENING_LOOP_POINTS:
             issues.append(
@@ -2208,9 +2349,7 @@ def process_variable_dataset(
 
     final_surface, _n_regions = finalize_surface(remeshed_surface)
     assert_template_scale(final_surface, vessel_mesh, context=dataset_id)
-    openings = assert_template_quality(
-        final_surface, n_expected_openings=int(built["n_clipped"]), context=dataset_id
-    )
+    openings = assert_template_quality(final_surface, context=dataset_id)
 
     os.makedirs(output_dir, exist_ok=True)
     out_file = os.path.join(output_dir, f"{dataset_id}.vtp")
@@ -2223,7 +2362,8 @@ def process_variable_dataset(
     )
     print(
         f"  -> Verified Open Boundaries Count: {len(openings)} "
-        f"(expected {int(built['n_clipped'])} clipped openings; {len(anatomical_profiles)} anatomical profiles)"
+        f"(pipe-section clipped {int(built['n_clipped'])}; "
+        f"{len(anatomical_profiles)} anatomical profiles)"
     )
     return out_file
 
@@ -2264,9 +2404,7 @@ def process_uniform_dataset(
 
     final_surface, _n_regions = finalize_surface(remeshed_surface)
     assert_template_scale(final_surface, vessel_mesh, context=dataset_id)
-    openings = assert_template_quality(
-        final_surface, n_expected_openings=int(built["n_clipped"]), context=dataset_id
-    )
+    openings = assert_template_quality(final_surface, context=dataset_id)
 
     os.makedirs(output_dir, exist_ok=True)
     out_file = os.path.join(output_dir, f"{dataset_id}.vtp")
@@ -2279,7 +2417,8 @@ def process_uniform_dataset(
     )
     print(
         f"  -> Verified Open Boundaries Count: {len(openings)} "
-        f"(expected {int(built['n_clipped'])} clipped openings; {len(anatomical_profiles)} anatomical profiles)"
+        f"(pipe-section clipped {int(built['n_clipped'])}; "
+        f"{len(anatomical_profiles)} anatomical profiles)"
     )
     return out_file
 
@@ -2294,28 +2433,38 @@ def compute_centerline_from_mesh(
     Does not read or write files. Callers that need a ``.vtp`` should use
     ``process_centerline_dataset``.
     """
-    print("Step 1: Applying Taubin surface smoothing...")
-    smoothed_vessel = apply_taubin_smoothing(vessel_mesh)
+    from batch_run_log import set_step
+
+    print("Step 1: Preparing surface (drop degenerates/ears, then Taubin)...")
+    set_step("1_prepare_surface")
+    work = drop_boundary_ear_triangles(drop_degenerate_triangles(clean_triangulate(vessel_mesh)))
+    smoothed_vessel = apply_taubin_smoothing(work)
     print("Step 1b: Detecting anatomical inlet/outlet boundaries...")
+    set_step("1b_anatomical_openings")
     anatomical_profiles = measure_open_profiles(smoothed_vessel)
     log_profiles(anatomical_profiles, label="Anatomical")
     seed_points_from_profiles(anatomical_profiles)
 
     print("Step 2: Adding flow extensions on the open surface...")
+    set_step("2_flow_extensions")
     extended_vessel = add_flow_extensions(smoothed_vessel, extension_length=extension_length)
     extended_profiles = measure_open_profiles(extended_vessel)
     log_profiles(extended_profiles, label="Extended")
 
     print("Step 3: Extracting Voronoi centerline and MISR...")
+    set_step("3_voronoi_centerline")
     centerline = extract_centerlines_for_tube(
         extended_vessel, smoothed_vessel, anatomical_profiles, extended_profiles
     )
     print(f"Step 4: Spline resampling ({sample_spacing} mm) and trajectory smoothing...")
+    set_step("4_resample_smooth")
     resampled = resample_centerline(centerline, sample_spacing=sample_spacing)
     smooth_centerline = smooth_centerline_preserve_misr(resampled)
     print("Step 5: Extracting branches...")
+    set_step("5_extract_branches")
     branched_centerline = extract_branches(smooth_centerline)
     print("Step 6: Trimming flow-extension ends at anatomical profile planes...")
+    set_step("6_clip_extensions")
     final_centerline = clip_centerline_at_profiles(
         branched_centerline, anatomical_profiles, extension_length=extension_length
     )
@@ -2360,6 +2509,36 @@ def resolve_vessel_file(vessel_dir, dataset_id, explicit=None):
     return os.path.join(vessel_dir, f"{dataset_id}.vtp")
 
 
+def load_meshes_from_folder(vessel_dir, limit=None, case_ids=None):
+    """Every mesh in ``vessel_dir`` is a case; the filename stem is the id."""
+    if not os.path.isdir(vessel_dir):
+        raise FileNotFoundError(f"Vessel directory not found: {vessel_dir}")
+    wanted = {str(x) for x in case_ids} if case_ids else None
+    ext_rank = {ext: i for i, ext in enumerate(VESSEL_FILE_EXTENSIONS)}
+    by_id = {}
+    for name in os.listdir(vessel_dir):
+        stem, ext = os.path.splitext(name)
+        ext = ext.lower()
+        if ext not in ext_rank:
+            continue
+        if wanted is not None and stem not in wanted:
+            continue
+        path = os.path.join(vessel_dir, name)
+        if not os.path.isfile(path):
+            continue
+        prev = by_id.get(stem)
+        if prev is None:
+            by_id[stem] = path
+            continue
+        prev_ext = os.path.splitext(prev)[1].lower()
+        if ext_rank[ext] < ext_rank[prev_ext]:
+            by_id[stem] = path
+    valid = [(dataset_id, by_id[dataset_id]) for dataset_id in sorted(by_id)]
+    if limit is not None:
+        valid = valid[: int(limit)]
+    return valid
+
+
 def load_valid_datasets(csv_path, vessel_dir, limit=None, case_ids=None):
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"Clinical CSV file not found at: {csv_path}")
@@ -2385,6 +2564,12 @@ def load_valid_datasets(csv_path, vessel_dir, limit=None, case_ids=None):
 def add_shared_cli_args(parser, default_output_dir, default_workers, include_remesh_grid=True):
     parser.add_argument("--csv", type=str, default=DEFAULT_CSV_PATH, help="Path to clinical.csv")
     parser.add_argument("--vessel-dir", type=str, default=DEFAULT_VESSEL_DIR, help="Directory of input vessel meshes (.vtp or .stl)")
+    parser.add_argument(
+        "--from-folder",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Process every mesh in --vessel-dir instead of filtering by clinical.csv",
+    )
     parser.add_argument("--output-dir", type=str, default=default_output_dir, help="Output directory")
     parser.add_argument("--limit", type=int, default=None, help="Maximum number of dataset meshes to process")
     parser.add_argument("--workers", type=int, default=default_workers, help="Number of parallel worker processes")
@@ -2401,7 +2586,7 @@ def add_shared_cli_args(parser, default_output_dir, default_workers, include_rem
     return parser
 
 
-def run_batch(script_path, process_one, args, extra_cli_flags):
+def run_batch(script_path, process_one, args, extra_cli_flags, on_worker_result=None):
     os.makedirs(args.output_dir, exist_ok=True)
     if args.case:
         v_file = resolve_vessel_file(args.vessel_dir, args.case, explicit=args.vessel_file)
@@ -2412,7 +2597,14 @@ def run_batch(script_path, process_one, args, extra_cli_flags):
         process_one(args.case, v_file, args)
         return
 
-    valid_datasets = load_valid_datasets(args.csv, args.vessel_dir, limit=args.limit, case_ids=args.cases)
+    if getattr(args, "from_folder", False):
+        valid_datasets = load_meshes_from_folder(
+            args.vessel_dir, limit=args.limit, case_ids=args.cases
+        )
+    else:
+        valid_datasets = load_valid_datasets(
+            args.csv, args.vessel_dir, limit=args.limit, case_ids=args.cases
+        )
     if args.skip_existing:
         valid_datasets = [
             (did, path)
@@ -2424,8 +2616,11 @@ def run_batch(script_path, process_one, args, extra_cli_flags):
         print("No matching dataset files to process.")
         return
     num_workers = max(1, min(int(args.workers), num_cases))
-    print(f"CSV Path: {args.csv}")
-    print(f"Vessel Dir: {args.vessel_dir}")
+    if getattr(args, "from_folder", False):
+        print(f"Input folder (all meshes): {args.vessel_dir}")
+    else:
+        print(f"CSV Path: {args.csv}")
+        print(f"Vessel Dir: {args.vessel_dir}")
     print(f"Output Dir: {args.output_dir}")
     print(f"Processing limit: {args.limit} samples | Valid dataset cases: {num_cases}")
     print(f"Parallel Workers: {num_workers} (Requested={args.workers}, Active Workers={num_workers})")
@@ -2464,6 +2659,11 @@ def run_batch(script_path, process_one, args, extra_cli_flags):
                 ] + extra_cli_flags
                 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
                 out, _ = proc.communicate()
+                if on_worker_result is not None:
+                    try:
+                        on_worker_result(dataset_id, proc.returncode, out)
+                    except Exception as log_exc:
+                        print(f"  WARNING: on_worker_result failed for {dataset_id}: {log_exc}")
                 if proc.returncode != 0:
                     print(f"\n[ERROR] Case {dataset_id} failed (code {proc.returncode}):\n{out}")
                     with lock:

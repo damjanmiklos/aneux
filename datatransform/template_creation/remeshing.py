@@ -15,6 +15,10 @@ This script remeshes the *original* raw surface for AI training:
 Centerlines still use a sanitised working copy (originals have zero-length
 edges that break Voronoi). That copy is discarded; the remeshed surface is
 the cleaned original.
+
+Each run writes debug logs under ``<output-dir>/gt_remesh_logs/run_<timestamp>/``:
+per-case JSON, ``errors/<id>.txt`` with traceback, worker transcripts, and
+``summary.csv`` / ``summary.xlsx``.
 """
 import os
 import sys
@@ -33,11 +37,22 @@ import pyvista as pv
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 from aneux_paths import (
-    CLEANDATA_UNIFORM as DEFAULT_OUTPUT_DIR,
-    VESSELS_ORIGINAL,
+    CLEAN_UNIFORM_MESH as DEFAULT_OUTPUT_DIR,
+    TOTAL_CLEAN_ORIGINAL_MESH,
     ensure_cleandata_layout,
 )
 
+from batch_run_log import (
+    add_run_log_args,
+    configure_batch_logging,
+    finalize_run_logs,
+    merge_run_logs,
+    run_logged_case,
+    set_step,
+    warn,
+    write_case_log,
+    write_worker_transcript,  # re-exported for tests
+)
 from vessel_pipeline import (
     TemplateQualityError,
     add_flow_extensions,
@@ -46,6 +61,7 @@ from vessel_pipeline import (
     assert_template_quality,
     clean_triangulate,
     clip_flow_extensions_and_uncap,
+    drop_boundary_ear_triangles,
     drop_degenerate_triangles,
     drop_tiny_islands,
     extract_boundary_loops,
@@ -81,15 +97,19 @@ GT_TAUBIN_ITER = 5
 GT_MIN_AREA_RATIO = 0.88
 GT_MAX_AREA_RATIO = 1.20
 OPENING_PLANARITY_STD_MM = 0.25
+LOG_FOLDER = "gt_remesh_logs"
+_set_step = set_step
+_warn = warn
 
 
 def prepare_gt_surface(vessel_mesh):
     """Keep original tessellation density; only drop degenerates and flaps."""
     poly = clean_triangulate(vessel_mesh)
     poly = drop_degenerate_triangles(poly)
+    poly = drop_boundary_ear_triangles(poly)
     poly, n_nm = repair_nonmanifold_triangles(poly)
     if n_nm > 0:
-        print(f"  WARNING: {n_nm} non-manifold edges remain on the original after repair")
+        _warn(f"{n_nm} non-manifold edges remain on the original after repair")
     return poly
 
 
@@ -133,7 +153,13 @@ def log_opening_planarity(surface, frames):
         rim = min(rims, key=lambda pts: float(np.linalg.norm(pts.mean(axis=0) - origin)))
         axial = (rim - origin) @ outward
         axial_std = float(np.std(axial))
-        flag = "" if axial_std <= OPENING_PLANARITY_STD_MM else "  (not planar)"
+        flag = ""
+        if axial_std > OPENING_PLANARITY_STD_MM:
+            flag = "  (not planar)"
+            _warn(
+                f"ostium not planar: origin {np.round(origin, 2)} "
+                f"r={radius:.3f} mm axial_std={axial_std:.3f} mm"
+            )
         print(
             f"  Ostium planarity: origin {np.round(origin, 2)} "
             f"r={radius:.3f} mm axial_std={axial_std:.3f} mm{flag}"
@@ -143,6 +169,7 @@ def log_opening_planarity(surface, frames):
 def _gt_centerline(work_vessel, extension_length, sample_spacing):
     """Sanitised + strongly smoothed copy is only used to trace the lumen."""
     print("Step 2: Working copy for centerlines (sanitise + strong Taubin, discarded later)...")
+    _set_step("2_centerline_working_copy")
     work = sanitize_vessel_for_vmtk(work_vessel)
     work = apply_taubin_smoothing(work)
     anatomical_profiles = measure_open_profiles(work)
@@ -150,12 +177,13 @@ def _gt_centerline(work_vessel, extension_length, sample_spacing):
     seed_points_from_profiles(anatomical_profiles)
 
     print("Step 3: Flow extensions on the working copy, then Voronoi centerline...")
+    _set_step("3_voronoi_centerline")
     extended_work = add_flow_extensions(work, extension_length=extension_length)
     extended_profiles = measure_open_profiles(extended_work)
     log_profiles(extended_profiles, label="Extended")
     if len(extended_profiles) != len(anatomical_profiles):
-        print(
-            f"  WARNING: opening count changed after extensions "
+        _warn(
+            f"opening count changed after extensions "
             f"({len(anatomical_profiles)} -> {len(extended_profiles)})."
         )
     centerline = extract_centerlines_for_tube(
@@ -181,9 +209,11 @@ def process_gt_remesh_dataset(
     original = pv.read(v_file)
 
     print("Step 1: Preparing original surface (keep detail, drop degenerates)...")
+    _set_step("1_prepare_original")
     gt_surface = prepare_gt_surface(original)
     print(f"  GT working surface: {gt_surface.GetNumberOfPoints()} points")
     print("Step 1b: Anatomical openings on the detailed original...")
+    _set_step("1b_gt_openings")
     gt_profiles = measure_open_profiles(gt_surface)
     log_profiles(gt_profiles, label="GT anatomical")
     seed_points_from_profiles(gt_profiles)
@@ -192,12 +222,13 @@ def process_gt_remesh_dataset(
         gt_surface, extension_length, sample_spacing
     )
     if len(gt_profiles) != len(work_profiles):
-        print(
-            f"  WARNING: opening count differs on GT vs sanitised working copy "
+        _warn(
+            f"opening count differs on GT vs sanitised working copy "
             f"({len(gt_profiles)} vs {len(work_profiles)}). Clipping uses GT loops."
         )
 
     print("Step 4: Flow extensions on the detailed original, then pipe-section ostia...")
+    _set_step("4_pipe_section_ostia")
     extended_gt = add_flow_extensions(gt_surface, extension_length=extension_length)
     opened_gt, n_clipped = clip_flow_extensions_and_uncap(
         extended_gt,
@@ -207,8 +238,8 @@ def process_gt_remesh_dataset(
     )
     n_in = len(gt_profiles)
     if n_clipped < n_in:
-        print(
-            f"  WARNING: pipe-section uncap opened {n_clipped}/{n_in} ends; "
+        _warn(
+            f"pipe-section uncap opened {n_clipped}/{n_in} ends; "
             "remaining ostia keep the original rim."
         )
     if len(inspect_openings(opened_gt)) < 2:
@@ -223,6 +254,7 @@ def process_gt_remesh_dataset(
         f"Step 5: Light Taubin (pass_band={GT_TAUBIN_PASS_BAND}, "
         f"n_iter={GT_TAUBIN_ITER}, boundary off)..."
     )
+    _set_step("5_light_taubin")
     opened_gt = apply_taubin_smoothing(
         opened_gt,
         pass_band=GT_TAUBIN_PASS_BAND,
@@ -237,6 +269,7 @@ def process_gt_remesh_dataset(
         f"(TargetEdgeLength={effective_edge:.3f} mm, n_iter={GT_REMESH_N_ITER}, "
         f"R_min={r_min:.3f} mm, PreserveBoundaryEdges=1)..."
     )
+    _set_step("6_isotropic_remesh")
     remeshed = remesh_surface_isotropically(
         opened_gt,
         target_edge_length=effective_edge,
@@ -245,11 +278,10 @@ def process_gt_remesh_dataset(
     )
     print(f"  -> Remeshed surface points: {remeshed.GetNumberOfPoints()}")
 
+    _set_step("7_finalize_and_save")
     final_surface, _n_regions = finalize_surface(remeshed)
     assert_gt_remesh_scale(final_surface, original, context=dataset_id)
-    openings = assert_template_quality(
-        final_surface, n_expected_openings=n_in, context=dataset_id
-    )
+    openings = assert_template_quality(final_surface, context=dataset_id)
     log_opening_planarity(final_surface, frames)
 
     os.makedirs(output_dir, exist_ok=True)
@@ -269,13 +301,23 @@ def process_gt_remesh_dataset(
 
 
 def _process_one(dataset_id, v_file, args):
-    process_gt_remesh_dataset(
-        dataset_id=dataset_id,
-        v_file=v_file,
-        output_dir=args.output_dir,
-        target_edge_length=args.target_edge_length,
-        extension_length=args.extension_length,
-        sample_spacing=args.sample_spacing,
+    def work():
+        return process_gt_remesh_dataset(
+            dataset_id=dataset_id,
+            v_file=v_file,
+            output_dir=args.output_dir,
+            target_edge_length=args.target_edge_length,
+            extension_length=args.extension_length,
+            sample_spacing=args.sample_spacing,
+        )
+
+    return run_logged_case(
+        dataset_id,
+        v_file,
+        args,
+        work,
+        log_folder_name=LOG_FOLDER,
+        default_output_dir=DEFAULT_OUTPUT_DIR,
     )
 
 
@@ -289,7 +331,7 @@ def parse_args(argv=None):
     add_shared_cli_args(
         parser,
         DEFAULT_OUTPUT_DIR,
-        default_workers=2,
+        default_workers=25,
         include_remesh_grid=False,
     )
     parser.add_argument(
@@ -298,12 +340,16 @@ def parse_args(argv=None):
         default=DEFAULT_GT_EDGE_LENGTH_MM,
         help="Uniform target edge length in mm (default 0.15).",
     )
-    parser.set_defaults(vessel_dir=VESSELS_ORIGINAL)
+    add_run_log_args(parser, LOG_FOLDER)
+    parser.set_defaults(vessel_dir=TOTAL_CLEAN_ORIGINAL_MESH, from_folder=True)
     return parser.parse_args(argv)
 
 
 def main(argv=None):
     args = parse_args(argv)
+    extra_log, on_worker_result = configure_batch_logging(
+        args, LOG_FOLDER, DEFAULT_OUTPUT_DIR
+    )
     extra = [
         "--target-edge-length",
         str(args.target_edge_length),
@@ -313,8 +359,17 @@ def main(argv=None):
         str(args.sample_spacing),
         "--vessel-dir",
         str(args.vessel_dir),
-    ]
-    run_batch(os.path.abspath(__file__), _process_one, args, extra)
+    ] + extra_log
+    try:
+        run_batch(
+            os.path.abspath(__file__),
+            _process_one,
+            args,
+            extra,
+            on_worker_result=on_worker_result,
+        )
+    finally:
+        finalize_run_logs(args)
 
 
 if __name__ == "__main__":

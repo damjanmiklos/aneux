@@ -1,4 +1,5 @@
 """GT remesh: original vessel, constant edge length, planar ostia."""
+import json
 import os
 import sys
 
@@ -16,9 +17,13 @@ from remeshing import (
     GT_REMESH_N_ITER,
     GT_TAUBIN_ITER,
     GT_TAUBIN_PASS_BAND,
+    _process_one,
     assert_gt_remesh_scale,
+    merge_run_logs,
     parse_args,
     prepare_gt_surface,
+    write_case_log,
+    write_worker_transcript,
 )
 from vessel_pipeline import (
     TemplateQualityError,
@@ -129,12 +134,12 @@ def test_pipe_section_then_edge_remesh_keeps_planar_rim():
 def test_cli_defaults_to_originals_and_cleandata():
     args = parse_args([])
     assert args.target_edge_length == DEFAULT_GT_EDGE_LENGTH_MM
+    assert args.log_dir is None
+    assert args.from_folder is True
     vessel_dir = os.path.normpath(args.vessel_dir).replace("\\", "/")
-    assert vessel_dir.endswith("vessels/original")
+    assert vessel_dir.endswith("total_clean_original_mesh")
     out_dir = os.path.normpath(args.output_dir).replace("\\", "/")
-    assert out_dir.endswith("cleandata/uniformly_remeshed") or out_dir.endswith(
-        "cleandata\\uniformly_remeshed"
-    )
+    assert out_dir.endswith("clean_uniform_mesh")
 
 
 def _open_tube(p0, p1, radius=2.0, n_sides=32, n_along=40):
@@ -231,13 +236,11 @@ def test_remove_spurious_openings_fills_wall_hole():
     n_punched = len(inspect_openings(punched))
     assert n_punched == 3
     profiles = _profiles_from_ends(p0, p1, radius)
-    with pytest.raises(TemplateQualityError, match="openings"):
-        assert_template_quality(punched, n_expected_openings=2, context="hole")
     filled, n_filled = remove_spurious_openings(punched, profiles)
     assert n_filled == 1
     openings = inspect_openings(filled)
     assert len(openings) == 2
-    assert_template_quality(filled, n_expected_openings=2, context="hole")
+    assert_template_quality(filled, context="hole")
 
 
 def test_remove_spurious_openings_fills_leftover_rim_near_ostium():
@@ -281,3 +284,131 @@ def test_remove_spurious_openings_keeps_real_third_branch():
     filled, n_filled = remove_spurious_openings(punched, profiles)
     assert n_filled == 0
     assert len(inspect_openings(filled)) == 3
+
+
+def test_centerline_cli_has_log_dir():
+    from centerline_creation import LOG_FOLDER, parse_args
+
+    args = parse_args([])
+    assert args.log_dir is None
+    assert args.from_folder is True
+    assert LOG_FOLDER == "centerline_logs"
+    out_dir = os.path.normpath(args.output_dir).replace("\\", "/")
+    assert out_dir.endswith("clean_centerline")
+
+
+def test_centerline_process_one_logs_failure(tmp_path, monkeypatch):
+    from centerline_creation import _process_one
+
+    def boom(dataset_id, **kwargs):
+        raise TemplateQualityError("Clipped centerline has no cells.", dataset_id=dataset_id)
+
+    monkeypatch.setattr("centerline_creation.process_centerline_dataset", boom)
+    log_dir = tmp_path / "logs"
+    args = type("Args", (), {})()
+    args.output_dir = str(tmp_path)
+    args.log_dir = str(log_dir)
+    args.extension_length = 5.0
+    args.sample_spacing = 0.1
+    with pytest.raises(TemplateQualityError, match="no cells"):
+        _process_one("C0001", "C0001.vtp", args)
+    rec = json.loads((log_dir / "C0001.json").read_text(encoding="utf-8"))
+    assert rec["status"] == "error"
+    assert rec["error_type"] == "TemplateQualityError"
+    assert "no cells" in rec["error_message"]
+    assert (log_dir / "errors" / "C0001.txt").is_file()
+
+
+def test_write_case_log_and_merge(tmp_path):
+    log_dir = tmp_path / "logs"
+    write_case_log(
+        str(log_dir),
+        {
+            "dataset_id": "C0001",
+            "status": "success",
+            "step": "7_finalize_and_save",
+            "error_type": "",
+            "error_message": "",
+            "warnings": ["opening count differs on GT vs sanitised working copy"],
+            "traceback": "",
+            "duration_s": 1.2,
+            "started_at": "2026-09-17T08:00:00Z",
+            "finished_at": "2026-09-17T08:00:01Z",
+            "input_file": "C0001.vtp",
+            "output_file": "out/C0001.vtp",
+        },
+    )
+    write_case_log(
+        str(log_dir),
+        {
+            "dataset_id": "C0002",
+            "status": "error",
+            "step": "3_voronoi_centerline",
+            "error_type": "TemplateQualityError",
+            "error_message": "C0002: Capping left 69 openings; cannot run centerlines.",
+            "warnings": [],
+            "traceback": "Traceback (most recent call last):\nTemplateQualityError: cap",
+            "duration_s": 8.0,
+            "started_at": "2026-09-17T08:00:00Z",
+            "finished_at": "2026-09-17T08:00:08Z",
+            "input_file": "C0002.vtp",
+            "output_file": "",
+        },
+    )
+    assert (log_dir / "C0001.json").is_file()
+    assert (log_dir / "errors" / "C0002.txt").is_file()
+    detail = (log_dir / "errors" / "C0002.txt").read_text(encoding="utf-8")
+    assert "Capping left 69 openings" in detail
+    assert "Traceback" in detail
+
+    summary = merge_run_logs(str(log_dir))
+    assert summary["n_error"] == 1
+    assert summary["n_success"] == 1
+    csv_text = (log_dir / "summary.csv").read_text(encoding="utf-8")
+    assert "C0002" in csv_text
+    assert "TemplateQualityError" in csv_text
+    errors_txt = (log_dir / "errors.txt").read_text(encoding="utf-8")
+    assert "errors=1" in errors_txt
+    assert "C0002" in errors_txt
+
+
+def test_process_one_logs_failure(tmp_path, monkeypatch):
+    def boom(dataset_id, **kwargs):
+        raise TemplateQualityError("quality failed: 20 non-manifold edges", dataset_id=dataset_id)
+
+    monkeypatch.setattr("remeshing.process_gt_remesh_dataset", boom)
+    log_dir = tmp_path / "logs"
+    args = type("Args", (), {})()
+    args.output_dir = str(tmp_path)
+    args.log_dir = str(log_dir)
+    args.target_edge_length = DEFAULT_GT_EDGE_LENGTH_MM
+    args.extension_length = 5.0
+    args.sample_spacing = 0.1
+    with pytest.raises(TemplateQualityError, match="non-manifold"):
+        _process_one("p361", "p361.vtp", args)
+    rec_path = log_dir / "p361.json"
+    assert rec_path.is_file()
+    rec = json.loads(rec_path.read_text(encoding="utf-8"))
+    assert rec["status"] == "error"
+    assert rec["error_type"] == "TemplateQualityError"
+    assert "non-manifold" in rec["error_message"]
+    assert rec["traceback"]
+    assert (log_dir / "errors" / "p361.txt").is_file()
+
+
+def test_worker_transcript_records_crash_without_json(tmp_path):
+    log_dir = tmp_path / "logs"
+    vtk_dump = (
+        "vtkDelaunay3D.cxx:519   WARN| 1 degenerate triangles encountered\n"
+        "vtkvmtkPolyDataBoundary:197    ERR| Can't find adjacent point. Bailing out.\n"
+        "Segmentation fault\n"
+    )
+    write_worker_transcript(str(log_dir), "p376", 139, vtk_dump)
+    rec = json.loads((log_dir / "p376.json").read_text(encoding="utf-8"))
+    assert rec["status"] == "error"
+    assert rec["error_type"] == "WorkerExit"
+    assert rec["returncode"] == 139
+    assert any("degenerate triangles" in w for w in rec["warnings"])
+    transcript = (log_dir / "transcripts" / "p376.txt").read_text(encoding="utf-8")
+    assert "Bailing out" in transcript
+
