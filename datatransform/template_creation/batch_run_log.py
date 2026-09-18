@@ -26,6 +26,7 @@ SUMMARY_FIELDS = [
     "n_clipped",
     "area_ratio",
     "step",
+    "step_times",
     "error_type",
     "error_message",
     "warnings",
@@ -94,9 +95,28 @@ def peak_memory_gb():
 
 
 def set_step(name):
+    """Name the step being entered, and bank the time the previous one took.
+
+    Every step boundary is already announced here, so timing them costs one
+    subtraction and turns "the run took 14 hours" into a per-step profile.
+    """
     rec = CASE_LOG.get()
-    if rec is not None:
-        rec["step"] = name
+    if rec is None:
+        return
+    _close_open_step(rec)
+    rec["_step_started"] = time.perf_counter()
+    rec["step"] = name
+
+
+def _close_open_step(rec):
+    started = rec.pop("_step_started", None)
+    if started is None:
+        return
+    name = rec.get("step")
+    if not name:
+        return
+    times = rec.setdefault("step_times", {})
+    times[name] = round(times.get(name, 0.0) + (time.perf_counter() - started), 1)
 
 
 def record(**fields):
@@ -435,6 +455,7 @@ def run_logged_case(dataset_id, v_file, args, work, log_folder_name, default_out
             rec["stdout"] = captured
         if rec.get("step") in ("", "start"):
             rec["step"] = last_step_from_output(captured) or rec["step"]
+        _close_open_step(rec)
         rec["finished_at"] = utc_now()
         rec["duration_s"] = round(time.perf_counter() - t0, 3)
         rec["peak_memory_gb"] = peak_memory_gb()
