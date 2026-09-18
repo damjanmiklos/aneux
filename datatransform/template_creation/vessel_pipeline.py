@@ -14,7 +14,10 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("VTK_NUMBER_OF_THREADS", "1")
 
 import argparse
+import json
+import shutil
 import subprocess
+import tempfile
 import threading
 from queue import Empty, Queue
 
@@ -882,26 +885,89 @@ def _centerline_reaches_targets(centerline, n_targets):
     return n_cells >= int(n_targets)
 
 
+CENTERLINE_TIMEOUT_S = 600.0
+
+
+def _centerlines_in_child(closed_surface, source_points, target_points, timeout_s):
+    """extract_voronoi_centerlines, but able to give up. None when it does not finish.
+
+    vmtkCenterlines tetrahedralises the whole capped surface before it traces
+    anything, and on six of the SNF vessels that step never returns. That is a
+    hang inside native VTK, not an exception, so no amount of try/except reaches
+    it -- the retry below sat unreachable while each of those cases burned its
+    entire 40-minute case budget. Run it where it can be killed and the retry
+    gets its turn: all six then trace cleanly off the un-extended surface in
+    4-15 s, reaching every target.
+    """
+    workdir = tempfile.mkdtemp(prefix="vmtk_centerline_")
+    try:
+        surface_path = os.path.join(workdir, "surface.vtp")
+        seeds_path = os.path.join(workdir, "seeds.json")
+        out_path = os.path.join(workdir, "centerline.vtp")
+        save_polydata(closed_surface, surface_path)
+        with open(seeds_path, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "source": [[float(c) for c in pt] for pt in source_points],
+                    "target": [[float(c) for c in pt] for pt in target_points],
+                },
+                fh,
+            )
+        worker = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "centerline_worker.py")
+        try:
+            done = subprocess.run(
+                [sys.executable, worker, surface_path, seeds_path, out_path],
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+                timeout=float(timeout_s),
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.TimeoutExpired:
+            print(
+                f"  WARNING: centerline on the extended surface did not finish "
+                f"in {timeout_s:.0f}s; falling back to the un-extended vessel."
+            )
+            return None
+        if done.returncode != 0 or not os.path.isfile(out_path):
+            tail = (done.stderr or "").strip().splitlines()[-1:] or [""]
+            print(
+                f"  WARNING: centerline on the extended surface failed "
+                f"({tail[0][:120]}); falling back to the un-extended vessel."
+            )
+            return None
+        return to_vtk_poly(pv.read(out_path))
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 def extract_centerlines_for_tube(extended_vessel, smoothed_vessel, anatomical_profiles, extended_profiles):
     """Flow extensions help most cases; on looping siphons they can wreck Delaunay. Retry without them."""
     source_ext, target_ext = seed_points_from_profiles(extended_profiles)
     closed_extended = cap_surface(extended_vessel)
-    centerline = extract_voronoi_centerlines(closed_extended, source_ext, target_ext)
-    ref_bounds = smoothed_vessel.GetBounds()
     n_targets = len(target_ext)
-    if centerline_looks_valid(centerline, ref_bounds) and _centerline_reaches_targets(centerline, n_targets):
-        return centerline
-    print(
-        "  WARNING: centerline on the extended surface left the lumen "
-        "or missed outlets "
-        f"(cells={centerline.GetNumberOfCells()} targets={n_targets}). "
-        "Retrying on the capped vessel without flow extensions."
+    centerline = _centerlines_in_child(
+        closed_extended, source_ext, target_ext, CENTERLINE_TIMEOUT_S
     )
+    ref_bounds = smoothed_vessel.GetBounds()
+    if (
+        centerline is not None
+        and centerline_looks_valid(centerline, ref_bounds)
+        and _centerline_reaches_targets(centerline, n_targets)
+    ):
+        return centerline
+    if centerline is not None:
+        print(
+            "  WARNING: centerline on the extended surface left the lumen "
+            "or missed outlets "
+            f"(cells={centerline.GetNumberOfCells()} targets={n_targets}). "
+            "Retrying on the capped vessel without flow extensions."
+        )
     source_anat, target_anat = seed_points_from_profiles(anatomical_profiles)
     try:
         closed_anat = cap_surface(smoothed_vessel)
     except TemplateQualityError as exc:
-        if centerline_looks_valid(centerline, ref_bounds):
+        if centerline is not None and centerline_looks_valid(centerline, ref_bounds):
             print(f"  WARNING: anatomical cap failed ({exc}); keeping the extended-surface centerline.")
             return centerline
         raise
