@@ -621,3 +621,74 @@ A chosen trace that still misses a branch now raises instead of warning; a
 centerline missing a branch makes a tube missing that branch. The second trace
 costs seconds against the minutes the extended one can take.
 
+The choice fires as intended: SNF00000415 picks the bare trace by 25.8% (458
+voxels against 364), and on the healthy C0010 the two agree to 1.0%.
+
+**What this does not move is the remesh, and that is worth being clear about.**
+SNF00000415's output mesh is the same either way — 103309 points before against
+103216 after, area 1352.04 mm² both times. That is correct, not a sign the fix
+failed to take. `remeshing.py` hands the centerline to exactly two places,
+`clip_flow_extensions_and_uncap` and `opening_clip_frames`, and both are local
+to the openings; a trace that stops early in a thin mid-vessel branch cannot
+move an ostium it already reached. The truncation was only ever going to damage
+the `clean_centerline` product, where the centerline is the deliverable rather
+than a jig.
+
+## 13. p551: a fan the weld cannot reach — open, and correctly refused
+
+p551_..._2 is the one fan-tent case the section 11 fix does not clear. It is not
+the same failure as the others: **its area is fine at every attempt** (1.02×),
+and only the fan gate refuses it. All ten weld/iteration combinations leave a
+fan between 14.2 and 33.5 mean edges, with 0.15 of the mean edge the best of
+them at 17.9.
+
+The weld cannot reach it because short edges are not what makes it. The surface
+handed to the remesher is clean: no fan at all, 115821 triangles of which 24 are
+mildly poor and none degenerate, no zero-area triangles. The remesher builds the
+fan out of nothing.
+
+Three facts narrow where it comes from:
+
+- **All three fans sit on an opening rim**, 0.005–0.019 mm from it, clustered
+  within 0.02 mm of each other at one small ostium, with valences 250, 111 and
+  34. Some 395 triangles meet at three nearly coincident rim points.
+- **`PreserveBoundaryEdges` is not the cause.** Running the same remesh with it
+  off gives an identical result — same fan, same CV, same area — so rim pinning
+  is not what traps those vertices.
+- **The rim itself is healthy where the fan lands.** Walking it either side of
+  the fan gives steps of 0.02 to 0.17 mm with nothing collapsed, against a 0.150
+  mm target.
+
+What is unusual about p551 is that every one of its six rims is 1.6 to 3.1 times
+finer than the target edge, so the remesher has to blend a 0.05 mm rim into a
+0.15 mm interior all the way round. That is the standing hypothesis and it is
+not yet proven; the other five rims do not fan.
+
+A second remesh pass is not the answer — it leaves five fans instead of three
+and costs 4% of the area.
+
+**Status**: refused, not shipped, which is the safe direction. It failed the
+2026-09-17 run too, at step 3 rather than step 6, so the fixes moved it forward
+rather than breaking it.
+
+## 14. SNF00000607_01_2: an ostium cut three times too wide — open, and refused
+
+The case reaches the last gate and is refused for finishing with 7 openings
+against 8 anatomical profiles. It also failed the 2026-09-17 run, at step 4.
+
+Profile 4 is the smallest opening on the vessel, anatomical radius **0.296 mm**,
+and the pipe-section uncap cuts it at **0.874 mm** — three times too wide, where
+every other profile is cut within 10% of its measured radius. That cut leaves a
+ragged rim: the uncap makes 9 loops where 8 were expected, one is filled, and the
+loop that survives carries 160 points on a 0.536 mm radius where comparable
+openings carry 57 to 82. Its rim sits 0.464 mm off its own plane.
+
+After the remesh, `finalize_surface` patches two wall pinholes and that ostium
+has no rim left. The ostium protection in `_loop_at_a_profile` should have held
+it: the tolerance is 0.5 mm and the loop is at the profile. Which repair closed
+it, and why the protection let it, is not yet established.
+
+The cut radius is the thing to chase, not the patch. A 0.296 mm ostium cut at
+0.874 mm is wrong before anything downstream touches it.
+
+**Status**: refused, not shipped.
