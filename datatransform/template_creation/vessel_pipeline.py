@@ -988,48 +988,112 @@ def _centerlines_in_child(closed_surface, source_points, target_points, timeout_
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def extract_centerlines_for_tube(extended_vessel, smoothed_vessel, anatomical_profiles, extended_profiles):
-    """Flow extensions help most cases; on looping siphons they can wreck Delaunay. Retry without them."""
-    source_ext, target_ext = seed_points_from_profiles(extended_profiles)
-    closed_extended = cap_surface(extended_vessel)
-    n_targets = len(target_ext)
-    centerline = _centerlines_in_child(
-        closed_extended, source_ext, target_ext, CENTERLINE_TIMEOUT_S
-    )
-    ref_bounds = smoothed_vessel.GetBounds()
-    if (
-        centerline is not None
-        and centerline_looks_valid(centerline, ref_bounds)
-        and _centerline_reaches_targets(centerline, n_targets)
-    ):
-        return centerline
-    if centerline is not None:
-        print(
-            "  WARNING: centerline on the extended surface left the lumen "
-            "or missed outlets "
-            f"(cells={centerline.GetNumberOfCells()} targets={n_targets}). "
-            "Retrying on the capped vessel without flow extensions."
+CENTERLINE_COVERAGE_VOXEL_MM = 0.5
+
+
+def centerline_anatomical_coverage(centerline, anatomical_profiles,
+                                   extension_length=DEFAULT_EXTENSION_LENGTH,
+                                   voxel_mm=CENTERLINE_COVERAGE_VOXEL_MM):
+    """How much of the vessel this trace actually visits, in 0.5 mm voxels.
+
+    Arc length is the obvious measure and the wrong one twice over: the raw
+    trace is one polyline per outlet, so every path re-walks the shared trunk
+    and the total counts that trunk once per outlet, and the extended trace
+    carries a flow extension on each end that is not anatomy at all. Clipping
+    to the anatomical planes removes the second problem and counting occupied
+    voxels removes the first, since a stretch walked six times occupies the
+    same voxels as a stretch walked once.
+    """
+    try:
+        clipped = clip_centerline_at_profiles(
+            centerline, anatomical_profiles, extension_length=extension_length
         )
+    except TemplateQualityError:
+        return 0
+    points = np.asarray(pv.wrap(to_vtk_poly(clipped)).points, dtype=float)
+    if points.size == 0:
+        return 0
+    voxels = np.unique(np.round(points / float(voxel_mm)).astype(np.int64), axis=0)
+    return int(len(voxels))
+
+
+def extract_centerlines_for_tube(extended_vessel, smoothed_vessel, anatomical_profiles, extended_profiles):
+    """Trace on both the extended and the bare vessel, and keep the fuller one.
+
+    Flow extensions exist to stop the Voronoi trace curling at the openings,
+    and they are clipped off again before anything ships. They usually help and
+    sometimes cost a great deal: on SNF00000415 the extended trace came back
+    with every outlet reached and 6 cells for 6 targets -- passing every check
+    this function used to make -- while quietly missing 186 mm of vessel. All
+    5234 points of the bare-surface trace sit inside the lumen, and the 367 the
+    extended one never visits sit 0.881 mm from the wall carrying an inscribed
+    radius of 0.895 mm, which is what a centerline point in a thin branch looks
+    like. VMTK had said so in passing: "Cannot find a steepest descent edge.
+    Target not reached."
+
+    Counting cells cannot catch that, so it is no longer asked to. Both traces
+    are computed and the one covering more anatomy wins. On a healthy vessel
+    that costs a second trace and changes nothing -- on C0010 the two agree to a
+    median of 0.015 mm, covering 99.5% and 98.7% of each other -- and the bare
+    trace is the cheap one anyway, seconds against the minutes the extended
+    trace can take.
+    """
+    ref_bounds = smoothed_vessel.GetBounds()
+    source_ext, target_ext = seed_points_from_profiles(extended_profiles)
+    n_targets = len(target_ext)
+
+    candidates = []
+    extended_cl = _centerlines_in_child(
+        cap_surface(extended_vessel), source_ext, target_ext, CENTERLINE_TIMEOUT_S
+    )
+    if extended_cl is not None and centerline_looks_valid(extended_cl, ref_bounds):
+        candidates.append(("extended surface", extended_cl, n_targets))
+    elif extended_cl is not None:
+        print("  WARNING: the extended-surface centerline left the lumen; discarding it.")
+
     source_anat, target_anat = seed_points_from_profiles(anatomical_profiles)
+    closed_anat = None
     try:
         closed_anat = cap_surface(smoothed_vessel)
     except TemplateQualityError as exc:
-        if centerline is not None and centerline_looks_valid(centerline, ref_bounds):
-            print(f"  WARNING: anatomical cap failed ({exc}); keeping the extended-surface centerline.")
-            return centerline
-        raise
-    retry = extract_voronoi_centerlines(closed_anat, source_anat, target_anat)
-    if not centerline_looks_valid(retry, ref_bounds):
+        if not candidates:
+            raise
+        print(f"  WARNING: anatomical cap failed ({exc}); only the extended trace is available.")
+    if closed_anat is not None:
+        bare_cl = extract_voronoi_centerlines(closed_anat, source_anat, target_anat)
+        if centerline_looks_valid(bare_cl, ref_bounds):
+            candidates.append(("bare vessel", bare_cl, len(target_anat)))
+        else:
+            print("  WARNING: the bare-vessel centerline left the lumen; discarding it.")
+
+    if not candidates:
         raise TemplateQualityError(
             "Voronoi centerline left the vessel lumen; input openings were detected, "
             "but VMTK could not trace a path inside the tube."
         )
-    if not _centerline_reaches_targets(retry, len(target_anat)):
-        print(
-            f"  WARNING: retry centerline still has {retry.GetNumberOfCells()} cells "
-            f"for {len(target_anat)} outlets; thin branches may be missing."
+
+    scored = [
+        (centerline_anatomical_coverage(cl, anatomical_profiles), name, cl, want)
+        for name, cl, want in candidates
+    ]
+    scored.sort(key=lambda row: row[0], reverse=True)
+    coverage, name, chosen, want = scored[0]
+    if len(scored) > 1:
+        other_cov, other_name = scored[1][0], scored[1][1]
+        gap = (coverage - other_cov) / other_cov if other_cov else float("inf")
+        if abs(gap) > 0.02:
+            print(
+                f"  NOTE: centerline taken from the {name}: it covers {coverage} "
+                f"voxels against {other_cov} for the {other_name} ({gap:+.1%})"
+            )
+
+    if not _centerline_reaches_targets(chosen, want):
+        raise TemplateQualityError(
+            f"the best centerline ({name}) has {chosen.GetNumberOfCells()} tracts for "
+            f"{want} outlets, so at least one branch was never reached. A centerline "
+            f"missing a branch produces a tube missing that branch."
         )
-    return retry
+    return chosen
 
 
 def resample_centerline(centerline, sample_spacing=DEFAULT_SAMPLE_SPACING):
@@ -3421,11 +3485,115 @@ def remesh_surface_isotropically(
 
 
 REMESH_MAX_AREA_DRIFT = 1.15
-# Back off *downwards*: on these surfaces the remesher diverges with more
-# iterations, not fewer, so a retry has to ask for less work than the attempt
-# that failed. 4 is below what we would choose (it leaves degenerate tails and
-# jagged rims) but a slightly coarse mesh beats a crumpled one.
+
+# Holding the area is not enough to call a remesh sound. A fan tent -- one
+# vertex left carrying a spray of triangles instead of a patch of proper ones --
+# barely moves the area, so the drift test waves it through: ten of the 111
+# meshes the validation run shipped carry one.
+#
+# The count of triangles at that vertex is the obvious measure and it does not
+# work. Measured across those ten, valence says nothing: C0010 carries 61 at an
+# edge-length CV of 0.172 and ANSYS_UNIGE_30_614 carries 94 at 0.190, both fine,
+# while p129 carries 21 at a CV of 0.437 and p363 22 at 0.540, both not.
+#
+# What separates them is how far the fan reaches, in units of the mesh's own
+# edge. A vertex whose ring sits about two edges away is a crowded vertex and
+# nothing more; one whose ring sits ten or twenty edges away is a patch thrown
+# across ground that should be carrying a hundred properly sized triangles,
+# which is precisely the uniformity this dataset exists to provide. The ten
+# split cleanly on that and on nothing else:
+#
+#     C0010 8.0, ANSYS_UNIGE_30_614 5.8, USFD_0035 4.7, SNF00000607_01_2 3.0
+#     p129 20.7, p551 21.4, p391 23.2, p363 32.5, SNF00000538_01 37.3, p399 38.4
+#
+# 12 sits in the gap with room on both sides. It is not a harsh gate either: the
+# weld sweep clears these outright rather than parking them -- p399 goes from
+# 38.4 edges to no hub at all, p363 and SNF00000538_01 likewise, and p391 from
+# 23.2 to 2.0 -- so reaching this test at all is rare.
+REMESH_HUB_VALENCE = 20
+REMESH_MAX_HUB_RING_EDGES = 12.0
+
+
+def worst_hub_ring_edges(surface, hub_valence=REMESH_HUB_VALENCE):
+    """How far the widest triangle fan reaches, in mean edge lengths.
+
+    Zero when no vertex carries enough triangles to be a fan at all.
+    """
+    _p, pts, faces = _triangle_points_faces(to_vtk_poly(surface))
+    if faces.size == 0:
+        return 0.0
+    edges = _triangle_edge_lengths(pts, faces)
+    mean_edge = float(edges.mean())
+    if not np.isfinite(mean_edge) or mean_edge <= 0.0:
+        return 0.0
+    valence = np.bincount(faces.ravel(), minlength=len(pts))
+    worst = 0.0
+    for hub in np.flatnonzero(valence >= int(hub_valence)):
+        ring = np.unique(faces[(faces == hub).any(axis=1)])
+        ring = ring[ring != hub]
+        if ring.size == 0:
+            continue
+        reach = float(np.linalg.norm(pts[ring] - pts[hub], axis=1).mean()) / mean_edge
+        if reach > worst:
+            worst = reach
+    return worst
+
+# What actually defeats vmtkSurfaceRemeshing on these surfaces is edges far
+# shorter than the mesh they sit in, and the tolerance that clears them has to
+# be measured in that mesh's own units. WELD_TOLERANCE_MM is a fixed 1e-3 mm,
+# which is the right instrument for exact duplicates and far too small for
+# this: p097 came out of the uncap with its shortest edge at 0.000777 mm inside
+# a mesh averaging 0.1337, welded at 1e-3 mm as before, and the remesh still ran
+# away to 1.476x. Welding the same surface at 0.05 of its mean edge -- 0.0067
+# mm, under seven times more -- lands it at 0.999x with an edge-length CV of
+# 0.119. The GT reconstruction of p379 needs 0.25 to do the same, 0.995x at CV
+# 0.133, and is still diverging at 2.157x at 0.05.
+#
+# So the tolerance is swept rather than chosen, gentlest first: 0.0 is exactly
+# what this pipeline did before, and a surface that converges there is remeshed
+# untouched. The sweep stops at 0.25 because it does not improve past there and
+# does get worse -- 0.5 of the mean edge took p379 to 10.056x.
+#
+# The weld is measured, not trusted: it moves no point off the surface (max
+# deviation 0.0000 mm on p379) and holds the area to within 0.08%, but it does
+# create non-manifold edges as it goes, 0 to 79 by 0.25 on that surface. That is
+# why every attempt is scored against the *unwelded* input, so a weld that ate
+# geometry cannot pass by flattering itself.
+REMESH_WELD_FRACTIONS = (0.0, 0.05, 0.10, 0.15, 0.25)
+
+# Last resort only, and it is a real concession: fewer iterations leave
+# degenerate tails and jagged rims, so a mesh rescued here is worse than one the
+# weld sweep rescued, and the log says which happened.
 REMESH_ITER_FALLBACKS = ((4, 6),)
+
+
+def weld_to_edge_fraction(surface, fraction):
+    """Merge points closer than ``fraction`` of this surface's mean edge."""
+    poly = to_vtk_poly(surface)
+    if fraction <= 0:
+        return poly
+    _p, pts, faces = _triangle_points_faces(poly)
+    if faces.size == 0:
+        return poly
+    mean_edge = float(_triangle_edge_lengths(pts, faces).mean())
+    if not np.isfinite(mean_edge) or mean_edge <= 0.0:
+        return poly
+    cleaner = vtk.vtkCleanPolyData()
+    cleaner.SetInputData(poly)
+    cleaner.SetTolerance(0.0)
+    cleaner.SetAbsoluteTolerance(mean_edge * float(fraction))
+    cleaner.ToleranceIsAbsoluteOn()
+    cleaner.PointMergingOn()
+    cleaner.ConvertPolysToLinesOn()
+    cleaner.ConvertLinesToPointsOn()
+    cleaner.ConvertStripsToPolysOn()
+    cleaner.Update()
+    triangles = vtk.vtkTriangleFilter()
+    triangles.SetInputData(cleaner.GetOutput())
+    triangles.PassLinesOff()
+    triangles.PassVertsOff()
+    triangles.Update()
+    return triangles.GetOutput()
 
 
 def _surface_area(surface):
@@ -3455,41 +3623,73 @@ def remesh_surface_verified(
     every bit of the growth was here. So each attempt is now measured against
     the surface handed in, and the first one that holds its area is taken.
 
-    The configured iteration count is always tried first, so cases that already
-    converge are remeshed exactly as before and their edge length is untouched.
+    What rescues a diverging case is welding out the edges that are far shorter
+    than the mesh around them, at a tolerance measured in that mesh's own units;
+    see REMESH_WELD_FRACTIONS. The sweep starts at no weld at all, so a case that
+    already converges is remeshed exactly as before, untouched and at full
+    iterations. Iterations are only given up when no tolerance worked, because a
+    mesh rescued that way is a worse mesh, and the log says which happened.
     """
     before = _surface_area(open_surface)
-    attempts = [(int(n_iter), int(connectivity_iter))]
-    attempts += [a for a in REMESH_ITER_FALLBACKS if a[0] < int(n_iter)]
+    n_iter = int(n_iter)
+    connectivity_iter = int(connectivity_iter)
+
+    # Weld first and keep the iterations, because that is what produces a mesh
+    # worth having: the sweep that rescues p097 and p379 lands them at CV 0.119
+    # and 0.133, where dropping to 4 iterations gives a coarse one. Iterations
+    # come off only when no tolerance in the sweep worked.
+    attempts = [(frac, n_iter, connectivity_iter) for frac in REMESH_WELD_FRACTIONS]
+    attempts += [
+        (frac, iters, conn)
+        for iters, conn in REMESH_ITER_FALLBACKS
+        if iters < n_iter
+        for frac in REMESH_WELD_FRACTIONS
+    ]
+
     best = None
-    for iters, conn in attempts:
+    for fraction, iters, conn in attempts:
+        welded = weld_to_edge_fraction(open_surface, fraction)
         out = remesh_surface_isotropically(
-            open_surface,
+            welded,
             target_edge_length=target_edge_length,
             n_iter=iters,
             connectivity_iter=conn,
         )
+        # Scored against the surface handed in, never against the welded one, so
+        # a tolerance that ate geometry cannot hide the loss.
         after = _surface_area(out)
         drift = after / before if before > 0 else float("inf")
-        if best is None or abs(drift - 1.0) < abs(best[1] - 1.0):
-            best = (out, drift, iters, conn)
-        if drift <= REMESH_MAX_AREA_DRIFT:
-            if (iters, conn) != (int(n_iter), int(connectivity_iter)):
+        hub = worst_hub_ring_edges(out)
+        # Rank attempts by area first and fan reach second, so "closest" in the
+        # failure message means the one that came nearest to being usable.
+        score = (abs(drift - 1.0), hub)
+        if best is None or score < best[0]:
+            best = (score, out, drift, hub, fraction, iters, conn)
+        if drift <= REMESH_MAX_AREA_DRIFT and hub <= REMESH_MAX_HUB_RING_EDGES:
+            if fraction > 0 or iters != n_iter:
+                how = f"welding at {fraction:.2f} of the mean edge"
+                if iters != n_iter:
+                    how += f" and backing off to {iters} iterations"
                 print(
-                    f"  Remesh at {n_iter} iterations diverged on the {label}; "
-                    f"{iters} iterations held the area ({drift:.3f}x)"
+                    f"  NOTE: remesh diverged on the {label} as configured; {how} "
+                    f"held it ({drift:.3f}x, widest fan {hub:.1f} edges)"
                 )
             return out
+        why = []
+        if drift > REMESH_MAX_AREA_DRIFT:
+            why.append(f"area {drift:.2f}x ({before:.1f} -> {after:.1f} mm^2)")
+        if hub > REMESH_MAX_HUB_RING_EDGES:
+            why.append(f"a triangle fan reaching {hub:.1f} mean edges")
         print(
-            f"  WARNING: remesh at {iters} iterations changed the {label} area "
-            f"{drift:.2f}x ({before:.1f} -> {after:.1f} mm^2); backing off"
+            f"  WARNING: remesh at weld {fraction:.2f}, {iters} iterations left "
+            f"the {label} with " + " and ".join(why)
         )
-    out, drift, iters, conn = best
+    _score, out, drift, hub, fraction, iters, conn = best
     raise TemplateQualityError(
         f"isotropic remesh did not converge on the {label}: the closest attempt "
-        f"({iters} iterations) still changed the area {drift:.2f}x "
-        f"({before:.1f} -> {_surface_area(out):.1f} mm^2). This is a remesher "
-        f"failure, not a clipping one."
+        f"(weld {fraction:.2f} of the mean edge, {iters} iterations) still changed "
+        f"the area {drift:.2f}x and left a triangle fan reaching {hub:.1f} mean "
+        f"edges. This is a remesher failure, not a clipping one."
     )
 
 

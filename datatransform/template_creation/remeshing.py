@@ -343,9 +343,11 @@ def process_gt_remesh_dataset(
     # The pipe-section uncap cuts fresh triangles at every rim and leaves
     # degeneracies behind: on p097 it took the shortest edge from 0.005032 to
     # 0.000037 mm and made 12 triangles of aspect ratio over 50, none of which
-    # were in the surface it was handed. Those are what step 6 cannot project
-    # against -- the same thing that makes the remesher diverge in hemoMesh --
-    # so they are welded out here rather than carried into the remesh.
+    # were in the surface it was handed. This weld clears the worst of that at a
+    # fixed 1e-3 mm. It is not what saves the remesh -- p097 still diverged
+    # 1.476x with it in place, and only a tolerance scaled to the mesh's own
+    # mean edge fixed that (see REMESH_WELD_FRACTIONS) -- but it keeps the
+    # quality gates honest about what the clip left behind.
     opened_gt, min_edge_after_clip = weld_degenerate_vertices(opened_gt)
     print(f"  Min edge after the uncap and weld: {min_edge_after_clip:.6f} mm")
     frames = opening_clip_frames(branched, gt_profiles)

@@ -138,11 +138,16 @@ def harvest_warning_lines(text, warnings, max_lines=50):
     seen = set(warnings)
     extra = 0
     for line in (text or "").splitlines():
+        # NOTE lines are not warnings: the pipeline did its job, but by a route
+        # worth being able to find afterwards -- which weld tolerance a case
+        # needed, or which of the two centerline traces won. Over 747 cases that
+        # is the difference between an auditable run and a silent one.
         marker = (
             "WARNING" in line
             or "WARN|" in line
             or " ERR|" in line
             or "ERROR:" in line
+            or "NOTE:" in line
         )
         if not marker:
             continue

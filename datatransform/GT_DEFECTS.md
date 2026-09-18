@@ -38,7 +38,7 @@ sends the mesh to `<output>/rejected/` with the reason beside it, so an hour of
 Voronoi work is not thrown away and the keep/discard call can be made by looking
 at it. Covered by `TestSalvageOnlyForLaterSteps` and `TestRejectionIsParked`.
 
-## 2. Fan tents — cause found, fixed as far as it can be, rest quarantined
+## 2. Fan tents in the ground truth — cause found, weld swept, rest quarantined
 
 **3 of 119: p375_2, p376_3, p551_2.** A single vertex carries hundreds of
 triangles and a sheet is stretched across the lumen. Confirmed by the user on
@@ -172,6 +172,17 @@ RESULT: RemeshDivergedError -- the remesh left 15 triangle-fan hub(s);
 The weld leaves the area unchanged to four figures, lifts the minimum edge by
 560x and removes 96% of the slivers; the case that cannot be built correctly is
 then refused instead of shipped. Covered by `TestRemeshDiagnosis`.
+
+**Superseded in part**: that verification used a single weld tolerance, 0.05 of
+the mean edge, chosen on the reasoning that welding harder creates non-manifold
+junctions and must make things worse. Section 7 measured that reasoning through
+to the remesh and it is wrong — the tolerance that makes the most junctions is
+the one that converges, and p379's reconstruction needs 0.25 to do it while
+still diverging at 2.157x at 0.05. `_remesh_surface_vmtk` now sweeps
+`REMESH_WELD_FRACTIONS` rather than using the one value, so p376_3 gets four
+attempts where it got one. Whether that is enough for it is not yet known; it
+will be answered by the keep-one rebuild, and until then the case stays parked
+by the same raise, which is the safe direction to be wrong in.
 
 ## 3. A ball on an opening (p375_1) — fixed and verified
 
@@ -388,33 +399,53 @@ their targets exactly, and the edge length is uniform with no fan hubs:
 | SNF00000592_01 | 139,476 | 15 | 0.1233 | 0.126 | 8 | 0 |
 | SNF00000614 | 99,494 | 10 | 0.1232 | 0.124 | 8 | 0 |
 
-## 7. Remesh divergence in the GT pipeline — narrowed to p097
+## 7. Remesh divergence in the GT pipeline — fixed
 
-The same divergence as section 2 but in `template_creation/remeshing.py`.
+`vmtkSurfaceRemeshing` would return a surface half again the area of the one it
+was given, report nothing, and let it ship. p097 came out at 1.47x.
 
-**The clip does damage the surface, and that damage is now repaired.** The
-pipe-section uncap cuts fresh triangles at every rim: on p097 it took the
-shortest edge from 0.005032 to 0.000037 mm and made 12 triangles of aspect ratio
-over 50, none of which were in the surface it was handed. `remeshing.py` now
-welds those out between the uncap and the remesh, the same repair section 2
-makes in hemoMesh, and the shortest edge comes out at 0.001062 mm — 29x better.
+**The cause is edges far shorter than the mesh around them, and the cure is a
+weld tolerance measured in that mesh's own units.** The pipeline already welded,
+at `WELD_TOLERANCE_MM` = 1e-3 mm, which is the right instrument for exact
+duplicates and roughly forty-five times too small for this. p097 entered the
+remesh with its shortest edge at 0.000777 mm inside a mesh averaging 0.1337, and
+still ran away. Welding the same surface at 0.05 of its mean edge — 0.0067 mm —
+lands it at **0.999x with an edge-length CV of 0.119**.
 
-**It does not fix p097, and saying otherwise would be wrong.** Measured either
-side of the change, the remesh lands in the same place:
+The tolerance cannot be a constant, because the value that works is not the same
+on every surface:
 
-| | before the weld | after |
+| weld, as a fraction of the mean edge | p097 (template) | p379 GT reconstruction (hemoMesh) |
 |---|---|---|
-| shortest edge into the remesh | 0.000037 mm | 0.001062 mm |
-| closest attempt (6 iterations) | 1.47x, 980.4 -> 1440.1 mm2 | 1.47x, 980.4 -> **1445.1** mm2 |
+| none | 1.476x, CV 1.137 | — |
+| **0.05** | **0.999x, CV 0.119** | 2.157x, CV 1.746 |
+| 0.10 | 0.999x, CV 0.119 | — |
+| **0.25** | — | **0.995x, CV 0.133** |
+| 0.50 | — | 10.056x, CV 1.591 |
 
-So the degeneracies were real but incidental, exactly as in section 2: what
-defeats the remesher on these surfaces is not the slivers. The weld stays
-because it removes a known hazard for nothing — the area is untouched — and the
-case is parked with a message that already says where the fault lies.
+So it is swept, gentlest first, and the first tolerance whose remesh survives
+inspection is taken. Starting at no weld at all means a case that already
+converges is remeshed exactly as it was before. The sweep stops at 0.25 because
+past there it gets worse, not better.
 
-p379_1 and p379_3 are not retested yet. Their input is one of the ground-truth
-meshes carrying the residual sac of section 4, so they need rebuilding with that
-fix before their divergence means anything.
+**What the weld actually does is worth recording, because it is not what it
+looks like.** It does not clean the surface up. Measured on p379 either side of
+the change, it moves no point off the surface at all (max deviation 0.0000 mm)
+and holds the area to within 0.08% — but it *creates* non-manifold edges as it
+goes, none at 0.05 and 79 by 0.25. The tolerance that makes 79 of them is the
+one that converges. What defeats this remesher is short edges, not junctions,
+and the old comment in `surface_mesh.py` had that backwards.
+
+Nothing else is the lever. On p379's reconstruction both element-size modes and
+1, 2, 5 and 10 iterations all diverge by 2.0x–2.6x, and `MinEdgeLength` changes
+the result not at all (5263.3 mm2 with and without).
+
+Every attempt is scored against the **unwelded** input, so a tolerance that ate
+geometry cannot pass by flattering itself.
+
+**Status**: p097 rebuilds clean. p379_1 and p379_3 need their ground truth
+rebuilt first (section 4), and the reconstruction that feeds them now converges
+at 0.995x, so they are expected to follow.
 
 ## 8. Silent surplus openings — the count was wrong, not the mesh
 
@@ -504,3 +535,89 @@ had to be rewritten around a Newell normal.
 
 Repairing it means reinstalling numpy in both envs, which would disturb a working
 pipeline, so it is left for a deliberate decision rather than done in passing.
+
+## 11. Triangle fans in the shipped meshes — fixed
+
+Ten of the 111 meshes the validation run shipped carry a vertex with a spray of
+triangles on it instead of a patch of properly sized ones. Area drift does not
+notice — a fan barely moves the area — so all ten passed.
+
+**Counting the triangles at that vertex does not identify the defect**, which is
+why this went unnoticed. Across the ten, valence says nothing useful: C0010
+carries 61 at an edge-length CV of 0.172 and ANSYS_UNIGE_30_614 carries 94 at
+0.190, both perfectly good meshes, while p129 carries 21 at a CV of 0.437 and
+p363 22 at 0.540, both bad.
+
+What separates them is **how far the fan reaches, in units of the mesh's own
+edge**:
+
+| | worst fan reach | valence | edge CV |
+|---|---|---|---|
+| SNF00000607_01_2 | 3.0 edges | 20 | 0.130 |
+| USFD_0035 | 4.7 edges | 55 | 0.168 |
+| ANSYS_UNIGE_30_614 | 5.8 edges | 94 | 0.190 |
+| C0010 | 8.0 edges | 61 | 0.172 |
+| p129 | 20.7 edges | 21 | 0.437 |
+| p551 | 21.4 edges | 206 | 0.875 |
+| p391 | 23.2 edges | 117 | 0.524 |
+| p363 | 32.5 edges | 22 | 0.540 |
+| SNF00000538_01 | 37.3 edges | 36 | 0.580 |
+| p399 | 38.4 edges | 104 | 0.762 |
+
+A ring two edges out is a crowded vertex and nothing more. A ring twenty or
+forty edges out is a patch thrown across ground that should be carrying a
+hundred triangles — exactly the uniformity this dataset exists to provide. The
+split is clean and the gate sits at 12, with room on both sides.
+
+These are made here, not inherited: p399's input has no such vertex at all and
+its output has one whose fan covers 104.8 mm2 where a flat disc of the same ring
+would cover 73.9, so the vertex is pulled off the surface, not capping a hole.
+Five of p551's eight sit within 0.06 mm of each other, one of them spanning a
+2.16 mm ring in 0.414 mm2 of area — slivers collapsed onto a line.
+
+**They are not pinhole patches.** `fan_fill_small_loops` does build a fan over a
+hole's barycentre, and that is legitimate, but it only touches loops under
+`WALL_PINHOLE_RADIUS_MM` = 0.20 mm. Nothing at 20 to 40 mean edges came from
+there.
+
+**Fix**: the same weld sweep as section 7, with the reach as the second test
+beside area drift. It does not park these cases, it repairs them — p399 goes
+from 38.4 edges to no fan at all, p363 and SNF00000538_01 likewise, and p391
+from 23.2 edges to 2.0.
+
+## 12. A centerline that stopped early, and nothing noticed — fixed
+
+`extract_centerlines_for_tube` traces on the flow-extended surface and falls
+back to the bare vessel when that fails. The two are not different algorithms —
+both call `extract_voronoi_centerlines`; the only difference is whether the
+extensions are on the surface while the Voronoi tessellation runs. They are
+clipped off again before anything ships.
+
+**The fallback is not the weak one. The test that chose between them was.** It
+asked `n_cells >= n_targets` and nothing else, and a trace can stop early while
+still having one polyline per outlet. On SNF00000415 it did, and the short one
+shipped:
+
+| SNF00000415, both clipped to the anatomical planes | tracts | length |
+|---|---|---|
+| extended surface (what shipped) | 17 | 328.21 mm |
+| bare vessel | 46 | 514.46 mm |
+
+98.6% of the extended trace lies within 0.5 mm of the bare one, so it is not a
+different path — it is a **subset**. The 367 points it never visits are all
+inside the lumen, sitting 0.881 mm from the wall with an inscribed radius of
+0.895 mm, which is what a centerline point in a thin branch looks like. VMTK had
+said so in passing and nothing was listening: *"Can't find a steepest descent
+edge. Target not reached."*
+
+On a healthy vessel the two agree: C0010 gives 627.53 mm against 577.74 mm,
+covering 99.5% and 98.7% of each other, median deviation 0.015 mm.
+
+**Fix**: compute both and keep the one that covers more anatomy. Coverage is
+counted in occupied 0.5 mm voxels after clipping to the anatomical planes,
+because arc length is wrong twice over — the raw trace re-walks the shared trunk
+once per outlet, and the extended one carries extensions that are not anatomy.
+A chosen trace that still misses a branch now raises instead of warning; a
+centerline missing a branch makes a tube missing that branch. The second trace
+costs seconds against the minutes the extended one can take.
+

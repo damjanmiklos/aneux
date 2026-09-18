@@ -14,6 +14,7 @@ from remeshing import (
     DEFAULT_GT_EDGE_LENGTH_MM,
     GT_MAX_AREA_RATIO,
     GT_MIN_AREA_RATIO,
+    GT_REMESH_CONNECTIVITY_ITER,
     GT_REMESH_N_ITER,
     GT_TAUBIN_ITER,
     GT_TAUBIN_PASS_BAND,
@@ -26,6 +27,8 @@ from remeshing import (
     write_worker_transcript,
 )
 from vessel_pipeline import (
+    REMESH_CONNECTIVITY_ITER,
+    REMESH_N_ITER,
     TemplateQualityError,
     _drop_small_fragments,
     _opening_clip_height,
@@ -67,7 +70,13 @@ def test_gt_smoothing_is_weaker_than_template():
     assert GT_TAUBIN_PASS_BAND >= 1.4
     assert GT_TAUBIN_ITER <= 8
     assert DEFAULT_GT_EDGE_LENGTH_MM == 0.15
-    assert GT_REMESH_N_ITER == 20
+    # Pinning the exact iteration count froze a number that measurement later
+    # moved: 20/20 drove p097's area to 5.45x at an edge CV of 2.32, while 6/10
+    # held it at 1.02x and CV 0.40. What the GT path actually owes is to use the
+    # same remesh budget as everything else, not a bigger one, so that is what
+    # is asserted -- it survives the next measurement without hiding a change.
+    assert GT_REMESH_N_ITER == REMESH_N_ITER
+    assert GT_REMESH_CONNECTIVITY_ITER == REMESH_CONNECTIVITY_ITER
 
 
 def test_gt_scale_rejects_lost_sac():
