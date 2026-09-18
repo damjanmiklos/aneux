@@ -288,15 +288,66 @@ That makes it the same defect as the stubs above, at its limit — nothing came 
 instead of most of it coming off — and the `RESIDUAL_SAC_MM` detector already
 catches it (0.100 mm, sixth in the table).
 
-**Cause: open, with a lead.** `MaskWithPatch` in `clipvoronoidiagram.py` already
-carries a comment naming this exact failure — it scales the tube radius "so the
-mask captures dome Voronoi points that fall outside the narrow MISR-based tube
-(especially at the top/sides of wide aneurysms where the centerline endpoint
-radius shrinks to 0)". The scale is a fixed `aneurysmTubeScale=2.0`
-(`removal.py:3206`). At the dome tip the maximum inscribed sphere radius goes to
-zero, so twice a vanishing radius is still a vanishing tube — precisely where the
-residuals sit, 0.036-0.119 mm from the apex. A debug re-run of p379 keep 1 is
-producing the intermediate Voronoi artifacts to confirm it.
+**Cause: found — the aneurysm centerline is built from the wrong line.**
+
+The mask that gets subtracted is a tube around the aneurysm centerline, so the
+first thing to check is whether that centerline goes anywhere near the sac. On
+p379 keep 1, with the two removed sacs side by side:
+
+| | sac 2 (bifurcation) | sac 3 (sidewall) |
+|---|---|---|
+| full Voronoi reaches to | 0.681 mm of the apex | 0.415 mm of the apex |
+| aneurysm centerline ends | **7.580 mm from the apex** | 0.000 mm from the apex |
+| mask reaches to | **3.540 mm of the apex** | 0.415 mm of the apex |
+| mask size | 46,320 points | 6,449 points |
+
+The sidewall sac's centerline runs to the dome and its mask covers the sac to the
+resolution of the diagram itself. The bifurcation sac's centerline stops 7.6 mm
+short, its tube therefore stops 3.5 mm short, and the top of the sac is never
+subtracted. That is the stub.
+
+Why it stops short: for a bifurcation, `patchandinterpolatecenterlines.py` took
+the aneurysm centerline to be **cell 0** of the first daughter centerline. But
+`vmtkcenterlines` emits its lines in its own order, not in the order the targets
+were supplied. On p379 daughter 1 has three cells and cell 0 is the one running
+back to the *inlet*, 24.9 mm from the dome; the line that ends on the dome is
+cell 2:
+
+```
+1_dau1cl.vtp  cells=3
+   cell 0: n=794  starts near outlet1  ends 24.91 mm from apex
+   cell 1: n=746  starts near outlet1  ends near outlet2
+   cell 2: n=465  starts near outlet1  ends  0.00 mm from apex   <- the dome line
+```
+
+So the aneurysm tube was built around a stretch of parent artery and the sac it
+was meant to remove survived. The sidewall path never had the bug because it
+takes its centerline from `SaveAneurysm(forwardCenterlines)`, which is the branch
+past the diverging point by construction.
+
+**This accounts for eight of the nine.** Sorting the 119 meshes by how close the
+nearest removed sac still is, and reading off how each was picked:
+
+| | n | residual under 0.25 mm | median standoff |
+|---|---|---|---|
+| bifurcation | 63 | **8** | 2.20 mm |
+| sidewall | 56 | 1 | 2.63 mm |
+
+Every residual in the table above is a bifurcation except p431_1 at 0.119 mm, the
+mildest of the nine and the one the user described as "a small stub". That one is
+a sidewall and needs its own answer; it is the only part of this section still
+open.
+
+**Fix** (`patchandinterpolatecenterlines.py`, `removal.py`): `dome_cell_id` picks
+the daughter cell that actually ends on the dome instead of trusting cell 0. It
+uses the picked dome point, which the driver now threads through `cut_aneurysm`
+as `top_point`, and falls back — when no point is supplied — to the endpoint
+standing farthest off the parent artery, which is what an aneurysm is. The chosen
+cell is then used for both the clipping points and the centerline itself, which
+previously re-extracted cell 0 a second time. Covered by `tests/test_dome_cell.py`,
+which fixes the emitted orders the selection has to survive, including p379's own.
+
+**End-to-end verification is running.**
 
 ## 5. A ball instead of the removed aneurysm (p439) — merged into section 4
 
