@@ -55,7 +55,6 @@ from batch_run_log import (
     write_worker_transcript,  # re-exported for tests
 )
 from vessel_pipeline import (
-    cap_unmatched_loops,
     TemplateQualityError,
     add_flow_extensions,
     weld_degenerate_vertices,
@@ -65,6 +64,7 @@ from vessel_pipeline import (
     add_shared_cli_args,
     apply_taubin_smoothing,
     assert_template_quality,
+    cap_unmatched_loops,
     clean_triangulate,
     clip_flow_extensions_and_uncap,
     drop_boundary_ear_triangles,
