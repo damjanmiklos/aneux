@@ -303,7 +303,19 @@ def test_repairs_did_not_relax_the_training_objectives():
     import remeshing as rm
 
     assert rm.DEFAULT_GT_EDGE_LENGTH_MM == 0.15
-    assert rm.GT_REMESH_N_ITER == 20
+    # This used to pin 20/20 on the assumption that more remesh iterations buy
+    # quality. Measured, they cost it: VMTK's relocation oscillates instead of
+    # converging, and 20/20 grows p129's area 5.45x at CV 2.3181 while 6/10
+    # holds it at 1.024x and CV 0.3952. So the objective is not "many
+    # iterations", it is "the iteration counts the rest of the pipeline is
+    # validated at", and raising them is the regression to guard against.
+    import vessel_pipeline as _vp
+
+    assert rm.GT_REMESH_N_ITER == _vp.REMESH_N_ITER
+    assert rm.GT_REMESH_CONNECTIVITY_ITER == _vp.REMESH_CONNECTIVITY_ITER
+    assert rm.GT_REMESH_N_ITER <= 6
+    # Every fallback must ask for *less* work than the attempt that diverged.
+    assert all(a[0] < rm.GT_REMESH_N_ITER for a in _vp.REMESH_ITER_FALLBACKS)
     # Light Taubin only: pass band near 2 barely filters, and few iterations.
     assert rm.GT_TAUBIN_PASS_BAND >= 1.4
     assert rm.GT_TAUBIN_ITER <= 8
@@ -597,3 +609,145 @@ def test_loop_collapse_also_refuses_to_close_the_last_openings():
     fixed, n = collapse_pinhole_loops(tube, min_radius=5.0, label="test surface")
     assert n == 0
     assert len(boundary_loop_radii(fixed)) == 2
+
+
+def _scaled_copy(surface, factor):
+    """A surface with `factor` times the area, standing in for a diverged remesh."""
+    import pyvista as pv
+
+    from vessel_pipeline import to_vtk_poly
+
+    grown = pv.wrap(to_vtk_poly(surface)).copy()
+    grown.points = grown.points * float(factor) ** 0.5
+    return to_vtk_poly(grown)
+
+
+def test_remesh_keeps_the_configured_iterations_when_they_converge():
+    """The 600+ cases that already remesh cleanly must not change behaviour."""
+    import vessel_pipeline as vp
+
+    tube = open_tube(n_sides=40, n_rings=30)
+    calls = []
+
+    def fake(surface, target_edge_length, n_iter, connectivity_iter):
+        calls.append((n_iter, connectivity_iter))
+        return vp.to_vtk_poly(surface)
+
+    original = vp.remesh_surface_isotropically
+    vp.remesh_surface_isotropically = fake
+    try:
+        vp.remesh_surface_verified(
+            tube, target_edge_length=0.15, n_iter=20, connectivity_iter=20
+        )
+    finally:
+        vp.remesh_surface_isotropically = original
+
+    assert calls == [(20, 20)], "a converging remesh must not be retried"
+
+
+def test_remesh_backs_off_when_the_configured_iterations_diverge():
+    """vmtkSurfaceRemeshing reports no error when it folds the surface."""
+    import vessel_pipeline as vp
+
+    tube = open_tube(n_sides=40, n_rings=30)
+    calls = []
+
+    def fake(surface, target_edge_length, n_iter, connectivity_iter):
+        calls.append((n_iter, connectivity_iter))
+        # The configured count diverges the way 20/20 does on p129; backing off
+        # to fewer iterations is what recovers it.
+        if n_iter >= vp.REMESH_N_ITER:
+            return _scaled_copy(surface, 5.45)
+        return vp.to_vtk_poly(surface)
+
+    original = vp.remesh_surface_isotropically
+    vp.remesh_surface_isotropically = fake
+    try:
+        out = vp.remesh_surface_verified(
+            tube,
+            target_edge_length=0.15,
+            n_iter=vp.REMESH_N_ITER,
+            connectivity_iter=vp.REMESH_CONNECTIVITY_ITER,
+        )
+    finally:
+        vp.remesh_surface_isotropically = original
+
+    # It must retry downwards, never upwards.
+    assert len(calls) > 1, calls
+    assert calls[0][0] == vp.REMESH_N_ITER, calls
+    assert [c[0] for c in calls] == sorted((c[0] for c in calls), reverse=True), calls
+    import pyvista as pv
+
+    ratio = pv.wrap(out).area / pv.wrap(vp.to_vtk_poly(tube)).area
+    assert ratio <= vp.REMESH_MAX_AREA_DRIFT, ratio
+
+
+def test_remesh_failure_is_reported_as_a_remesh_failure():
+    """The old message blamed flow extensions for damage done here."""
+    import pytest
+
+    import vessel_pipeline as vp
+
+    tube = open_tube(n_sides=40, n_rings=30)
+
+    def fake(surface, target_edge_length, n_iter, connectivity_iter):
+        return _scaled_copy(surface, 4.0)
+
+    original = vp.remesh_surface_isotropically
+    vp.remesh_surface_isotropically = fake
+    try:
+        with pytest.raises(vp.TemplateQualityError) as excinfo:
+            vp.remesh_surface_verified(
+                tube, target_edge_length=0.15, n_iter=20, connectivity_iter=20
+            )
+    finally:
+        vp.remesh_surface_isotropically = original
+
+    message = str(excinfo.value)
+    assert "remesh" in message.lower()
+    assert "flow extension" not in message.lower()
+
+def test_fan_lid_is_not_coplanar_with_the_rim_it_closes():
+    """A flat lid hands the Delaunay step the degeneracy caps exist to avoid.
+
+    ``cap_surface`` falls back to fanning when vtkvmtkCapPolyData cannot walk a
+    rim, and that fallback only ever runs on damaged meshes -- the ones whose
+    centerlines hang. Putting the apex in the rim plane there would reintroduce
+    coplanar points on exactly those cases.
+    """
+    import vessel_pipeline as vp
+
+    tube = open_tube(n_sides=40, n_rings=30)
+    closed = vp.fan_fill_every_loop(tube)
+    assert vp.extract_boundary_loops(closed).GetNumberOfCells() == 0
+
+    _poly, pts, _faces = _triangle_points_faces(tube)
+    # The rim of an open tube lies in a plane of constant z; a domed lid must not.
+    rim_z = np.unique(np.round(pts[:, 2], 6))
+    _poly2, pts2, _faces2 = _triangle_points_faces(closed)
+    added = pts2[len(pts):]
+    assert len(added) > 0
+    assert np.all(added[:, 2] < rim_z.min() - 1e-9) or np.all(
+        added[:, 2] > rim_z.max() + 1e-9
+    ) or np.any(
+        np.abs(added[:, 2][:, None] - rim_z[None, :]).min(axis=1) > 1e-6
+    ), added
+
+
+def test_fan_lid_domes_away_from_the_lumen():
+    """Outwards, so the lid reads as a cap rather than a dent in the vessel."""
+    import vessel_pipeline as vp
+
+    tube = open_tube(n_sides=40, n_rings=30)
+    _poly, pts, _faces = _triangle_points_faces(tube)
+    centroid = pts.mean(axis=0)
+    rim_reach = np.abs(pts[:, 2] - centroid[2]).max()
+    closed = vp.fan_fill_every_loop(tube)
+    _poly2, pts2, _faces2 = _triangle_points_faces(closed)
+    added = pts2[len(pts):]
+    assert len(added) > 0
+    # Strictly beyond the rim, not merely off-plane: a lid pushed the other way
+    # would also be non-coplanar but would dent the lumen it is meant to close.
+    assert np.all(np.abs(added[:, 2] - centroid[2]) > rim_reach + 1e-9), (
+        added, rim_reach
+    )

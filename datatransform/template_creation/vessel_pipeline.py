@@ -530,6 +530,63 @@ def seed_points_from_profiles(profiles):
     return inlet, outlets
 
 
+def _vmtk_boundary_count(surface):
+    """How many rims vtkvmtkPolyDataFlowExtensionsFilter will index.
+
+    It extracts boundaries with vtkvmtkPolyDataBoundaryExtractor, which walks
+    rims and skips the ones it cannot, so its numbering is its own -- taking the
+    count from extract_boundary_loops would hand the filter ids it never made.
+    """
+    extractor = vtkvmtk.vtkvmtkPolyDataBoundaryExtractor()
+    extractor.SetInputData(to_vtk_poly(surface))
+    extractor.Update()
+    return to_vtk_poly(extractor.GetOutput()).GetNumberOfCells()
+
+
+def _extrude_boundaries(poly, extension_length, boundary_ids=None):
+    """Run the extrusion filter directly, optionally on a subset of rims.
+
+    vmtkFlowExtensions only forwards BoundaryIds when it is interactive, and
+    choosing which rims to extrude is the whole point here. Settings mirror what
+    the script would apply for boundarynormal/linear.
+    """
+    extender = vtkvmtk.vtkvmtkPolyDataFlowExtensionsFilter()
+    extender.SetInputData(poly)
+    extender.SetSigma(1.0)
+    extender.SetAdaptiveExtensionLength(0)
+    extender.SetAdaptiveExtensionRadius(1)
+    extender.SetAdaptiveNumberOfBoundaryPoints(0)
+    extender.SetExtensionLength(float(extension_length))
+    extender.SetExtensionRatio(10.0)
+    extender.SetExtensionRadius(1.0)
+    extender.SetTransitionRatio(0.25)
+    extender.SetCenterlineNormalEstimationDistanceRatio(1.0)
+    extender.SetNumberOfBoundaryPoints(50)
+    extender.SetExtensionModeToUseNormalToBoundary()
+    extender.SetInterpolationModeToLinear()
+    if boundary_ids is not None:
+        ids = vtk.vtkIdList()
+        for i in boundary_ids:
+            ids.InsertNextId(int(i))
+        extender.SetBoundaryIds(ids)
+    extender.Update()
+    return to_vtk_poly(extender.GetOutput())
+
+
+def _extension_attempt(poly, extension_length, boundary_ids, max_cells):
+    """(cleaned surface, opening count) for one extrusion, or (None, None)."""
+    try:
+        raw = _extrude_boundaries(poly, extension_length, boundary_ids)
+    except Exception:
+        return None, None
+    if raw is None or raw.GetNumberOfCells() == 0:
+        return None, None
+    if raw.GetNumberOfCells() > max_cells:
+        return None, None
+    cleaned = clean_triangulate(raw)
+    return cleaned, extract_boundary_loops(cleaned).GetNumberOfCells()
+
+
 def add_flow_extensions(open_surface, extension_length=DEFAULT_EXTENSION_LENGTH):
     """Extrude cylinders on an OPEN surface. Must not be capped first or this is a no-op."""
     vtk_poly = clean_triangulate(open_surface)
@@ -546,22 +603,47 @@ def add_flow_extensions(open_surface, extension_length=DEFAULT_EXTENSION_LENGTH)
             f"(cap {MAX_FLOW_EXTENSION_LAYERS}); its rim edges are degenerate."
         )
 
-    extender = vmtkscripts.vmtkFlowExtensions()
-    extender.Surface = vtk_poly
-    extender.ExtensionLength = float(extension_length)
-    extender.ExtensionMode = "boundarynormal"
-    extender.InterpolationMode = "linear"
-    extender.AdaptiveExtensionLength = 0
-    extender.Interactive = 0
-    extender.Execute()
-    raw = to_vtk_poly(extender.Surface)
-    if raw.GetNumberOfCells() > MAX_EXTENSION_CELL_GROWTH * max(vtk_poly.GetNumberOfCells(), 1):
+    max_cells = MAX_EXTENSION_CELL_GROWTH * max(vtk_poly.GetNumberOfCells(), 1)
+    extended, n_after = _extension_attempt(vtk_poly, extension_length, None, max_cells)
+    if extended is None:
         raise TemplateQualityError(
-            f"flow extensions produced {raw.GetNumberOfCells()} cells from "
+            f"flow extensions blew past {max_cells} cells from "
             f"{vtk_poly.GetNumberOfCells()}; refusing to clean a runaway surface."
         )
-    extended = clean_triangulate(raw)
-    n_after = extract_boundary_loops(extended).GetNumberOfCells()
+
+    if n_after > n_open:
+        # An extrusion should move a rim, not multiply it. More openings out than
+        # in means the extruder tore the wall, and every later step inherits the
+        # damage: the capper cannot close the tears, and the Voronoi diagram of
+        # whatever does close them leaves the lumen. Extruding one rim at a time
+        # shows which rim the filter cannot handle, and a vessel with one end
+        # left flat still traces a good centerline -- a torn one never does.
+        n_ids = _vmtk_boundary_count(vtk_poly)
+        good = []
+        for i in range(n_ids):
+            _probe, n_probe = _extension_attempt(
+                vtk_poly, extension_length, [i], max_cells
+            )
+            if n_probe == n_open:
+                good.append(i)
+        subset, n_subset = (None, None)
+        if good:
+            subset, n_subset = _extension_attempt(
+                vtk_poly, extension_length, good, max_cells
+            )
+        if subset is not None and n_subset == n_open:
+            print(
+                f"  Flow extensions tore {n_after - n_open} opening(s); extended "
+                f"{len(good)}/{n_ids} rim(s) and left the rest flat"
+            )
+            extended, n_after = subset, n_subset
+        else:
+            print(
+                f"  Flow extensions tear this surface ({n_open} openings in, "
+                f"{n_after} out); tracing the centerline without them"
+            )
+            return vtk_poly
+
     if n_after == 0:
         raise TemplateQualityError("Flow extensions produced a closed surface (unexpected).")
     if extended.GetNumberOfPoints() <= vtk_poly.GetNumberOfPoints():
@@ -590,6 +672,128 @@ def _flow_extension_layer_estimate(surface, extension_length):
     return worst
 
 
+def _loop_apex(coords, centroid, displacement):
+    """Where to put the tip of a lid over one rim.
+
+    Not in the rim's own plane. ``cap_surface`` displaces its caps precisely so
+    the Delaunay tetrahedralisation behind the centerlines does not have to work
+    with coplanar points, and a flat lid reintroduces the degeneracy that
+    displacement exists to avoid -- on the damaged meshes that reach this
+    fallback in the first place, which are exactly the ones that hang.
+
+    Pushed along the rim's Newell normal, away from the surface centroid so the
+    lid domes outwards like a real cap rather than into the lumen. Unlike
+    vtkvmtkCapPolyData's displacement, which is an absolute distance, this one
+    scales with the rim's own radius so it breaks coplanarity by the same
+    proportion on a 0.5 mm branch and on a 4 mm parent.
+    """
+    center = coords.mean(axis=0)
+    if displacement <= 0.0:
+        return center
+    rolled = np.roll(coords, -1, axis=0)
+    normal = np.cross(coords, rolled).sum(axis=0)
+    norm = float(np.linalg.norm(normal))
+    radius = float(np.mean(np.linalg.norm(coords - center, axis=1)))
+    if norm <= 0.0 or radius <= 0.0:
+        return center
+    normal = normal / norm
+    if float(np.dot(normal, center - centroid)) < 0.0:
+        normal = -normal
+    return center + normal * (displacement * radius)
+
+
+def _close_loops_once(surface, weld, displacement=DEFAULT_CAP_DISPLACEMENT):
+    """Close every boundary loop, either by fanning it or by welding it shut.
+
+    Fanning keeps the rim geometry and adds a lid. Welding pulls the whole rim to
+    one point, which closes a hole whatever shape it is -- including rims that
+    repeat a vertex, where a fan only produces degenerate triangles that get
+    cleaned away again, leaving the hole open.
+    """
+    poly, pts, faces = _triangle_points_faces(surface)
+    if faces.size == 0:
+        return poly, 0
+    loops = extract_boundary_loops(poly)
+    if loops.GetNumberOfCells() == 0:
+        return poly, 0
+    locator = vtk.vtkStaticPointLocator()
+    locator.SetDataSet(poly)
+    locator.BuildLocator()
+
+    centroid = pts.mean(axis=0)
+    pts_list = pts.tolist()
+    new_faces = faces.tolist()
+    remap = {}
+    n_closed = 0
+    for i in range(loops.GetNumberOfCells()):
+        cell = loops.GetCell(i)
+        n = cell.GetNumberOfPoints()
+        if n < 3:
+            continue
+        coords = np.array(
+            [cell.GetPoints().GetPoint(j) for j in range(n)], dtype=np.float64
+        )
+        ids = [int(locator.FindClosestPoint(xyz)) for xyz in coords]
+        pts_list.append(_loop_apex(coords, centroid, displacement).tolist())
+        target = len(pts_list) - 1
+        if weld:
+            for pid in set(ids):
+                remap[pid] = target
+        else:
+            seen = set()
+            ring = []
+            for pid in ids:
+                if pid not in seen:
+                    seen.add(pid)
+                    ring.append(pid)
+            if len(ring) < 3:
+                continue
+            for k in range(len(ring)):
+                new_faces.append([ring[k], ring[(k + 1) % len(ring)], target])
+        n_closed += 1
+    if n_closed == 0:
+        return poly, 0
+    if remap:
+        rebuilt = []
+        for a, b, c in new_faces:
+            a, b, c = remap.get(a, a), remap.get(b, b), remap.get(c, c)
+            if a == b or b == c or c == a:
+                continue
+            rebuilt.append([a, b, c])
+        new_faces = rebuilt
+    closed = _polydata_from_triangles(
+        np.asarray(pts_list, dtype=np.float64),
+        np.asarray(new_faces, dtype=np.int64).reshape(-1, 3),
+    )
+    return closed, n_closed
+
+
+def fan_fill_every_loop(surface, max_passes=3):
+    """Make a surface watertight for the Delaunay/Voronoi step.
+
+    Used only on the capped copy that the centerline is traced from, and that
+    copy is discarded afterwards, so a flat lid over each opening costs nothing.
+    It needs no rim walk, which is the point: vtkvmtkCapPolyData gives up on rims
+    it cannot traverse.
+
+    Fans first, because they keep the rim where it is. Rims that survive a fan
+    repeat a vertex, so they get welded shut instead -- forcing manifoldness
+    between passes only re-cut what the fan had just closed.
+    """
+    current = clean_triangulate(surface)
+    for weld in (False, True):
+        for _ in range(int(max_passes)):
+            if extract_boundary_loops(current).GetNumberOfCells() == 0:
+                return current
+            current, n_closed = _close_loops_once(current, weld=weld)
+            if n_closed == 0:
+                break
+    current, _n = force_manifold_triangles(current)
+    if extract_boundary_loops(current).GetNumberOfCells() != 0:
+        current, _n2 = _close_loops_once(current, weld=True)
+    return current
+
+
 def cap_surface(open_surface, displacement=DEFAULT_CAP_DISPLACEMENT):
     """Close openings with a slight cap displacement so Delaunay tets at caps are non-degenerate."""
     vtk_poly = clean_triangulate(open_surface)
@@ -602,7 +806,15 @@ def cap_surface(open_surface, displacement=DEFAULT_CAP_DISPLACEMENT):
     capped = clean_triangulate(capper.GetOutput())
     n_open = extract_boundary_loops(capped).GetNumberOfCells()
     if n_open != 0:
-        raise TemplateQualityError(f"Capping left {n_open} openings; cannot run centerlines.")
+        # The capper walks rims; a fragmented vessel has rims it cannot walk, and
+        # refusing here ended the case before a centerline was ever attempted.
+        print(f"  Capper left {n_open} opening(s); fanning them shut for the centerline copy")
+        capped = fan_fill_every_loop(capped)
+        n_open = extract_boundary_loops(capped).GetNumberOfCells()
+        if n_open != 0:
+            raise TemplateQualityError(
+                f"Capping left {n_open} openings; cannot run centerlines."
+            )
     return recompute_point_normals(capped, auto_orient=True)
 
 
@@ -2433,6 +2645,113 @@ def _polydata_from_kept_cells(poly, keep_cell_ids):
     return clean_triangulate(geom.GetOutput())
 
 
+def _loop_geometry(surface):
+    """(point ids, barycentre, radius, n_points) for every boundary loop."""
+    poly, pts, faces = _triangle_points_faces(surface)
+    if faces.size == 0:
+        return poly, pts, faces, []
+    loops = extract_boundary_loops(poly)
+    locator = vtk.vtkStaticPointLocator()
+    locator.SetDataSet(poly)
+    locator.BuildLocator()
+    out = []
+    for i in range(loops.GetNumberOfCells()):
+        cell = loops.GetCell(i)
+        n = cell.GetNumberOfPoints()
+        if n == 0:
+            continue
+        coords = np.array(
+            [cell.GetPoints().GetPoint(j) for j in range(n)], dtype=np.float64
+        )
+        center = coords.mean(axis=0)
+        radius = float(np.mean(np.linalg.norm(coords - center, axis=1)))
+        ids = [int(locator.FindClosestPoint(xyz)) for xyz in coords]
+        out.append((ids, center, radius, int(n)))
+    return poly, pts, faces, out
+
+
+def cap_unmatched_loops(surface, profiles, label="surface"):
+    """Fan-fill every boundary loop that is not one of the anatomical ostia.
+
+    remove_spurious_openings closes tears by capping the whole surface and
+    re-opening the ostia, which needs vtkvmtkCapPolyData to walk every rim. When
+    it cannot -- "Can't find adjacent point" -- the tears were left in place and
+    the mesh shipped with more openings than it has ostia, which is exactly what
+    a homogeneous training set must not contain. A triangle fan per unmatched
+    loop needs no such walk.
+
+    It only runs once every profile already has a loop of its own. Without that
+    precondition an ostium the matcher failed to recognise would be capped, and
+    losing a real opening is far worse than keeping a tear.
+    """
+    if not profiles:
+        return to_vtk_poly(surface), 0
+    poly, pts, faces, loops = _loop_geometry(surface)
+    if not loops:
+        return poly, 0
+
+    matched_profiles = set()
+    unmatched = []
+    for ids, center, radius, n in loops:
+        hit = None
+        for k, profile in enumerate(profiles):
+            if _loop_at_a_profile(center, [profile], radius=radius, n_points=n):
+                hit = k
+                break
+        if hit is None:
+            unmatched.append((ids, center, radius, n))
+        else:
+            matched_profiles.add(hit)
+
+    if not unmatched:
+        return poly, 0
+    if len(matched_profiles) < len(profiles):
+        # An ostium the matcher failed to recognise has to keep a loop, but it
+        # needs only one. Refusing outright meant a single unmatched profile
+        # left every tear in place -- on p551 one unmatched ostium kept 12 extra
+        # openings on a mesh with 6. Each unmatched ostium reserves the loop
+        # nearest to it; the rest are still closed.
+        reserved = set()
+        for k, profile in enumerate(profiles):
+            if k in matched_profiles:
+                continue
+            center = np.asarray(profile["barycenter"], dtype=np.float64)
+            free = [i for i in range(len(unmatched)) if i not in reserved]
+            if not free:
+                break
+            reserved.add(
+                min(free, key=lambda i: float(np.linalg.norm(unmatched[i][1] - center)))
+            )
+        kept = [u for i, u in enumerate(unmatched) if i not in reserved]
+        print(
+            f"  Reserved {len(reserved)} opening(s) on the {label} for ostia the "
+            f"matcher did not recognise; capping the other {len(kept)}"
+        )
+        unmatched = kept
+        if not unmatched:
+            return poly, 0
+
+    pts_list = pts.tolist()
+    new_faces = faces.tolist()
+    for ids, center, _radius, _n in unmatched:
+        pts_list.append(center.tolist())
+        apex = len(pts_list) - 1
+        for k in range(len(ids)):
+            a, b = ids[k], ids[(k + 1) % len(ids)]
+            if a != b:
+                new_faces.append([a, b, apex])
+    capped = _polydata_from_triangles(
+        np.asarray(pts_list, dtype=np.float64),
+        np.asarray(new_faces, dtype=np.int64).reshape(-1, 3),
+    )
+    radii = ", ".join(f"{r:.3f}" for _i, _c, r, _n in unmatched)
+    print(
+        f"  Capped {len(unmatched)} opening(s) on the {label} that match no ostium "
+        f"(r={radii} mm)"
+    )
+    return capped, len(unmatched)
+
+
 def remove_spurious_openings(surface, profiles):
     """Fill leftover rims / wall tears that are not the expected ostia.
 
@@ -2454,14 +2773,14 @@ def remove_spurious_openings(surface, profiles):
         if n_left == 0:
             break
     if capped is None or extract_boundary_loops(capped).GetNumberOfCells() != 0:
-        print("  WARNING: could not cap leftover openings; leaving them in place")
-        return poly, 0
+        print("  Capper could not close the leftover openings; fanning them instead")
+        return cap_unmatched_loops(poly, profiles, label="remeshed surface")
 
     ids = capped.GetCellData().GetArray("CellEntityIds")
     center_ids = capper.GetCapCenterIds()
     if ids is None or center_ids is None or center_ids.GetNumberOfIds() == 0:
-        print("  WARNING: capper produced no CellEntityIds; skipping leftover fill")
-        return poly, 0
+        print("  Capper produced no CellEntityIds; fanning the leftovers instead")
+        return cap_unmatched_loops(poly, profiles, label="remeshed surface")
 
     offset = int(capper.GetCellEntityIdOffset())
     n_caps = int(center_ids.GetNumberOfIds())
@@ -2986,6 +3305,79 @@ def remesh_surface_isotropically(
     remesher.MinEdgeLength = float(REMESH_MIN_EDGE_MM)
     remesher.Execute()
     return to_vtk_poly(remesher.Surface)
+
+
+REMESH_MAX_AREA_DRIFT = 1.15
+# Back off *downwards*: on these surfaces the remesher diverges with more
+# iterations, not fewer, so a retry has to ask for less work than the attempt
+# that failed. 4 is below what we would choose (it leaves degenerate tails and
+# jagged rims) but a slightly coarse mesh beats a crumpled one.
+REMESH_ITER_FALLBACKS = ((4, 6),)
+
+
+def _surface_area(surface):
+    return float(pv.wrap(to_vtk_poly(surface)).area)
+
+
+def remesh_surface_verified(
+    open_surface,
+    target_edge_length,
+    n_iter,
+    connectivity_iter,
+    label="surface",
+):
+    """Remesh, and reject a pass that diverged instead of shipping it.
+
+    vmtkSurfaceRemeshing does not always converge, and it reports no error when
+    it fails to. On p129 the configured 20 iterations inflated the area from
+    1986 to 10825 mm^2, shattered one connected region into seven, and drove the
+    edge-length CV to 2.32 -- the opposite of the uniformity the iterations are
+    there to produce. Six iterations on the same surface land within 2% of the
+    input area. More passes are not monotonically better: past the point where
+    the optimiser starts fighting itself, they fold the surface.
+
+    Because the failure is silent, the damage used to surface only at the final
+    area gate, whose message blames flow extensions -- measured per step, the
+    extensions were added and clipped back to within 0.2% of the original, and
+    every bit of the growth was here. So each attempt is now measured against
+    the surface handed in, and the first one that holds its area is taken.
+
+    The configured iteration count is always tried first, so cases that already
+    converge are remeshed exactly as before and their edge length is untouched.
+    """
+    before = _surface_area(open_surface)
+    attempts = [(int(n_iter), int(connectivity_iter))]
+    attempts += [a for a in REMESH_ITER_FALLBACKS if a[0] < int(n_iter)]
+    best = None
+    for iters, conn in attempts:
+        out = remesh_surface_isotropically(
+            open_surface,
+            target_edge_length=target_edge_length,
+            n_iter=iters,
+            connectivity_iter=conn,
+        )
+        after = _surface_area(out)
+        drift = after / before if before > 0 else float("inf")
+        if best is None or abs(drift - 1.0) < abs(best[1] - 1.0):
+            best = (out, drift, iters, conn)
+        if drift <= REMESH_MAX_AREA_DRIFT:
+            if (iters, conn) != (int(n_iter), int(connectivity_iter)):
+                print(
+                    f"  Remesh at {n_iter} iterations diverged on the {label}; "
+                    f"{iters} iterations held the area ({drift:.3f}x)"
+                )
+            return out
+        print(
+            f"  WARNING: remesh at {iters} iterations changed the {label} area "
+            f"{drift:.2f}x ({before:.1f} -> {after:.1f} mm^2); backing off"
+        )
+    out, drift, iters, conn = best
+    raise TemplateQualityError(
+        f"isotropic remesh did not converge on the {label}: the closest attempt "
+        f"({iters} iterations) still changed the area {drift:.2f}x "
+        f"({before:.1f} -> {_surface_area(out):.1f} mm^2). This is a remesher "
+        f"failure, not a clipping one."
+    )
 
 
 def uniform_edge_length_for_profiles(profiles, target_edge_length):

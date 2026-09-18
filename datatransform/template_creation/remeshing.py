@@ -55,6 +55,7 @@ from batch_run_log import (
     write_worker_transcript,  # re-exported for tests
 )
 from vessel_pipeline import (
+    cap_unmatched_loops,
     TemplateQualityError,
     add_flow_extensions,
     weld_degenerate_vertices,
@@ -78,6 +79,7 @@ from vessel_pipeline import (
     measure_open_profiles,
     opening_clip_frames,
     remesh_surface_isotropically,
+    remesh_surface_verified,
     repair_nonmanifold_triangles,
     resample_centerline,
     run_batch,
@@ -91,9 +93,18 @@ from vessel_pipeline import (
 
 # Edge-length remesh near AneuX area-001 (~0.13 mm median edge from 0.01 mm^2 cells).
 DEFAULT_GT_EDGE_LENGTH_MM = 0.15
-# VMTK default remesh loop is 10; 20 extra split/collapse/relax passes at bends.
-GT_REMESH_N_ITER = 20
-GT_REMESH_CONNECTIVITY_ITER = 20
+# 20/20 was meant to give extra split/collapse/relax passes at bends. It does the
+# opposite: VMTK's vertex relocation does not converge on these surfaces, it
+# oscillates. On p129 the area grows 5.45x while the cell count rises only 1.6x
+# and the mean edge *grows* to 0.2593 mm -- a crumpling surface, not a finer one.
+# Sweeping the same input: 20/20 -> 5.452x area, CV 2.3181; 10/10 -> 1.372x,
+# CV 1.2631; 6/10 -> 1.024x, CV 0.3952 and mean edge 0.1253 mm, matching the
+# dataset-wide healthy 0.1254 mm. Fewer iterations is better on every objective
+# -- uniform edge length, texture kept, and area preserved -- and it is also
+# ~3x faster, which matters because this step is 68-96% of a case's runtime.
+# These now match REMESH_N_ITER / REMESH_CONNECTIVITY_ITER used everywhere else.
+GT_REMESH_N_ITER = 6
+GT_REMESH_CONNECTIVITY_ITER = 10
 # vtkWindowedSinc PassBand is [0, 2]: 0 = strongest, 2 = none, 0.1 = VTK default.
 # 1.5 is light (weaker than VMTK's 1.0); 0.9 would still be strong smoothing.
 GT_TAUBIN_PASS_BAND = 1.5
@@ -175,31 +186,84 @@ def log_opening_planarity(surface, frames):
         rims.append(pts)
     if not rims or not frames:
         return
-    for origin, outward, radius in frames:
+    # One rim per ostium. Picking each frame's nearest rim independently let two
+    # frames share one rim and let a frame borrow a different ostium's rim
+    # entirely, which reported an axial spread larger than the opening's own
+    # radius -- a planar cut cannot do that, so the warning was measuring the
+    # wrong hole rather than a malformed one.
+    centers = [pts.mean(axis=0) for pts in rims]
+    pairs = sorted(
+        (
+            float(np.linalg.norm(centers[j] - np.asarray(frames[i][0], dtype=np.float64))),
+            i,
+            j,
+        )
+        for i in range(len(frames))
+        for j in range(len(rims))
+    )
+    assigned = {}
+    taken = set()
+    for dist, i, j in pairs:
+        if i in assigned or j in taken:
+            continue
+        assigned[i] = (j, dist)
+        taken.add(j)
+
+    for i, (origin, outward, radius) in enumerate(frames):
         origin = np.asarray(origin, dtype=np.float64)
         outward = np.asarray(outward, dtype=np.float64)
-        rim = min(rims, key=lambda pts: float(np.linalg.norm(pts.mean(axis=0) - origin)))
+        if i not in assigned:
+            _warn(
+                f"ostium has no rim of its own: origin {np.round(origin, 2)} "
+                f"r={radius:.3f} mm"
+            )
+            print(
+                f"  Ostium planarity: origin {np.round(origin, 2)} "
+                f"r={radius:.3f} mm (no rim matched)"
+            )
+            continue
+        j, dist = assigned[i]
+        rim = rims[j]
         axial = (rim - origin) @ outward
         axial_std = float(np.std(axial))
+        # A rim further away than the opening is wide is not this ostium.
+        reach = max(2.0 * float(radius), 1.0)
         flag = ""
-        if axial_std > OPENING_PLANARITY_STD_MM:
+        if dist > reach:
+            flag = f"  (nearest rim is {dist:.2f} mm away; not this ostium)"
+            _warn(
+                f"ostium has no rim within {reach:.2f} mm: origin "
+                f"{np.round(origin, 2)} r={radius:.3f} mm d={dist:.3f} mm"
+            )
+        elif axial_std > OPENING_PLANARITY_STD_MM:
             flag = "  (not planar)"
             _warn(
                 f"ostium not planar: origin {np.round(origin, 2)} "
-                f"r={radius:.3f} mm axial_std={axial_std:.3f} mm"
+                f"r={radius:.3f} mm axial_std={axial_std:.3f} mm d={dist:.3f} mm"
             )
         print(
             f"  Ostium planarity: origin {np.round(origin, 2)} "
-            f"r={radius:.3f} mm axial_std={axial_std:.3f} mm{flag}"
+            f"r={radius:.3f} mm axial_std={axial_std:.3f} mm d={dist:.3f} mm{flag}"
         )
 
 
-def _gt_centerline(work_vessel, extension_length, sample_spacing):
+def _gt_centerline(work_vessel, extension_length, sample_spacing, gt_profiles=None):
     """Sanitised + strongly smoothed copy is only used to trace the lumen."""
     print("Step 2: Working copy for centerlines (sanitise + strong Taubin, discarded later)...")
     _set_step("2_centerline_working_copy")
     work = sanitize_vessel_for_vmtk(work_vessel)
     work = apply_taubin_smoothing(work)
+    # Decimating to a quarter of the points tears the wall wherever the input
+    # was already punctured, and merges neighbouring punctures into holes far
+    # bigger than either -- a 4-point, 1.2 mm quad on p375. Those are not
+    # openings, and a Voronoi diagram that has to route around them leaves the
+    # lumen. Which loops are real is not a judgement call here: the ostia were
+    # measured on the detailed original one step earlier, so anything on this
+    # copy that matches none of them is damage, and this copy is discarded
+    # anyway.
+    work, n_junk = cap_unmatched_loops(work, gt_profiles, label="centerline copy")
+    if n_junk:
+        _warn(f"capped {n_junk} torn opening(s) on the centerline copy")
     anatomical_profiles = measure_open_profiles(work)
     log_profiles(anatomical_profiles, label="Anatomical")
     seed_points_from_profiles(anatomical_profiles)
@@ -247,7 +311,7 @@ def process_gt_remesh_dataset(
     seed_points_from_profiles(gt_profiles)
 
     _work, work_profiles, branched = _gt_centerline(
-        gt_surface, extension_length, sample_spacing
+        gt_surface, extension_length, sample_spacing, gt_profiles=gt_profiles
     )
     if len(gt_profiles) != len(work_profiles):
         _warn(
@@ -299,11 +363,12 @@ def process_gt_remesh_dataset(
         f"R_min={r_min:.3f} mm, PreserveBoundaryEdges=1)..."
     )
     _set_step("6_isotropic_remesh")
-    remeshed = remesh_surface_isotropically(
+    remeshed = remesh_surface_verified(
         opened_gt,
         target_edge_length=effective_edge,
         n_iter=GT_REMESH_N_ITER,
         connectivity_iter=GT_REMESH_CONNECTIVITY_ITER,
+        label="GT surface",
     )
     print(f"  -> Remeshed surface points: {remeshed.GetNumberOfPoints()}")
 
