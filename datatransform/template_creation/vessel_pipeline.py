@@ -119,6 +119,12 @@ WELD_MAX_PASSES = 4
 # ostia. Flow extensions grow tubes out of them and wreck the uncap, so they are
 # patched before anything else runs.
 WALL_PINHOLE_RADIUS_MM = MIN_SEED_OPENING_RADIUS_MM
+# An audit of the 629 outputs of the 2026-09-17 run put the smallest genuine
+# ostium at r=0.205 mm while the leftover rims measured 0.128-0.199 mm. Radius
+# alone therefore separates anatomy from debris by 2.5%, which is no margin at
+# all, so any loop sitting at an anatomical profile is protected by name instead.
+PROFILE_PROTECT_RADIUS_FACTOR = 1.5
+PROFILE_PROTECT_MIN_MM = 0.5
 # An extension cell this far outboard of its ostium plane is leftover tube.
 EXTENSION_PLANE_TOL_MM = 1e-3
 # VMTK writes float32 point coordinates, so a vessel a few tens of mm across comes
@@ -1260,7 +1266,26 @@ def boundary_loop_radii(surface):
     return out
 
 
-def _is_wall_pinhole(loop, min_radius):
+def _loop_at_a_profile(bary, profiles):
+    """True when a boundary loop sits on one of the anatomical ostia.
+
+    The geometric pinhole tests know nothing about anatomy, and on this dataset
+    a real ostium can be smaller than a leftover rim. When the profiles are
+    known they, not the radius, decide what may be closed.
+    """
+    if not profiles:
+        return False
+    b = np.asarray(bary, dtype=np.float64)
+    for profile in profiles:
+        center = np.asarray(profile["barycenter"], dtype=np.float64)
+        radius = max(float(profile["radius"]), MIN_OPENING_RADIUS_MM)
+        tol = max(PROFILE_PROTECT_RADIUS_FACTOR * radius, PROFILE_PROTECT_MIN_MM)
+        if float(np.linalg.norm(b - center)) <= tol:
+            return True
+    return False
+
+
+def _is_wall_pinhole(loop, min_radius, profiles=None):
     """A loop too small, or with too few points, to be an anatomical ostium.
 
     The point-count test is not cosmetic: vtkvmtkPolyDataFlowExtensionsFilter
@@ -1269,7 +1294,9 @@ def _is_wall_pinhole(loop, min_radius):
     what turned a 70k-point vessel into a 123M-cell surface and produced both the
     out-of-memory worker crashes and the multi-hour hangs.
     """
-    radius, n_points, _bary = loop
+    radius, n_points, bary = loop
+    if _loop_at_a_profile(bary, profiles):
+        return False
     return radius < float(min_radius) or n_points < MIN_OPENING_LOOP_POINTS
 
 
@@ -1316,7 +1343,7 @@ def _boundary_loop_vertex_rings(surface):
     return poly, pts, faces, rings
 
 
-def fan_fill_small_loops(surface, min_radius=WALL_PINHOLE_RADIUS_MM):
+def fan_fill_small_loops(surface, min_radius=WALL_PINHOLE_RADIUS_MM, profiles=None):
     """Stitch every sub-``min_radius`` boundary loop shut with a triangle fan.
 
     vtkvmtkCapPolyData refuses surfaces whose rims it cannot walk, and
@@ -1338,7 +1365,7 @@ def fan_fill_small_loops(surface, min_radius=WALL_PINHOLE_RADIUS_MM):
         coords = np.asarray([pts[i] for i in ring], dtype=np.float64)
         center = coords.mean(axis=0)
         radius = float(np.mean(np.linalg.norm(coords - center, axis=1)))
-        if radius >= float(min_radius) and len(ring) >= MIN_OPENING_LOOP_POINTS:
+        if not _is_wall_pinhole((radius, len(ring), center), min_radius, profiles):
             continue
         pts.append(center.tolist())
         apex = len(pts) - 1
@@ -1355,21 +1382,141 @@ def fan_fill_small_loops(surface, min_radius=WALL_PINHOLE_RADIUS_MM):
     return filled, n_filled
 
 
-def close_wall_pinholes(surface, min_radius=WALL_PINHOLE_RADIUS_MM, label="surface", max_passes=4):
+def _free_edge_components(pts, faces):
+    """Connected components of the free-edge graph, as lists of point ids.
+
+    Unlike a loop walk this makes no assumption that a rim is a simple cycle, so
+    it still describes a boundary whose vertices branch.
+    """
+    if faces.size == 0:
+        return []
+    edges = np.concatenate(
+        (
+            np.sort(faces[:, [0, 1]], axis=1),
+            np.sort(faces[:, [1, 2]], axis=1),
+            np.sort(faces[:, [2, 0]], axis=1),
+        ),
+        axis=0,
+    )
+    uniq, counts = np.unique(edges, axis=0, return_counts=True)
+    free = uniq[counts == 1]
+    if free.size == 0:
+        return []
+    parent = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for a, b in free:
+        union(int(a), int(b))
+    groups = {}
+    for node in list(parent):
+        groups.setdefault(find(node), []).append(node)
+    return list(groups.values())
+
+
+def _boundary_component_extent(pts, ids):
+    coords = pts[np.asarray(ids, dtype=np.int64)]
+    center = coords.mean(axis=0)
+    radius = float(np.mean(np.linalg.norm(coords - center, axis=1)))
+    return center, radius
+
+
+def collapse_small_boundary_components(
+    surface, min_radius=WALL_PINHOLE_RADIUS_MM, label="surface", profiles=None
+):
+    """Weld every sub-``min_radius`` boundary component down to a single point.
+
+    A rim whose vertices branch -- more than two free edges meeting at one point
+    -- is not a cycle, so neither vtkvmtkCapPolyData nor a triangle fan can walk
+    it; VMTK reports "Can't find adjacent point" and bails, and the puncture then
+    reaches assert_template_quality unrepaired. Collapsing the whole component to
+    its barycentre needs no traversal order at all, so it closes the hole
+    whatever shape the rim is. It only ever runs on punctures far below the
+    target edge length, so it moves less geometry than a single triangle.
+    """
+    poly, pts, faces = _triangle_points_faces(surface)
+    comps = _free_edge_components(pts, faces)
+    if not comps:
+        return poly, 0
+    small, keep = [], []
+    for ids in comps:
+        center, radius = _boundary_component_extent(pts, ids)
+        if _is_wall_pinhole((radius, len(ids), center), min_radius, profiles):
+            small.append((ids, center, radius))
+        else:
+            keep.append(ids)
+    if not small:
+        return poly, 0
+    if len(keep) < 2:
+        print(
+            f"  WARNING: collapsing {len(small)} pinhole(s) on the {label} would "
+            f"leave {len(keep)} opening(s); leaving them in place"
+        )
+        return poly, 0
+    pts_list = pts.tolist()
+    remap = {}
+    for ids, center, _radius in small:
+        pts_list.append(center.tolist())
+        target = len(pts_list) - 1
+        for pid in ids:
+            remap[int(pid)] = target
+    new_faces = []
+    for a, b, c in faces.tolist():
+        a, b, c = remap.get(a, a), remap.get(b, b), remap.get(c, c)
+        if a == b or b == c or c == a:
+            continue
+        new_faces.append([a, b, c])
+    collapsed = _polydata_from_triangles(
+        np.asarray(pts_list, dtype=np.float64),
+        np.asarray(new_faces, dtype=np.int64).reshape(-1, 3),
+    )
+    radii = ", ".join(f"{r:.4f}" for _i, _c, r in small)
+    print(f"  Collapsed {len(small)} branching pinhole(s) on the {label} (r={radii} mm)")
+    return collapsed, len(small)
+
+
+def close_wall_pinholes(surface, min_radius=WALL_PINHOLE_RADIUS_MM, label="surface", max_passes=4, profiles=None):
     """Patch pinholes until none are left; each fan can expose the next one."""
     total = 0
     current = clean_triangulate(surface)
     for _ in range(int(max_passes)):
-        current, n_filled = patch_wall_pinholes(current, min_radius=min_radius, label=label)
+        current, n_filled = patch_wall_pinholes(
+            current, min_radius=min_radius, label=label, profiles=profiles
+        )
         total += n_filled
+        if not any(
+            _is_wall_pinhole(lp, min_radius, profiles) for lp in boundary_loop_radii(current)
+        ):
+            return current, total
         if n_filled == 0:
             break
-        if not any(_is_wall_pinhole(lp, min_radius) for lp in boundary_loop_radii(current)):
+    # Neither the capper nor the fan could walk what is left: those rims branch.
+    for _ in range(int(max_passes)):
+        current, n_collapsed = collapse_small_boundary_components(
+            current, min_radius=min_radius, label=label, profiles=profiles
+        )
+        total += n_collapsed
+        if n_collapsed == 0:
+            break
+        current, _n_forced = force_manifold_triangles(current)
+        if not any(
+            _is_wall_pinhole(lp, min_radius, profiles) for lp in boundary_loop_radii(current)
+        ):
             break
     return current, total
 
 
-def patch_wall_pinholes(surface, min_radius=WALL_PINHOLE_RADIUS_MM, label="surface"):
+def patch_wall_pinholes(surface, min_radius=WALL_PINHOLE_RADIUS_MM, label="surface", profiles=None):
     """Close boundary loops smaller than ``min_radius``; keep the real ostia open.
 
     Caps every loop with vtkvmtkCapPolyData (which triangulates a hole of any
@@ -1379,10 +1526,10 @@ def patch_wall_pinholes(surface, min_radius=WALL_PINHOLE_RADIUS_MM, label="surfa
     """
     poly = clean_triangulate(surface)
     loops = boundary_loop_radii(poly)
-    small = [lp for lp in loops if _is_wall_pinhole(lp, min_radius)]
+    small = [lp for lp in loops if _is_wall_pinhole(lp, min_radius, profiles)]
     if not small:
         return poly, 0
-    keep = [lp for lp in loops if not _is_wall_pinhole(lp, min_radius)]
+    keep = [lp for lp in loops if not _is_wall_pinhole(lp, min_radius, profiles)]
     if len(keep) < 2:
         print(
             f"  WARNING: patching {len(small)} pinhole(s) on the {label} would leave "
@@ -1397,12 +1544,12 @@ def patch_wall_pinholes(surface, min_radius=WALL_PINHOLE_RADIUS_MM, label="surfa
             break
     if capped is None or extract_boundary_loops(capped).GetNumberOfCells() != 0:
         print(f"  Capper could not close the {label}; fan-filling {len(small)} pinhole(s)")
-        return fan_fill_small_loops(poly, min_radius=min_radius)
+        return fan_fill_small_loops(poly, min_radius=min_radius, profiles=profiles)
     ids = capped.GetCellData().GetArray("CellEntityIds")
     center_ids = capper.GetCapCenterIds()
     if ids is None or center_ids is None or center_ids.GetNumberOfIds() == 0:
         print(f"  Capper produced no CellEntityIds for the {label}; fan-filling instead")
-        return fan_fill_small_loops(poly, min_radius=min_radius)
+        return fan_fill_small_loops(poly, min_radius=min_radius, profiles=profiles)
     offset = int(capper.GetCellEntityIdOffset())
     cap_centers = [
         np.array(capped.GetPoint(center_ids.GetId(i)), dtype=np.float64)
@@ -1432,7 +1579,7 @@ def patch_wall_pinholes(surface, min_radius=WALL_PINHOLE_RADIUS_MM, label="surfa
             f"  Pinhole patch on the {label} left {n_after} loops (expected "
             f"{len(keep)}); fan-filling instead"
         )
-        return fan_fill_small_loops(poly, min_radius=min_radius)
+        return fan_fill_small_loops(poly, min_radius=min_radius, profiles=profiles)
     print(f"  Patched {len(small)} wall pinhole(s) on the {label} (r < {min_radius:.2f} mm)")
     return filled, len(small)
 
@@ -2448,7 +2595,9 @@ def clip_flow_extensions_and_uncap(
                 f"Uncapped parent tube has {n_nm} non-manifold edges; remesh would amplify them"
             )
     current, _n_regions = drop_tiny_islands(current)
-    current, _n_pin = close_wall_pinholes(current, label="uncapped surface")
+    current, _n_pin = close_wall_pinholes(
+        current, label="uncapped surface", profiles=profiles
+    )
     current, n_filled = remove_spurious_openings(current, profiles)
     post = inspect_openings(current)
     print(
@@ -2814,7 +2963,7 @@ def drop_tiny_islands(surface):
     return main, count_connected_regions(main)
 
 
-def finalize_surface(surface, profiles=None, max_passes=3):
+def finalize_surface(surface, profiles=None, max_passes=6):
     """Clean, weld, force manifoldness and close every non-ostium hole.
 
     The remesher is free to leave micron-scale rim edges (PreserveBoundaryEdges
@@ -2834,7 +2983,9 @@ def finalize_surface(surface, profiles=None, max_passes=3):
         cleaned, _n_nm = repair_nonmanifold_triangles(cleaned)
         cleaned, _n_forced = force_manifold_triangles(cleaned)
         cleaned = fill_pinholes(cleaned)
-        cleaned, _n_pin = close_wall_pinholes(cleaned, label="remeshed surface")
+        cleaned, _n_pin = close_wall_pinholes(
+            cleaned, label="remeshed surface", profiles=profiles
+        )
         if profiles:
             cleaned, _n_left = remove_spurious_openings(cleaned, profiles)
         cleaned, _min_edge = weld_degenerate_vertices(cleaned)
@@ -2844,7 +2995,7 @@ def finalize_surface(surface, profiles=None, max_passes=3):
         extra_loops = [
             lp
             for lp in boundary_loop_radii(cleaned)
-            if _is_wall_pinhole(lp, MIN_OPENING_RADIUS_MM)
+            if _is_wall_pinhole(lp, MIN_OPENING_RADIUS_MM, profiles)
         ]
         if (
             topo["n_nonmanifold"] == 0

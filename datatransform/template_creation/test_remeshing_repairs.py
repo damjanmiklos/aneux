@@ -326,3 +326,144 @@ def test_prepare_gt_surface_still_keeps_the_original_tessellation():
     prepared = rm.prepare_gt_surface(tube)
     assert prepared.GetNumberOfPoints() == tube.GetNumberOfPoints()
     assert vtk_area(prepared) == pytest.approx(vtk_area(tube), rel=1e-6)
+
+
+def _pinch_two_holes(n_sides=40, n_rings=30):
+    """Open tube with two vertex fans removed whose links share one vertex.
+
+    The two holes then meet at that vertex, which carries four free edges. VMTK's
+    boundary extractor bails on such a rim ("Can't find adjacent point") and a
+    cycle walk cannot traverse it, so this is the shape that used to reach
+    ``assert_template_quality`` as a surviving pinhole.
+    """
+    tube = open_tube(n_sides=n_sides, n_rings=n_rings)
+    _poly, pts, faces = _triangle_points_faces(tube)
+    u = 10 * n_sides + 5
+    w = 12 * n_sides + 7
+    kept = np.asarray([f for f in faces.tolist() if u not in f and w not in f], dtype=np.int64)
+    return _polydata_from_triangles(pts, kept)
+
+
+def test_collapse_closes_a_branching_pinhole_rim():
+    from vessel_pipeline import (
+        boundary_loop_radii,
+        collapse_small_boundary_components,
+        count_connected_regions,
+        inspect_surface_topology,
+    )
+
+    holed = _pinch_two_holes()
+    loops = boundary_loop_radii(holed)
+    # two real ends plus the two pinched holes
+    assert len(loops) == 4
+
+    fixed, n = collapse_small_boundary_components(holed, min_radius=0.5)
+    assert n == 1, "the pinched pair is one free-edge component"
+    after = boundary_loop_radii(fixed)
+    assert len(after) == 2, f"expected only the two tube ends, got {after}"
+    assert inspect_surface_topology(fixed)["n_nonmanifold"] == 0
+    assert count_connected_regions(fixed) == 1
+
+
+def test_close_wall_pinholes_leaves_no_pinhole_on_a_pinched_rim():
+    """Whichever repair gets there first, nothing sub-ostium may survive.
+
+    Whether the fan can walk a pinched rim depends on the tessellation -- on some
+    it recovers after the ear drop, on others it merges the two holes into a
+    bigger one. close_wall_pinholes has to converge either way, which is what the
+    batch run needs and what a single repair could not promise.
+    """
+    from vessel_pipeline import (
+        _is_wall_pinhole,
+        boundary_loop_radii,
+        close_wall_pinholes,
+    )
+
+    holed = _pinch_two_holes()
+    assert len(boundary_loop_radii(holed)) == 4
+
+    fixed, n = close_wall_pinholes(holed, min_radius=0.5, label="test surface")
+    assert n >= 1
+    after = boundary_loop_radii(fixed)
+    assert len(after) == 2, f"expected only the two tube ends, got {after}"
+    assert not [lp for lp in after if _is_wall_pinhole(lp, 0.5)]
+
+
+def test_collapse_refuses_to_close_the_last_openings():
+    """A pinhole patch may never cost the mesh its anatomical ostia."""
+    from vessel_pipeline import boundary_loop_radii, collapse_small_boundary_components
+
+    tube = open_tube(n_sides=40, n_rings=30)
+    # min_radius above the tube radius makes every loop look like a pinhole
+    fixed, n = collapse_small_boundary_components(tube, min_radius=5.0)
+    assert n == 0
+    assert len(boundary_loop_radii(fixed)) == 2
+
+
+def _tube_with_a_narrow_end(end_radius=0.18):
+    """Open tube whose far end is narrowed to a sub-threshold opening.
+
+    0.18 mm is below WALL_PINHOLE_RADIUS_MM but above the 0.128-0.199 mm band
+    the old run's leftover rims occupied, and the smallest real ostium measured
+    on this dataset was 0.205 mm -- so radius alone cannot tell them apart.
+    """
+    tube = open_tube(radius=1.0, length=6.0, n_sides=40, n_rings=30)
+    _poly, pts, faces = _triangle_points_faces(tube)
+    z = pts[:, 2]
+    top = z > (z.max() - 1e-9)
+    scale = end_radius / 1.0
+    pts[top, 0] *= scale
+    pts[top, 1] *= scale
+    return _polydata_from_triangles(pts, faces)
+
+
+def _profiles_for(surface):
+    from vessel_pipeline import boundary_loop_radii
+
+    return [
+        {"barycenter": np.asarray(bary, dtype=np.float64), "radius": float(r)}
+        for r, _n, bary in boundary_loop_radii(surface)
+    ]
+
+
+def test_a_real_ostium_below_the_pinhole_radius_is_not_closed():
+    """Objective (c): a genuine opening may never be welded shut."""
+    from vessel_pipeline import boundary_loop_radii, close_wall_pinholes
+
+    surf = _tube_with_a_narrow_end(end_radius=0.18)
+    loops = boundary_loop_radii(surf)
+    narrow = min(lp[0] for lp in loops)
+    assert narrow < 0.2, "the fixture must sit below the pinhole radius"
+
+    profiles = _profiles_for(surf)
+    fixed, n = close_wall_pinholes(surf, label="test surface", profiles=profiles)
+    assert n == 0, "a loop at an anatomical profile must be left alone"
+    assert len(boundary_loop_radii(fixed)) == len(loops)
+
+
+def test_debris_is_still_closed_when_no_profile_claims_it():
+    """Protection is not a blanket amnesty: unclaimed holes still get closed."""
+    from vessel_pipeline import boundary_loop_radii, close_wall_pinholes
+
+    holed = _pinch_two_holes()
+    loops = boundary_loop_radii(holed)
+    assert len(loops) == 4
+    # the two tube ends are the anatomy; the pinched pair is debris
+    profiles = [p for p in _profiles_for(holed) if p["radius"] > 0.5]
+    assert len(profiles) == 2
+
+    fixed, n = close_wall_pinholes(
+        holed, min_radius=0.5, label="test surface", profiles=profiles
+    )
+    assert n >= 1
+    assert len(boundary_loop_radii(fixed)) == 2
+
+
+def test_profile_protection_needs_the_loop_to_be_at_the_profile():
+    """Protection is by position, not by merely having profiles around."""
+    from vessel_pipeline import _loop_at_a_profile
+
+    profiles = [{"barycenter": np.zeros(3), "radius": 0.3}]
+    assert _loop_at_a_profile(np.zeros(3), profiles)
+    assert not _loop_at_a_profile(np.asarray([5.0, 0.0, 0.0]), profiles)
+    assert not _loop_at_a_profile(np.zeros(3), [])
