@@ -38,7 +38,7 @@ sends the mesh to `<output>/rejected/` with the reason beside it, so an hour of
 Voronoi work is not thrown away and the keep/discard call can be made by looking
 at it. Covered by `TestSalvageOnlyForLaterSteps` and `TestRejectionIsParked`.
 
-## 2. Fan tents — fixed
+## 2. Fan tents — cause found, guard in, real fix in progress
 
 **3 of 119: p375_2, p376_3, p551_2.** A single vertex carries hundreds of
 triangles and a sheet is stretched across the lumen. Confirmed by the user on
@@ -89,17 +89,42 @@ a different vessel size. Covered by `TestMeshQualityGate`.
 against its input on both symptoms — `REMESH_MAX_AREA_DRIFT = 1.2` either way,
 and `REMESH_MAX_VALENCE = 20` — and `_remesh_surface_vmtk` returns the **input
 surface unchanged** when the remesh diverged. There is no better setting to fall
-back to, as the sweep above shows; the input is the only sound surface available,
-and it costs nothing here because it is an intermediate that `remeshing.py`
-remeshes to a uniform target downstream. Shipping a lumen-spanning tent instead
-would not be recoverable.
+back to, as the sweep above shows.
+
+**That back-off is not sufficient, and the first version of this note claimed it
+was.** The surface it falls back to is the raw marching-cubes reconstruction, and
+measuring it rather than assuming shows it is not fit to ship:
+
+| | fallback surface | a sound remesh |
+|---|---|---|
+| edge CV | **0.415** | 0.133 |
+| min edge | **0.000010 mm** | 0.0104 mm |
+| triangles with aspect > 50 | **5,656** | 0 |
+| triangles under 1e-6 mm2 | **1,031** | 2 |
+
+So the remesh is doing essential work — it is what turns the isosurface into a
+usable triangulation — and falling back to its input violates the uniform-edge
+objective outright. Worse, a surface carrying 5,656 slivers is exactly the kind
+of input that section 7 records as making `remeshing.py` diverge downstream, so
+the back-off would trade a visible defect for a harder-to-see one.
+
+The back-off stays as a **floor**, because shipping a lumen-spanning tent is
+worse than shipping a dense surface and the guard must never let a tent through.
+But it cannot be the whole fix.
+
+**Being tested now:** that the degeneracies are what makes the remesher diverge
+in the first place. vmtkSurfaceRemeshing collapses and splits edges, and a
+triangle of area 1e-6 mm2 has no well-defined normal to project against — which
+would explain points being thrown off the surface and the area doubling. If
+cleaning them out first makes the remesh behave, that is the real fix and the
+back-off never fires.
 
 Verified on the exact surface that produced the tents: the guard fires
 (`the remesh changed the surface area by 2.173x (2110.7 -> 4587.0 mm2)`) and the
 returned surface is the input, intact — 232,580 points, 2110.7 mm2, max valence
 18, zero hubs. Covered by `TestRemeshDiagnosis`.
 
-## 3. A ball on an opening (p375_1) — fix in, verification running
+## 3. A ball on an opening (p375_1) — fixed and verified
 
 The user's report: one opening "has a ball at the end with parts missing from
 that scattered ball, that ball shouldn't even be there".
@@ -142,7 +167,19 @@ reaches past the inscribed radius, the worst by 52%.
 | 0.943 | 1.188 | 1.415 | 1.782 |
 | 0.393 | 0.539 | 0.593 | 0.808 |
 
-End-to-end re-run of p375 keep 1 in progress.
+**Verified end to end.** p375 keep 1 previously failed the opening-count guard
+5 to 7; with the clip sized from the rim it now passes, and every rim on the
+mesh is round:
+
+| | shipped (old) | clip fix |
+|---|---|---|
+| openings | 7 (5 real + 2 pinholes) | **5** |
+| worst rim, out-of-plane sd | **1.012 mm** | **0.012 mm** |
+| worst rim, perimeter / circle | **2.31** | **1.09** |
+| every other rim, perimeter / circle | 0.68-1.03 | 1.00 |
+| edge CV | 0.132 | 0.132 |
+
+The ball is gone, the two pinholes with it, and edge uniformity is untouched.
 
 ## 4. A residual stub where an aneurysm was removed — detector in, cause open
 
