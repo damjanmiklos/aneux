@@ -467,3 +467,65 @@ def test_profile_protection_needs_the_loop_to_be_at_the_profile():
     assert _loop_at_a_profile(np.zeros(3), profiles)
     assert not _loop_at_a_profile(np.asarray([5.0, 0.0, 0.0]), profiles)
     assert not _loop_at_a_profile(np.zeros(3), [])
+
+
+def test_debris_next_to_an_ostium_is_not_protected():
+    """Proximity alone must not shield a 4-point micron rim beside a real ostium.
+
+    This is the shape that survived the uncap stage on SNF00000365_01
+    (r=0.004 mm, 4 points) because it sat within the protection radius of a
+    genuine opening.
+    """
+    from vessel_pipeline import _loop_at_a_profile
+
+    profiles = [{"barycenter": np.zeros(3), "radius": 1.0}]
+    near = np.asarray([0.3, 0.0, 0.0])
+    # right size and a real rim -> anatomy
+    assert _loop_at_a_profile(near, profiles, radius=0.9, n_points=40)
+    # right place, far too small -> debris
+    assert not _loop_at_a_profile(near, profiles, radius=0.004, n_points=40)
+    # right place and size, but no rim to speak of -> debris
+    assert not _loop_at_a_profile(near, profiles, radius=0.9, n_points=4)
+
+
+def test_a_small_but_real_ostium_is_still_protected():
+    """An ostium below the pinhole radius must survive on the profile's word.
+
+    The smallest real opening measured on this dataset was 0.205 mm against a
+    0.20 mm threshold, so the margin is 2.5% and the next mesh may well fall the
+    other side of it. 0.19 mm is that mesh.
+    """
+    from vessel_pipeline import _is_wall_pinhole, _loop_at_a_profile
+
+    profiles = [{"barycenter": np.zeros(3), "radius": 0.19}]
+    loop = (0.19, 14, np.zeros(3))
+    assert _loop_at_a_profile(loop[2], profiles, radius=loop[0], n_points=loop[1])
+    assert not _is_wall_pinhole(loop, 0.20, profiles)
+    # and without the anatomy backing it, the same loop is closable debris
+    assert _is_wall_pinhole(loop, 0.20, None)
+
+
+def test_finalize_does_not_reintroduce_holes_it_just_repaired():
+    """vtkFillHolesFilter is out of the loop; the loop must not spin.
+
+    On C0010 it turned an nm=0 surface into nm=5 while closing no holes at all,
+    and the next pass removed exactly those triangles again -- four identical
+    passes in a row.
+    """
+    import inspect
+
+    from vessel_pipeline import finalize_surface
+
+    src = inspect.getsource(finalize_surface)
+    assert "fill_pinholes" not in src, "the hole filler must stay out of the repair loop"
+    assert "seen" in src, "the loop must detect a repeated state"
+
+
+def test_finalize_returns_the_best_surface_not_the_last():
+    from vessel_pipeline import _finalize_defects, finalize_surface
+
+    holed = _pinch_two_holes()
+    fixed, n_regions = finalize_surface(holed)
+    assert n_regions == 1
+    # whatever path it took, what comes back must be no worse than clean
+    assert _finalize_defects(fixed, None, n_regions)[0] == 0

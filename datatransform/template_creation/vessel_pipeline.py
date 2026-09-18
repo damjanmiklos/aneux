@@ -125,6 +125,11 @@ WALL_PINHOLE_RADIUS_MM = MIN_SEED_OPENING_RADIUS_MM
 # all, so any loop sitting at an anatomical profile is protected by name instead.
 PROFILE_PROTECT_RADIUS_FACTOR = 1.5
 PROFILE_PROTECT_MIN_MM = 0.5
+# Proximity alone over-protects: clip debris sits right next to the ostium it
+# was cut from, and a 4-point, 4-micron rim 0.3 mm from a real opening was being
+# shielded as if it were anatomy. A loop only counts as the ostium if it is also
+# the right size for it.
+PROFILE_PROTECT_MIN_RADIUS_FRACTION = 0.5
 # An extension cell this far outboard of its ostium plane is leftover tube.
 EXTENSION_PLANE_TOL_MM = 1e-3
 # VMTK writes float32 point coordinates, so a vessel a few tens of mm across comes
@@ -1266,22 +1271,30 @@ def boundary_loop_radii(surface):
     return out
 
 
-def _loop_at_a_profile(bary, profiles):
-    """True when a boundary loop sits on one of the anatomical ostia.
+def _loop_at_a_profile(bary, profiles, radius=None, n_points=None):
+    """True when a boundary loop really is one of the anatomical ostia.
 
     The geometric pinhole tests know nothing about anatomy, and on this dataset
-    a real ostium can be smaller than a leftover rim. When the profiles are
-    known they, not the radius, decide what may be closed.
+    a real ostium can be smaller than a leftover rim, so when the profiles are
+    known they decide what may be closed. Position is not enough on its own:
+    clip debris lies next to the ostium it came from. The loop also has to be
+    the right size for that ostium and carry a real rim's worth of points -- the
+    smallest genuine opening measured here had 10.
     """
     if not profiles:
+        return False
+    if n_points is not None and int(n_points) < MIN_OPENING_LOOP_POINTS:
         return False
     b = np.asarray(bary, dtype=np.float64)
     for profile in profiles:
         center = np.asarray(profile["barycenter"], dtype=np.float64)
-        radius = max(float(profile["radius"]), MIN_OPENING_RADIUS_MM)
-        tol = max(PROFILE_PROTECT_RADIUS_FACTOR * radius, PROFILE_PROTECT_MIN_MM)
-        if float(np.linalg.norm(b - center)) <= tol:
-            return True
+        r_p = max(float(profile["radius"]), MIN_OPENING_RADIUS_MM)
+        tol = max(PROFILE_PROTECT_RADIUS_FACTOR * r_p, PROFILE_PROTECT_MIN_MM)
+        if float(np.linalg.norm(b - center)) > tol:
+            continue
+        if radius is not None and float(radius) < PROFILE_PROTECT_MIN_RADIUS_FRACTION * r_p:
+            continue
+        return True
     return False
 
 
@@ -1295,7 +1308,7 @@ def _is_wall_pinhole(loop, min_radius, profiles=None):
     out-of-memory worker crashes and the multi-hour hangs.
     """
     radius, n_points, bary = loop
-    if _loop_at_a_profile(bary, profiles):
+    if _loop_at_a_profile(bary, profiles, radius=radius, n_points=n_points):
         return False
     return radius < float(min_radius) or n_points < MIN_OPENING_LOOP_POINTS
 
@@ -2963,6 +2976,27 @@ def drop_tiny_islands(surface):
     return main, count_connected_regions(main)
 
 
+def _finalize_defects(surface, profiles, n_regions):
+    """How far a candidate is from being acceptable, worst defect first.
+
+    Ordered so that a straight tuple comparison picks the better surface:
+    non-manifold edges first (the remesher amplifies them), then holes that are
+    not anatomy, then extra shells, then degenerate edges.
+    """
+    topo = inspect_surface_topology(surface)
+    extra = [
+        lp
+        for lp in boundary_loop_radii(surface)
+        if _is_wall_pinhole(lp, MIN_OPENING_RADIUS_MM, profiles)
+    ]
+    return (
+        int(topo["n_nonmanifold"]),
+        len(extra),
+        max(int(n_regions) - 1, 0),
+        0 if topo["min_edge"] >= MIN_EDGE_LENGTH_MM else 1,
+    )
+
+
 def finalize_surface(surface, profiles=None, max_passes=6):
     """Clean, weld, force manifoldness and close every non-ostium hole.
 
@@ -2971,18 +3005,35 @@ def finalize_surface(surface, profiles=None, max_passes=6):
     pinholes wider than vtkFillHolesFilter's hole size. Each of those used to
     reach ``assert_template_quality`` unrepaired and fail the case, so they are
     repaired here instead. ``profiles`` are the anatomical openings; when given,
-    boundary loops that are not one of them are closed.
+    boundary loops that are not one of them are closed and the ostia themselves
+    are protected.
 
     The repairs interact -- welding can fuse two rim vertices into a non-manifold
     edge, and cutting a non-manifold edge opens a new pinhole -- so the sequence
-    runs until the surface stops changing rather than exactly once.
+    runs until the surface stops changing rather than exactly once. Two of those
+    interactions can cycle instead of settling, so the loop also stops when a
+    state repeats and returns the best surface it saw rather than the last one.
     """
     cleaned = clean_triangulate(surface)
     n_regions = count_connected_regions(cleaned)
+    best = cleaned
+    best_regions = n_regions
+    best_defects = _finalize_defects(cleaned, profiles, n_regions)
+    seen = set()
     for _ in range(int(max_passes)):
+        if best_defects == (0, 0, 0, 0):
+            break
+        signature = (cleaned.GetNumberOfPoints(), cleaned.GetNumberOfCells(), best_defects)
+        if signature in seen:
+            print("  Repair loop reached a fixed point; keeping the best surface so far")
+            break
+        seen.add(signature)
+
         cleaned, _n_nm = repair_nonmanifold_triangles(cleaned)
         cleaned, _n_forced = force_manifold_triangles(cleaned)
-        cleaned = fill_pinholes(cleaned)
+        # No vtkFillHolesFilter here: it is neither ostium-aware nor
+        # manifold-safe, and it kept stitching back exactly the triangles the
+        # manifold repair had just removed, which is how this loop used to spin.
         cleaned, _n_pin = close_wall_pinholes(
             cleaned, label="remeshed surface", profiles=profiles
         )
@@ -2991,22 +3042,15 @@ def finalize_surface(surface, profiles=None, max_passes=6):
         cleaned, _min_edge = weld_degenerate_vertices(cleaned)
         cleaned = strip_all_arrays(cleaned)
         cleaned, n_regions = drop_tiny_islands(cleaned)
-        topo = inspect_surface_topology(cleaned)
-        extra_loops = [
-            lp
-            for lp in boundary_loop_radii(cleaned)
-            if _is_wall_pinhole(lp, MIN_OPENING_RADIUS_MM, profiles)
-        ]
-        if (
-            topo["n_nonmanifold"] == 0
-            and topo["min_edge"] >= MIN_EDGE_LENGTH_MM
-            and not extra_loops
-            and n_regions == 1
-        ):
+
+        defects = _finalize_defects(cleaned, profiles, n_regions)
+        if defects < best_defects:
+            best, best_regions, best_defects = cleaned, n_regions, defects
+        if defects == (0, 0, 0, 0):
             break
-    cleaned = strip_all_arrays(cleaned)
-    cleaned = recompute_point_normals(cleaned, auto_orient=False)
-    return cleaned, n_regions
+    best = strip_all_arrays(best)
+    best = recompute_point_normals(best, auto_orient=False)
+    return best, best_regions
 
 
 def assert_template_scale(surface, reference_mesh, context="template", max_area_ratio=2.5):
