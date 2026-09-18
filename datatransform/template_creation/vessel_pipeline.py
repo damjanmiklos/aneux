@@ -389,16 +389,63 @@ def _n_usable_boundary_loops(loops_poly, min_points=MIN_OPENING_LOOP_POINTS):
     return n
 
 
+def count_boundary_regions(surface):
+    """How many openings the surface has, by connectivity on its boundary edges.
+
+    This is topology and nothing else: a connected rim is one region however
+    ragged it is, and two rims are never one. Both loop extractors can disagree
+    with it -- they walk the rim and can break the walk part way -- so it is the
+    referee rather than a third opinion.
+    """
+    feat = vtk.vtkFeatureEdges()
+    feat.SetInputData(to_vtk_poly(surface))
+    feat.BoundaryEdgesOn()
+    feat.FeatureEdgesOff()
+    feat.NonManifoldEdgesOff()
+    feat.ManifoldEdgesOff()
+    feat.ColoringOff()
+    feat.Update()
+    if feat.GetOutput().GetNumberOfCells() == 0:
+        return 0
+    conn = vtk.vtkPolyDataConnectivityFilter()
+    conn.SetInputData(feat.GetOutput())
+    conn.SetExtractionModeToAllRegions()
+    conn.Update()
+    return int(conn.GetNumberOfExtractedRegions())
+
+
 def extract_boundary_loops(surface):
+    """Ordered boundary polylines, one per opening.
+
+    Two extractors, because each fails where the other holds: the VMTK one
+    bails when a rim vertex has more than two boundary neighbours, and the
+    stripper walks only simple cycles. The old rule was to take whichever
+    reported more loops, which is wrong in the one direction that matters --
+    a rim reported twice is an opening that does not exist. On p489 the VMTK
+    extractor split five rims into nine and won on count, and the case shipped
+    claiming nine openings against five anatomical profiles; p129 went out at
+    six against four the same way.
+
+    So connectivity decides. Whichever extractor agrees with the number of
+    boundary regions is the one telling the truth about how many openings there
+    are; if neither does, the one that over-counts least is kept, since an
+    invented opening is worse than a missed rim walk.
+    """
     vtk_poly = to_vtk_poly(surface)
     extractor = vtkvmtk.vtkvmtkPolyDataBoundaryExtractor()
     extractor.SetInputData(vtk_poly)
     extractor.Update()
     vmtk_out = to_vtk_poly(extractor.GetOutput())
     strip_out = _feature_edge_boundary_loops(vtk_poly)
-    if _n_usable_boundary_loops(strip_out) > _n_usable_boundary_loops(vmtk_out):
+
+    expected = count_boundary_regions(vtk_poly)
+    n_vmtk = _n_usable_boundary_loops(vmtk_out)
+    n_strip = _n_usable_boundary_loops(strip_out)
+    if n_vmtk == expected:
+        return vmtk_out
+    if n_strip == expected:
         return strip_out
-    return vmtk_out
+    return vmtk_out if abs(n_vmtk - expected) <= abs(n_strip - expected) else strip_out
 
 
 def _profile_from_loop_points(pts_xyz, body, index):

@@ -340,6 +340,14 @@ def process_gt_remesh_dataset(
             f"GT remesh has fewer than 2 openings after uncap ({n_clipped}/{n_in} clipped)."
         )
     opened_gt, _n_regions_pre = drop_tiny_islands(opened_gt)
+    # The pipe-section uncap cuts fresh triangles at every rim and leaves
+    # degeneracies behind: on p097 it took the shortest edge from 0.005032 to
+    # 0.000037 mm and made 12 triangles of aspect ratio over 50, none of which
+    # were in the surface it was handed. Those are what step 6 cannot project
+    # against -- the same thing that makes the remesher diverge in hemoMesh --
+    # so they are welded out here rather than carried into the remesh.
+    opened_gt, min_edge_after_clip = weld_degenerate_vertices(opened_gt)
+    print(f"  Min edge after the uncap and weld: {min_edge_after_clip:.6f} mm")
     frames = opening_clip_frames(branched, gt_profiles)
     log_opening_planarity(opened_gt, frames)
 
@@ -392,9 +400,19 @@ def process_gt_remesh_dataset(
         f"(anatomical profiles {n_in}, pipe-section clipped {n_clipped})"
     )
     if len(openings) != n_in:
-        print(
-            f"  WARNING: {len(openings)} openings but {n_in} anatomical profiles; "
-            f"the surplus are leftover tears, not ostia"
+        # This used to print and ship anyway, which is how p489 went out with 9
+        # openings against 5 profiles and p129 with 6 against 4. Neither number
+        # was real: extract_boundary_loops was splitting rims, and the split
+        # also misled patch_wall_pinholes into re-opening a hole it had just
+        # patched, which is what put the one genuine tear in p129. With the
+        # count refereed by connectivity both cases now agree with their
+        # profiles, so what reaches this branch is a rim this pipeline actually
+        # tore -- the opposite of the well-made openings the dataset exists to
+        # provide, and not something to ship quietly.
+        raise TemplateQualityError(
+            f"{dataset_id} finished with {len(openings)} openings against "
+            f"{n_in} anatomical profiles ({n_clipped} pipe-section clipped); "
+            f"the difference is torn rims, not ostia."
         )
     record(n_openings=len(openings), n_profiles=n_in, n_clipped=n_clipped)
     return out_file

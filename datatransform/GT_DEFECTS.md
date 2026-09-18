@@ -388,19 +388,90 @@ their targets exactly, and the edge length is uniform with no fan hubs:
 | SNF00000592_01 | 139,476 | 15 | 0.1233 | 0.126 | 8 | 0 |
 | SNF00000614 | 99,494 | 10 | 0.1232 | 0.124 | 8 | 0 |
 
-## 7. Remesh divergence in the GT pipeline (p097, p379_1, p379_3) — open
+## 7. Remesh divergence in the GT pipeline — narrowed to p097
 
-The same divergence as section 2 but in `template_creation/remeshing.py`. p097 is
-cleared of a parameter cause: an 8-setting sweep on its step-1 surface all give
-0.999x area, so the remesher is innocent there and the **step-4b clip** is what
-introduces the damage — it takes min edge from 0.005032 to 0.000037 mm and
-aspect-ratio>50 triangles from 0 to 12.
+The same divergence as section 2 but in `template_creation/remeshing.py`.
 
-## 8. Silent surplus openings — open
+**The clip does damage the surface, and that damage is now repaired.** The
+pipe-section uncap cuts fresh triangles at every rim: on p097 it took the
+shortest edge from 0.005032 to 0.000037 mm and made 12 triangles of aspect ratio
+over 50, none of which were in the surface it was handed. `remeshing.py` now
+welds those out between the uncap and the remesh, the same repair section 2
+makes in hemoMesh, and the shortest edge comes out at 0.001062 mm — 29x better.
 
-p489 ships 9 openings against 5 expected, p129 6 against 4. Nothing rejects a
-mesh for having *too many* openings that the profile matcher never claimed; the
-count guard only catches a change during removal.
+**It does not fix p097, and saying otherwise would be wrong.** Measured either
+side of the change, the remesh lands in the same place:
+
+| | before the weld | after |
+|---|---|---|
+| shortest edge into the remesh | 0.000037 mm | 0.001062 mm |
+| closest attempt (6 iterations) | 1.47x, 980.4 -> 1440.1 mm2 | 1.47x, 980.4 -> **1445.1** mm2 |
+
+So the degeneracies were real but incidental, exactly as in section 2: what
+defeats the remesher on these surfaces is not the slivers. The weld stays
+because it removes a known hazard for nothing — the area is untouched — and the
+case is parked with a message that already says where the fault lies.
+
+p379_1 and p379_3 are not retested yet. Their input is one of the ground-truth
+meshes carrying the residual sac of section 4, so they need rebuilding with that
+fix before their divergence means anything.
+
+## 8. Silent surplus openings — the count was wrong, not the mesh
+
+p489 shipped claiming 9 openings against 5 anatomical profiles, p129 6 against
+4, and nothing rejected either.
+
+**p489 was never broken.** Counting its boundary edges by connectivity — pure
+topology, which cannot split a connected rim — gives **5**, matching its 5
+profiles exactly. Both inputs are clean too: p489 arrives with 5 openings and
+p129 with 4, so nothing was tearing rims.
+
+The fault was in `extract_boundary_loops`. It runs two extractors, because each
+fails where the other holds, and took **whichever reported more loops**. That is
+wrong in the one direction that matters: a rim counted twice is an opening that
+does not exist.
+
+| | VMTK extractor | stripper | connectivity | was chosen |
+|---|---|---|---|---|
+| p489 | **9** | 5 | 5 | 9 |
+| p129 | **6** | 5 | 5 | 6 |
+| C0010 | 7 | 7 | 7 | 7 |
+| SNF00000152 | 4 | 4 | 4 | 4 |
+
+**Fix**: `count_boundary_regions` is the referee. Whichever extractor agrees
+with the number of boundary regions is the one telling the truth; if neither
+does, the one that over-counts least is kept, since an invented opening is worse
+than a missed rim walk. Checked across all 110 outputs of the validation run:
+**every one now agrees with connectivity**, where two did not before.
+
+**The miscount was also making the tear**, which is why p129 came out worse
+than its input. `patch_wall_pinholes` caps every loop and then re-opens the one
+cap nearest each rim it means to keep. Hand it a rim split in two and both
+halves go looking for a cap: the first takes the right one, the second takes the
+next nearest -- which on p129 was the pinhole 0.85 mm away that had just been
+patched. So the patcher reported "patched 4 wall pinhole(s)" and shipped a mesh
+with one of them re-opened, in the same run.
+
+Re-run end to end with the referee in place, p129 comes out with **4 openings
+against 4 profiles** and the 6-point tear is gone:
+
+| | old run | with the referee |
+|---|---|---|
+| p489 | warned 9 openings vs 5 profiles | 5 openings, no warning |
+| p129 | warned 6 vs 4; output carried a 6-pt r=0.197 tear | 4 openings, smallest 24 pts at r=0.327 |
+
+Both were the same mesh going in. p489 was only ever miscounted; p129 was
+miscounted **and** damaged by what the miscount told the patcher to do.
+
+**Gate in** (`remeshing.py`): a finished mesh whose opening count differs from
+its anatomical profile count now raises instead of printing a warning and
+shipping. With the count repaired neither of these two trips it, which is the
+point -- the old gate would have condemned p489, which was fine, and let p129
+through, which was not.
+
+**Regression**: the seven-case run (C0010, C0056, SNF00000152, SNF00000415,
+ANSYS_UNIGE_09, p489, p129) is 7/7 success with every opening count matching
+connectivity, so neither the referee nor the weld disturbs a healthy case.
 
 ## 9. Tiny edges in the input — not a defect of ours
 
