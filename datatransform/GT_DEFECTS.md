@@ -38,7 +38,7 @@ sends the mesh to `<output>/rejected/` with the reason beside it, so an hour of
 Voronoi work is not thrown away and the keep/discard call can be made by looking
 at it. Covered by `TestSalvageOnlyForLaterSteps` and `TestRejectionIsParked`.
 
-## 2. Fan tents — cause found, guard in, real fix in progress
+## 2. Fan tents — cause found, fixed as far as it can be, rest quarantined
 
 **3 of 119: p375_2, p376_3, p551_2.** A single vertex carries hundreds of
 triangles and a sheet is stretched across the lumen. Confirmed by the user on
@@ -85,15 +85,57 @@ one peaks at 13 and the three damaged ones at 39, 273 and 336. Being a plain
 neighbour count it carries no millimetre scale, so it does not need retuning for
 a different vessel size. Covered by `TestMeshQualityGate`.
 
-**Fix** (`src/mesh/surface_mesh.py`): `_remesh_diagnosis` measures the remesh
-against its input on both symptoms — `REMESH_MAX_AREA_DRIFT = 1.2` either way,
-and `REMESH_MAX_VALENCE = 20` — and `_remesh_surface_vmtk` returns the **input
-surface unchanged** when the remesh diverged. There is no better setting to fall
-back to, as the sweep above shows.
+**Root cause.** The surface handed to the remesher is a marching-cubes
+reconstruction, and it is not as sound as the valence column above suggests. It
+carries **1,031 triangles under 1e-6 mm2, edges down to 0.000010 mm, 25
+non-manifold edges and 5 duplicate triangles**. vmtkSurfaceRemeshing works by
+collapsing and splitting edges and projecting the result back onto the input, and
+a triangle that small has no usable normal to project against — so points get
+thrown off the surface, which is both the area doubling and the tents.
 
-**That back-off is not sufficient, and the first version of this note claimed it
-was.** The surface it falls back to is the raw marching-cubes reconstruction, and
-measuring it rather than assuming shows it is not fit to ship:
+Welding those degeneracies out first, with `vtkCleanPolyData` at an absolute
+tolerance set as a fraction of the mesh's own mean edge:
+
+| weld tolerance | area drift | edge CV | hubs | aspect > 50 | non-manifold | dup tris |
+|---|---|---|---|---|---|---|
+| none | 2.173x | 2.022 | 36 | 5,656 | 25 | 5 |
+| 0.001 mm | 2.096x | 2.001 | 29 | — | 25 | 5 |
+| **0.005 mm (shipped)** | **1.116x** | **0.593** | **16** | **1** | 25 | 5 |
+| 0.02 mm | 1.364x | 1.067 | 22 | — | **61** | **43** |
+
+0.005 mm is a twentieth of the mean edge, and it is where the curve turns: it
+preserves the area itself to four figures (1.000x) while taking aspect>50 from
+5,656 to 1. Past it the weld starts joining walls that merely *pass close to one
+another* — non-manifold edges 25 -> 61, duplicate triangles 5 -> 43 — and the
+remesh gets worse again. The tolerance is stored as
+`REMESH_WELD_FRACTION_OF_EDGE = 0.05`, a fraction rather than a distance, so it
+does not need retuning for a finer reconstruction or a different vessel size.
+
+**Welding is a large improvement but not a cure.** Sweeping the settings again on
+the *cleaned* surface (base area 2110.7):
+
+| mode | size | iters | pts | area | drift | CV | max val | hubs |
+|---|---|---|---|---|---|---|---|---|
+| area | 0.025 | 5 (shipped) | — | 2354 | **1.116x** | 0.593 | — | 16 |
+| area | 0.025 | 3 | 302,458 | 2605.7 | 1.235x | 0.852 | 29 | 15 |
+| area | 0.025 | 1 | 251,646 | 2755.1 | 1.305x | 1.083 | 22 | 3 |
+| edgelength | 0.15 | 3 | 394,755 | 2604.4 | 1.234x | 0.918 | 34 | 18 |
+| edgelength | 0.15 | 1 | 288,718 | 2762.4 | 1.309x | 1.109 | 22 | 4 |
+
+Every one still drifts past the 1.2x tolerance or leaves hubs. What is left after
+the weld is the 25 non-manifold edges, and no amount of point merging repairs
+topology — it needs a remesher that is robust to it, and none of pyacvd,
+pymeshlab, open3d or trimesh is installed in either env.
+
+**So the shipped behaviour is: weld, remesh, and insist.**
+`_weld_degenerate_triangles` cleans the input, `_remesh_diagnosis` measures the
+result against that cleaned input on both symptoms — `REMESH_MAX_AREA_DRIFT =
+1.2` either way and `REMESH_MAX_VALENCE = 20` — and a remesh that diverged
+**raises `RemeshDivergedError`**, which `_MESH_VERDICT_ERRORS` in the driver
+parks as a verdict rather than a crash.
+
+**An earlier version of this note said the diverged remesh should fall back to
+its input, and that was wrong.** Measuring the fallback rather than assuming:
 
 | | fallback surface | a sound remesh |
 |---|---|---|
@@ -102,27 +144,34 @@ measuring it rather than assuming shows it is not fit to ship:
 | triangles with aspect > 50 | **5,656** | 0 |
 | triangles under 1e-6 mm2 | **1,031** | 2 |
 
-So the remesh is doing essential work — it is what turns the isosurface into a
-usable triangulation — and falling back to its input violates the uniform-edge
-objective outright. Worse, a surface carrying 5,656 slivers is exactly the kind
-of input that section 7 records as making `remeshing.py` diverge downstream, so
-the back-off would trade a visible defect for a harder-to-see one.
+The fallback violates the uniform-edge objective outright, and it is exactly the
+kind of input section 7 records as making `remeshing.py` diverge downstream. It
+also **converts a caught failure into an uncaught one**: a tent peaks at valence
+327 so the driver's quality gate catches it, but the dense fallback peaks at 18
+and sails straight through to be shipped. Raising is the right outcome — the case
+is parked carrying the measurement that condemned it, and nothing damaged
+reaches the dataset.
 
-The back-off stays as a **floor**, because shipping a lumen-spanning tent is
-worse than shipping a dense surface and the guard must never let a tent through.
-But it cannot be the whole fix.
+**Guard still in, as the backstop** (`remove_other_aneurysms.py`):
+`MAX_VERTEX_VALENCE = 20` and `MAX_EDGE_LENGTH_CV = 0.25` reject a damaged mesh
+before it is copied, whatever produced it. Over the 119 meshes the 116 sound ones
+span CV 0.125-0.188 and peak at valence 13; the three damaged ones sit at CV
+0.317 / 1.256 / 1.943 and valence 39 / 273 / 336. Being a plain neighbour count
+and a dimensionless ratio, neither needs retuning for a different vessel size.
+Covered by `TestMeshQualityGate`.
 
-**Being tested now:** that the degeneracies are what makes the remesher diverge
-in the first place. vmtkSurfaceRemeshing collapses and splits edges, and a
-triangle of area 1e-6 mm2 has no well-defined normal to project against — which
-would explain points being thrown off the surface and the area doubling. If
-cleaning them out first makes the remesh behave, that is the real fix and the
-back-off never fires.
+**Verified end to end** on the exact surface that produced the tents:
 
-Verified on the exact surface that produced the tents: the guard fires
-(`the remesh changed the surface area by 2.173x (2110.7 -> 4587.0 mm2)`) and the
-returned surface is the input, intact — 232,580 points, 2110.7 mm2, max valence
-18, zero hubs. Covered by `TestRemeshDiagnosis`.
+```
+input        pts=232580  area=2110.7  CV=0.415  minedge=0.000010  slivers=1031
+after weld   pts=223941  area=2110.7  CV=0.391  minedge=0.005604  slivers=  40
+RESULT: RemeshDivergedError -- the remesh left 15 triangle-fan hub(s);
+        the worst vertex carries 29 triangles
+```
+
+The weld leaves the area unchanged to four figures, lifts the minimum edge by
+560x and removes 96% of the slivers; the case that cannot be built correctly is
+then refused instead of shipped. Covered by `TestRemeshDiagnosis`.
 
 ## 3. A ball on an opening (p375_1) — fixed and verified
 
@@ -181,7 +230,7 @@ mesh is round:
 
 The ball is gone, the two pinholes with it, and edge uniformity is untouched.
 
-## 4. A residual stub where an aneurysm was removed — detector in, cause open
+## 4. A sac left behind where it should have been removed — detector in, cause open
 
 Reported by the user on p379_1 ("did not fully delete one of the aneurysms and
 left a little stub") and independently on p431_1.
@@ -211,18 +260,50 @@ the gap and is still about two edge lengths above the mesh's own resolution. It
 measures "is the wall still here", not a size, so it holds for a small sidewall
 sac as well as a big one.
 
-**Cause: open.** The Voronoi subtraction is leaving part of the sac behind; which
-step drops it has not been traced yet.
+**p439 belongs here, and it is the extreme case.** The user reported it as
+"p439_2 leaves a ball instead of removing that aneurysm", which read at first
+like a separate failure mode. Measuring both files says otherwise. For each sac,
+its distance to the surface of each output and the surface area within 6 mm of
+its apex:
 
-## 5. A ball left instead of the removed aneurysm (p439_2) — open
+| sac | file | role | apex-to-surface | area within 6 mm |
+|---|---|---|---|---|
+| #1 | `..._1.stl` | kept | 0.104 mm | 137.98 mm2 |
+| #1 | `..._2.stl` | **removed** | 3.739 mm | 35.88 mm2 |
+| #2 | `..._1.stl` | **removed** | **0.100 mm** | **112.35 mm2** |
+| #2 | `..._2.stl` | kept | 0.038 mm | 97.76 mm2 |
 
-Reported by the user. Distinct from section 4: here the apex is **3.739 mm**
-clear of the surface, so the section 4 detector does not fire — the top of the
-sac *was* taken off and a rounded body was left below it. Within 6 mm of the old
-apex the mesh carries a 1128-point, 35.9 mm2 patch whose centroid is 4.40 mm from
-the apex.
+Removing sac #1 took away **74% of the local surface** and left the centerline a
+normal standoff nearby (median 1.086, max 1.448) with all five openings round to
+within perim/circumference 1.00-1.05. That file is sound.
 
-Being diagnosed by a debug re-run of p439 keep 2.
+Removing sac #2 took away **-15%** — the mesh that is supposed to have lost that
+sac carries *more* surface there than the mesh that keeps it — with the apex
+0.100 mm from the wall. **The sac was not removed at all.** So the ball is sac #2
+sitting intact, and it is in the file ending `_1`, not `_2`. Worth stating
+plainly because the report named the other file: `p439_..._1.stl` is the damaged
+one, and the sac involved is #2.
+
+That makes it the same defect as the stubs above, at its limit — nothing came off
+instead of most of it coming off — and the `RESIDUAL_SAC_MM` detector already
+catches it (0.100 mm, sixth in the table).
+
+**Cause: open, with a lead.** `MaskWithPatch` in `clipvoronoidiagram.py` already
+carries a comment naming this exact failure — it scales the tube radius "so the
+mask captures dome Voronoi points that fall outside the narrow MISR-based tube
+(especially at the top/sides of wide aneurysms where the centerline endpoint
+radius shrinks to 0)". The scale is a fixed `aneurysmTubeScale=2.0`
+(`removal.py:3206`). At the dome tip the maximum inscribed sphere radius goes to
+zero, so twice a vanishing radius is still a vanishing tube — precisely where the
+residuals sit, 0.036-0.119 mm from the apex. A debug re-run of p379 keep 1 is
+producing the intermediate Voronoi artifacts to confirm it.
+
+## 5. A ball instead of the removed aneurysm (p439) — merged into section 4
+
+Kept as a heading so the numbering the rest of this file refers to does not
+move. It looked like a second failure mode and it is not: p439 is section 4 at
+its limit, the sac not removed at all rather than mostly removed, and in the
+file ending `_1` rather than `_2`. The numbers are in section 4.
 
 ## 6. Centerline hangs on the SNF vessels — fixed and verified
 
