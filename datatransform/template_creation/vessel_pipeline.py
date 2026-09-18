@@ -95,6 +95,14 @@ OPENING_CLIP_HEIGHT_FACTOR = 5.0
 OPENING_CLIP_INWARD_OVERLAP_MM = 0.05
 OPENING_CLIP_INSET_STEP_MM = 0.1
 OPENING_CLIP_INSET_MAX_MM = 0.5
+# Once trim_extension_patches has cut the tubes back to the ostium plane there is
+# only a short collar left to remove, so the cutter no longer needs to be as long
+# as the flow extension. A long cutter is what swallowed mid-vessel segments of
+# tortuous siphons and lost a branch (area ratio < 0.88).
+OPENING_CLIP_TRIMMED_HEIGHT_FACTOR = 2.0
+OPENING_CLIP_TRIMMED_HEIGHT_MIN_MM = 0.75
+# A pipe-section cut on a pre-trimmed surface removes a collar, never a branch.
+CLIP_MAX_AREA_LOSS_FRACTION = 0.12
 # Disconnected flow-extension stubs can be >5% of the mesh (thin outlets, 5 mm
 # extensions). Drop anything small relative to the largest component.
 FRAGMENT_RELATIVE_TO_LARGEST = 0.15
@@ -102,7 +110,47 @@ FRAGMENT_RELATIVE_TO_LARGEST = 0.15
 SPURIOUS_OPENING_MATCH_FACTOR = 4.0
 SPURIOUS_OPENING_MATCH_FLOOR_MM = 3.0
 MIN_EDGE_LENGTH_MM = 1e-4
+# Weld vertices closer than this. 1e-3 mm is 0.7% of the 0.15 mm GT target edge,
+# i.e. far below any anatomical feature, but 10x above the MIN_EDGE_LENGTH_MM gate
+# so a single pass cannot leave an edge that still trips it.
+WELD_TOLERANCE_MM = 1e-3
+WELD_MAX_PASSES = 4
+# Boundary loops smaller than this on an input surface are wall punctures, not
+# ostia. Flow extensions grow tubes out of them and wreck the uncap, so they are
+# patched before anything else runs.
+WALL_PINHOLE_RADIUS_MM = MIN_SEED_OPENING_RADIUS_MM
+# An extension cell this far outboard of its ostium plane is leftover tube.
+EXTENSION_PLANE_TOL_MM = 1e-3
+# VMTK writes float32 point coordinates, so a vessel a few tens of mm across comes
+# back displaced by ~1e-7 mm. Still 100x under WELD_TOLERANCE_MM, so no two
+# distinct vertices can be confused.
+ORIGINAL_MATCH_TOL_MM = 1e-5
+# A flat end cap is planar to machine precision; an anatomical wall is not.
+CAP_PLANARITY_MM = 0.02
+CAP_PATCH_ANGLE_DEG = 5.0
+CAP_MAX_AREA_FRACTION = 0.15
+CAP_MAX_COUNT = 32
+CAP_MIN_DISC_FILL = 0.4
+CAP_MIN_TRIANGLES = 6
+# A cap meets the wall at a rim; a flat piece of wall flows smoothly into its
+# neighbours. Calibrated on USFD_0052, where the caps sit at 6.8-7.5 deg and
+# every equally planar wall patch is under 3.2 deg -- the rim is shallow because
+# the AneuX originals were remeshed and smoothed after they were capped.
+CAP_MIN_RIM_ANGLE_DEG = 5.0
+# Below this a "cap" is a wall artefact; leaving a sub-millimetre branch capped
+# is much safer than tearing a hole in the wall.
+CAP_MIN_RADIUS_MM = 0.5
+# vmtkFlowExtensions advances a boundary by ~its mean rim edge per layer. A
+# degenerate rim asks for millions of layers and hundreds of millions of cells.
+MAX_FLOW_EXTENSION_LAYERS = 4000
+MAX_EXTENSION_CELL_GROWTH = 20.0
 SLIVER_Q01_THRESHOLD = 0.3
+# A healthy GT remesh finishes well inside this; anything longer is a runaway
+# VMTK filter, and the 2026-09-17 run lost ten hours to nine such cases.
+DEFAULT_CASE_TIMEOUT_S = 5400.0
+# Peak resident set of one worker on a large vessel. 25 workers x this exceeded
+# 32 GB and produced the vtkGenericDataArray allocation failures.
+DEFAULT_WORKER_MEMORY_GB = 2.5
 FILTER_LOCATIONS = ["ICA pcom", "ICA oph", "ICA cav", "ICA bif"]
 
 
@@ -466,6 +514,13 @@ def add_flow_extensions(open_surface, extension_length=DEFAULT_EXTENSION_LENGTH)
             "Flow extensions require open boundaries; input surface is already closed."
         )
 
+    n_layers = _flow_extension_layer_estimate(vtk_poly, extension_length)
+    if n_layers > MAX_FLOW_EXTENSION_LAYERS:
+        raise TemplateQualityError(
+            f"a boundary loop would need {n_layers} flow-extension layers "
+            f"(cap {MAX_FLOW_EXTENSION_LAYERS}); its rim edges are degenerate."
+        )
+
     extender = vmtkscripts.vmtkFlowExtensions()
     extender.Surface = vtk_poly
     extender.ExtensionLength = float(extension_length)
@@ -474,7 +529,13 @@ def add_flow_extensions(open_surface, extension_length=DEFAULT_EXTENSION_LENGTH)
     extender.AdaptiveExtensionLength = 0
     extender.Interactive = 0
     extender.Execute()
-    extended = clean_triangulate(extender.Surface)
+    raw = to_vtk_poly(extender.Surface)
+    if raw.GetNumberOfCells() > MAX_EXTENSION_CELL_GROWTH * max(vtk_poly.GetNumberOfCells(), 1):
+        raise TemplateQualityError(
+            f"flow extensions produced {raw.GetNumberOfCells()} cells from "
+            f"{vtk_poly.GetNumberOfCells()}; refusing to clean a runaway surface."
+        )
+    extended = clean_triangulate(raw)
     n_after = extract_boundary_loops(extended).GetNumberOfCells()
     if n_after == 0:
         raise TemplateQualityError("Flow extensions produced a closed surface (unexpected).")
@@ -485,6 +546,23 @@ def add_flow_extensions(open_surface, extension_length=DEFAULT_EXTENSION_LENGTH)
         f"{vtk_poly.GetNumberOfPoints()} -> {extended.GetNumberOfPoints()} points"
     )
     return extended
+
+
+def _flow_extension_layer_estimate(surface, extension_length):
+    """Worst-case number of extrusion layers vmtkFlowExtensions would build.
+
+    The filter advances each boundary by roughly its mean rim edge length, so a
+    rim with micron-scale edges asks for millions of layers. Estimating this is
+    cheap and turns a machine-killing allocation into a normal case failure.
+    """
+    worst = 0
+    for radius, n_points, _bary in boundary_loop_radii(surface):
+        perimeter = 2.0 * np.pi * max(float(radius), 1e-9)
+        step = perimeter / max(int(n_points), 1)
+        if step <= 0.0:
+            return MAX_FLOW_EXTENSION_LAYERS + 1
+        worst = max(worst, int(float(extension_length) / step))
+    return worst
 
 
 def cap_surface(open_surface, displacement=DEFAULT_CAP_DISPLACEMENT):
@@ -911,6 +989,452 @@ def repair_nonmanifold_triangles(surface):
         f"({n0} -> {len(faces)}); remaining non-manifold edges={n_nm}"
     )
     return out, n_nm
+
+
+def _nonmanifold_edges_from_faces(faces):
+    """Sorted (a, b) vertex pairs used by more than two triangles."""
+    if faces.size == 0:
+        return set()
+    edges = np.concatenate(
+        (
+            np.sort(faces[:, [0, 1]], axis=1),
+            np.sort(faces[:, [1, 2]], axis=1),
+            np.sort(faces[:, [2, 0]], axis=1),
+        ),
+        axis=0,
+    )
+    uniq, counts = np.unique(edges, axis=0, return_counts=True)
+    return {(int(a), int(b)) for (a, b), c in zip(uniq, counts) if c > 2}
+
+
+def force_manifold_triangles(surface, max_passes=6):
+    """Delete the triangles that keep an edge non-manifold.
+
+    ``repair_nonmanifold_triangles`` only removes duplicates and small flaps, so
+    two full-size sheets sharing an edge survive and every later VMTK filter
+    inherits them. Here the smallest triangle on each offending edge is dropped
+    until the edge is manifold. The holes this opens are sub-triangle sized and
+    are closed by the pinhole fill that follows.
+    """
+    poly, pts, faces = _triangle_points_faces(surface)
+    if faces.size == 0:
+        return poly, 0
+    n_dropped = 0
+    for _ in range(int(max_passes)):
+        bad_edges = _nonmanifold_edges_from_faces(faces)
+        if not bad_edges:
+            break
+        areas = _triangle_areas(pts, faces)
+        per_edge = {}
+        for fi, (a, b, c) in enumerate(faces):
+            for u, v in ((a, b), (b, c), (c, a)):
+                key = (int(u), int(v)) if u <= v else (int(v), int(u))
+                if key in bad_edges:
+                    per_edge.setdefault(key, []).append(fi)
+        drop = set()
+        for fis in per_edge.values():
+            if len(fis) <= 2:
+                continue
+            ranked = sorted(fis, key=lambda fi: areas[fi], reverse=True)
+            drop.update(ranked[2:])
+        if not drop:
+            break
+        mask = np.ones(len(faces), dtype=bool)
+        mask[list(drop)] = False
+        faces = faces[mask]
+        n_dropped += len(drop)
+    if n_dropped == 0:
+        return poly, 0
+    out = _polydata_from_triangles(pts, faces)
+    print(f"  Forced manifold: dropped {n_dropped} triangles on non-manifold edges")
+    return out, n_dropped
+
+
+def weld_degenerate_vertices(
+    surface, tolerance=WELD_TOLERANCE_MM, min_edge=MIN_EDGE_LENGTH_MM, max_passes=WELD_MAX_PASSES
+):
+    """Merge near-coincident vertices so no edge is shorter than ``min_edge``.
+
+    ``clean_triangulate`` runs ``vtkCleanPolyData`` at tolerance 0, which only
+    merges exactly identical points. Originals (and VMTK's boundary-preserving
+    remesh, which never touches a rim edge) therefore keep micron-scale edges
+    that fail the final quality gate. ``tolerance`` is three orders of magnitude
+    below the target edge length, so welding is invisible in the surface texture.
+    """
+    poly = to_vtk_poly(surface)
+    for _ in range(int(max_passes)):
+        _p, pts, faces = _triangle_points_faces(poly)
+        if faces.size == 0:
+            return poly, 0.0
+        edges = _triangle_edge_lengths(pts, faces)
+        shortest = float(edges.min())
+        if shortest >= float(min_edge):
+            return poly, shortest
+        cleaner = vtk.vtkCleanPolyData()
+        cleaner.SetInputData(poly)
+        cleaner.ToleranceIsAbsoluteOn()
+        cleaner.SetAbsoluteTolerance(float(tolerance))
+        cleaner.ConvertPolysToLinesOn()
+        cleaner.ConvertLinesToPointsOn()
+        cleaner.ConvertStripsToPolysOn()
+        cleaner.PointMergingOn()
+        cleaner.Update()
+        welded = clean_triangulate(cleaner.GetOutput())
+        welded = drop_degenerate_triangles(welded, min_edge=float(min_edge))
+        if welded.GetNumberOfCells() == 0:
+            return poly, shortest
+        poly = welded
+        tolerance = float(tolerance) * 2.0
+    _p, pts, faces = _triangle_points_faces(poly)
+    edges = _triangle_edge_lengths(pts, faces)
+    shortest = float(edges.min()) if edges.size else 0.0
+    if shortest < float(min_edge):
+        print(f"  WARNING: shortest edge still {shortest:.3e} mm after welding")
+    return poly, shortest
+
+
+def _triangle_adjacency(faces):
+    """Neighbour lists over manifold (usage == 2) edges."""
+    edge_faces = {}
+    for fi, (a, b, c) in enumerate(faces):
+        for u, v in ((a, b), (b, c), (c, a)):
+            key = (int(u), int(v)) if u <= v else (int(v), int(u))
+            edge_faces.setdefault(key, []).append(fi)
+    adj = {}
+    for fis in edge_faces.values():
+        if len(fis) != 2:
+            continue
+        adj.setdefault(fis[0], []).append(fis[1])
+        adj.setdefault(fis[1], []).append(fis[0])
+    return adj
+
+
+def _patch_rim_angles(labels, label, normals, adj):
+    """Dihedral angles, in degrees, across the boundary of one patch.
+
+    This is what separates an end cap from an equally planar piece of wall: the
+    vessel meets a cap at a sharp edge all the way round, while a wall patch
+    continues smoothly into its neighbours.
+    """
+    angles = []
+    inside = np.flatnonzero(labels == label)
+    inside_set = set(inside.tolist())
+    for fi in inside.tolist():
+        for gi in adj.get(fi, ()):
+            if gi in inside_set:
+                continue
+            dot = float(np.clip(np.dot(normals[fi], normals[gi]), -1.0, 1.0))
+            angles.append(np.degrees(np.arccos(dot)))
+    return np.asarray(angles, dtype=np.float64)
+
+
+def _coplanar_patches(pts, faces, angle_deg=CAP_PATCH_ANGLE_DEG):
+    """Label triangles by region-growing while the normal stays near the seed's."""
+    a = pts[faces[:, 1]] - pts[faces[:, 0]]
+    b = pts[faces[:, 2]] - pts[faces[:, 0]]
+    cross = np.cross(a, b)
+    areas = 0.5 * np.linalg.norm(cross, axis=1)
+    normals = cross / np.maximum(np.linalg.norm(cross, axis=1, keepdims=True), 1e-30)
+    adj = _triangle_adjacency(faces)
+    cos_tol = float(np.cos(np.deg2rad(angle_deg)))
+    labels = np.full(len(faces), -1, dtype=np.int64)
+    n_labels = 0
+    for seed in range(len(faces)):
+        if labels[seed] >= 0:
+            continue
+        seed_n = normals[seed]
+        labels[seed] = n_labels
+        stack = [seed]
+        while stack:
+            f = stack.pop()
+            for g in adj.get(f, ()):
+                if labels[g] < 0 and float(np.dot(normals[g], seed_n)) >= cos_tol:
+                    labels[g] = n_labels
+                    stack.append(g)
+        n_labels += 1
+    return labels, n_labels, areas, normals, adj
+
+
+def _is_disc(faces_subset):
+    """Euler characteristic 1 -> the patch is a triangulated disc (one rim, no handle)."""
+    if faces_subset.size == 0:
+        return False
+    verts = np.unique(faces_subset)
+    edges = np.unique(
+        np.concatenate(
+            (
+                np.sort(faces_subset[:, [0, 1]], axis=1),
+                np.sort(faces_subset[:, [1, 2]], axis=1),
+                np.sort(faces_subset[:, [2, 0]], axis=1),
+            ),
+            axis=0,
+        ),
+        axis=0,
+    )
+    return int(len(verts) - len(edges) + len(faces_subset)) == 1
+
+
+def uncap_closed_surface(surface, max_caps=CAP_MAX_COUNT):
+    """Remove flat end caps from a vessel that arrives fully closed.
+
+    A handful of AneuX originals were never decapped, so ``measure_open_profiles``
+    finds no ostium and the case dies at step 1b. A cap is a machine-planar,
+    disc-shaped patch (it was made by triangulating a planar cross-section), which
+    no anatomical wall is. Surfaces that already have open boundaries are returned
+    untouched, so this can run on every case.
+    """
+    poly = clean_triangulate(surface)
+    if extract_boundary_loops(poly).GetNumberOfCells() > 0:
+        return poly
+    _p, pts, faces = _triangle_points_faces(poly)
+    if faces.size == 0:
+        return poly
+    labels, n_labels, areas, normals, adj = _coplanar_patches(pts, faces)
+    total_area = float(areas.sum())
+    caps = []
+    for label in range(n_labels):
+        sel = labels == label
+        area = float(areas[sel].sum())
+        if area <= 0.0 or area > CAP_MAX_AREA_FRACTION * total_area:
+            continue
+        sub = faces[sel]
+        # One triangle is trivially planar, disc-shaped and Euler-1; a cap is
+        # a fan over a real cross-section.
+        if len(sub) < CAP_MIN_TRIANGLES:
+            continue
+        corners = pts[sub].reshape(-1, 3)
+        center = corners.mean(axis=0)
+        normal = _unit((normals[sel] * areas[sel, None]).sum(axis=0))
+        if float(np.abs((corners - center) @ normal).max()) > CAP_PLANARITY_MM:
+            continue
+        r_max = float(np.linalg.norm(corners - center, axis=1).max())
+        if r_max < CAP_MIN_RADIUS_MM:
+            continue
+        # A cap fills most of its own circumcircle. A flat strip of cylinder
+        # facets is just as planar but nothing like a disc, and removing one
+        # would tear a hole in the vessel wall.
+        fill = area / (np.pi * r_max * r_max)
+        if fill < CAP_MIN_DISC_FILL or fill > 1.0:
+            continue
+        if not _is_disc(sub):
+            continue
+        rim_angles = _patch_rim_angles(labels, label, normals, adj)
+        if rim_angles.size == 0 or float(np.median(rim_angles)) < CAP_MIN_RIM_ANGLE_DEG:
+            continue
+        caps.append((area, label))
+    if not caps:
+        print("  WARNING: surface is closed but no flat cap was recognised")
+        return poly
+    caps.sort(reverse=True)
+    keep_labels = {label for _area, label in caps[: int(max_caps)]}
+    keep = ~np.isin(labels, list(keep_labels))
+    opened = _polydata_from_triangles(pts, faces[keep])
+    opened, _n_regions = drop_tiny_islands(opened)
+    n_loops = extract_boundary_loops(opened).GetNumberOfCells()
+    if n_loops < 2:
+        print(
+            f"  WARNING: removing {len(keep_labels)} cap(s) left {n_loops} opening(s); "
+            "keeping the closed surface"
+        )
+        return poly
+    removed = float(sum(area for area, _label in caps[: int(max_caps)]))
+    print(
+        f"  Removed {len(keep_labels)} flat cap(s) ({removed:.1f} mm^2, "
+        f"{100.0 * removed / total_area:.1f}% of area) -> {n_loops} openings"
+    )
+    return opened
+
+
+def boundary_loop_radii(surface):
+    """(radius, n_points, barycenter) for every closed boundary loop."""
+    loops = extract_boundary_loops(surface)
+    out = []
+    for i in range(loops.GetNumberOfCells()):
+        cell = loops.GetCell(i)
+        n = cell.GetNumberOfPoints()
+        if n == 0:
+            continue
+        pts = np.array([cell.GetPoints().GetPoint(j) for j in range(n)], dtype=np.float64)
+        center = pts.mean(axis=0)
+        out.append((float(np.mean(np.linalg.norm(pts - center, axis=1))), int(n), center))
+    return out
+
+
+def _is_wall_pinhole(loop, min_radius):
+    """A loop too small, or with too few points, to be an anatomical ostium.
+
+    The point-count test is not cosmetic: vtkvmtkPolyDataFlowExtensionsFilter
+    derives its layer thickness from a boundary's mean edge length, so a 4-point
+    rim whose edges are microns long makes it extrude millions of layers. That is
+    what turned a 70k-point vessel into a 123M-cell surface and produced both the
+    out-of-memory worker crashes and the multi-hour hangs.
+    """
+    radius, n_points, _bary = loop
+    return radius < float(min_radius) or n_points < MIN_OPENING_LOOP_POINTS
+
+
+def _boundary_loop_vertex_rings(surface):
+    """Boundary loops as lists of point ids, walking the rim edges of ``surface``.
+
+    ``extract_boundary_loops`` returns coordinates from a stripper, which is fine
+    for measuring but useless for stitching. Walking the mesh's own rim edges
+    gives ids that can be triangulated directly.
+    """
+    poly = clean_triangulate(surface)
+    _p, pts, faces = _triangle_points_faces(poly)
+    if faces.size == 0:
+        return poly, pts, faces, []
+    usage = {}
+    for a, b, c in faces:
+        for u, v in ((a, b), (b, c), (c, a)):
+            key = (int(u), int(v)) if u <= v else (int(v), int(u))
+            usage[key] = usage.get(key, 0) + 1
+    neighbours = {}
+    for (u, v), count in usage.items():
+        if count != 1:
+            continue
+        neighbours.setdefault(u, []).append(v)
+        neighbours.setdefault(v, []).append(u)
+    rings = []
+    visited = set()
+    for start in neighbours:
+        if start in visited or len(neighbours[start]) != 2:
+            continue
+        ring = [start]
+        visited.add(start)
+        cur, prev = start, None
+        while True:
+            options = [w for w in neighbours.get(cur, ()) if w != prev]
+            nxt = next((w for w in options if w not in visited), None)
+            if nxt is None:
+                break
+            ring.append(nxt)
+            visited.add(nxt)
+            prev, cur = cur, nxt
+        if len(ring) >= 3 and start in neighbours.get(ring[-1], ()):
+            rings.append(ring)
+    return poly, pts, faces, rings
+
+
+def fan_fill_small_loops(surface, min_radius=WALL_PINHOLE_RADIUS_MM):
+    """Stitch every sub-``min_radius`` boundary loop shut with a triangle fan.
+
+    vtkvmtkCapPolyData refuses surfaces whose rims it cannot walk, and
+    vtkFillHolesFilter silently gives up above its hole size, so neither can be
+    the only way to close a puncture. A fan over the loop's barycentre always
+    can, and a puncture is small enough that the flat patch is invisible.
+    """
+    # A rim vertex with four boundary neighbours is not part of any simple cycle,
+    # so the walk below would skip its hole entirely. Those ears are debris from
+    # the clip, never anatomy.
+    surface = drop_boundary_ear_triangles(surface)
+    poly, pts, faces, rings = _boundary_loop_vertex_rings(surface)
+    if not rings:
+        return poly, 0
+    pts = pts.tolist()
+    faces = faces.tolist()
+    n_filled = 0
+    for ring in rings:
+        coords = np.asarray([pts[i] for i in ring], dtype=np.float64)
+        center = coords.mean(axis=0)
+        radius = float(np.mean(np.linalg.norm(coords - center, axis=1)))
+        if radius >= float(min_radius) and len(ring) >= MIN_OPENING_LOOP_POINTS:
+            continue
+        pts.append(center.tolist())
+        apex = len(pts) - 1
+        for k in range(len(ring)):
+            faces.append([ring[k], ring[(k + 1) % len(ring)], apex])
+        n_filled += 1
+    if n_filled == 0:
+        return poly, 0
+    filled = _polydata_from_triangles(
+        np.asarray(pts, dtype=np.float64), np.asarray(faces, dtype=np.int64)
+    )
+    filled = recompute_point_normals(filled, auto_orient=False)
+    print(f"  Fan-filled {n_filled} small boundary loop(s)")
+    return filled, n_filled
+
+
+def close_wall_pinholes(surface, min_radius=WALL_PINHOLE_RADIUS_MM, label="surface", max_passes=4):
+    """Patch pinholes until none are left; each fan can expose the next one."""
+    total = 0
+    current = clean_triangulate(surface)
+    for _ in range(int(max_passes)):
+        current, n_filled = patch_wall_pinholes(current, min_radius=min_radius, label=label)
+        total += n_filled
+        if n_filled == 0:
+            break
+        if not any(_is_wall_pinhole(lp, min_radius) for lp in boundary_loop_radii(current)):
+            break
+    return current, total
+
+
+def patch_wall_pinholes(surface, min_radius=WALL_PINHOLE_RADIUS_MM, label="surface"):
+    """Close boundary loops smaller than ``min_radius``; keep the real ostia open.
+
+    Caps every loop with vtkvmtkCapPolyData (which triangulates a hole of any
+    shape), then re-opens the caps that belong to loops at or above
+    ``min_radius``. Unlike vtkFillHolesFilter this is not limited by hole size
+    and never leaves a partially stitched rim.
+    """
+    poly = clean_triangulate(surface)
+    loops = boundary_loop_radii(poly)
+    small = [lp for lp in loops if _is_wall_pinhole(lp, min_radius)]
+    if not small:
+        return poly, 0
+    keep = [lp for lp in loops if not _is_wall_pinhole(lp, min_radius)]
+    if len(keep) < 2:
+        print(
+            f"  WARNING: patching {len(small)} pinhole(s) on the {label} would leave "
+            f"{len(keep)} opening(s); leaving them in place"
+        )
+        return poly, 0
+    capper = None
+    capped = None
+    for displacement in (0.0, DEFAULT_CAP_DISPLACEMENT):
+        capper, capped = _cap_surface_with_entity_ids(poly, displacement)
+        if extract_boundary_loops(capped).GetNumberOfCells() == 0:
+            break
+    if capped is None or extract_boundary_loops(capped).GetNumberOfCells() != 0:
+        print(f"  Capper could not close the {label}; fan-filling {len(small)} pinhole(s)")
+        return fan_fill_small_loops(poly, min_radius=min_radius)
+    ids = capped.GetCellData().GetArray("CellEntityIds")
+    center_ids = capper.GetCapCenterIds()
+    if ids is None or center_ids is None or center_ids.GetNumberOfIds() == 0:
+        print(f"  Capper produced no CellEntityIds for the {label}; fan-filling instead")
+        return fan_fill_small_loops(poly, min_radius=min_radius)
+    offset = int(capper.GetCellEntityIdOffset())
+    cap_centers = [
+        np.array(capped.GetPoint(center_ids.GetId(i)), dtype=np.float64)
+        for i in range(center_ids.GetNumberOfIds())
+    ]
+    cap_eids = [offset + 1 + i for i in range(len(cap_centers))]
+    remaining = list(range(len(cap_centers)))
+    reopen = set()
+    for _radius, _n, bary in keep:
+        if not remaining:
+            break
+        best = min(remaining, key=lambda i: float(np.linalg.norm(cap_centers[i] - bary)))
+        reopen.add(cap_eids[best])
+        remaining.remove(best)
+    keep_cells = [
+        ci
+        for ci in range(capped.GetNumberOfCells())
+        if int(ids.GetComponent(ci, 0)) not in reopen
+    ]
+    if not keep_cells:
+        return poly, 0
+    filled = _polydata_from_kept_cells(capped, keep_cells)
+    filled = strip_all_arrays(filled)
+    n_after = len(boundary_loop_radii(filled))
+    if n_after != len(keep):
+        print(
+            f"  Pinhole patch on the {label} left {n_after} loops (expected "
+            f"{len(keep)}); fan-filling instead"
+        )
+        return fan_fill_small_loops(poly, min_radius=min_radius)
+    print(f"  Patched {len(small)} wall pinhole(s) on the {label} (r < {min_radius:.2f} mm)")
+    return filled, len(small)
 
 
 def _triangle_edge_lengths(pts, faces):
@@ -1449,25 +1973,32 @@ def _opening_clip_radius(radius):
     return max(float(radius) * OPENING_CLIP_RADIUS_FACTOR, float(radius) + 0.2)
 
 
-def _opening_clip_height(radius, extension_length=None):
+def _opening_clip_height(radius, extension_length=None, trimmed=False):
     """Finite cylinder length along the outward tangent.
 
     ``7R`` is enough for the short polyball stubs on the parent tube. GT remesh
     adds a fixed-length flow extension; on thin outlets ``7R`` is shorter than
     that extension and the far stub survives as a leftover fragment.
+
+    ``trimmed`` says the flow extensions were already cut back to the ostium
+    plane, so only a collar remains and the cutter can be short. That matters on
+    a tortuous siphon, where a 12 mm cylinder reaches a different part of the
+    same vessel and deletes it.
     """
     r = float(radius)
+    if trimmed:
+        return max(r * OPENING_CLIP_TRIMMED_HEIGHT_FACTOR, OPENING_CLIP_TRIMMED_HEIGHT_MIN_MM)
     by_radius = max(r * OPENING_CLIP_HEIGHT_FACTOR, 2.0) + r * OPENING_EXTENSION_LENGTH_FACTOR
     if extension_length is None:
         return by_radius
     return max(by_radius, float(extension_length) + 2.0 * r)
 
 
-def _outboard_cap_implicit(origin, outward, radius, extension_length=None):
+def _outboard_cap_implicit(origin, outward, radius, extension_length=None, trimmed=False):
     origin = np.asarray(origin, dtype=np.float64)
     outward = _unit(outward)
     clip_radius = _opening_clip_radius(radius)
-    height = _opening_clip_height(radius, extension_length=extension_length)
+    height = _opening_clip_height(radius, extension_length=extension_length, trimmed=trimmed)
     p_in = origin - OPENING_CLIP_INWARD_OVERLAP_MM * outward
     p_far = origin + height * outward
 
@@ -1517,6 +2048,25 @@ def _drop_small_fragments(surface, min_fraction=0.05):
     return to_vtk_poly(kept.triangulate().clean())
 
 
+def _keep_region_with_point(surface, point):
+    """Keep only the connected component that contains ``point``.
+
+    ``_drop_small_fragments`` keeps every component above 15% of the largest,
+    which is exactly wrong right after a cut: a severed branch is retained as a
+    floating shell, and on a bad cut the vessel body can end up as the fragment
+    that is thrown away.
+    """
+    poly = to_vtk_poly(surface)
+    if count_connected_regions(poly) <= 1:
+        return clean_triangulate(poly)
+    conn = vtk.vtkPolyDataConnectivityFilter()
+    conn.SetInputData(poly)
+    conn.SetExtractionModeToClosestPointRegion()
+    _set_vec3(conn.SetClosestPoint, np.asarray(point, dtype=np.float64))
+    conn.Update()
+    return clean_triangulate(conn.GetOutput())
+
+
 def _delete_outboard_leftover(surface, origin, outward, radius, outboard_mm=0.0):
     poly, pts, faces = _triangle_points_faces(surface)
     if faces.size == 0:
@@ -1533,10 +2083,10 @@ def _delete_outboard_leftover(surface, origin, outward, radius, outboard_mm=0.0)
     return _polydata_from_triangles(pts, faces[~bad])
 
 
-def _clip_opening_cap_locally(surface, origin, outward, radius, extension_length=None):
+def _clip_opening_cap_locally(surface, origin, outward, radius, extension_length=None, trimmed=False):
     """Delete the outboard stub of one opening with a bounded cylinder."""
     region = _outboard_cap_implicit(
-        origin, outward, radius, extension_length=extension_length
+        origin, outward, radius, extension_length=extension_length, trimmed=trimmed
     )
     clipper = vtk.vtkClipPolyData()
     clipper.SetInputData(to_vtk_poly(surface))
@@ -1551,25 +2101,41 @@ def _clip_opening_cap_locally(surface, origin, outward, radius, extension_length
 
 
 def clip_one_opening_pipe_section(
-    surface, origin, outward, radius, _body_point, extension_length=None
+    surface, origin, outward, radius, body_point, extension_length=None, trimmed=False
 ):
-    """Open one ostium with a pipe-section cut; inset slightly if the cutter misses."""
+    """Open one ostium with a pipe-section cut; inset slightly if the cutter misses.
+
+    On a pre-trimmed surface the cut may only take a collar off. Anything larger
+    means the bounded cylinder reached a different part of a tortuous vessel, so
+    the candidate is rejected and the cutter is moved inward instead of silently
+    deleting a branch.
+    """
     origin0 = np.asarray(origin, dtype=np.float64)
     outward = _unit(outward)
     radius = max(float(radius), 1e-3)
     before = _n_boundary_loops(surface)
     n_prev = surface.GetNumberOfPoints()
+    area_prev = float(pv.wrap(to_vtk_poly(surface)).area)
     inset = 0.0
     while inset <= OPENING_CLIP_INSET_MAX_MM + 1e-12:
         origin_i = origin0 - inset * outward
         clipped = _clip_opening_cap_locally(
-            surface, origin_i, outward, radius, extension_length=extension_length
+            surface, origin_i, outward, radius, extension_length=extension_length, trimmed=trimmed
         )
-        clipped = _drop_small_fragments(clipped)
+        clipped = (
+            _keep_region_with_point(clipped, body_point)
+            if trimmed
+            else _drop_small_fragments(clipped)
+        )
         n_cand = clipped.GetNumberOfPoints()
         if n_cand < 50 or n_cand < 0.45 * n_prev:
             inset += OPENING_CLIP_INSET_STEP_MM
             continue
+        if trimmed and area_prev > 1e-9:
+            lost = 1.0 - float(pv.wrap(to_vtk_poly(clipped)).area) / area_prev
+            if lost > CLIP_MAX_AREA_LOSS_FRACTION:
+                inset += OPENING_CLIP_INSET_STEP_MM
+                continue
         loops_after = _n_boundary_loops(clipped)
         near = any(
             float(np.linalg.norm(np.asarray(op["center"]) - origin_i)) < 2.0 * radius
@@ -1699,16 +2265,146 @@ def remove_spurious_openings(surface, profiles):
     return filled, n_filled
 
 
+def original_cell_mask(extended_surface, original_surface, tol=ORIGINAL_MATCH_TOL_MM):
+    """Per-cell mask of ``extended_surface``: True where the cell exists on the original.
+
+    vmtkFlowExtensions grows tubes out of every boundary loop and returns them
+    fused with the input, untagged. Matching triangles by vertex identity is
+    exact and does not depend on the filter's cell ordering, so the extension can
+    be isolated and trimmed geometrically later on. ``tol`` is not zero because
+    VMTK stores points as float32, so every coordinate comes back rounded.
+    """
+    ext = clean_triangulate(extended_surface)
+    orig = clean_triangulate(original_surface)
+    _o, opts, ofaces = _triangle_points_faces(orig)
+    _e, epts, efaces = _triangle_points_faces(ext)
+    if efaces.size == 0:
+        return ext, np.zeros(0, dtype=bool)
+    if ofaces.size == 0:
+        return ext, np.zeros(len(efaces), dtype=bool)
+
+    locator = vtk.vtkStaticPointLocator()
+    locator.SetDataSet(orig)
+    locator.BuildLocator()
+    mapped = np.full(len(epts), -1, dtype=np.int64)
+    for i, xyz in enumerate(epts):
+        pid = locator.FindClosestPoint(_vec3(xyz))
+        if pid >= 0 and float(np.linalg.norm(opts[pid] - xyz)) <= tol:
+            mapped[i] = pid
+    orig_keys = set(map(tuple, np.sort(ofaces, axis=1).tolist()))
+    mapped_faces = mapped[efaces]
+    ok = np.all(mapped_faces >= 0, axis=1)
+    keys = np.sort(np.where(ok[:, None], mapped_faces, 0), axis=1)
+    mask = np.zeros(len(efaces), dtype=bool)
+    for i, good in enumerate(ok):
+        if good and tuple(keys[i].tolist()) in orig_keys:
+            mask[i] = True
+    return ext, mask
+
+
+def _clip_patch_at_plane(patch, origin, outward):
+    """Keep the part of ``patch`` on the inboard side of the ostium plane."""
+    plane = vtk.vtkPlane()
+    _set_vec3(plane.SetOrigin, np.asarray(origin, dtype=np.float64) + EXTENSION_PLANE_TOL_MM * _unit(outward))
+    _set_vec3(plane.SetNormal, _unit(outward))
+    clipper = vtk.vtkClipPolyData()
+    clipper.SetInputData(to_vtk_poly(patch))
+    clipper.SetClipFunction(plane)
+    clipper.InsideOutOn()
+    clipper.GenerateClippedOutputOff()
+    clipper.Update()
+    return clean_triangulate(clipper.GetOutput())
+
+
+def trim_extension_patches(extended_surface, original_surface, frames):
+    """Cut every flow-extension tube back to its own ostium plane.
+
+    The bounded pipe-section cutter only reaches a tube that stays inside a
+    1.5R cylinder around the centerline tangent. vmtkFlowExtensions extrudes
+    along the *boundary normal*, so on an oblique ostium a 5 mm tube walks out
+    of that cylinder and survives the uncap, which is what leaves a remeshed
+    surface 1.3-1.6x the original area. Clipping each extension patch with its
+    own ostium plane removes the tube whatever direction it took, and leaves
+    only the collar that fills an oblique rim.
+    """
+    ext, mask = original_cell_mask(extended_surface, original_surface)
+    if not np.any(~mask):
+        return ext, 0
+    _p, pts, faces = _triangle_points_faces(ext)
+    body = _polydata_from_triangles(pts, faces[mask])
+    ext_only = _polydata_from_triangles(pts, faces[~mask])
+    if ext_only.GetNumberOfCells() == 0:
+        return ext, 0
+
+    conn = vtk.vtkPolyDataConnectivityFilter()
+    conn.SetInputData(ext_only)
+    conn.SetExtractionModeToAllRegions()
+    conn.ColorRegionsOn()
+    conn.Update()
+    n_regions = int(conn.GetNumberOfExtractedRegions())
+    labelled = conn.GetOutput()
+    region = labelled.GetPointData().GetArray("RegionId")
+    if region is None or n_regions == 0:
+        return ext, 0
+    region_ids = vtk_to_numpy(region)
+
+    origins = np.asarray([np.asarray(f[0], dtype=np.float64) for f in frames], dtype=np.float64)
+    outwards = np.asarray([_unit(f[1]) for f in frames], dtype=np.float64)
+
+    pieces = [body]
+    n_trimmed = 0
+    for rid in range(n_regions):
+        sel = vtk.vtkThreshold()
+        sel.SetInputData(labelled)
+        sel.SetInputArrayToProcess(0, 0, 0, vtk.vtkDataObject.FIELD_ASSOCIATION_POINTS, "RegionId")
+        sel.SetLowerThreshold(rid - 0.5)
+        sel.SetUpperThreshold(rid + 0.5)
+        sel.Update()
+        geom = vtk.vtkGeometryFilter()
+        geom.SetInputConnection(sel.GetOutputPort())
+        geom.Update()
+        patch = clean_triangulate(geom.GetOutput())
+        if patch.GetNumberOfCells() == 0:
+            continue
+        _pp, ppts = _poly_points(patch)
+        centroid = ppts.mean(axis=0)
+        j = int(np.argmin(np.linalg.norm(origins - centroid, axis=1)))
+        kept = _clip_patch_at_plane(patch, origins[j], outwards[j])
+        before = patch.GetNumberOfCells()
+        after = kept.GetNumberOfCells()
+        if after < before:
+            n_trimmed += 1
+        if after > 0:
+            pieces.append(kept)
+    del region_ids
+
+    append = vtk.vtkAppendPolyData()
+    for piece in pieces:
+        append.AddInputData(to_vtk_poly(piece))
+    append.Update()
+    merged = clean_triangulate(append.GetOutput())
+    if n_trimmed:
+        print(
+            f"  Trimmed {n_trimmed}/{n_regions} flow-extension patch(es) back to the ostium plane"
+        )
+    return merged, n_trimmed
+
+
 def clip_flow_extensions_and_uncap(
     base_surface,
     profiles,
     extension_length=DEFAULT_EXTENSION_LENGTH,
     centerline=None,
+    unextended_surface=None,
 ):
     current = to_vtk_poly(base_surface)
+    frames = opening_clip_frames(centerline, profiles) if centerline is not None else None
+    trimmed = False
+    if unextended_surface is not None and frames is not None:
+        current, _n_trimmed = trim_extension_patches(current, unextended_surface, frames)
+        trimmed = True
     body_pt = mesh_body_point(current)
     n_clipped = 0
-    frames = opening_clip_frames(centerline, profiles) if centerline is not None else None
     for i, profile in enumerate(profiles):
         search_mm = float(extension_length) + 3.0 * max(float(profile["radius"]), 0.5)
         ok = False
@@ -1721,6 +2417,7 @@ def clip_flow_extensions_and_uncap(
                 radius,
                 body_pt,
                 extension_length=extension_length,
+                trimmed=trimmed,
             )
             if ok:
                 print(
@@ -1740,10 +2437,18 @@ def clip_flow_extensions_and_uncap(
     current = clean_triangulate(current)
     current, n_nm = repair_nonmanifold_triangles(current)
     if n_nm > 0:
-        raise TemplateQualityError(
-            f"Uncapped parent tube has {n_nm} non-manifold edges; remesh would amplify them"
-        )
+        # A vtkClipPolyData seam can leave two full-size sheets on one edge, which
+        # the flap heuristic will not touch. Cut them apart instead of failing the
+        # case: the remesher only needs a manifold input, and the holes this opens
+        # are sub-triangle sized.
+        current, _n_forced = force_manifold_triangles(current)
+        current, n_nm = repair_nonmanifold_triangles(current)
+        if n_nm > 0:
+            raise TemplateQualityError(
+                f"Uncapped parent tube has {n_nm} non-manifold edges; remesh would amplify them"
+            )
     current, _n_regions = drop_tiny_islands(current)
+    current, _n_pin = close_wall_pinholes(current, label="uncapped surface")
     current, n_filled = remove_spurious_openings(current, profiles)
     post = inspect_openings(current)
     print(
@@ -2109,11 +2814,45 @@ def drop_tiny_islands(surface):
     return main, count_connected_regions(main)
 
 
-def finalize_surface(surface):
-    cleaned, _n_nm = repair_nonmanifold_triangles(clean_triangulate(surface))
-    cleaned = fill_pinholes(cleaned)
-    cleaned = strip_all_arrays(cleaned)
-    cleaned, n_regions = drop_tiny_islands(cleaned)
+def finalize_surface(surface, profiles=None, max_passes=3):
+    """Clean, weld, force manifoldness and close every non-ostium hole.
+
+    The remesher is free to leave micron-scale rim edges (PreserveBoundaryEdges
+    keeps them), non-manifold sheets a flap heuristic will not touch, and
+    pinholes wider than vtkFillHolesFilter's hole size. Each of those used to
+    reach ``assert_template_quality`` unrepaired and fail the case, so they are
+    repaired here instead. ``profiles`` are the anatomical openings; when given,
+    boundary loops that are not one of them are closed.
+
+    The repairs interact -- welding can fuse two rim vertices into a non-manifold
+    edge, and cutting a non-manifold edge opens a new pinhole -- so the sequence
+    runs until the surface stops changing rather than exactly once.
+    """
+    cleaned = clean_triangulate(surface)
+    n_regions = count_connected_regions(cleaned)
+    for _ in range(int(max_passes)):
+        cleaned, _n_nm = repair_nonmanifold_triangles(cleaned)
+        cleaned, _n_forced = force_manifold_triangles(cleaned)
+        cleaned = fill_pinholes(cleaned)
+        cleaned, _n_pin = close_wall_pinholes(cleaned, label="remeshed surface")
+        if profiles:
+            cleaned, _n_left = remove_spurious_openings(cleaned, profiles)
+        cleaned, _min_edge = weld_degenerate_vertices(cleaned)
+        cleaned = strip_all_arrays(cleaned)
+        cleaned, n_regions = drop_tiny_islands(cleaned)
+        topo = inspect_surface_topology(cleaned)
+        extra_loops = [
+            lp
+            for lp in boundary_loop_radii(cleaned)
+            if _is_wall_pinhole(lp, MIN_OPENING_RADIUS_MM)
+        ]
+        if (
+            topo["n_nonmanifold"] == 0
+            and topo["min_edge"] >= MIN_EDGE_LENGTH_MM
+            and not extra_loops
+            and n_regions == 1
+        ):
+            break
     cleaned = strip_all_arrays(cleaned)
     cleaned = recompute_point_normals(cleaned, auto_orient=False)
     return cleaned, n_regions
@@ -2573,6 +3312,30 @@ def add_shared_cli_args(parser, default_output_dir, default_workers, include_rem
     parser.add_argument("--output-dir", type=str, default=default_output_dir, help="Output directory")
     parser.add_argument("--limit", type=int, default=None, help="Maximum number of dataset meshes to process")
     parser.add_argument("--workers", type=int, default=default_workers, help="Number of parallel worker processes")
+    parser.add_argument(
+        "--case-timeout",
+        type=float,
+        default=DEFAULT_CASE_TIMEOUT_S,
+        help=(
+            "Kill a worker that runs longer than this many seconds and log it as a "
+            "failure (0 disables). Default 5400."
+        ),
+    )
+    parser.add_argument(
+        "--worker-memory-gb",
+        type=float,
+        default=DEFAULT_WORKER_MEMORY_GB,
+        help=(
+            "Memory to reserve per worker when capping --workers against installed RAM "
+            "(0 disables the cap). Default 2.5."
+        ),
+    )
+    parser.add_argument(
+        "--retry-failed",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="After the parallel pass, retry crashed/timed-out cases one at a time.",
+    )
     parser.add_argument("--case", type=str, default=None, help="Process a single dataset id")
     parser.add_argument("--vessel-file", type=str, default=None, help="Explicit input mesh for --case (.vtp or .stl)")
     parser.add_argument("--skip-existing", action="store_true", help="Skip cases whose output .vtp already exists")
@@ -2584,6 +3347,103 @@ def add_shared_cli_args(parser, default_output_dir, default_workers, include_rem
         parser.add_argument("--grid-spacing", type=float, default=DEFAULT_GRID_SPACING, help="Requested modeller voxel size in mm")
         parser.add_argument("--max-grid-size", type=int, default=DEFAULT_MAX_GRID_SIZE, help="Max voxels along the longest axis (spacing stays isotropic)")
     return parser
+
+
+# 0xC0000409 (STATUS_STACK_BUFFER_OVERRUN) is what Windows reports when VTK
+# aborts on a failed allocation; -9/-6/137 are the POSIX equivalents.
+RESOURCE_FAILURE_CODES = frozenset({3221226505, 3221225725, -9, -6, 137})
+TIMEOUT_RETURNCODE = -1000
+
+
+def _is_resource_failure(returncode):
+    return returncode in RESOURCE_FAILURE_CODES or returncode == TIMEOUT_RETURNCODE
+
+
+def _run_one_worker(script_path, dataset_id, v_file, args, extra_cli_flags, case_timeout):
+    """Run one case in a subprocess, killing it if it exceeds ``case_timeout``."""
+    cmd = [
+        sys.executable,
+        "-u",
+        script_path,
+        "--case",
+        str(dataset_id),
+        "--vessel-file",
+        v_file,
+        "--output-dir",
+        args.output_dir,
+    ] + extra_cli_flags
+    env = dict(os.environ)
+    # Without this a crashed worker loses every "Step N" line to the pipe buffer,
+    # which is why every crash in the 2026-09-17 run logged an empty step.
+    env["PYTHONUNBUFFERED"] = "1"
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env
+    )
+    try:
+        out, _ = proc.communicate(timeout=case_timeout if case_timeout > 0 else None)
+        return proc.returncode, out or ""
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            out, _ = proc.communicate(timeout=60)
+        except Exception:
+            out = ""
+        msg = f"case timed out after {case_timeout:.0f} s and was killed"
+        print(f"[TIMEOUT] {dataset_id}: {msg}")
+        return TIMEOUT_RETURNCODE, (out or "") + "\n" + msg + "\n"
+
+
+def _installed_memory_gb():
+    try:
+        if hasattr(os, "sysconf") and "SC_PHYS_PAGES" in getattr(os, "sysconf_names", {}):
+            return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1024**3
+    except (OSError, ValueError):
+        pass
+    try:
+        import ctypes
+
+        class _MemoryStatusEx(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = _MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(_MemoryStatusEx)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return status.ullTotalPhys / 1024**3
+    except Exception:
+        pass
+    return None
+
+
+def memory_capped_workers(requested, per_worker_gb=DEFAULT_WORKER_MEMORY_GB):
+    """Lower ``requested`` so the pool cannot exhaust RAM.
+
+    Every worker holds the extended surface, the Voronoi diagram and a remeshed
+    surface of several hundred thousand triangles at once. 25 of them on a 32 GB
+    machine is what made VTK fail to allocate and took thirteen workers down.
+    """
+    requested = max(1, int(requested))
+    if per_worker_gb <= 0:
+        return requested
+    total_gb = _installed_memory_gb()
+    if not total_gb:
+        return requested
+    allowed = max(1, int((total_gb - 4.0) // float(per_worker_gb)))
+    if allowed < requested:
+        print(
+            f"Capping workers {requested} -> {allowed} "
+            f"({total_gb:.0f} GB RAM, {per_worker_gb:.1f} GB reserved per worker)"
+        )
+    return min(requested, allowed)
 
 
 def run_batch(script_path, process_one, args, extra_cli_flags, on_worker_result=None):
@@ -2615,7 +3475,10 @@ def run_batch(script_path, process_one, args, extra_cli_flags, on_worker_result=
     if num_cases == 0:
         print("No matching dataset files to process.")
         return
-    num_workers = max(1, min(int(args.workers), num_cases))
+    num_workers = memory_capped_workers(
+        args.workers, getattr(args, "worker_memory_gb", DEFAULT_WORKER_MEMORY_GB)
+    )
+    num_workers = max(1, min(num_workers, num_cases))
     if getattr(args, "from_folder", False):
         print(f"Input folder (all meshes): {args.vessel_dir}")
     else:
@@ -2625,6 +3488,7 @@ def run_batch(script_path, process_one, args, extra_cli_flags, on_worker_result=
     print(f"Processing limit: {args.limit} samples | Valid dataset cases: {num_cases}")
     print(f"Parallel Workers: {num_workers} (Requested={args.workers}, Active Workers={num_workers})")
 
+    case_timeout = float(getattr(args, "case_timeout", DEFAULT_CASE_TIMEOUT_S) or 0.0)
     failures = []
     if num_workers == 1:
         for dataset_id, v_file in tqdm(valid_datasets, desc="Processing"):
@@ -2635,11 +3499,22 @@ def run_batch(script_path, process_one, args, extra_cli_flags, on_worker_result=
                 failures.append((dataset_id, str(exc)))
     else:
         print(f"Spawning worker pool with max active concurrent workers = {num_workers}...")
+        if case_timeout > 0:
+            print(f"Per-case timeout: {case_timeout:.0f} s")
         task_queue = Queue()
         for item in valid_datasets:
             task_queue.put(item)
         pbar = tqdm(total=num_cases, desc="Processing Parallel")
         lock = threading.Lock()
+        retry_queue = []
+
+        def report(dataset_id, returncode, out):
+            if on_worker_result is None:
+                return
+            try:
+                on_worker_result(dataset_id, returncode, out)
+            except Exception as log_exc:
+                print(f"  WARNING: on_worker_result failed for {dataset_id}: {log_exc}")
 
         def worker_thread():
             while True:
@@ -2647,27 +3522,16 @@ def run_batch(script_path, process_one, args, extra_cli_flags, on_worker_result=
                     dataset_id, v_file = task_queue.get_nowait()
                 except Empty:
                     break
-                cmd = [
-                    sys.executable,
-                    script_path,
-                    "--case",
-                    str(dataset_id),
-                    "--vessel-file",
-                    v_file,
-                    "--output-dir",
-                    args.output_dir,
-                ] + extra_cli_flags
-                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-                out, _ = proc.communicate()
-                if on_worker_result is not None:
-                    try:
-                        on_worker_result(dataset_id, proc.returncode, out)
-                    except Exception as log_exc:
-                        print(f"  WARNING: on_worker_result failed for {dataset_id}: {log_exc}")
-                if proc.returncode != 0:
-                    print(f"\n[ERROR] Case {dataset_id} failed (code {proc.returncode}):\n{out}")
+                returncode, out = _run_one_worker(
+                    script_path, dataset_id, v_file, args, extra_cli_flags, case_timeout
+                )
+                report(dataset_id, returncode, out)
+                if returncode != 0:
+                    print(f"\n[ERROR] Case {dataset_id} failed (code {returncode}):\n{out[-2000:]}")
                     with lock:
-                        failures.append((dataset_id, out[-2000:] if out else f"exit {proc.returncode}"))
+                        failures.append((dataset_id, out[-2000:] if out else f"exit {returncode}"))
+                        if _is_resource_failure(returncode):
+                            retry_queue.append((dataset_id, v_file))
                 pbar.update(1)
 
         threads = [threading.Thread(target=worker_thread) for _ in range(num_workers)]
@@ -2677,6 +3541,22 @@ def run_batch(script_path, process_one, args, extra_cli_flags, on_worker_result=
             t.join()
         pbar.close()
         print("Parallel execution complete. All worker processes finished.")
+
+        if retry_queue and getattr(args, "retry_failed", True):
+            print(
+                f"Retrying {len(retry_queue)} case(s) one at a time "
+                "(a crash under a full worker pool is usually memory pressure)."
+            )
+            for dataset_id, v_file in retry_queue:
+                returncode, out = _run_one_worker(
+                    script_path, dataset_id, v_file, args, extra_cli_flags, case_timeout
+                )
+                report(dataset_id, returncode, out)
+                if returncode == 0:
+                    print(f"  Retry succeeded: {dataset_id}")
+                    failures = [f for f in failures if f[0] != dataset_id]
+                else:
+                    print(f"  Retry failed: {dataset_id} (code {returncode})")
 
     if failures:
         fail_path = os.path.join(args.output_dir, "failures.txt")

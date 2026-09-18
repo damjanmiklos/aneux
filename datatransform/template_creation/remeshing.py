@@ -56,6 +56,10 @@ from batch_run_log import (
 from vessel_pipeline import (
     TemplateQualityError,
     add_flow_extensions,
+    weld_degenerate_vertices,
+    patch_wall_pinholes,
+    force_manifold_triangles,
+    uncap_closed_surface,
     add_shared_cli_args,
     apply_taubin_smoothing,
     assert_template_quality,
@@ -103,13 +107,36 @@ _warn = warn
 
 
 def prepare_gt_surface(vessel_mesh):
-    """Keep original tessellation density; only drop degenerates and flaps."""
+    """Keep original tessellation density; only repair what breaks VMTK.
+
+    Nothing here resamples the surface, so the aneurysm texture is untouched.
+    What is removed is exactly what the rest of the pipeline cannot survive:
+    micron-scale edges (VMTK's boundary-preserving remesh keeps them and the
+    final quality gate then rejects the case), non-manifold sheets, ears on the
+    ostium rims, and wall punctures small enough that vmtkFlowExtensions would
+    grow a spurious 5 mm tube out of them.
+    """
     poly = clean_triangulate(vessel_mesh)
     poly = drop_degenerate_triangles(poly)
     poly = drop_boundary_ear_triangles(poly)
     poly, n_nm = repair_nonmanifold_triangles(poly)
     if n_nm > 0:
+        poly, n_forced = force_manifold_triangles(poly)
+        poly, n_nm = repair_nonmanifold_triangles(poly)
+        if n_forced:
+            _warn(
+                f"cut {n_forced} triangle(s) to make the original manifold "
+                f"({n_nm} non-manifold edges left)"
+            )
+    if n_nm > 0:
         _warn(f"{n_nm} non-manifold edges remain on the original after repair")
+    poly, min_edge = weld_degenerate_vertices(poly)
+    poly = drop_boundary_ear_triangles(poly)
+    poly, n_pin = patch_wall_pinholes(poly, label="original")
+    if n_pin:
+        _warn(f"patched {n_pin} wall pinhole(s) on the original before flow extensions")
+    poly = uncap_closed_surface(poly)
+    print(f"  Original min edge after welding: {min_edge:.6f} mm")
     return poly
 
 
@@ -235,6 +262,7 @@ def process_gt_remesh_dataset(
         gt_profiles,
         extension_length=extension_length,
         centerline=branched,
+        unextended_surface=gt_surface,
     )
     n_in = len(gt_profiles)
     if n_clipped < n_in:
@@ -279,7 +307,7 @@ def process_gt_remesh_dataset(
     print(f"  -> Remeshed surface points: {remeshed.GetNumberOfPoints()}")
 
     _set_step("7_finalize_and_save")
-    final_surface, _n_regions = finalize_surface(remeshed)
+    final_surface, _n_regions = finalize_surface(remeshed, profiles=gt_profiles)
     assert_gt_remesh_scale(final_surface, original, context=dataset_id)
     openings = assert_template_quality(final_surface, context=dataset_id)
     log_opening_planarity(final_surface, frames)

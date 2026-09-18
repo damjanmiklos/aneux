@@ -1,0 +1,328 @@
+"""Repairs added after the 2026-09-17 batch run.
+
+Every test here builds its mesh from explicit triangles rather than
+``pyvista.Sphere``: on this machine's VTK build ``pv.Sphere`` aborts the
+interpreter, which takes the rest of the session's tests with it.
+"""
+import os
+import sys
+
+import numpy as np
+import pytest
+import vtk
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from vessel_pipeline import (
+    CLIP_MAX_AREA_LOSS_FRACTION,
+    cap_surface,
+    MAX_FLOW_EXTENSION_LAYERS,
+    MIN_EDGE_LENGTH_MM,
+    MIN_OPENING_LOOP_POINTS,
+    TemplateQualityError,
+    _flow_extension_layer_estimate,
+    _is_disc,
+    _keep_region_with_point,
+    _opening_clip_height,
+    _polydata_from_triangles,
+    _triangle_edge_lengths,
+    _triangle_points_faces,
+    add_flow_extensions,
+    boundary_loop_radii,
+    fan_fill_small_loops,
+    finalize_surface,
+    force_manifold_triangles,
+    inspect_surface_topology,
+    original_cell_mask,
+    patch_wall_pinholes,
+    trim_extension_patches,
+    uncap_closed_surface,
+    weld_degenerate_vertices,
+)
+
+
+def open_tube(radius=1.0, length=6.0, n_sides=40, n_rings=30, axis=2, center=(0.0, 0.0, 0.0)):
+    """Triangulated open cylinder along ``axis``, both ends free."""
+    theta = np.linspace(0.0, 2.0 * np.pi, n_sides, endpoint=False)
+    zs = np.linspace(-0.5 * length, 0.5 * length, n_rings)
+    pts = np.zeros((n_rings * n_sides, 3), dtype=np.float64)
+    other = [a for a in range(3) if a != axis]
+    for i, z in enumerate(zs):
+        block = pts[i * n_sides : (i + 1) * n_sides]
+        block[:, other[0]] = radius * np.cos(theta)
+        block[:, other[1]] = radius * np.sin(theta)
+        block[:, axis] = z
+    pts += np.asarray(center, dtype=np.float64)
+    faces = []
+    for i in range(n_rings - 1):
+        for j in range(n_sides):
+            a = i * n_sides + j
+            b = i * n_sides + (j + 1) % n_sides
+            c = (i + 1) * n_sides + j
+            d = (i + 1) * n_sides + (j + 1) % n_sides
+            faces.append((a, b, d))
+            faces.append((a, d, c))
+    return _polydata_from_triangles(pts, np.asarray(faces, dtype=np.int64))
+
+
+def capped_tube(**kwargs):
+    """``open_tube`` closed with the same capper the pipeline uses."""
+    return cap_surface(open_tube(**kwargs), displacement=0.0)
+
+
+def _interior_edge(faces):
+    """An edge used by exactly two triangles, so a third makes it non-manifold."""
+    usage = {}
+    for a, b, c in faces:
+        for u, v in ((a, b), (b, c), (c, a)):
+            key = (int(u), int(v)) if u <= v else (int(v), int(u))
+            usage[key] = usage.get(key, 0) + 1
+    return next(edge for edge, n in usage.items() if n == 2)
+
+
+def test_weld_removes_micron_edges_without_moving_the_surface():
+    tube = open_tube()
+    _p, pts, faces = _triangle_points_faces(tube)
+    area_before = float(vtk_area(tube))
+    # Split one vertex into two points 2 nm apart, as the originals do.
+    pts = np.vstack([pts, pts[0] + np.array([2e-6, 0.0, 0.0])])
+    faces = np.vstack([faces, np.array([[0, len(pts) - 1, int(faces[0][1])]])])
+    dirty = _polydata_from_triangles(pts, faces)
+    assert inspect_surface_topology(dirty)["min_edge"] < MIN_EDGE_LENGTH_MM
+
+    welded, shortest = weld_degenerate_vertices(dirty)
+    assert shortest >= MIN_EDGE_LENGTH_MM
+    assert inspect_surface_topology(welded)["min_edge"] >= MIN_EDGE_LENGTH_MM
+    assert vtk_area(welded) == pytest.approx(area_before, rel=1e-4)
+
+
+def vtk_area(surface):
+    mass = vtk.vtkMassProperties()
+    tri = vtk.vtkTriangleFilter()
+    tri.SetInputData(surface)
+    tri.Update()
+    mass.SetInputData(tri.GetOutput())
+    mass.Update()
+    return mass.GetSurfaceArea()
+
+
+def test_force_manifold_cuts_a_sheet_sharing_an_edge():
+    tube = open_tube()
+    _p, pts, faces = _triangle_points_faces(tube)
+    a, b = _interior_edge(faces)
+    # A third, full-size triangle on the (a, b) edge: too big for the flap rule.
+    apex = pts[a] + np.array([0.0, 0.0, 2.0])
+    pts = np.vstack([pts, apex])
+    faces = np.vstack([faces, np.array([[a, b, len(pts) - 1]])])
+    dirty = _polydata_from_triangles(pts, faces)
+    assert inspect_surface_topology(dirty)["n_nonmanifold"] == 1
+
+    fixed, n_dropped = force_manifold_triangles(dirty)
+    assert n_dropped >= 1
+    assert inspect_surface_topology(fixed)["n_nonmanifold"] == 0
+
+
+def test_patch_wall_pinholes_closes_a_puncture_and_keeps_both_ostia():
+    tube = open_tube()
+    _p, pts, faces = _triangle_points_faces(tube)
+    # Punch a hole in the middle of the wall.
+    mid = len(faces) // 2
+    keep = np.ones(len(faces), dtype=bool)
+    keep[mid] = False
+    punctured = _polydata_from_triangles(pts, faces[keep])
+    assert len(boundary_loop_radii(punctured)) == 3
+
+    patched, n_filled = patch_wall_pinholes(punctured)
+    assert n_filled == 1
+    loops = boundary_loop_radii(patched)
+    assert len(loops) == 2
+    assert all(radius > 0.5 for radius, _n, _bary in loops)
+
+
+def test_patch_wall_pinholes_treats_a_four_point_rim_as_a_pinhole():
+    """A 4-point rim is what makes vmtkFlowExtensions extrude millions of layers."""
+    tube = open_tube()
+    _p, pts, faces = _triangle_points_faces(tube)
+    keep = np.ones(len(faces), dtype=bool)
+    keep[len(faces) // 2] = False
+    punctured = _polydata_from_triangles(pts, faces[keep])
+    small = [lp for lp in boundary_loop_radii(punctured) if lp[1] < MIN_OPENING_LOOP_POINTS]
+    assert small, "expected the single-triangle hole to have fewer than 6 rim points"
+    patched, n_filled = patch_wall_pinholes(patched_input := punctured, min_radius=0.0)
+    assert n_filled == 1
+    assert len(boundary_loop_radii(patched)) == 2
+    assert patched_input is not patched
+
+
+def test_flow_extension_layer_estimate_flags_a_degenerate_rim():
+    tube = open_tube()
+    assert _flow_extension_layer_estimate(tube, 5.0) < MAX_FLOW_EXTENSION_LAYERS
+    _p, pts, faces = _triangle_points_faces(tube)
+    keep = np.ones(len(faces), dtype=bool)
+    keep[len(faces) // 2] = False
+    tiny_rim = _polydata_from_triangles(pts * 1e-4, faces[keep])
+    assert _flow_extension_layer_estimate(tiny_rim, 5.0) > MAX_FLOW_EXTENSION_LAYERS
+
+
+def test_add_flow_extensions_refuses_a_runaway_rim():
+    tube = open_tube(radius=1e-4, length=1e-3, n_sides=8, n_rings=4)
+    with pytest.raises(TemplateQualityError, match="flow-extension layers"):
+        add_flow_extensions(tube, extension_length=5.0)
+
+
+def test_original_cell_mask_separates_the_extension():
+    tube = open_tube()
+    extended = add_flow_extensions(tube, extension_length=3.0)
+    _ext, mask = original_cell_mask(extended, tube)
+    assert mask.sum() == tube.GetNumberOfCells()
+    assert (~mask).sum() > 0
+
+
+def test_trim_extension_patches_removes_an_oblique_tube():
+    """The cutter's cylinder misses a tube that leans away from the tangent."""
+    tube = open_tube(radius=1.0, length=6.0)
+    extended = add_flow_extensions(tube, extension_length=4.0)
+    area_tube = vtk_area(tube)
+    assert vtk_area(extended) > 1.5 * area_tube
+
+    frames = [
+        (np.array([0.0, 0.0, 3.0]), np.array([0.0, 0.0, 1.0]), 1.0),
+        (np.array([0.0, 0.0, -3.0]), np.array([0.0, 0.0, -1.0]), 1.0),
+    ]
+    trimmed, n_trimmed = trim_extension_patches(extended, tube, frames)
+    assert n_trimmed == 2
+    assert vtk_area(trimmed) == pytest.approx(area_tube, rel=0.02)
+
+
+def test_trimmed_clip_height_is_short_enough_for_a_siphon():
+    """A 12 mm cutter reaches the other limb of a tortuous vessel; 3 mm does not."""
+    assert _opening_clip_height(1.66, extension_length=5.0) > 10.0
+    assert _opening_clip_height(1.66, extension_length=5.0, trimmed=True) < 4.0
+    assert _opening_clip_height(0.1, trimmed=True) >= 0.75
+
+
+def test_keep_region_with_point_drops_a_severed_limb():
+    body = open_tube(radius=1.0, length=6.0)
+    limb = open_tube(radius=1.0, length=6.0, center=(20.0, 0.0, 0.0))
+    append = vtk.vtkAppendPolyData()
+    append.AddInputData(body)
+    append.AddInputData(limb)
+    append.Update()
+    both = append.GetOutput()
+
+    kept = _keep_region_with_point(both, (0.0, 0.0, 0.0))
+    assert kept.GetNumberOfPoints() < both.GetNumberOfPoints()
+    bounds = kept.GetBounds()
+    assert bounds[1] < 10.0
+
+
+def test_uncap_closed_surface_opens_a_capped_tube():
+    closed = capped_tube(radius=1.0, length=6.0)
+    assert len(boundary_loop_radii(closed)) == 0
+
+    opened = uncap_closed_surface(closed)
+    loops = boundary_loop_radii(opened)
+    assert len(loops) == 2
+    assert all(radius == pytest.approx(1.0, rel=0.05) for radius, _n, _b in loops)
+
+
+def test_uncap_closed_surface_leaves_an_open_vessel_alone():
+    tube = open_tube()
+    out = uncap_closed_surface(tube)
+    assert out.GetNumberOfCells() == tube.GetNumberOfCells()
+
+
+def test_is_disc_accepts_a_fan_and_rejects_a_closed_shell():
+    fan = np.array([[0, 1, 4], [1, 2, 4], [2, 3, 4]], dtype=np.int64)
+    assert _is_disc(fan)
+    tetra = np.array([[0, 1, 2], [0, 2, 3], [0, 3, 1], [1, 3, 2]], dtype=np.int64)
+    assert not _is_disc(tetra)
+
+
+def test_clip_area_loss_budget_is_tight_enough_to_catch_a_lost_branch():
+    # The 2026-09-17 failures lost 12-30% of the surface to a single cut.
+    assert CLIP_MAX_AREA_LOSS_FRACTION <= 0.15
+
+
+def test_fan_fill_closes_a_loop_the_capper_cannot_walk():
+    """The vmtk capper bails on rims with a branching vertex; the fan never does."""
+    tube = open_tube()
+    _p, pts, faces = _triangle_points_faces(tube)
+    keep = np.ones(len(faces), dtype=bool)
+    keep[len(faces) // 2] = False
+    punctured = _polydata_from_triangles(pts, faces[keep])
+    assert len(boundary_loop_radii(punctured)) == 3
+
+    filled, n_filled = fan_fill_small_loops(punctured)
+    assert n_filled == 1
+    loops = boundary_loop_radii(filled)
+    assert len(loops) == 2
+    assert all(radius > 0.5 for radius, _n, _bary in loops)
+
+
+def test_fan_fill_leaves_the_ostia_open():
+    tube = open_tube()
+    filled, n_filled = fan_fill_small_loops(tube)
+    assert n_filled == 0
+    assert len(boundary_loop_radii(filled)) == 2
+
+
+def test_finalize_surface_repairs_what_the_quality_gate_checks():
+    """A surface with a puncture, a stuck sheet and a micron edge must come out clean."""
+    tube = open_tube()
+    _p, pts, faces = _triangle_points_faces(tube)
+    keep = np.ones(len(faces), dtype=bool)
+    keep[len(faces) // 2] = False
+    faces = faces[keep]
+    a, b = _interior_edge(faces)
+    pts = np.vstack([pts, pts[a] + np.array([0.0, 0.0, 2.0]), pts[0] + np.array([2e-6, 0.0, 0.0])])
+    faces = np.vstack(
+        [
+            faces,
+            np.array([[a, b, len(pts) - 2]]),
+            np.array([[0, len(pts) - 1, int(faces[0][1])]]),
+        ]
+    )
+    dirty = _polydata_from_triangles(pts, faces)
+    topo = inspect_surface_topology(dirty)
+    assert topo["n_nonmanifold"] > 0
+    assert topo["min_edge"] < MIN_EDGE_LENGTH_MM
+
+    final, n_regions = finalize_surface(dirty)
+    topo = inspect_surface_topology(final)
+    assert n_regions == 1
+    assert topo["n_nonmanifold"] == 0
+    assert topo["min_edge"] >= MIN_EDGE_LENGTH_MM
+    loops = boundary_loop_radii(final)
+    assert len(loops) == 2
+    assert all(radius > 0.5 for radius, _n, _bary in loops)
+
+
+def test_repairs_did_not_relax_the_training_objectives():
+    """The robustness work must not cost edge uniformity, detail or the gates."""
+    import remeshing as rm
+
+    assert rm.DEFAULT_GT_EDGE_LENGTH_MM == 0.15
+    assert rm.GT_REMESH_N_ITER == 20
+    # Light Taubin only: pass band near 2 barely filters, and few iterations.
+    assert rm.GT_TAUBIN_PASS_BAND >= 1.4
+    assert rm.GT_TAUBIN_ITER <= 8
+    # The area gates still bracket the original closely.
+    assert rm.GT_MIN_AREA_RATIO >= 0.88
+    assert rm.GT_MAX_AREA_RATIO <= 1.20
+    # Welding must stay far below the target edge so it cannot smooth anything.
+    from vessel_pipeline import WELD_TOLERANCE_MM, WALL_PINHOLE_RADIUS_MM
+
+    assert WELD_TOLERANCE_MM <= rm.DEFAULT_GT_EDGE_LENGTH_MM / 100.0
+    # Only sub-ostium holes may be patched shut.
+    assert WALL_PINHOLE_RADIUS_MM <= 0.2
+
+
+def test_prepare_gt_surface_still_keeps_the_original_tessellation():
+    """Repairs may remove debris; they may not resample the aneurysm wall."""
+    import remeshing as rm
+
+    tube = open_tube(n_sides=60, n_rings=60)
+    prepared = rm.prepare_gt_surface(tube)
+    assert prepared.GetNumberOfPoints() == tube.GetNumberOfPoints()
+    assert vtk_area(prepared) == pytest.approx(vtk_area(tube), rel=1e-6)
