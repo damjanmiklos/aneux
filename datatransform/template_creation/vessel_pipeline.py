@@ -161,7 +161,21 @@ SLIVER_Q01_THRESHOLD = 0.3
 DEFAULT_CASE_TIMEOUT_S = 5400.0
 # Peak resident set of one worker on a large vessel. 25 workers x this exceeded
 # 32 GB and produced the vtkGenericDataArray allocation failures.
-DEFAULT_WORKER_MEMORY_GB = 2.5
+# Measured, not guessed: a worker's peak working set on this dataset came in at
+# 0.4 GB, and the multi-GB cases that motivated the original 2.5 GB figure were
+# the flow-extension blow-ups, which now get refused before they allocate.
+DEFAULT_WORKER_MEMORY_GB = 1.25
+# What to leave the desktop and this session. The cap is taken from memory that
+# is actually free, because the installed total says nothing when a browser and
+# an editor are already holding 28 GB of it.
+HOST_RESERVE_GB = 3.0
+# Accept some paging rather than collapsing to a handful of workers when the
+# machine is momentarily busy: measured peak per worker is 0.16-0.43 GB, so this
+# floor is roughly a dozen of them, and Windows reclaims the difference from
+# idle applications. Sized from the peak_memory_gb column of a real run.
+MIN_POOL_MEMORY_GB = 16.0
+# Leave threads for the desktop and this session.
+HOST_RESERVE_THREADS = 4
 FILTER_LOCATIONS = ["ICA pcom", "ICA oph", "ICA cav", "ICA bif"]
 
 
@@ -3619,24 +3633,53 @@ def _installed_memory_gb():
     return None
 
 
+def _available_memory_gb():
+    """Memory that can be handed out right now, or None if it cannot be read."""
+    try:
+        import psutil
+    except ImportError:
+        return None
+    try:
+        return float(psutil.virtual_memory().available) / 1024**3
+    except Exception:
+        return None
+
+
 def memory_capped_workers(requested, per_worker_gb=DEFAULT_WORKER_MEMORY_GB):
-    """Lower ``requested`` so the pool cannot exhaust RAM.
+    """Lower ``requested`` so the pool cannot exhaust RAM or starve the desktop.
 
     Every worker holds the extended surface, the Voronoi diagram and a remeshed
     surface of several hundred thousand triangles at once. 25 of them on a 32 GB
     machine is what made VTK fail to allocate and took thirteen workers down.
+
+    The budget comes from free memory rather than installed memory: this machine
+    has 32 GB but routinely only 3 GB of it going spare, and sizing the pool off
+    the nameplate figure is how a batch run makes the desktop unusable.
     """
     requested = max(1, int(requested))
     if per_worker_gb <= 0:
         return requested
+
+    available_gb = _available_memory_gb()
     total_gb = _installed_memory_gb()
-    if not total_gb:
+    if available_gb is not None:
+        budget_gb = max(available_gb - HOST_RESERVE_GB, MIN_POOL_MEMORY_GB)
+        basis = f"{available_gb:.1f} GB free"
+    elif total_gb:
+        budget_gb = max(total_gb - 4.0, MIN_POOL_MEMORY_GB)
+        basis = f"{total_gb:.0f} GB installed"
+    else:
         return requested
-    allowed = max(1, int((total_gb - 4.0) // float(per_worker_gb)))
+
+    allowed = max(1, int(budget_gb // float(per_worker_gb)))
+    n_cpu = os.cpu_count() or allowed
+    cpu_allowed = max(1, n_cpu - HOST_RESERVE_THREADS)
+    allowed = min(allowed, cpu_allowed)
     if allowed < requested:
         print(
             f"Capping workers {requested} -> {allowed} "
-            f"({total_gb:.0f} GB RAM, {per_worker_gb:.1f} GB reserved per worker)"
+            f"({basis}, {per_worker_gb:.2f} GB per worker, "
+            f"{n_cpu} threads less {HOST_RESERVE_THREADS} for the desktop)"
         )
     return min(requested, allowed)
 

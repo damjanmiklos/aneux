@@ -20,6 +20,7 @@ CASE_LOG: ContextVar[dict | None] = ContextVar("batch_case_log", default=None)
 SUMMARY_FIELDS = [
     "dataset_id",
     "status",
+    "peak_memory_gb",
     "step",
     "error_type",
     "error_message",
@@ -70,6 +71,22 @@ class StreamTee:
 
 def utc_now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def peak_memory_gb():
+    """Peak working set of this worker, so the pool size can be sized on data.
+
+    Each case runs in its own process, so this is that case's own high-water
+    mark rather than the pool's.
+    """
+    try:
+        import psutil
+
+        info = psutil.Process().memory_info()
+        peak = getattr(info, "peak_wset", None) or getattr(info, "rss", 0)
+        return round(float(peak) / 1024**3, 3)
+    except Exception:
+        return ""
 
 
 def set_step(name):
@@ -409,6 +426,7 @@ def run_logged_case(dataset_id, v_file, args, work, log_folder_name, default_out
             rec["step"] = last_step_from_output(captured) or rec["step"]
         rec["finished_at"] = utc_now()
         rec["duration_s"] = round(time.perf_counter() - t0, 3)
+        rec["peak_memory_gb"] = peak_memory_gb()
         try:
             write_case_log(log_dir, rec)
         except Exception as log_exc:
