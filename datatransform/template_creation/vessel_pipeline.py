@@ -1512,6 +1512,77 @@ def collapse_small_boundary_components(
     return collapsed, len(small)
 
 
+def collapse_pinhole_loops(
+    surface, min_radius=WALL_PINHOLE_RADIUS_MM, label="surface", profiles=None
+):
+    """Weld each sub-ostium boundary loop down to a single point.
+
+    This works per loop where collapse_small_boundary_components works per
+    free-edge component, and that difference is the whole point: a puncture
+    whose rim touches an ostium's rim shares a component with it, so the merged
+    component measures far too large to look like a pinhole and nothing gets
+    closed at all. The boundary extractor still separates the two as loops, so
+    collapsing per loop reaches punctures the component pass cannot.
+    """
+    poly, pts, faces = _triangle_points_faces(surface)
+    if faces.size == 0:
+        return poly, 0
+    loops = extract_boundary_loops(poly)
+    n_loops = loops.GetNumberOfCells()
+    if n_loops == 0:
+        return poly, 0
+
+    locator = vtk.vtkStaticPointLocator()
+    locator.SetDataSet(poly)
+    locator.BuildLocator()
+
+    small, n_keep = [], 0
+    for i in range(n_loops):
+        cell = loops.GetCell(i)
+        n = cell.GetNumberOfPoints()
+        if n == 0:
+            continue
+        coords = np.array(
+            [cell.GetPoints().GetPoint(j) for j in range(n)], dtype=np.float64
+        )
+        center = coords.mean(axis=0)
+        radius = float(np.mean(np.linalg.norm(coords - center, axis=1)))
+        if not _is_wall_pinhole((radius, int(n), center), min_radius, profiles):
+            n_keep += 1
+            continue
+        ids = {int(locator.FindClosestPoint(xyz)) for xyz in coords}
+        small.append((ids, center, radius))
+    if not small:
+        return poly, 0
+    if n_keep < 2:
+        print(
+            f"  WARNING: collapsing {len(small)} pinhole loop(s) on the {label} would "
+            f"leave {n_keep} opening(s); leaving them in place"
+        )
+        return poly, 0
+
+    pts_list = pts.tolist()
+    remap = {}
+    for ids, center, _radius in small:
+        pts_list.append(center.tolist())
+        target = len(pts_list) - 1
+        for pid in ids:
+            remap[pid] = target
+    new_faces = []
+    for a, b, c in faces.tolist():
+        a, b, c = remap.get(a, a), remap.get(b, b), remap.get(c, c)
+        if a == b or b == c or c == a:
+            continue
+        new_faces.append([a, b, c])
+    collapsed = _polydata_from_triangles(
+        np.asarray(pts_list, dtype=np.float64),
+        np.asarray(new_faces, dtype=np.int64).reshape(-1, 3),
+    )
+    radii = ", ".join(f"{r:.4f}" for _i, _c, r in small)
+    print(f"  Collapsed {len(small)} pinhole loop(s) on the {label} (r={radii} mm)")
+    return collapsed, len(small)
+
+
 def close_wall_pinholes(surface, min_radius=WALL_PINHOLE_RADIUS_MM, label="surface", max_passes=4, profiles=None):
     """Patch pinholes until none are left; each fan can expose the next one."""
     total = 0
@@ -1534,6 +1605,19 @@ def close_wall_pinholes(surface, min_radius=WALL_PINHOLE_RADIUS_MM, label="surfa
         )
         total += n_collapsed
         if n_collapsed == 0:
+            break
+        current, _n_forced = force_manifold_triangles(current)
+        if not any(
+            _is_wall_pinhole(lp, min_radius, profiles) for lp in boundary_loop_radii(current)
+        ):
+            return current, total
+    # A rim that touches an ostium's rim hides inside its free-edge component.
+    for _ in range(int(max_passes)):
+        current, n_loops = collapse_pinhole_loops(
+            current, min_radius=min_radius, label=label, profiles=profiles
+        )
+        total += n_loops
+        if n_loops == 0:
             break
         current, _n_forced = force_manifold_triangles(current)
         if not any(
@@ -3037,7 +3121,11 @@ def finalize_surface(surface, profiles=None, max_passes=6):
     for _ in range(int(max_passes)):
         if best_defects == (0, 0, 0, 0):
             break
-        signature = (cleaned.GetNumberOfPoints(), cleaned.GetNumberOfCells(), best_defects)
+        signature = (
+            cleaned.GetNumberOfPoints(),
+            cleaned.GetNumberOfCells(),
+            _finalize_defects(cleaned, profiles, n_regions),
+        )
         if signature in seen:
             print("  Repair loop reached a fixed point; keeping the best surface so far")
             break

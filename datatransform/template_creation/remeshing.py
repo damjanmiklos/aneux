@@ -47,6 +47,7 @@ from batch_run_log import (
     configure_batch_logging,
     finalize_run_logs,
     merge_run_logs,
+    record,
     run_logged_case,
     set_step,
     warn,
@@ -325,6 +326,12 @@ def process_gt_remesh_dataset(
         f"  -> Verified Open Boundaries Count: {len(openings)} "
         f"(anatomical profiles {n_in}, pipe-section clipped {n_clipped})"
     )
+    if len(openings) != n_in:
+        print(
+            f"  WARNING: {len(openings)} openings but {n_in} anatomical profiles; "
+            f"the surplus are leftover tears, not ostia"
+        )
+    record(n_openings=len(openings), n_profiles=n_in, n_clipped=n_clipped)
     return out_file
 
 

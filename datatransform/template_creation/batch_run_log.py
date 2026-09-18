@@ -21,6 +21,10 @@ SUMMARY_FIELDS = [
     "dataset_id",
     "status",
     "peak_memory_gb",
+    "n_openings",
+    "n_profiles",
+    "n_clipped",
+    "area_ratio",
     "step",
     "error_type",
     "error_message",
@@ -93,6 +97,13 @@ def set_step(name):
     rec = CASE_LOG.get()
     if rec is not None:
         rec["step"] = name
+
+
+def record(**fields):
+    """Attach measured values to this case's log row."""
+    rec = CASE_LOG.get()
+    if rec is not None:
+        rec.update(fields)
 
 
 def warn(msg):

@@ -529,3 +529,71 @@ def test_finalize_returns_the_best_surface_not_the_last():
     assert n_regions == 1
     # whatever path it took, what comes back must be no worse than clean
     assert _finalize_defects(fixed, None, n_regions)[0] == 0
+
+
+def _component_and_loop_radii(surface):
+    """Radius of each free-edge component, and of each boundary loop."""
+    from vessel_pipeline import (
+        _boundary_component_extent,
+        _free_edge_components,
+        boundary_loop_radii,
+    )
+
+    _poly, pts, faces = _triangle_points_faces(surface)
+    comps = _free_edge_components(pts, faces)
+    comp_radii = [_boundary_component_extent(pts, ids)[1] for ids in comps]
+    loop_radii = [lp[0] for lp in boundary_loop_radii(surface)]
+    return comp_radii, loop_radii
+
+
+def test_a_pinched_pair_hides_inside_one_free_edge_component():
+    """Documents why the per-loop pass exists.
+
+    Two punctures meeting at a vertex share a free-edge component, and that
+    component measures larger than either hole. A threshold that catches the
+    holes therefore misses the component -- on ANSYS_UNIGE_30_614 the component
+    was fused to an ostium rim and an r=0.08 mm hole reached the quality gate.
+    """
+    comp_radii, loop_radii = _component_and_loop_radii(_pinch_two_holes())
+    small_loops = sorted(loop_radii)[:2]
+    fused = min(r for r in comp_radii if r > max(small_loops))
+    assert fused > max(small_loops), (
+        f"the fused component {fused:.3f} must measure larger than its holes "
+        f"{small_loops}"
+    )
+
+
+def test_loop_collapse_reaches_what_component_collapse_cannot():
+    from vessel_pipeline import (
+        _is_wall_pinhole,
+        boundary_loop_radii,
+        collapse_pinhole_loops,
+        collapse_small_boundary_components,
+        count_connected_regions,
+        inspect_surface_topology,
+    )
+
+    holed = _pinch_two_holes()
+    comp_radii, loop_radii = _component_and_loop_radii(holed)
+    small_loops = sorted(loop_radii)[:2]
+    fused = min(r for r in comp_radii if r > max(small_loops))
+    # a threshold that catches both holes but not the component they share
+    cutoff = 0.5 * (max(small_loops) + fused)
+
+    _unchanged, n_comp = collapse_small_boundary_components(holed, min_radius=cutoff)
+    assert n_comp == 0, "the component pass cannot see these holes"
+
+    fixed, n_loop = collapse_pinhole_loops(holed, min_radius=cutoff)
+    assert n_loop == 2, "the per-loop pass closes both"
+    assert not [lp for lp in boundary_loop_radii(fixed) if _is_wall_pinhole(lp, cutoff)]
+    assert inspect_surface_topology(fixed)["n_nonmanifold"] == 0
+    assert count_connected_regions(fixed) == 1
+
+
+def test_loop_collapse_also_refuses_to_close_the_last_openings():
+    from vessel_pipeline import boundary_loop_radii, collapse_pinhole_loops
+
+    tube = open_tube(n_sides=40, n_rings=30)
+    fixed, n = collapse_pinhole_loops(tube, min_radius=5.0, label="test surface")
+    assert n == 0
+    assert len(boundary_loop_radii(fixed)) == 2
