@@ -2637,7 +2637,10 @@ def clip_one_profile(surface, profile, body_point, search_mm):
     cleaner = vtk.vtkCleanPolyData()
     cleaner.SetInputConnection(connectivity.GetOutputPort())
     cleaner.Update()
-    candidate = to_vtk_poly(cleaner.GetOutput())
+    # This cleaner runs at the default tolerance, so it merges only points that
+    # are exactly equal and leaves everything the seam clip shaved off a vertex.
+    # Same cut, same slivers, same consequences as the pipe-section one.
+    candidate = weld_clip_slivers(cleaner.GetOutput())
 
     n_prev = surface.GetNumberOfPoints()
     n_cand = candidate.GetNumberOfPoints()
