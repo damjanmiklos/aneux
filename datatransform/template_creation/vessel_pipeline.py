@@ -3636,7 +3636,19 @@ def remesh_surface_isotropically(
     remesher.PreserveBoundaryEdges = 1
     remesher.NumberOfIterations = int(n_iter)
     remesher.NumberOfConnectivityOptimizationIterations = int(connectivity_iter)
-    remesher.MinEdgeLength = float(REMESH_MIN_EDGE_MM)
+    # No MinEdgeLength here, because setting it would do nothing. vmtk turns
+    # that number into the MinArea the remesher actually reads, and it only
+    # does so in the `edgelengtharray` branch (vmtksurfaceremeshing.py:110-111);
+    # in `edgelength` mode MinArea keeps its 0.0 default whatever we assign. So
+    # this path -- the one the ground-truth remesh takes -- has never had the
+    # 0.01 mm floor it looked like it had, which is worth knowing next to a run
+    # that logged 46 degenerate min edges with a median of 1e-06 mm. It is not
+    # the cause: those edges come in with the surface, the clippers make them
+    # and the pre-remesh weld multiplied them, and with that fixed the same
+    # cases come out at 3.1e-02 mm. If a floor is ever wanted here it has to be
+    # `remesher.MinArea = 0.25 * 3.0**0.5 * REMESH_MIN_EDGE_MM**2`, and it
+    # should be measured before it is trusted -- a nonzero MinArea gives the
+    # remesher licence to collapse triangles, which is not free.
     remesher.Execute()
     return to_vtk_poly(remesher.Surface)
 
