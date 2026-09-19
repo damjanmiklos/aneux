@@ -974,6 +974,56 @@ def _centerline_reaches_targets(centerline, n_targets):
     return n_cells >= int(n_targets)
 
 
+# How far the nearest centerline point may sit from an ostium and still count as
+# having arrived there, in units of that ostium's own radius.
+#
+# The trace is seeded on the ostium barycentres, so on a branch it reaches it
+# comes within a rounding error of them -- and where it does not, it is not
+# merely further away, it is in a different vessel. Measured over 391 openings
+# in 72 cases the two populations do not overlap or even approach each other:
+#
+#     arrived   p50 0.08, p90 0.79, largest 1.01
+#     missed    9.34, 9.37, 10.37, 11.54, 11.58, 13.17, 13.43
+#
+# Nothing at all falls between 1.01 and 9.34. Two radii sits in that gap with a
+# factor of two below it and nearly five above, and it selects exactly the seven
+# openings that were genuinely never visited, in two cases. The floor is three
+# times the 0.1 mm centerline resampling step, so an ostium small enough that
+# the resampling alone keeps the trace off its barycentre is not failed for it.
+CENTERLINE_ARRIVAL_RADII = 2.0
+CENTERLINE_ARRIVAL_FLOOR_MM = 0.3
+
+
+def centerline_arrival_gaps(centerline, profiles):
+    """Distance from each ostium barycentre to the nearest point on the trace."""
+    from scipy.spatial import cKDTree
+
+    points = np.asarray(pv.wrap(to_vtk_poly(centerline)).points, dtype=float)
+    if points.size == 0:
+        return np.full(len(profiles), np.inf)
+    tree = cKDTree(points)
+    return np.array(
+        [float(tree.query(np.asarray(p["barycenter"], dtype=float))[0]) for p in profiles],
+        dtype=float,
+    )
+
+
+def centerline_arrivals(centerline, profiles):
+    """Which openings this trace actually reaches, and how far it missed the rest."""
+    gaps = centerline_arrival_gaps(centerline, profiles)
+    limits = np.array(
+        [
+            max(
+                CENTERLINE_ARRIVAL_RADII * float(p["radius"]),
+                CENTERLINE_ARRIVAL_FLOOR_MM,
+            )
+            for p in profiles
+        ],
+        dtype=float,
+    )
+    return gaps <= limits, gaps
+
+
 CENTERLINE_TIMEOUT_S = 600.0
 
 
@@ -1124,20 +1174,61 @@ def extract_centerlines_for_tube(extended_vessel, smoothed_vessel, anatomical_pr
             "but VMTK could not trace a path inside the tube."
         )
 
-    scored = [
-        (centerline_anatomical_coverage(cl, anatomical_profiles), name, cl, want)
-        for name, cl, want in candidates
-    ]
-    scored.sort(key=lambda row: row[0], reverse=True)
-    coverage, name, chosen, want = scored[0]
-    if len(scored) > 1:
-        other_cov, other_name = scored[1][0], scored[1][1]
-        gap = (coverage - other_cov) / other_cov if other_cov else float("inf")
-        if abs(gap) > 0.02:
-            print(
-                f"  NOTE: centerline taken from the {name}: it covers {coverage} "
-                f"voxels against {other_cov} for the {other_name} ({gap:+.1%})"
+    # Coverage alone is too blunt to choose between these. On SNF00000607_01 the
+    # extended trace never goes near three of the eight ostia -- 3.56, 3.84 and
+    # 4.63 mm from openings of radius 0.38, 0.29 and 0.40 -- while the bare trace
+    # arrives at all eight, and yet the extended one wins on voxels by 2.8% (330
+    # to 322), because the branches it drops are short and the trunk it re-walks
+    # is not. Picking it there cost the 0.296 mm ostium its frame: with no
+    # centerline at the opening, opening_clip_frames read MISR off a vessel
+    # 3.9 mm away and cut that ostium at 0.874 mm, three times too wide.
+    #
+    # An opening the trace never visits is not a smaller amount of the same good;
+    # it is a branch this vessel has and this centerline does not. So arrivals
+    # are counted first, and coverage only separates traces that arrive at the
+    # same openings.
+    scored = []
+    for name, cl, want in candidates:
+        arrived, gaps = centerline_arrivals(cl, anatomical_profiles)
+        scored.append(
+            (
+                int(arrived.sum()),
+                centerline_anatomical_coverage(cl, anatomical_profiles),
+                name,
+                cl,
+                want,
+                arrived,
+                gaps,
             )
+        )
+    scored.sort(key=lambda row: (row[0], row[1]), reverse=True)
+    n_arrived, coverage, name, chosen, want, arrived, gaps = scored[0]
+    if len(scored) > 1:
+        other = scored[1]
+        if n_arrived != other[0]:
+            print(
+                f"  NOTE: centerline taken from the {name}: it reaches "
+                f"{n_arrived}/{len(anatomical_profiles)} openings against "
+                f"{other[0]} for the {other[2]}"
+            )
+        else:
+            other_cov = other[1]
+            drift = (coverage - other_cov) / other_cov if other_cov else float("inf")
+            if abs(drift) > 0.02:
+                print(
+                    f"  NOTE: centerline taken from the {name}: it covers {coverage} "
+                    f"voxels against {other_cov} for the {other[2]} ({drift:+.1%})"
+                )
+    if not bool(arrived.all()):
+        missed = ", ".join(
+            f"profile {anatomical_profiles[i]['index']} "
+            f"(r={anatomical_profiles[i]['radius']:.3f} mm, {gaps[i]:.2f} mm away)"
+            for i in np.flatnonzero(~arrived)
+        )
+        print(
+            f"  WARNING: the {name} centerline never reaches {missed}; those "
+            f"openings are cut on their own measured plane instead."
+        )
 
     if not _centerline_reaches_targets(chosen, want):
         raise TemplateQualityError(
@@ -2635,7 +2726,18 @@ def opening_clip_frames(centerline, profiles):
         profile_r = max(float(profile["radius"]), MIN_OPENING_RADIUS_MM)
         pid = locator.FindClosestPoint(_vec3(origin))
         closest = np.asarray(vtk_cl.GetPoint(pid), dtype=np.float64)
-        if np.linalg.norm(closest - origin) > 8.0 * max(profile_r, 0.5):
+        # The old bar here was eight radii or 4 mm, whichever was larger, which
+        # for a small ostium is no bar at all: SNF00000607_01's 0.296 mm opening
+        # had no centerline point within 3.9 mm and still took its frame from
+        # one, inheriting a 0.874 mm inscribed radius off a vessel it has
+        # nothing to do with. The pipe-section cutter widens that again, to
+        # max(1.5 r, r + 0.2) = 1.31 mm, and bites 4.4 radii of wall out around
+        # a rim it was only supposed to trim. Where the trace is not actually at
+        # the opening, the profile measured on the surface is the better
+        # authority, and it is what this falls back to.
+        if np.linalg.norm(closest - origin) > max(
+            CENTERLINE_ARRIVAL_RADII * profile_r, CENTERLINE_ARRIVAL_FLOOR_MM
+        ):
             tangent = profile_n
             radius = profile_r
         else:
@@ -2793,7 +2895,7 @@ def _clip_opening_cap_locally(surface, origin, outward, radius, extension_length
     clipper.InsideOutOff()
     clipper.GenerateClippedOutputOff()
     clipper.Update()
-    clipped = clean_triangulate(clipper.GetOutput())
+    clipped = weld_clip_slivers(clean_triangulate(clipper.GetOutput()))
     if clipped.GetNumberOfPoints() == 0:
         return to_vtk_poly(surface)
     return _delete_outboard_leftover(clipped, origin, outward, radius)
@@ -3119,7 +3221,7 @@ def _clip_patch_at_plane(patch, origin, outward):
     clipper.InsideOutOn()
     clipper.GenerateClippedOutputOff()
     clipper.Update()
-    return clean_triangulate(clipper.GetOutput())
+    return weld_clip_slivers(clean_triangulate(clipper.GetOutput()))
 
 
 def trim_extension_patches(extended_surface, original_surface, frames):
@@ -3617,6 +3719,40 @@ REMESH_WELD_FRACTIONS = (0.0, 0.05, 0.10, 0.15, 0.25)
 # degenerate tails and jagged rims, so a mesh rescued here is worse than one the
 # weld sweep rescued, and the log says which happened.
 REMESH_ITER_FALLBACKS = ((4, 6),)
+
+
+# Every cut this pipeline makes is a plane or a cylinder through a triangle
+# mesh, and wherever the cutter passes close to a vertex it keeps that vertex
+# and adds another one microns away. vtkCleanPolyData then merges nothing,
+# because its default tolerance is zero and the two points are not equal, only
+# indistinguishable.
+#
+# On p551 that is the whole failure. Trimming the extension patches takes the
+# shortest edge from 2.20e-03 mm to 1.92e-05 and leaves 19 sub-micron edges on
+# one ostium rim; the pipe-section cut at that same ostium turns them into 130
+# vertex pairs within 5 microns of each other; close_wall_pinholes patches the
+# mess and adds 22 more; and the light Taubin pass, where a vertex whose
+# neighbours are all microns away is pulled in with them, finally draws 27
+# vertices into a ball a tenth of a millimetre across -- still carrying their
+# original long connections, mean edge 0.83 mm against the mesh's 0.196. The
+# remesher is handed that and builds a tent on it: 368 triangles on one vertex,
+# spokes out to 9.3 mm.
+#
+# Welding it at the end does not help, and that is the point. By then the ball
+# exists, and merging it leaves one vertex holding every long edge that ran
+# into it -- the same hub, arrived at by a different route. The slivers have to
+# go when they are made, before the next step builds on them, which is why this
+# runs at each cut rather than once before the remesh.
+#
+# A twentieth of the mean edge is far below anything real: on p551 it is
+# 0.0098 mm against a 1st-percentile legitimate edge of 0.109, an eleven-fold
+# margin, and it catches every one of the slivers.
+CLIP_SLIVER_WELD_FRACTION = 0.05
+
+
+def weld_clip_slivers(surface):
+    """Merge the near-coincident vertices a cut leaves behind."""
+    return weld_to_edge_fraction(surface, CLIP_SLIVER_WELD_FRACTION)
 
 
 def weld_to_edge_fraction(surface, fraction):
