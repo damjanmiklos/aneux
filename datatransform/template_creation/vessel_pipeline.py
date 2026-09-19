@@ -868,10 +868,52 @@ def cap_surface(open_surface, displacement=DEFAULT_CAP_DISPLACEMENT):
     return recompute_point_normals(capped, auto_orient=True)
 
 
+# vtkDelaunay3D places each tetrahedron's circumsphere by factoring a 4x4
+# system, and a flow extension is the one thing on these surfaces that makes
+# that system singular: an extension patch is a boundary ring swept along a
+# single straight axis, so its points lie in exact concentric circles on exact
+# parallel planes, and four of them are cospherical far more often than
+# anything organic is. A failed factorisation is not an error the tessellator
+# raises, it is one it grinds on -- SNF00000261 logs 375 "Unable to factor
+# linear system" warnings and is still inside vmtkDelaunayVoronoi a quarter of
+# an hour later, while the same vessel without its extensions traces in 7 s.
+# In the 747-case run, where nothing yet put a clock on the trace, that one
+# case ran 57,019 s: 15.8 hours against a median of 1,024, and the same failure
+# as the six vessels that never came back at all.
+#
+# Raising or removing DelaunayTolerance does not touch it -- 0.0 and 0.01 both
+# hang with the same 375 warnings -- because the points are not coincident,
+# they are cospherical. Moving every point by a fraction of a micron destroys
+# that without moving the geometry: the sigma below is about 1/1900 of the mean
+# edge on that surface and 1/680 of the distance at which the tessellator
+# already calls two points the same one, so the only tetrahedra it can change
+# are the degenerate ones that had no well-defined circumsphere to start with.
+# It takes SNF00000261 from 375 warnings to none and from hanging to 16.5 s.
+#
+# The seed is fixed, so the same case traces the same line on every run.
+DELAUNAY_JITTER_MM = 1e-4
+DELAUNAY_JITTER_SEED = 0
+
+
+def _break_tessellation_degeneracy(closed_surface, sigma_mm=DELAUNAY_JITTER_MM):
+    """A sub-micron nudge, so no four points sit exactly on one sphere."""
+    poly = vtk.vtkPolyData()
+    poly.DeepCopy(to_vtk_poly(closed_surface))
+    points = poly.GetPoints()
+    if points is None or points.GetNumberOfPoints() == 0 or sigma_mm <= 0.0:
+        return poly
+    coords = vtk_to_numpy(points.GetData()).astype(float)
+    rng = np.random.default_rng(DELAUNAY_JITTER_SEED)
+    coords += rng.normal(0.0, float(sigma_mm), coords.shape)
+    points.SetData(numpy_to_vtk(coords, deep=1))
+    points.Modified()
+    return poly
+
+
 def extract_voronoi_centerlines(closed_surface, source_points, target_points):
     if not target_points:
         raise TemplateQualityError("No outlet seed points for vmtkCenterlines.")
-    vtk_poly = to_vtk_poly(closed_surface)
+    vtk_poly = _break_tessellation_degeneracy(closed_surface)
     centerlines = vmtkscripts.vmtkCenterlines()
     centerlines.Surface = vtk_poly
     centerlines.SeedSelectorName = "pointlist"
@@ -935,7 +977,8 @@ def _centerline_reaches_targets(centerline, n_targets):
 CENTERLINE_TIMEOUT_S = 600.0
 
 
-def _centerlines_in_child(closed_surface, source_points, target_points, timeout_s):
+def _centerlines_in_child(closed_surface, source_points, target_points, timeout_s,
+                          label="extended surface"):
     """extract_voronoi_centerlines, but able to give up. None when it does not finish.
 
     vmtkCenterlines tetrahedralises the whole capped surface before it traces
@@ -972,15 +1015,15 @@ def _centerlines_in_child(closed_surface, source_points, target_points, timeout_
             )
         except subprocess.TimeoutExpired:
             print(
-                f"  WARNING: centerline on the extended surface did not finish "
-                f"in {timeout_s:.0f}s; falling back to the un-extended vessel."
+                f"  WARNING: centerline on the {label} did not finish in "
+                f"{timeout_s:.0f}s; it takes no further part in the trace."
             )
             return None
         if done.returncode != 0 or not os.path.isfile(out_path):
             tail = (done.stderr or "").strip().splitlines()[-1:] or [""]
             print(
-                f"  WARNING: centerline on the extended surface failed "
-                f"({tail[0][:120]}); falling back to the un-extended vessel."
+                f"  WARNING: centerline on the {label} failed "
+                f"({tail[0][:120]}); it takes no further part in the trace."
             )
             return None
         return to_vtk_poly(pv.read(out_path))
@@ -1044,7 +1087,8 @@ def extract_centerlines_for_tube(extended_vessel, smoothed_vessel, anatomical_pr
 
     candidates = []
     extended_cl = _centerlines_in_child(
-        cap_surface(extended_vessel), source_ext, target_ext, CENTERLINE_TIMEOUT_S
+        cap_surface(extended_vessel), source_ext, target_ext, CENTERLINE_TIMEOUT_S,
+        label="extended surface",
     )
     if extended_cl is not None and centerline_looks_valid(extended_cl, ref_bounds):
         candidates.append(("extended surface", extended_cl, n_targets))
@@ -1060,10 +1104,18 @@ def extract_centerlines_for_tube(extended_vessel, smoothed_vessel, anatomical_pr
             raise
         print(f"  WARNING: anatomical cap failed ({exc}); only the extended trace is available.")
     if closed_anat is not None:
-        bare_cl = extract_voronoi_centerlines(closed_anat, source_anat, target_anat)
-        if centerline_looks_valid(bare_cl, ref_bounds):
+        # On the same clock as the extended trace. This one is the fallback and
+        # it is usually the fast one, but it runs the same tessellator on the
+        # same kind of surface, so leaving it in-process would leave exactly
+        # the hole the watchdog was written to close: a case that hangs here
+        # burns its entire budget with nothing to fall back to.
+        bare_cl = _centerlines_in_child(
+            closed_anat, source_anat, target_anat, CENTERLINE_TIMEOUT_S,
+            label="un-extended vessel",
+        )
+        if bare_cl is not None and centerline_looks_valid(bare_cl, ref_bounds):
             candidates.append(("bare vessel", bare_cl, len(target_anat)))
-        else:
+        elif bare_cl is not None:
             print("  WARNING: the bare-vessel centerline left the lumen; discarding it.")
 
     if not candidates:
