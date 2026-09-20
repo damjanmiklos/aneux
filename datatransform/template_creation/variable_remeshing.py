@@ -11,7 +11,10 @@ os.environ["VTK_NUMBER_OF_THREADS"] = "1"
 import argparse
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
-from aneux_paths import TEMPLATE_OUTPUT_VARIABLE as DEFAULT_OUTPUT_DIR
+from aneux_paths import (
+    CLEANDATA_TEMPLATE_MESH as DEFAULT_OUTPUT_DIR,
+    CLEANDATA_UNIFORM,
+)
 
 from vessel_pipeline import add_shared_cli_args, process_variable_dataset, run_batch
 
@@ -32,6 +35,7 @@ def _process_one(dataset_id, v_file, args):
 def main():
     parser = argparse.ArgumentParser(description="AneuX variable (MISR-stretch) surface remeshing pipeline")
     add_shared_cli_args(parser, DEFAULT_OUTPUT_DIR, default_workers=20, include_remesh_grid=True)
+    parser.set_defaults(vessel_dir=CLEANDATA_UNIFORM, from_folder=True)
     args = parser.parse_args()
     extra = [
         "--target-edge-length", str(args.target_edge_length),
