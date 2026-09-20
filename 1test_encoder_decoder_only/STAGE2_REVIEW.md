@@ -8,8 +8,9 @@ What changed between the previous review (`d0fdc1b`) and this one:
 - `vessel_pipeline.py`: `apply_taubin_smoothing` default `pass_band` changed from 1.0 to 0.1 (stronger smoothing, silently affecting `build_parent_tube` and `compute_centerline_from_mesh`, measured in §2.6); new `remove_spurious_openings`, extension-length-aware `_opening_clip_height`, `clip_flow_extensions_and_uncap` now also drops islands and fills leftover rims; `compute_centerline_from_mesh` extracted from `process_centerline_dataset`.
 - Nothing in `train_pipeline/` changed. `clip_centerline_at_profiles` (cell arrays dropped) and `compute_raycast_stretch_distances` (orientation-dependent) are unchanged, so P0 items 2 and 3 of the previous list are still open, and everything the previous review measured about the training side still holds and was re-verified where a fresh file made that possible.
 - §5 (latent) is rewritten: the encoding decision is examined against the literature and taken (§5.3) — a stochastic encoder kept as a rate-controlled channel, with the specification in §5.3.6 and the measurements that set its free parameters in §5.3.7. The rest of the document is aligned to it.
+- `cleandata/` was regenerated (709 GT meshes and centerlines), which allowed the last guessed number in §5 to be measured instead: the latent width. §5.3.3a estimates the degrees of freedom of one 2 mm token from 38 689 measured wall patches by four independent methods and fixes `LATENT_DIM = 16`; §5.3.5 replaces the single-case heterogeneity argument with the population table; §5.3.8 closes option F as a replacement. The same pass measured the centerline duplication of §2.4 directly on all 709 delivered files (§2.4.2a).
 
-Decisions taken (Damján, 9 Sep) that this review builds on: training reads only `cleandata/`; `uniformly_remeshed/` is the *original vessel with the aneurysm*, finely remeshed, and is the GT for everything; templates come from `variable_remeshing.py` and are the decoder's identity surface; there is no `coarse_remeshed` — mid/coarse are decimations of the template; Stage 1 will emit the centerline at **1 mm** with a texture token every **2 mm**, along the *entire* tree; output must be a single watertight manifold with open outlets (CFD), outlet position/planarity fixed in post; HPC wall-time effectively unlimited, accuracy over speed; manual per-case work acceptable; aneurysm removal (hemoMesh) is a later topic and is not treated here. Encoding (13 Sep): keep a stochastic encoder, but as a rate-controlled channel with explicit standardisation rather than as a generative prior (option C of §5.3.4); strong regularisation toward N(0, I) is not a goal.
+Decisions taken (Damján, 9 Sep) that this review builds on: training reads only `cleandata/`; `uniformly_remeshed/` is the *original vessel with the aneurysm*, finely remeshed, and is the GT for everything; templates come from `variable_remeshing.py` and are the decoder's identity surface; there is no `coarse_remeshed` — mid/coarse are decimations of the template; Stage 1 will emit the centerline at **1 mm** with a texture token every **2 mm**, along the *entire* tree; output must be a single watertight manifold with open outlets (CFD), outlet position/planarity fixed in post; HPC wall-time effectively unlimited, accuracy over speed; manual per-case work acceptable; aneurysm removal (hemoMesh) is a later topic and is not treated here. Encoding (13 Sep): keep a stochastic encoder, but as a rate-controlled channel with explicit standardisation rather than as a generative prior (option C of §5.3.4); strong regularisation toward N(0, I) is not a goal. Latent width (20 Sep): `LATENT_DIM = 16`, set by the measurement of §5.3.3a rather than by the sweep alone; the sweep now confirms it over D ∈ {4, 8, 16, 32}.
 
 How to read this document. Each finding is written in four parts: *what the code does* (with the function names and, where it matters, the exact lines), *what was measured* (the probe, the case, the number), *why it matters for the model that will be trained*, and *what to change*. Everything that is a number was measured on real files produced by the current generators. The main case is **SNF00000100** (an ICA segment, 3 openings, one lateral aneurysm of roughly 25 mm outward extent, 22 076 original vertices, 1 320.6 mm² of wall); **C0002** (7 openings, one of which leaves the sac) is used where a second case is informative. All artifacts are under `scratch/uniform_probe/` (see Appendix A for the file list and the script that produced each number).
 
@@ -27,7 +28,7 @@ How to read this document. Each finding is written in four parts: *what the code
    - `template_centerline` is measurably the same curve as `original_centerline` (Hausdorff 0.12 mm, MISR within 0.06 mm); the training code reads the original and then ignores it in favour of the template's.
    Measured and good: the fine level *is* the posed template (identity displacement 0.0 at init); decimation kept 3 boundary loops, 1 component, 0 non-manifold edges at every level (7 909 / 1 980 / 638 vertices at 0.41 / 0.89 / 1.56 mm); kNN upsampling has no opposite-wall mixing (0.0 % / 0.04 %); template normals point outward on 99.8 % of vertices (by luck of winding, not by construction).
 5. **The Taubin default change is benign but should be known.** Windowed-sinc smoothing at pass band 0.1 × 15 iterations moves the SNF00000100 wall by 0.041 mm median / 0.178 mm max versus 0.032 / 0.092 mm at the old pass band 1.0 (§2.6). The regenerated centerline differs from the old one by ≤ 0.14 mm and the MISR by ≤ 0.06 mm; the regenerated template by ≤ 0.29 mm (mostly remesh noise). Because the GT uses an even lighter setting (1.5 × 5 iterations), the "should the GT be smoothed like the template" question of the previous review (§15.1) is answered by measurement: the two smoothing levels differ by less than one GT edge length.
-6. **Latent: decision taken; decoder kernel and training hygiene findings carry over unchanged** (§4–§8). The 96 × 128 = 12 288-dim latent is a near-autoencoder with a KL weight that contributes 0.3 % of the objective — but the weight is not the main defect: validation never samples, the log-variance clamp allows σ = 0.018, the latent mixer runs after sampling and can average the noise away, and tokens are not local (§5.1). Neither Stage-1 diffusion nor latent interpolation needs a latent pushed to N(0, I) (§5.3.1–5.3.2); the real regularisation problem is ~20 latent dimensions per training case (§5.3.3). Decision: a light, rate-controlled VAE — `LATENT_DIM` 128 → 24 (set by a rate–distortion sweep), soft σ floor 0.1, per-token rate target with an adaptive β, mixer before sampling, sampling at evaluation, post-training standardisation, and a noise-robustness curve as the Stage-1 contract (§5.3.6–5.3.7). Other carried-over findings: θ-blind SplineConv pseudo-coordinates on the template (ring neighbours land at `e_th = 0.5 ± 0.035`); `aggr="add"` without normalisation; no augmentation, no resume, `print` logging, EMA horizon 47 epochs. With the 2 mm token contract now fixed, `LATENT_LEN = 96` *fixed* slots contradicts it — on this 95 mm case the spacing is 2.02–2.04 mm by coincidence, on a 50 mm vessel it would be 1 mm.
+6. **Latent: decision taken; decoder kernel and training hygiene findings carry over unchanged** (§4–§8). The 96 × 128 = 12 288-dim latent is a near-autoencoder with a KL weight that contributes 0.3 % of the objective — but the weight is not the main defect: validation never samples, the log-variance clamp allows σ = 0.018, the latent mixer runs after sampling and can average the noise away, and tokens are not local (§5.1). Neither Stage-1 diffusion nor latent interpolation needs a latent pushed to N(0, I) (§5.3.1–5.3.2); the real regularisation problem is ~20 latent dimensions per training case (§5.3.3). Decision: a light, rate-controlled VAE — `LATENT_DIM` 128 → **16**, soft σ floor 0.1, per-token rate target with an adaptive β, mixer before sampling, sampling at evaluation, post-training standardisation with the inactive dimensions dropped first, and a noise-robustness curve as the Stage-1 contract (§5.3.6–5.3.7). The width is measured, not guessed: over 38 689 wall patches from all 709 cases, one 2 mm token's residual field has a calibrated intrinsic dimension of 8–9 under a sac and 11–13 on healthy wall, needing 9–14 and 4–6 dimensions respectively to reach 0.1 mm, while one extra token costs ≈ 1 dimension (§5.3.3a). The same patches show the heterogeneity that justifies the stochastic encoder — a sac token's residual is 12× wider in σ and 30× larger in amplitude than a healthy one, on ≈ 5 of ≈ 56 tokens per case (§5.3.5) — and rule out the analytic Fourier alternative on sacs (§5.3.8). Other carried-over findings: θ-blind SplineConv pseudo-coordinates on the template (ring neighbours land at `e_th = 0.5 ± 0.035`); `aggr="add"` without normalisation; no augmentation, no resume, `print` logging, EMA horizon 47 epochs. With the 2 mm token contract now fixed, `LATENT_LEN = 96` *fixed* slots contradicts it — on this 95 mm case the spacing is 2.02–2.04 mm by coincidence, on a 50 mm vessel it would be 1 mm.
 
 Good and worth keeping: the centerline-intrinsic design, the template as identity surface, kNN inter-level tables with `__inc__`, the decoupled radial/shear head with identity init, multi-scale point-to-plane Chamfer, cache/warm-up infrastructure and the rawdata guard, FP32/TF32, the smoke-test culture (55/55 pass), and now a GT generator with hard quality gates.
 
@@ -313,6 +314,19 @@ Reading the table:
 - **Inlet and canonical pose.** `_choose_inlet` picks the longest arm of the highest-degree node — a rule written for a tree with a bifurcation node. With two full-length paths that meet at most at the inlet seed there is no degree-3 node, the "root" is whichever endpoint the tie-break yields, and the inlet (hence the canonical pose, `u = 0`, and the Bishop frame origin) is chosen by a rule that was never meant for this input. It happens to give the inlet on SNF00000100; nothing guarantees it elsewhere.
 - **Smoothness weights and Dirichlet.** `_cross_tract_smooth` multiplies the Dirichlet/Laplacian weight by 0.05 on edges whose ends have different `tract_id`; with the random bipartition that is roughly half the parent's edges, so the smoothness terms are ~20× weaker than intended over the parent.
 
+#### 2.4.2a The same duplication measured on every `cleandata` centerline (`scratch/latent_dim/`)
+
+The scaffold probe above reads the defect through `dataset.py`. It is also directly visible in the delivered files: `cleandata/original_centerline/` stores raw VMTK paths, one per outlet, so the trunk is repeated once per path. Over all **709 files**:
+
+| quantity | p5 | p50 | p95 |
+|---|---|---|---|
+| polyline cells as stored | 6 | 22 | 68 |
+| total stored length (mm) | 138 | 335 | 739 |
+| **disjoint tracts after dedup** | **3** | **6** | **10** |
+| **actual tree length (mm)** | **60** | **120** | **216** |
+
+The stored length exceeds the true tree length by a factor of 2.8 at the median and 4.4 at p95, and **704 of 709 files are affected** (the five that are not are single-outlet segments). Any per-tract or per-token quantity computed from these files without dedup is counted three to ten times over, and any nearest-centerline-point lookup is decided by numerical noise between coincident copies — which is what §2.4.2 sees from inside `dataset.py`. The measurement in §5.3.3a therefore deduped first, by walking the cells longest-first and keeping from each only the longest contiguous run not already covered by an accepted tract. That stopgap recovers the tree geometry but not `GroupIds`, `Blanking` or the junction semantics, which is why §2.4.3 remains the fix.
+
 #### 2.4.3 The fix, both sides
 
 Generator: in `clip_centerline_at_profiles`, carry the cell arrays — either keep the (group, blanking) cell structure and copy each kept cell's tuple, or convert cell data to point data before the rebuild (`vtkCellDataToPointData`, then the existing point-array copy handles it). One function, ~10 lines.
@@ -476,7 +490,7 @@ After stage 4 there are 64 tokens of 512 features, one per ~1.5 mm of centerline
 
 1. **The input is coordinates only.** GT normals are cached (`x_true_normal`) and not fed to the encoder; nor is the one feature that would make the encoder's job explicit now that a template exists — the **signed distance of each GT point to the template** (positive outside the healthy tube = sac). Both are free: concatenate to the stem input (3 → 7 channels). The encoder's task is precisely "describe the residual"; giving it the residual as a feature removes the need to infer the tube from 16 k points.
 2. **The latent head is thin.** One head, one layer, no feed-forward block, no LayerNorm, positional queries only (the query knows *where* it is, `γ(u)` and tract, but not *what* is there until the softmax has mixed the 64 values). Angular information (θ) is not in the query or key at all — it can only arrive through the content of `h`. On a 2 mm-token contract with ~50 tokens per case, the head should be a small transformer: assign each of the 64 (or more) centres to its nearest token along the tree, pool per token (attention or max), then 2–4 self-attention layers over the token *tree* with arc-length and branch-depth positional encodings (§5.4). This is what makes tokens local, which §5.2 requires and no KL setting provides (§5.1 item 4).
-3. **Capacity is in the wrong place.** 12.6 M parameters process 64 points at stage 4; the head that has to produce 96 × 128 latent values has 1.2 M (~40–70 × 24 under §5.4 and §5.3.6). Halve stage 4 (256 wide) and give the head the difference.
+3. **Capacity is in the wrong place.** 12.6 M parameters process 64 points at stage 4; the head that has to produce 96 × 128 latent values has 1.2 M (≈ 56 × 16 under §5.4 and §5.3.6). Halve stage 4 (256 wide) and give the head the difference.
 4. **`logvar.clamp(-8, 2)`** is a hard clamp: outside the range the gradient to `logvar_head` is exactly zero, so a token whose log-variance drifts past −8 (posterior collapsed to a point) or 2 stops learning its variance. Replace it with the soft bound of §5.3.6 item 2, `log σ²_min + (log σ²_max − log σ²_min) · sigmoid(·)` with σ_min = 0.1 and σ_max = e: the gradient never dies, and the floor stops the posterior collapsing to a deterministic code (§5.1 item 2).
 5. **Batching.** With `n_graphs > 1` the head loops over graphs in Python (`for g in range(n_graphs)`); fine at batch 4–8, but the per-graph GEMM pattern means batching does not buy throughput in this module.
 
@@ -560,10 +574,12 @@ The regularisation concern behind the VAE choice is legitimate; the KL is the wr
 | latent layout | dims per case | dims per training case |
 |---|---|---|
 | **96 × 128 (as built)** | **12 288** | **19.8** |
-| 64 × 32 | 2 048 | 3.3 |
-| **64 × 24 (proposed start)** | **1 536** | **2.5** |
-| 64 × 16 | 1 024 | 1.7 |
-| 50 × 8 | 400 | 0.6 |
+| 56 × 32 | 1 792 | 2.9 |
+| 56 × 24 | 1 344 | 2.2 |
+| **56 × 16 (decided, §5.3.3a)** | **896** | **1.4** |
+| 56 × 8 | 448 | 0.7 |
+
+(56 tokens per case is the measured 2 mm token count over the whole tree, §5.3.3a, not an estimate.)
 
 Diffusion models trained on few examples relative to their target dimensionality reproduce training examples (Carlini et al. 2023; Somepalli et al. 2023), and here the conditioning — a full centerline and a condition vector — is so informative that nearest-training-case retrieval is close to optimal for most of the tree. A 12 288-dimensional Stage-1 target invites exactly that. The instruments that regularise, in order of effect:
 
@@ -573,6 +589,35 @@ Diffusion models trained on few examples relative to their target dimensionality
 4. **the geometric losses** once they are actually active (§7.1, §7.2).
 
 Rate control (option C) is the fifth item, and its value is less "regularisation" than *making the channel's capacity a chosen, logged quantity*. No achievable rate prevents a latent from carrying enough information to identify a training case (that needs only log₂ 620 ≈ 9.3 bits); memorisation is guarded by D, augmentation, and held-out evaluation (§5.3.7), not by the KL.
+
+#### 5.3.3a How wide a token has to be, measured on all 709 cases (`scratch/latent_dim/`)
+
+`LATENT_DIM` was the one number in this section that was a guess. It is now measured, without training anything, on the field the decoder actually has to produce.
+
+**Method.** For every case in `cleandata/` (709 GT meshes + centerlines; `template_mesh/` is *not* needed, because the template's radius *is* the centerline MISR): dedupe the centerline into disjoint tracts (§2.4.2a), cut each tract into 2 mm tokens, and sample each token's wall on a 4 × 16 grid — 0.5 mm in `u` × 22.5° in θ — taking the outward distance from the centerline to the GT surface per bin and subtracting MISR(u). A token is dropped if it touches a mesh opening (any vertex within 1.5 mm of a boundary loop) or if more than 10 % of its bins are empty. Each token is labelled **sac** (≥ 5 % of its vertices within 0.3 mm of the AneuX dome mesh, `aneurysms/original/{id}_dome`), **peri-sac neck** (within 2 tokens of any dome contact), **near-junction** (within 3 mm of an interior tract end) or **healthy**. Cases whose `location` tag does not carry the ICA (`BA`, `BA tip`, `SCA`, `PICA`, `VA V4`, `ACA dist`, and the mixed `PCA P1-P2` / `MCA M2`) are excluded from the statistics. Result: **38 689 token patches from 708 cases**, 35 991 of them on 644 ICA-bearing cases, ≈ 56 tokens per case.
+
+This residual is the single-valued radial field seen from the centerline (max per bin), which is exactly the class of shape a template + Δr-along-normal decoder can express (§6.7); overhanging domes are truncated the same way the decoder truncates them. Tangential shear Δs is not measured. MISR is itself inflated inside a sac, so sac residuals are conservative.
+
+**Four estimators, chosen because they fail in different ways** (`analyze2.py`–`analyze4.py`):
+
+| estimator | healthy token | sac token |
+|---|---|---|
+| linear PCA, held-out, case-level 5-fold: K for RMS ≤ 0.1 mm | 12–16 | **> 32** (K = 32 → 0.364 mm) |
+| nonlinear parametric fit: params → median RMS | 4 → 0.074 mm; 9 → 0.036 mm | 9 → 0.389 mm; 14 → 0.221 mm |
+| intrinsic dimension (TwoNN / Levina–Bickel MLE), calibration-corrected | **11–13** | **8–9** |
+| marginal cost of one more 2 mm token (dimension growth over windows of 1–7 tokens) | ≈ 0 | ≈ +1 |
+
+Three things make that table readable:
+
+1. **The linear number is an artifact, not a result.** A sac is a bump whose angular position, width and height vary from case to case — a translation manifold, which no linear basis compresses. The θ-Fourier spectrum says the same from the other side: reproducing a sac token to 0.17 mm RMS needs harmonic order 7 of the 8 available. Since the decoder is nonlinear, the PCA figure is only a ceiling. It is, however, decisive against option F (§5.3.4, §5.3.8).
+2. **The intrinsic-dimension estimators were calibrated** on synthetic smooth manifolds of known dimension at matched sample sizes, because both saturate: this implementation of TwoNN runs ≈ 30 % high (true 8 → 11.3, true 16 → 20.3, true 32 → 30.2) and the Levina–Bickel MLE at k = 10 is near-unbiased to about 12, then compresses (true 16 → 14.0, true 32 → 20.0). The raw sac values (TwoNN 11.5, MLE 7.8) both map back to **≈ 8–9**; healthy (17.5 / 10.5) to **≈ 11–13**.
+3. **The degrees of freedom are intrinsic, not an artifact of the grid.** Re-extracting 178 cases at 32 angular bins (patch dimension 64 → 128) moves the estimate by ≤ 1.5 dimensions in both groups. The field is a smooth low-dimensional family sampled more finely, not a richer one.
+
+Healthy tokens have the *higher* intrinsic dimension yet need far fewer dimensions at the accuracy that matters: 4 nonlinear parameters — calibre, axial taper and two eccentricity terms — already reach 0.074 mm median RMS, and the remaining degrees of freedom live below 0.05 mm. Dimension counting has to be tolerance-aware. At a 0.1 mm target: **healthy ≈ 4–6, sac ≈ 9–14**.
+
+**Decision: `LATENT_DIM = 16`.** It covers the calibrated estimate for both groups (8–13) with headroom for the irregular sac tail, which is where a tight D fails first. D = 8 sits exactly on the sac estimate with no margin and below the healthy intrinsic dimension — defensible, and the value most likely to force a retrain. D = 24 is above everything measured; D = 128 is off by an order of magnitude. Because one additional token costs only ≈ 1 dimension, the per-token width is genuinely a *ceiling* rather than a budget: choose 16, let the rate target (§5.3.6 item 3) do the squeezing, and read the width that was actually used off the active-unit count on sac tokens (§5.3.6 item 7).
+
+One limit of the measurement constrains the *decoder*, not the latent: the sac field has angular gradients steeper than one 22.5° bin (several mm between adjacent bins at the neck rim). That is a statement about output mesh density, not about latent width.
 
 #### 5.3.4 The options compared
 
@@ -587,7 +632,7 @@ Rate control (option C) is the fifth item, and its value is less "regularisation
 | tuning burden | — | β (steep) | one rate target (dual variable adapts β) + σ floor | σ | codebook size, commitment, dead codes | basis order only |
 | main failure mode | silent collapse to an AE | blurry sacs | rate target set too low → blurry sacs (visible in the sweep) | σ too small → brittle; too large → blurry | codebook collapse | non-star-shaped sacs not representable |
 
-Option F — each 2 mm token a truncated Fourier series of the local cross-section radius in θ (≈ 17 numbers at order 8) — is attractive for a dataset this size: exactly local, fixed scale, exact null code, interpretable, and no learned encoder to memorise. Its limit is that a large sac with a narrow neck is not single-valued in `r(θ)` about the centerline. The current decoder makes a related commitment (Δr along the template normal plus ≤ 3 mm shear, §6.7), so F is only moderately more restrictive; §5.3.8 gives the measurement that decides whether it should replace or complement C.
+Option F — each 2 mm token a truncated Fourier series of the local cross-section radius in θ (≈ 17 numbers at order 8) — is attractive for a dataset this size: exactly local, fixed scale, exact null code, interpretable, and no learned encoder to memorise. Its limit is that a large sac with a narrow neck is not single-valued in `r(θ)` about the centerline. The current decoder makes a related commitment (Δr along the template normal plus ≤ 3 mm shear, §6.7), so F is only moderately more restrictive. **That measurement has now been made** (§5.3.3a): truncating the measured sac residual at harmonic order 8 leaves 0.39 mm RMS and 2.9 mm at the p95 of per-token maximum error, and order 12 still leaves 0.22 mm RMS. A truncated Fourier series is a linear basis and a sac is a localised bump — the wrong basis for it. F is ruled out as a *replacement* at any order small enough to be worth having, and survives only as the hybrid of §5.3.8.
 
 #### 5.3.5 Why a stochastic encoder is still the right choice here
 
@@ -596,20 +641,31 @@ The decisive argument is not generic. In a template-plus-residual model **the in
 - over healthy wall the template already explains the geometry; the token carries essentially nothing, and the right posterior is *wide* (σ ≈ 1, centred at the prior mean) — a large region of codes all decoding to "template, unchanged", which is what makes the null code and Stage 1's job on most of the tree easy;
 - under the sac the token carries the outward displacement — 4.1 / 11.8 / 24.9 mm (p50 / p90 / max of the outward ray to the GT over the 304 sac vertices of SNF00000100, §7.1) — and the posterior must be *narrow* or the sac blurs.
 
+The imbalance is now measured across the dataset rather than on one case (§5.3.3a; 2 mm tokens, residual against the MISR template, 644 ICA-bearing cases):
+
+| token group | n | per case | residual σ (p50 / p95) | max residual (p50 / p95) |
+|---|---|---|---|---|
+| healthy | 24 108 | 37.4 | 0.092 / 0.315 mm | 0.35 / 1.14 mm |
+| healthy at a junction | 6 768 | 10.6 | 0.093 / 0.611 mm | 0.36 / 2.44 mm |
+| peri-sac neck | 2 552 | 4.8 | 0.089 / 0.565 mm | 0.33 / 2.97 mm |
+| **sac** | **2 563** | **4.7** | **1.114 / 2.856 mm** | **4.24 / 10.25 mm** |
+
+A sac token's residual is **12× wider in σ and 30× larger in amplitude** than a healthy one, and only ≈ 5 of ≈ 56 tokens per case are sac tokens. One global σ has to serve both ends of that range; a learned per-token σ does not.
+
 A fixed σ (option D) cannot serve both: σ = 0.3 blurs sacs, σ = 0.05 gives healthy tokens no coverage and no null code. A learned per-token, per-dimension σ with a floor is the right instrument for a latent whose informativeness is this heterogeneous. As a by-product the per-token KL along the tree becomes a diagnostic of where the template fails — ≈ 0 on healthy wall, large under the sac — which is independently useful for the private patient data, where dome annotations will not exist.
 
 #### 5.3.6 Option C, specified
 
 The recipe is the latent-diffusion one — weak KL for scale, explicit standardisation for the diffusion model — plus what this architecture needs: a σ floor, a rate that is controlled rather than inherited, a null code, and a mixer that cannot launder the noise.
 
-1. **`LATENT_DIM` 128 → 24** as the starting point, to be fixed by the rate–distortion sweep of §5.3.7 over D ∈ {8, 16, 24, 32}. With ~40–70 tokens per case under the 2 mm contract (§5.4) the Stage-1 target becomes ~1 000–1 700 dimensions.
+1. **`LATENT_DIM` 128 → 16**, from the measurement in §5.3.3a (calibrated intrinsic dimension 8–13 per 2 mm token; 4–6 dimensions reach 0.1 mm on healthy wall, 9–14 on a sac), confirmed by the rate–distortion sweep of §5.3.7 over D ∈ {4, 8, 16, 32}. With the measured ≈ 56 tokens per case under the 2 mm contract (§5.4) the Stage-1 target becomes ≈ 900 dimensions.
 2. **Soft σ floor.** Replace the hard `clamp(-8, 2)` in `CenterlineLatentHead` with a smooth bound, `logvar = log σ²_min + (log σ²_max − log σ²_min) · sigmoid(raw)`, with σ_min = 0.1 (log σ² = −4.61) and σ_max = e (log σ² = 2). The floor keeps noise in the channel however strong the reconstruction pull, which decouples "keep a neighbourhood around every code" from "squeeze μ"; the smooth bound removes the dead gradient of §4.2 item 4. The KL of a dimension sitting at the floor with μ = 0 is ½(0.01 − 1 + 4.61) = 1.81 nats — the model will only go there on dimensions that pay for it in reconstruction.
-3. **Controlled rate instead of a fixed λ.** Keep the per-token KL sum over dimensions, and control its mean over valid tokens with a Lagrangian multiplier (GECO-style, Rezende & Viola 2018, with the constraint on rate instead of distortion): `β ← clip(β · exp(η · (KL̄_raw − R*)), β_min, β_max)`, updated once per optimiser step, with `R*` the target rate in nats per token. Because the constraint is on the *mean*, the model is free to spend ≈ 0 on healthy tokens and much more on sac tokens — the distribution §5.3.5 asks for. Starting target: `R* ≈ 8–16` nats/token at D = 24, set finally by the sweep. The existing 20-epoch warm-up is kept (it now ramps β_max).
+3. **Controlled rate instead of a fixed λ.** Keep the per-token KL sum over dimensions, and control its mean over valid tokens with a Lagrangian multiplier (GECO-style, Rezende & Viola 2018, with the constraint on rate instead of distortion): `β ← clip(β · exp(η · (KL̄_raw − R*)), β_min, β_max)`, updated once per optimiser step, with `R*` the target rate in nats per token. Because the constraint is on the *mean*, the model is free to spend ≈ 0 on healthy tokens and much more on sac tokens — the distribution §5.3.5 asks for. Starting target: `R* ≈ 8–16` nats/token at D = 16, set finally by the sweep. The existing 20-epoch warm-up is kept (it now ramps β_max).
    *Why not per-dimension free bits, as the previous edition of this section recommended.* A per-dimension floor λ lets every dimension sit anywhere with KL < λ at zero cost: at λ = 0.25 nats that is |μ| ≤ 0.71 at σ = 1, or σ ∈ [0.55, 1.54] at μ = 0, and 128 × 0.25 = 32 nats ≈ 46 bits per token for free. The null code becomes a ball rather than a point, and the per-token KL profile is clamped from below at D·λ on every token, so the "≈ 0 on healthy wall" diagnostic reads flat by construction. A floor is still useful as insurance against posterior collapse during warm-up; if used, apply it **per token** and small, `max(λ_tok, Σ_j KL_j)` with λ_tok ≈ 0.5 nats, and apply the `max` to the accumulated batch (`bs 1 × accum 8`), not per step. Posterior collapse is a lesser risk here than in autoregressive VAEs: the decoder cannot place the sac without the latent.
 4. **Mask and normalise the KL by valid tokens** (`latent_valid` from §5.4), so β and `R*` mean the same thing on a 50 mm and a 130 mm tree.
 5. **Move the mixer to the encoder side.** Apply `LatentTractSelfAttention` to μ (and, if wanted, to `logvar`) *before* reparameterisation, compute the KL on the mixed posterior, and feed the sampled code directly to the decoder. The smoothing along the tree is kept, the noise the KL prices is the noise the decoder sees, and Stage 1 generates exactly the codes the decoder consumes. If the mixer is kept after sampling for any reason, log the code scale before/after it and the gate value, and read the noise-robustness curve with that path in mind.
 6. **Sample at evaluation, report both paths.** `reparameterize` gains an explicit `sample` flag; `evaluate_epoch` reports recon at σ = 0 (the μ path, kept for `best.pt` selection and comparability) *and* at the learned σ. The difference between the two is the first indicator of whether the decoder has learned a neighbourhood.
-7. **Standardise after training.** Run the encoder over the training split, compute the per-dimension mean and standard deviation of μ over valid tokens, store both in the checkpoint. Stage 1 is trained on standardised codes (preferably on posterior samples `μ + σ·ε`, which is free augmentation for Stage 1); Stage 2 de-standardises before decoding. Report the statistics separately for healthy and sac tokens: healthy tokens dominate the count and will pull the mean toward the null code, which is correct for the diffusion target but should be visible.
+7. **Standardise after training — and drop the dead dimensions first.** Run the encoder over the training split, compute the per-dimension mean and standard deviation of μ over valid tokens, store both in the checkpoint. Dimensions the rate controller left inactive (mean raw KL < 0.01 nats, §5.3.7) must be **removed before standardising**, not standardised: an unused dimension has μ ≈ 0 on every token and a near-zero spread, so dividing by its standard deviation amplifies numerical noise into the Stage-1 target. The surviving count is the width the model actually used and is what Stage 1 should be given; record it in the checkpoint beside the statistics. This is also what makes a slightly generous D cheap and a too-small D expensive — the asymmetry behind choosing 16 over 8 in §5.3.3a. Stage 1 is trained on standardised codes (preferably on posterior samples `μ + σ·ε`, which is free augmentation for Stage 1); Stage 2 de-standardises before decoding. Report the statistics separately for healthy and sac tokens: healthy tokens dominate the count and will pull the mean toward the null code, which is correct for the diffusion target but should be visible.
 8. **Define the null code and the sweeps explicitly.** The null code is the prior mean in raw (un-standardised) space, 0 per dimension. Healthy → aneurysmal sweeps use `t · z_case` on the case's own scaffold; case → case sweeps use slerp per token after resampling B's tokens onto A's scaffold by arc position (§5.3.2 d). For publication-grade "growth" figures prefer the displacement-field interpolation of §5.3.2 (c).
 9. **Once Stage 1 exists, fine-tune the decoder on Stage-1 samples**, with the Stage-1 error distribution replacing the Gaussian posterior noise.
 
@@ -626,7 +682,7 @@ These are logged per epoch as structured records (CSV/TensorBoard, §8), because
 
 Two experiments set the free parameters before the full HPC run, both on a 50-case subset on the local 3080 Ti:
 
-1. **Rate–distortion sweep**: D ∈ {8, 16, 24, 32} × `R*` ∈ {2, 8, 16, 32} nats/token. Plot sac-region and healthy-region reconstruction against measured rate (Alemi et al. 2018). Choose the smallest D and rate at which sac reconstruction stops improving materially.
+1. **Rate–distortion sweep**: D ∈ {4, 8, 16, 32} × `R*` ∈ {2, 8, 16, 32} nats/token. The grid brackets the estimate of §5.3.3a from both sides; 24 adds nothing between 16 and 32. Plot sac-region and healthy-region reconstruction against measured rate (Alemi et al. 2018), and read the knee from the **sac-region** error, not the global Chamfer — the global number is dominated by healthy wall and saturates by D ≈ 4 (§5.3.3a). Choose the smallest D whose held-out sac p95 error is within ~10 % of the D = 32 result, and inspect the worst 10 % of sacs separately, because a too-small D fails on the irregular tail first. Then check **saturation**: if nearly all D dimensions are active on sac tokens at the chosen D, the latent is at capacity and D goes up one step.
 2. **Noise-robustness curve** at the chosen point, recorded in the repository as the Stage-1 contract.
 
 Acceptance for the chosen configuration: sampled-path recon within a few percent of μ-path recon; the KL profile peaked at the sac on the validation cases; decoding the null code on a case's scaffold reproduces the template to within remesh noise; every mesh along `t · z_case`, t ∈ {0, 0.25, 0.5, 0.75, 1}, has one component, three boundary loops and no non-manifold edges.
@@ -635,7 +691,7 @@ Because the §2.4 tract fix, the §5.4 token layout and the §7.1 `r*` fix all c
 
 #### 5.3.8 What would change this decision
 
-- **Option F replaces or complements C** if a per-token truncated Fourier fit of the GT cross-section radius about the centerline reaches sub-edge accuracy (≲ 0.2 mm) on the sac region at order K ≈ 8–12 on ~20 cases. That test needs no training. If it holds, a hybrid — analytic low orders (calibre, eccentricity) plus a small learned residual code (8–16 dims) under the same rate control — keeps interpretability and the exact null code while retaining capacity for difficult sacs.
+- **Option F as a replacement for C is closed.** The test — a per-token truncated Fourier fit of the GT cross-section radius about the centerline reaching ≲ 0.2 mm on the sac region at order 8–12 — was run on all 709 cases (§5.3.3a) and fails: order 8 leaves 0.39 mm RMS / 2.9 mm p95-max on sac tokens, order 12 leaves 0.22 mm RMS. On healthy wall it passes easily (order 8 → 0.053 mm RMS, 0.063 mm p95-max), which is the useful half of the result. What survives is the **hybrid**: analytic low orders for the healthy part (the 4-parameter calibre/taper/eccentricity fit already reaches 0.074 mm median RMS) plus a small learned residual code under the same rate control. It would keep the exact null code and interpretability on the ≈ 51 of 56 tokens per case that are not sac tokens. It is a refinement of C, not an alternative, and it is not on the critical path.
 - **Option D replaces C** only if the rate controller proves unstable on this data (β oscillating or pinned at a bound across the sweep); then use a fixed σ ≈ 0.2–0.3 in standardised units, accept the loss of the per-token σ and the KL profile, and tune σ against the noise-robustness curve.
 - **Option B** is not recommended at this sample size; it would be reconsidered only if unconditional sampling from the prior became a requirement.
 
@@ -643,18 +699,20 @@ References for §5.3: Rombach et al., *High-Resolution Image Synthesis with Late
 
 ### 5.4 Token geometry under the 1 mm / 2 mm decision
 
-| `ds_tok` | tokens per sample (80–130 mm tree) | tokens on a sac (neck 3–6 mm, height 3–15 mm) | comment |
+The tree length is now known for the whole dataset rather than assumed: after deduplication (§2.4.2a) it is **60 / 120 / 216 mm** at p5 / p50 / p95 over the 709 `cleandata` centerlines, and the token counts below follow from it (the measured count in §5.3.3a, ≈ 56 per case, is after dropping tokens that touch an opening).
+
+| `ds_tok` | tokens per sample (p5 / p50 / p95) | tokens on a sac (neck 3–6 mm, height 3–15 mm) | comment |
 |---|---|---|---|
-| 1 mm | 80–130 | 5–15 | every token sees half a sac; Stage 1 must model 100+ tokens |
-| **2 mm** | **40–70** | **3–8** | a sac is 3–8 tokens: neck, body, dome are separable |
-| 3–4 mm | 25–40 | 1–4 | a sac becomes one blob token |
+| 1 mm | 60 / 120 / 216 | 5–15 | every token sees half a sac; Stage 1 must model 100+ tokens |
+| **2 mm** | **30 / 56 / 108** | **3–8** (measured: 4.7 sac tokens per case) | a sac is 3–8 tokens: neck, body, dome are separable |
+| 3–4 mm | 15 / 30 / 54 | 1–4 | a sac becomes one blob token |
 
 Given the decision, the changes are:
 
 - `TOKEN_SPACING_MM = 2.0` and `CL_SAMPLE_MM = 1.0` as shared constants of both stages; per branch `n_tok = floor(L / 2) + 1` tokens at arc positions `k · 2 mm` (first token at the branch start). The daughter's first token *is* the junction — no separate junction tokens; the tree gives adjacency. `LATENT_LEN` becomes the padding maximum (e.g. 128) with a validity mask (`latent_valid`, used by the head, the mixer, the decoder cross-attention and the KL, §5.3.6), not the count. `allocate_token_counts` and the fixed-slot logic go.
 - Tokens on the **original / Stage-1 centerline** (§2.5), not on `template_centerline`.
 - Encoder head as in §4.2 item 2.
-- Decoder cross-attention (§6.4) restricted to the ~5 nearest tokens along the vertex's branch (plus the neighbouring branch's tokens within ~4 mm of an ostium), instead of softmax over all of a tract's slots — with 40–70 tokens and a positional query this is what the softmax converges to anyway, and the restriction makes the latent provably local.
+- Decoder cross-attention (§6.4) restricted to the ~5 nearest tokens along the vertex's branch (plus the neighbouring branch's tokens within ~4 mm of an ostium), instead of softmax over all of a tract's slots — with ≈ 56 tokens (30–108 at p5–p95) and a positional query this is what the softmax converges to anyway, and the restriction makes the latent provably local.
 
 ---
 
@@ -790,7 +848,7 @@ HPC wall-time is effectively unlimited; VRAM on the 3080 Ti already has headroom
 | augmentation set of §8 | largest single generalisation gain on ~200–680 samples | free |
 | 5–10× more optimisation steps | nowhere near convergence at 4.3 k steps | time, now cheap (0.79 s/step → 2–5 · 10⁴ steps is 4–11 GPU-hours per fold) |
 | decoder depth (6–8 residual convs/level, pre-norm) and multi-head cross-attention + FFN instead of the 5³ kernel | capacity where it is used (§6.2, §6.4) | modest |
-| rate–distortion sweep, D ∈ {8, 16, 24, 32} × R* ∈ {2, 8, 16, 32} nats/token on 50 cases (§5.3.7) | fixes `LATENT_DIM` and the rate before the full run; the decision everything in Stage 1 inherits | 16 short runs, local GPU |
+| rate–distortion sweep, D ∈ {4, 8, 16, 32} × R* ∈ {2, 8, 16, 32} nats/token on 50 cases (§5.3.7) | confirms `LATENT_DIM = 16` (measured in §5.3.3a) and fixes the rate before the full run; the decision everything in Stage 1 inherits | 16 short runs, local GPU |
 | local-pooling transformer latent head (§4.2, §5.4) | local tokens, better latent, less overfitting | small |
 | normals + template signed distance into the encoder (§4.2) | cheap accuracy | free |
 | densified templates under the sac (§2.3 fix) | fine resolution where the residual lives | regenerate templates |
@@ -892,7 +950,7 @@ Earlier scratch probes still relevant: `analyze_stage2_pipeline.py`, `scan_tract
 
 **P1 — model**
 
-9. Tokens at 2 mm with arc-length-driven counts and a mask; local-pooling transformer latent head (§4.2, §5.4). Latent as a rate-controlled channel (§5.3.6): `LATENT_DIM` 128 → 24 pending the rate–distortion sweep, soft σ floor 0.1, per-token rate target with an adaptive β (a small per-token floor only as warm-up insurance — no per-dimension free bits), mixer before sampling, sampling at evaluation, post-training standardisation; instrumentation and noise-robustness curve (§5.3.7).
+9. Tokens at 2 mm with arc-length-driven counts and a mask; local-pooling transformer latent head (§4.2, §5.4). Latent as a rate-controlled channel (§5.3.6): `LATENT_DIM` 128 → 16 (measured, §5.3.3a; confirmed by the sweep), soft σ floor 0.1, per-token rate target with an adaptive β (a small per-token floor only as warm-up insurance — no per-dimension free bits), mixer before sampling, sampling at evaluation, post-training standardisation with inactive dimensions dropped first; instrumentation and noise-robustness curve (§5.3.7).
 10. θ pseudo-coordinate in physical units; kernel `(5, 5, 2)` or a separate cross-branch conv; `aggr="mean"`, pre-norm, `root_weight=True`; 6–8 convs/level (§6).
 11. Free 3-D displacement at coarse; fold and stretch penalties (§6.7, §11); face-sampled Chamfer on the full GT; robust Dirichlet with GT-driven weights (§7).
 12. Encoder: normals + template signed distance in; stage-3/4 width down; node features `r_local`, curvature, torsion, ostium distance (§4, §6.6).
@@ -911,7 +969,7 @@ Earlier scratch probes still relevant: `analyze_stage2_pipeline.py`, `scan_tract
 2. **Template density at inference.** Variable remeshing needs the GT's stretch field, which Stage 1 cannot provide. Train on uniform templates only (simplest, matches inference exactly), or on variable templates and accept a train/inference density mismatch, or predict a stretch field from the tokens and remesh with it? Decide before regenerating templates after the §2.3 fix.
 3. **`template_centerline`.** Drop the folder, or keep it as a per-case consistency check against `original_centerline` (Hausdorff < 0.5 mm)?
 4. **GT remesh target edge.** 0.15 mm on SNF00000100 gives 96 918 vertices (C0002: 121 426), 12× the template, 6× `N_TRUE`, 999 s / 570 s per case. Anything finer mostly costs cache size, encoder FPS time and generation wall-time; 0.25 mm was the previous estimate (~30–40 k vertices) and would still be denser than the template. Confirm 0.15 mm is the number so `N_TRUE` and the encoder input can be sized to it (§2.2.3). A 10-iteration remesh (VMTK default) is the obvious time/quality trade if 0.15 mm is kept.
-5. **Analytic cross-section descriptors.** Does a per-token truncated Fourier fit of the GT radius in θ reach ≲ 0.2 mm on the sac at order 8–12 (§5.3.8)? If so, option F replaces or complements the learned code; the test needs no training.
+5. **Analytic cross-section descriptors — answered, no.** The per-token truncated Fourier fit reaches 0.053 mm RMS on healthy wall at order 8 but only 0.39 mm on sac tokens (0.22 mm at order 12), measured on all 709 cases (§5.3.3a). Option F cannot replace the learned code. What remains open is whether the **hybrid** is worth building: analytic low orders on the ≈ 51 of 56 non-sac tokens per case plus a learned residual code elsewhere, which would buy an exact null code and interpretability at the cost of two code paths (§5.3.8).
 6. **Case-to-case interpolation landmark.** Latent sweeps between two vessels need B's tokens resampled onto A's scaffold (§5.3.2 d). Anchor on the bifurcation, the neck centre, or both?
 
 ---
@@ -930,4 +988,5 @@ Everything that is a number in this review was produced by a script in `scratch/
 | `template_mesh/SNF00000100.vtp`, `original_centerline/`, `template_centerline/` | `process_variable_dataset` / `process_centerline_dataset` | §2.3–§2.5 |
 | `SNF00000100.vtp`, `C0002.vtp` (parent-tube uniform remesh) + `*_distance.json` + `*_uniform_vs_original.png` | `probe_uniform_gt.py`, `render_uniform_probe.py` | §2.2 contrast |
 | `test_remeshing_log.txt` | `run_test_remeshing_nopytest.py` | §2.2.4, §13 |
+| `latent_dim/patches_all/*.npz` (38 689 token patches, 708 cases), `latent_dim/patches32/` (178 cases at 32 θ bins), `latent_dim/report.txt` | `latent_dim/extract.py` + `run_all.py` (extraction), `analyze.py`–`analyze4.py` (PCA / parametric fit / intrinsic dimension / calibration) | §2.4.2a, §5.3.3a, §5.3.5, §5.3.8 |
 
