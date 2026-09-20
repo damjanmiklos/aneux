@@ -999,9 +999,9 @@ Everything that is a number in this review was produced by a script in `scratch/
 | `latent_dim/patches_all/*.npz` (38 689 token patches, 708 cases), `latent_dim/patches32/` (178 cases at 32 θ bins), `latent_dim/report.txt` | `latent_dim/extract.py` + `run_all.py` (extraction), `analyze.py`–`analyze4.py` (PCA / parametric fit / intrinsic dimension / calibration) | §2.4.2a, §5.3.3a, §5.3.5, §5.3.8 |
 ---
 
-## Appendix B. Everything that needs a code change
+## Appendix B. What needs a code change, and what does not
 
-Only code. Everything else in this review is a measurement or a decision.
+Groups **A**, **B** and **C** (items 1–32) are code. Group **D** (items 33–45) is explicitly *not* — it exists so that a number or a finding elsewhere in the review does not get mistaken for a task.
 
 ### A. Broken today
 
@@ -1062,3 +1062,21 @@ Only code. Everything else in this review is a measurement or a decision.
 30. Augmentation: L/R mirror, θ-phase, ±5° pose jitter (§8).
 31. Batch size above 1 × 8; one fixed seeded train / validation / test split (§8).
 32. The tests of §13.
+
+### D. No code — nothing to implement
+
+These are measurements, decisions or closed questions. **Do not write code for anything in this list.** They are here so that reading a section and finding a number does not turn into a task.
+
+33. §2.2 — the GT generator is verified; every density, distance and topology number in it. Nothing to do.
+34. §2.2.3 — the GT/template/`N_TRUE` density ratios. The only action they imply is item 27.
+35. §2.4.2a — the centerline duplication measured on all 709 files. The dedup script is analysis scaffolding; the production fix is items 1 and 4.
+36. §2.6 — the Taubin `pass_band` 1.0 → 0.1 change is measured benign (≤ 0.18 mm, under one GT edge). Do **not** revert it and do **not** match the GT's smoothing to the template's.
+37. §3.8, §6.3, §10.1 — the scaffold numbers, the compute profile and the migration status table.
+38. §5.3.1, §5.3.2 — the literature case that neither diffusion nor interpolation needs a latent pushed to N(0, I), and the Gaussian norm-shell table.
+39. §5.3.3a, §5.3.5 — the latent-width and heterogeneity measurements. They set `LATENT_DIM = 16` and justify the stochastic encoder; the code they imply is items 16–21, nothing more.
+40. §5.3.4, §5.3.8, §15 item 5 — option F and the Fourier hybrid are closed. Do not build them.
+41. §15 item 1 — GT smoothing, settled.
+42. §15 item 2 — the variable-density decision needs **no Stage-2 change**. What it does oblige is items 2 and 13.
+43. §15 item 4 — the 0.15 mm GT edge target is confirmed and the run is done; VMTK's undershoot to ≈ 0.12 mm is expected behaviour, not a defect to fix.
+44. §15 item 6 — the case-to-case interpolation landmark is deferred. Not now.
+45. Cross-validation — dropped for now (§8). The 5-fold in §5.3.3a is how the PCA measurement was run, not a training plan; do not build a fold harness.
