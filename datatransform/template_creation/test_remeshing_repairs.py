@@ -751,3 +751,88 @@ def test_fan_lid_domes_away_from_the_lumen():
     assert np.all(np.abs(added[:, 2] - centroid[2]) > rim_reach + 1e-9), (
         added, rim_reach
     )
+
+
+def _grid_sheet(n=6, spacing=1.0, z=0.0, first_id=0):
+    """A flat (n x n) triangulated patch; ids start at ``first_id``."""
+    pts, faces = [], []
+    for i in range(n):
+        for j in range(n):
+            pts.append((i * spacing, j * spacing, z))
+    for i in range(n - 1):
+        for j in range(n - 1):
+            a = first_id + i * n + j
+            b = a + 1
+            c = a + n
+            d = c + 1
+            faces.append((a, c, b))
+            faces.append((b, c, d))
+    return np.asarray(pts, dtype=float), faces
+
+
+def test_collapse_tiny_edges_removes_a_sliver():
+    """The whole point: an edge microns long must not reach the remesher."""
+    from vessel_pipeline import collapse_tiny_edges, count_connected_regions
+
+    pts, faces = _grid_sheet()
+    # Pull one interior vertex onto its neighbour, leaving a 1e-6 mm edge.
+    victim, anchor = 14, 15
+    pts[victim] = pts[anchor] + np.array([1e-6, 0.0, 0.0])
+    surf = _polydata_from_triangles(pts, np.asarray(faces, dtype=np.int64))
+
+    _p, before_pts, before_faces = _triangle_points_faces(surf)
+    assert _triangle_edge_lengths(before_pts, before_faces).min() < 1e-5
+
+    fixed = collapse_tiny_edges(surf, floor=1e-3)
+    _p, after_pts, after_faces = _triangle_points_faces(fixed)
+    assert _triangle_edge_lengths(after_pts, after_faces).min() >= 1e-3
+    assert inspect_surface_topology(fixed)["n_nonmanifold"] == 0
+    assert count_connected_regions(fixed) == 1
+
+
+def test_collapse_tiny_edges_leaves_a_clean_surface_alone():
+    """No edge under the floor means nothing may move."""
+    from vessel_pipeline import collapse_tiny_edges, count_connected_regions
+
+    pts, faces = _grid_sheet()
+    surf = _polydata_from_triangles(pts, np.asarray(faces, dtype=np.int64))
+    fixed = collapse_tiny_edges(surf, floor=1e-3)
+
+    _p, a, fa = _triangle_points_faces(surf)
+    _p, b, fb = _triangle_points_faces(fixed)
+    assert len(a) == len(b)
+    assert len(fa) == len(fb)
+    assert np.allclose(np.sort(a, axis=0), np.sort(b, axis=0))
+
+
+def test_collapse_tiny_edges_does_not_fuse_two_sheets_touching_at_a_point():
+    """The link condition, which is the reason this is not a point merge.
+
+    Two sheets that meet at a single vertex share that vertex's neighbours.
+    Folding an edge into it would zip them together along a seam -- the exact
+    damage the tolerance merge used to do, and the reason a naive collapse took
+    one surface from 5 non-manifold edges to 9. Here the collapse must decline.
+    """
+    from vessel_pipeline import collapse_tiny_edges, count_connected_regions
+
+    lower_pts, lower_faces = _grid_sheet(z=0.0, first_id=0)
+    upper_pts, upper_faces = _grid_sheet(z=1.0, first_id=len(lower_pts))
+    pts = np.vstack([lower_pts, upper_pts])
+    faces = lower_faces + upper_faces
+
+    # Pinch: drag one upper vertex down onto a lower one so the two sheets meet
+    # at that single point, then put a sliver edge across the pinch.
+    pinch_low = 14
+    pinch_high = len(lower_pts) + 14
+    pts[pinch_high] = pts[pinch_low]
+    pts[len(lower_pts) + 15] = pts[pinch_low] + np.array([1e-6, 0.0, 0.0])
+
+    surf = _polydata_from_triangles(pts, np.asarray(faces, dtype=np.int64))
+    before = count_connected_regions(surf)
+    fixed = collapse_tiny_edges(surf, floor=1e-3)
+
+    assert count_connected_regions(fixed) == before, "the sheets were fused"
+    assert (
+        inspect_surface_topology(fixed)["n_nonmanifold"]
+        <= inspect_surface_topology(surf)["n_nonmanifold"]
+    ), "the collapse added non-manifold edges"

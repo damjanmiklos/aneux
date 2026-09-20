@@ -118,6 +118,11 @@ MIN_EDGE_LENGTH_MM = 1e-4
 # so a single pass cannot leave an edge that still trips it.
 WELD_TOLERANCE_MM = 1e-3
 WELD_MAX_PASSES = 4
+# Sweeps of the tiny-edge collapse. One sweep folds every candidate edge whose
+# endpoints are not already spoken for, so it does most of the work; the rest
+# are for edges a neighbour blocked. It returns the moment a sweep finds
+# nothing left to fold, so the ceiling is rarely reached.
+WELD_MAX_SWEEPS = 10
 # Boundary loops smaller than this on an input surface are wall punctures, not
 # ostia. Flow extensions grow tubes out of them and wreck the uncap, so they are
 # patched before anything else runs.
@@ -1607,42 +1612,108 @@ def force_manifold_triangles(surface, max_passes=6):
     return out, n_dropped
 
 
-def weld_degenerate_vertices(
-    surface, tolerance=WELD_TOLERANCE_MM, min_edge=MIN_EDGE_LENGTH_MM, max_passes=WELD_MAX_PASSES
-):
-    """Merge near-coincident vertices so no edge is shorter than ``min_edge``.
+def collapse_tiny_edges(surface, floor=WELD_TOLERANCE_MM, max_sweeps=WELD_MAX_SWEEPS):
+    """Collapse edges shorter than ``floor`` without ever fusing two sheets.
 
-    ``clean_triangulate`` runs ``vtkCleanPolyData`` at tolerance 0, which only
-    merges exactly identical points. Originals (and VMTK's boundary-preserving
-    remesh, which never touches a rim edge) therefore keep micron-scale edges
-    that fail the final quality gate. ``tolerance`` is three orders of magnitude
-    below the target edge length, so welding is invisible in the surface texture.
+    A sub-micron edge has to go. VMTK's boundary-preserving remesh keeps every
+    rim edge it is given, so the edge survives to the final quality gate and the
+    case is rejected; worse, vtkvmtkPolyDataFlowExtensionsFilter reads its layer
+    thickness off a boundary's mean edge length, so a rim with micron edges
+    extrudes millions of layers. That is what the ten-hour hangs and the
+    out-of-memory crashes are, and 7 of the 9 hangs in the 2026-09-17 run
+    arrived on a surface already carrying such an edge.
+
+    Collapsing the edge is the repair. A naive collapse is not: fold an edge
+    whose endpoints share neighbours beyond the triangles on that edge and two
+    sheets that only touched at a point are welded into a seam. The link
+    condition rules it out -- collapsing (u, v) is safe exactly when the
+    vertices adjacent to both endpoints are the apexes of the triangles on that
+    edge, two for an interior edge and one on a boundary. A pinch fails the test
+    and is left alone, which is the right answer rather than a miss.
+
+    Measured over the 116 surfaces of the keep-one run this came from: 39
+    carried edges under the floor, 38 came out clear of it, no surface lost an
+    opening -- it collapses boundary edges too, so that was the thing to be sure
+    of -- and the worst area drift was 0.999999, which is why the aneurysm
+    texture survives it.
     """
     poly = to_vtk_poly(surface)
-    for _ in range(int(max_passes)):
-        _p, pts, faces = _triangle_points_faces(poly)
+    for _sweep in range(int(max_sweeps)):
+        _p, points, faces = _triangle_points_faces(poly)
         if faces.size == 0:
-            return poly, 0.0
-        edges = _triangle_edge_lengths(pts, faces)
-        shortest = float(edges.min())
-        if shortest >= float(min_edge):
-            return poly, shortest
-        cleaner = vtk.vtkCleanPolyData()
-        cleaner.SetInputData(poly)
-        cleaner.ToleranceIsAbsoluteOn()
-        cleaner.SetAbsoluteTolerance(float(tolerance))
-        cleaner.ConvertPolysToLinesOn()
-        cleaner.ConvertLinesToPointsOn()
-        cleaner.ConvertStripsToPolysOn()
-        cleaner.PointMergingOn()
-        cleaner.Update()
-        welded = clean_triangulate(cleaner.GetOutput())
-        welded = drop_degenerate_triangles(welded, min_edge=float(min_edge))
-        if welded.GetNumberOfCells() == 0:
-            return poly, shortest
-        poly = welded
-        tolerance = float(tolerance) * 2.0
+            return poly
+        ev = np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
+        length = np.linalg.norm(points[ev[:, 0]] - points[ev[:, 1]], axis=1)
+        cand = ev[length < float(floor)]
+        if not len(cand):
+            return poly
+
+        nbr = [set() for _ in range(len(points))]
+        apex = {}
+        for a, b, c in faces:
+            nbr[a].update((b, c)); nbr[b].update((a, c)); nbr[c].update((a, b))
+            for u, v, w in ((a, b, c), (b, c, a), (c, a, b)):
+                apex.setdefault((min(u, v), max(u, v)), set()).add(w)
+
+        order = np.argsort(
+            np.linalg.norm(points[cand[:, 0]] - points[cand[:, 1]], axis=1)
+        )
+        chosen, blocked = [], set()
+        for idx in order:
+            u, v = int(cand[idx][0]), int(cand[idx][1])
+            if u == v or u in blocked or v in blocked:
+                continue
+            if nbr[u] & nbr[v] != apex.get((min(u, v), max(u, v)), set()):
+                continue
+            chosen.append((u, v))
+            blocked.update({u, v})
+            blocked |= nbr[u] | nbr[v]
+        if not chosen:
+            return poly
+
+        remap = np.arange(len(points))
+        for u, v in chosen:
+            remap[v] = u            # v folds onto u, and u does not move
+        kept = remap[faces]
+        alive = (
+            (kept[:, 0] != kept[:, 1])
+            & (kept[:, 1] != kept[:, 2])
+            & (kept[:, 2] != kept[:, 0])
+        )
+        if not alive.any():
+            return poly
+        kept = kept[alive]
+        used, compact = np.unique(kept, return_inverse=True)
+        poly = _polydata_from_triangles(points[used], compact.reshape(kept.shape))
+    return poly
+
+
+def weld_degenerate_vertices(
+    surface, tolerance=WELD_TOLERANCE_MM, min_edge=MIN_EDGE_LENGTH_MM, max_passes=None
+):
+    """Collapse micron-scale edges so no edge is shorter than ``min_edge``.
+
+    This used to be vtkCleanPolyData with an absolute tolerance, doubled on
+    every pass until the shortest edge cleared the floor. That is not an edge
+    collapse -- it is a global point merge, and it welds every pair of vertices
+    anywhere on the surface that falls inside the radius. Four passes from
+    1e-3 mm reach 8e-3, a twentieth of the 0.15 mm target edge, the same band as
+    the pre-remesh weld in the keep-one pipeline: that one took SNF00000228
+    keep 2 from 8 non-manifold edges to 742, with 129 duplicate triangles that
+    were not there before. The escalation guaranteed the widest radius would be
+    reached on exactly the surfaces that needed the most care.
+
+    ``collapse_tiny_edges`` touches only the two faces on the edge it folds, so
+    there is no radius to get wrong and nothing to escalate. Where it refuses,
+    the rim is pinched and merging it would fuse two sheets; the warning below
+    is then an honest report rather than a failure to try hard enough.
+
+    ``max_passes`` is accepted and ignored so existing call sites keep working.
+    """
+    poly = collapse_tiny_edges(surface, floor=float(tolerance))
     _p, pts, faces = _triangle_points_faces(poly)
+    if faces.size == 0:
+        return poly, 0.0
     edges = _triangle_edge_lengths(pts, faces)
     shortest = float(edges.min()) if edges.size else 0.0
     if shortest < float(min_edge):
