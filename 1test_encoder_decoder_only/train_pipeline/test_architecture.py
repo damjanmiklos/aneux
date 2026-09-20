@@ -30,16 +30,20 @@ from config import (
     LATENT_LEN,
     LEVEL_FINE,
     LOGVAR_CLAMP,
+    LOGVAR_MIN,
     MAX_TRACTS,
-    N_SPLINE_FINE,
-    N_SPLINE_MID,
+    N_CONV_PER_LEVEL,
     N_TRUE,
     N_TRUE_FAR_FRAC,
     PLANE_HUBER_DELTA_MM,
     PLANE_L2_MIX,
+    RADIAL_FLOOR_FRAC,
     SA_STAGES,
+    SIGMA_MIN,
     SKIP_GATE_INIT,
     SMOOTH_W_AMBIGUOUS,
+    SPLINE_KERNEL_SIZE,
+    TOKEN_SPACING_MM,
     Z_ATTN_ALPHA_INIT,
     Z_ATTN_GATE_MAX,
     Z_ATTN_HEADS,
@@ -49,10 +53,10 @@ from config import (
 from dataset import (
     AneurysmDataset,
     allocate_ring_counts,
-    allocate_token_counts,
     couple_ostium_edges,
     extract_groupid_tracts,
     extract_unique_tracts,
+    _arc_len,
 )
 from cleaned_io import (
     list_cleandata_samples,
@@ -86,19 +90,24 @@ from losses import (
 from model import (
     CoarsePositionalSelfAttention,
     DecoupledDisplacementHead,
+    FreeDisplacementHead,
     GraphVAE,
     LatentCrossAttention,
     LatentTractSelfAttention,
+    ResidualSplineConv,
     _attr_batch,
     _ones_batch,
+    _soft_logvar,
     _upsample_level,
 )
-from ops import fps_indices, make_spline_conv
+from ops import composed_radius, fps_indices, make_spline_conv
 from raycast import (
     choose_normal_sign,
     compute_level_r_star,
     r_star_grid_stats,
     select_r_star_from_hits,
+    template_ray_r_star,
+    transform_vessel_mesh,
     voronoi_ok_hit,
 )
 from train import ModelEMA, kl_anneal_weight
@@ -120,7 +129,25 @@ def _make_factory(radius=2.0, n_true=64, hierarchy=TINY_HIERARCHY, latent_len=8)
     ds.ensure_derived = False
     ds.require_templates = False
     ds.cleandata_root = None
+    ds.token_spacing_mm = float(TOKEN_SPACING_MM)
     return ds
+
+
+class SkipTest(Exception):
+    """Missing optional fixture; the architecture runner treats this as SKIP."""
+
+
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+
+def _vertex_r_local(data, pos=None):
+    """Cached r_local, else distance to the dense centerline (generated tubes)."""
+    pos = data.x if pos is None else pos
+    r = getattr(data, "r_local", None)
+    if torch.is_tensor(r) and r.reshape(-1).numel() == pos.size(0):
+        return r.to(dtype=torch.float32).reshape(pos.size(0))
+    cl = data.cl_dense[:, :3]
+    return torch.cdist(pos.float(), cl.float()).min(dim=1).values.clamp_min(1e-4)
 
 
 def _straight_branch(n=24, length=20.0, offset=(3.0, -2.0, 5.0)):
@@ -214,23 +241,27 @@ def test_config_contracts():
     from aneuxai import BATCH_SIZE
 
     _assert(SA_STAGES[-1][0] == 64, f"last SA n_out {SA_STAGES[-1][0]}")
-    _assert(LOGVAR_CLAMP == (-8.0, 2.0), LOGVAR_CLAMP)
+    _assert(abs(LOGVAR_CLAMP[0] - math.log(0.01)) < 1e-4, LOGVAR_CLAMP)
+    _assert(abs(LOGVAR_CLAMP[1] - 2.0) < 1e-4, LOGVAR_CLAMP)
+    _assert(abs(SIGMA_MIN - 0.1) < 1e-12, SIGMA_MIN)
     _assert(LAMBDA_CD_COARSE <= 0.05 + 1e-12, LAMBDA_CD_COARSE)
-    _assert(CACHE_VERSION >= 9, CACHE_VERSION)
-    _assert(LATENT_DIM == 128, LATENT_DIM)
-    _assert(LATENT_LEN == 96, LATENT_LEN)
+    _assert(CACHE_VERSION >= 10, CACHE_VERSION)
+    _assert(LATENT_DIM == 16, LATENT_DIM)
+    _assert(LATENT_LEN == 128, LATENT_LEN)
+    _assert(abs(TOKEN_SPACING_MM - 2.0) < 1e-12, TOKEN_SPACING_MM)
     _assert(DECODER_HIDDEN_DIM == 128, DECODER_HIDDEN_DIM)
     _assert(N_TRUE == 16384, N_TRUE)
     _assert(LEVEL_FINE[1] == 64, LEVEL_FINE)
     _assert(abs(N_TRUE_FAR_FRAC - 0.25) < 1e-12, N_TRUE_FAR_FRAC)
-    _assert(N_SPLINE_MID == 4 and N_SPLINE_FINE == 4, (N_SPLINE_MID, N_SPLINE_FINE))
+    _assert(N_CONV_PER_LEVEL == 6, N_CONV_PER_LEVEL)
+    _assert(tuple(SPLINE_KERNEL_SIZE) == (5, 5, 2), SPLINE_KERNEL_SIZE)
     _assert(CHAMFER_WEIGHT_CAP == 4.0, CHAMFER_WEIGHT_CAP)
     _assert(abs(SKIP_GATE_INIT - 0.1) < 1e-12, SKIP_GATE_INIT)
     _assert(Z_ATTN_HEADS == 4, Z_ATTN_HEADS)
     _assert(abs(Z_ATTN_ALPHA_INIT - 0.1) < 1e-12, Z_ATTN_ALPHA_INIT)
     _assert(Z_ATTN_RADIUS == 2, Z_ATTN_RADIUS)
     _assert(Z_ATTN_GATE_MAX <= 0.5 + 1e-12, Z_ATTN_GATE_MAX)
-    _assert(BATCH_SIZE == 1, BATCH_SIZE)
+    _assert(isinstance(BATCH_SIZE, int) and BATCH_SIZE >= 1, BATCH_SIZE)
     from aneuxai import USE_GRADIENT_CHECKPOINTING
     from config import normalize_gradient_checkpointing
 
@@ -272,11 +303,38 @@ def test_kl_and_anneal():
     _assert(abs(kl_anneal_weight(20, 5e-4, 20) - 5e-4) < 1e-12, "KL reaches max at warmup")
     _assert(abs(kl_anneal_weight(10, 5e-4, 20) - 5e-4 * 9 / 19) < 1e-12, "KL mid schedule")
 
+    torch.manual_seed(0)
+    mu_v = torch.randn(1, 4, 8)
+    lv_v = torch.randn(1, 4, 8) * 0.1
+    loss_short, info_short = vae_kl_loss(mu_v, lv_v)
+    mu_pad = torch.cat([mu_v, torch.full((1, 3, 8), 10.0)], dim=1)
+    lv_pad = torch.cat([lv_v, torch.full((1, 3, 8), 5.0)], dim=1)
+    valid = torch.zeros(1, 7, dtype=torch.bool)
+    valid[:, :4] = True
+    loss_pad, info_pad = vae_kl_loss(mu_pad, lv_pad, latent_valid=valid)
+    _assert(
+        torch.allclose(info_short["kl_mean_raw"], info_pad["kl_mean_raw"], atol=1e-6),
+        f"KL mean must ignore padding: {info_short['kl_mean_raw']} vs {info_pad['kl_mean_raw']}",
+    )
+    _assert(torch.allclose(loss_short, loss_pad, atol=1e-6), f"KL loss {loss_short} vs {loss_pad}")
+    _assert(int(info_pad["n_valid"].item()) == 4, info_pad["n_valid"])
+    _assert(float(loss_pad) == float(loss_short), "float(KlLossResult) must match")
+
 
 def test_pseudo_coords_range():
     data = make_synthetic_data(sac=False)
+    r_local = _vertex_r_local(data)
+    raised = False
+    try:
+        intrinsic_spline_pseudo_coords(
+            data.u, data.theta, data.tract_id, data.edge_index, data.u_step
+        )
+    except ValueError:
+        raised = True
+    _assert(raised, "r_local is required; π-normalised Δθ is not a fallback")
     e = intrinsic_spline_pseudo_coords(
-        data.u, data.theta, data.tract_id, data.edge_index, data.u_step
+        data.u, data.theta, data.tract_id, data.edge_index, data.u_step,
+        r_local=r_local, pos=data.x,
     )
     _assert(e.dtype == torch.float32, "pseudo dtype")
     _assert(e.min() >= 0.0 and e.max() <= 1.0, f"pseudo coords out of [0,1]: {e.min()}, {e.max()}")
@@ -405,9 +463,6 @@ def test_allocate_rings():
         _assert(len(alloc) == len(arcs), alloc)
         _assert(sum(alloc) == n_len, f"ring counts {alloc} sum to {sum(alloc)} != {n_len}")
         _assert(min(alloc) >= 1, alloc)
-    alloc, n_junc = allocate_token_counts(64, [10.0, 10.0, 5.0], 2)
-    _assert(sum(alloc) + n_junc == 64, (alloc, n_junc))
-    _assert(n_junc == 2, n_junc)
 
 
 def test_decoupled_head_no_inversion():
@@ -446,20 +501,34 @@ def test_decoder_composed_non_inversion():
     batch = next(iter(loader))
     model = _tiny_model()
     model.eval()
-    for head in (model.decoder.coarse_head, model.decoder.mid_head, model.decoder.head):
+    _assert(
+        isinstance(model.decoder.coarse_head, FreeDisplacementHead),
+        type(model.decoder.coarse_head).__name__,
+    )
+    z = torch.zeros(1, 8, 8)
+    with torch.no_grad():
+        _, delta_x0, x_c0, _, _, *_ = model.decoder(z, batch)
+    dx_c0 = x_c0 - batch.pos_coarse
+    _assert(
+        torch.allclose(dx_c0, torch.zeros_like(dx_c0), atol=1e-4),
+        f"coarse identity Δx max={float(dx_c0.abs().max())}",
+    )
+    for head in (model.decoder.mid_head, model.decoder.head):
         torch.nn.init.zeros_(head.radial.weight)
         head.radial.bias.data.fill_(-80.0)
         torch.nn.init.zeros_(head.shear.weight)
         torch.nn.init.zeros_(head.shear.bias)
-    z = torch.zeros(1, 8, 8)
     with torch.no_grad():
-        _, delta_x, x_c, x_m, _, _ = model.decoder(z, batch)
-    r_c = (batch.normal_coarse * (x_c - batch.pos_coarse)).sum(-1)
+        _, delta_x, x_c, x_m, _, *_ = model.decoder(z, batch)
     r_m = (batch.normal_mid * (x_m - batch.pos_mid)).sum(-1)
     r_f = (batch.normal * delta_x).sum(-1)
-    _assert(bool((r_c >= -2.0 - 1e-3).all()), f"coarse composed Δr min={float(r_c.min())}")
-    _assert(bool((r_m >= -2.0 - 1e-3).all()), f"mid composed Δr min={float(r_m.min())}")
-    _assert(bool((r_f >= -2.0 - 1e-3).all()), f"fine composed Δr min={float(r_f.min())}")
+    floor = float(RADIAL_FLOOR_FRAC) * 2.0
+    _assert(bool((r_m >= -floor - 1e-3).all()), f"mid composed Δr min={float(r_m.min())}")
+    _assert(bool((r_f >= -floor - 1e-3).all()), f"fine composed Δr min={float(r_f.min())}")
+    _assert(
+        torch.allclose(x_c, batch.pos_coarse, atol=1e-4),
+        "coarse FreeDisplacementHead must stay at identity when inverted mid/fine heads run",
+    )
 
 
 def test_orphan_attention_uniform():
@@ -659,6 +728,11 @@ def test_spline_conv_backend():
     attr = torch.rand(3, 3)
     y = conv(x, ei, attr)
     _assert(y.shape == (6, 4), y.shape)
+    res = ResidualSplineConv(8)
+    kraw = res.conv.kernel_size
+    ks = tuple(int(v) for v in (kraw.tolist() if hasattr(kraw, "tolist") else kraw))
+    _assert(ks == (5, 5, 2), ks)
+    _assert(bool(res.conv.root_weight), "SplineConv root_weight")
 
 
 def test_dirichlet_zero_on_rigid():
@@ -755,7 +829,6 @@ def test_cleandata_discovery_and_complete():
             "uniformly_remeshed": os.path.join(root, "uniformly_remeshed"),
             "template_mesh": os.path.join(root, "template_mesh"),
             "original_centerline": os.path.join(root, "original_centerline"),
-            "template_centerline": os.path.join(root, "template_centerline"),
         }
         for folder in layout_dirs.values():
             os.makedirs(folder, exist_ok=True)
@@ -769,6 +842,15 @@ def test_cleandata_discovery_and_complete():
         _assert(os.path.basename(os.path.dirname(rec["vessel_file"])) == "uniformly_remeshed", rec["vessel_file"])
         _assert(os.path.basename(os.path.dirname(rec["centerline_file"])) == "original_centerline", rec["centerline_file"])
         _assert(os.path.basename(os.path.dirname(rec["template_mesh_file"])) == "template_mesh", rec["template_mesh_file"])
+        rec_no_tpl_cl = dict(rec)
+        rec_no_tpl_cl["template_centerline_file"] = os.path.join(
+            root, "template_centerline", "CASE01.vtp"
+        )
+        _assert(
+            sample_is_complete(rec_no_tpl_cl, require_templates=True),
+            "completeness must not require template_centerline",
+        )
+        _assert(not os.path.isdir(os.path.join(root, "template_centerline")), "test must not create the dropped folder")
         ds = AneurysmDataset(
             cleandata_root=root,
             cache_dir=os.path.join(root, "cache"),
@@ -796,6 +878,71 @@ def _template_cylinder_pair(radius_tpl=2.0, radius_gt=2.4, n_sides=20, n_len=40)
     if not bool(gt.is_all_triangles):
         gt = gt.triangulate()
     return _polyline_mesh(pts), tpl, gt
+
+
+def _open_cylinder_surface(radius=2.0, height=20.0, n_th=24, n_z=40, bulge=0.0):
+    """Open cylinder (2 boundary loops). Optional +X Gaussian bulge on the wall."""
+    z = np.linspace(0.0, height, n_z)
+    th = np.linspace(0.0, 2.0 * np.pi, n_th, endpoint=False)
+    zz, tt = np.meshgrid(z, th, indexing="ij")
+    r = np.full_like(zz, float(radius), dtype=np.float64)
+    if bulge:
+        sigma = 3.0
+        bump = float(bulge) * np.exp(-0.5 * ((zz - 0.5 * height) / sigma) ** 2)
+        r = r + bump * np.clip(np.cos(tt), 0.0, None)
+    pts = np.stack(
+        [(r * np.cos(tt)).reshape(-1), (r * np.sin(tt)).reshape(-1), zz.reshape(-1)],
+        axis=1,
+    )
+    faces = []
+    for i in range(n_z - 1):
+        for j in range(n_th):
+            a = i * n_th + j
+            b = i * n_th + (j + 1) % n_th
+            c = (i + 1) * n_th + j
+            d = (i + 1) * n_th + (j + 1) % n_th
+            faces.extend([3, a, b, c, 3, b, d, c])
+    return pv.PolyData(pts, np.asarray(faces, dtype=np.int64))
+
+
+def _cell_y_centerline():
+    """VMTK-like cells: duplicate parent, ~1.6 mm blank, two daughters."""
+    parent = np.stack([np.zeros(90), np.zeros(90), np.linspace(0.0, 88.8, 90)], axis=1)
+    blank = np.stack([np.zeros(8), np.zeros(8), np.linspace(88.8, 90.4, 8)], axis=1)
+    d0 = np.stack([np.linspace(0.0, 13.3, 20), np.zeros(20), np.full(20, 90.4)], axis=1)
+    d1 = np.stack([np.zeros(20), np.linspace(0.0, 12.9, 20), np.full(20, 90.4)], axis=1)
+    chunks = [parent, blank, d0, parent.copy(), blank.copy(), d1]
+    gids = [0, 1, 2, 0, 1, 3]
+    blanks = [0, 1, 0, 0, 1, 0]
+    clids = [0, 0, 0, 1, 1, 1]
+    tids = [0, 1, 2, 0, 1, 2]
+    pts = np.concatenate(chunks, axis=0)
+    lines = []
+    off = 0
+    for ch in chunks:
+        n = len(ch)
+        lines.append(np.concatenate(([n], np.arange(off, off + n, dtype=np.int64))))
+        off += n
+    mesh = pv.PolyData(pts, lines=np.concatenate(lines))
+    mesh.cell_data["GroupIds"] = np.asarray(gids, dtype=np.float64)
+    mesh.cell_data["Blanking"] = np.asarray(blanks, dtype=np.float64)
+    mesh.cell_data["CenterlineIds"] = np.asarray(clids, dtype=np.float64)
+    mesh.cell_data["TractIds"] = np.asarray(tids, dtype=np.float64)
+    return mesh
+
+
+def _snf_unclipped_paths():
+    return [
+        os.path.join(_REPO_ROOT, "scratch", "cl_probe", "SNF00000100_branched_unclipped.vtp"),
+        os.path.join(_REPO_ROOT, "scratch", "uniform_probe", "original_centerline", "SNF00000100.vtp"),
+    ]
+
+
+def _first_existing(paths):
+    for path in paths:
+        if os.path.isfile(path):
+            return path
+    return None
 
 
 def test_template_scaffold_starts_from_mesh():
@@ -1123,12 +1270,14 @@ def test_synthetic_data_fp32():
     _assert(data.edge_index.dtype == torch.long, "edge_index dtype")
     _assert(data.face.dtype == torch.long, "face dtype")
     _assert(data.token_attend.dtype == torch.bool, data.token_attend.dtype)
+    _assert(data.latent_valid.dtype == torch.bool, data.latent_valid.dtype)
+    _assert(data.latent_valid.shape[0] == data.latent_u.shape[0], "latent_valid length")
     _assert(data.x_true_normal.shape == data.x_true.shape, "x_true_normal shape")
     _assert(not hasattr(data, "cl_pos") or getattr(data, "cl_pos") is None, "cl_pos should be gone")
 
 
 def test_train_val_split_covers_all():
-    from aneuxai import train_val_split
+    from aneuxai import hospital_group, split_ids, train_val_split
 
     class Dummy:
         samples = [{"dataset_id": f"c{i}"} for i in range(5)]
@@ -1142,6 +1291,26 @@ def test_train_val_split_covers_all():
     _assert(set(train.indices).isdisjoint(val.indices), (train.indices, val.indices))
     _assert(set(train.indices) | set(val.indices) == set(range(5)), (train.indices, val.indices))
 
+    _assert(hospital_group("SNF00000100") == "SNF", hospital_group("SNF00000100"))
+    _assert(hospital_group("p157_EgAYExEF") == "p", hospital_group("p157_EgAYExEF"))
+    _assert(hospital_group("UPF_P0286.00_ID1") == "UPF", hospital_group("UPF_P0286.00_ID1"))
+    _assert(hospital_group("USFD_UNIGE_0001") == "USFD", hospital_group("USFD_UNIGE_0001"))
+    _assert(hospital_group("ANSYS_UNIGE_30_612") == "ANSYS", hospital_group("ANSYS_UNIGE_30_612"))
+
+    ids = (
+        [f"SNF{i:08d}" for i in range(20)]
+        + [f"p{i:03d}_xxxx" for i in range(20)]
+        + [f"UPF_P{i:04d}.00_ID1" for i in range(20)]
+    )
+    tr, va, te = split_ids(ids, 0.15, 0.15, 31)
+    _assert(len(tr) + len(va) + len(te) == 60, (len(tr), len(va), len(te)))
+    _assert(len(set(tr) & set(va)) == 0 and len(set(tr) & set(te)) == 0 and len(set(va) & set(te)) == 0, "overlaps")
+    for prefix in ("SNF", "p", "UPF"):
+        n_va = sum(1 for x in va if hospital_group(x) == prefix)
+        n_te = sum(1 for x in te if hospital_group(x) == prefix)
+        _assert(n_va >= 1, f"{prefix} missing from val")
+        _assert(n_te >= 1, f"{prefix} missing from test")
+
 
 def test_chamfer_weight_cap():
     w = chamfer_distance_weights(torch.tensor([0.0, 2.0, 20.0]), radius=2.0, cap=4.0)
@@ -1150,6 +1319,16 @@ def test_chamfer_weight_cap():
     _assert(float(w[2]) == 4.0, f"cap failed {w[2]}")
     w2 = chamfer_distance_weights(torch.tensor([8.0]), radius=2.0, cap=4.0)
     _assert(float(w2[0]) == 4.0, "1+(d/R) must clamp at cap")
+    dist = torch.tensor([0.0, 1.0, 2.0])
+    r_loc = torch.tensor([1.0, 2.0, 0.5])
+    wt = chamfer_distance_weights(dist, radius=r_loc, cap=8.0)
+    _assert(torch.allclose(wt, torch.tensor([1.0, 1.5, 5.0])), f"tensor r_local weights {wt}")
+    x = torch.tensor([[3.0, 0.0, 0.0], [0.0, 4.0, 0.0]])
+    tube = torch.zeros(2, 3)
+    nrm = torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    r_vec = torch.tensor([1.5, 2.5])
+    cr = composed_radius(x, tube, nrm, r_vec)
+    _assert(torch.allclose(cr, torch.tensor([4.5, 6.5])), f"composed_radius r_local {cr}")
 
 
 def test_huber_and_radial_loss():
@@ -1427,8 +1606,12 @@ def test_full_capacity_model_forward():
     out = model(batch)
     _assert(out.mu.shape[-1] == LATENT_DIM, out.mu.shape)
     _assert(out.x_pred.shape == batch.x.shape, out.x_pred.shape)
-    _assert(len(model.decoder.mid_convs) == N_SPLINE_MID, len(model.decoder.mid_convs))
-    _assert(len(model.decoder.fine_convs) == N_SPLINE_FINE, len(model.decoder.fine_convs))
+    _assert(len(model.decoder.mid_convs) == N_CONV_PER_LEVEL, len(model.decoder.mid_convs))
+    _assert(len(model.decoder.fine_convs) == N_CONV_PER_LEVEL, len(model.decoder.fine_convs))
+    _assert(len(model.decoder.coarse_convs) == N_CONV_PER_LEVEL, len(model.decoder.coarse_convs))
+    kraw = model.decoder.fine_convs[0].conv.kernel_size
+    ks = tuple(int(v) for v in (kraw.tolist() if hasattr(kraw, "tolist") else kraw))
+    _assert(ks == tuple(SPLINE_KERNEL_SIZE) == (5, 5, 2), ks)
     terms = compute_losses(
         out.x_pred,
         batch.x_true,
@@ -1467,6 +1650,257 @@ def test_full_capacity_model_forward():
     _assert(torch.isfinite(loss), f"non-finite loss {loss}")
     grads = [p.grad.abs().sum().item() for p in model.parameters() if p.grad is not None]
     _assert(len(grads) > 0 and sum(grads) > 0, "no gradients on capacity model")
+
+
+def test_coaxial_rstar_healthy_and_bulge_ray():
+    """§13: coaxial cylinders keep exact healthy r*; bulge r* follows the ray."""
+    factory = _make_factory(n_true=64, latent_len=16)
+    cl_pts = np.stack([np.zeros(41), np.zeros(41), np.linspace(0.0, 20.0, 41)], axis=1)
+    cl = _polyline_mesh(cl_pts)
+    tpl = _open_cylinder_surface(radius=2.0, height=20.0, n_th=24, n_z=40, bulge=0.0)
+    gt_h = _open_cylinder_surface(radius=2.4, height=20.0, n_th=28, n_z=44, bulge=0.0)
+    data_h = factory.build_scaffold(cl, vessel_mesh=gt_h, template_mesh=tpl)
+    valid_h = data_h.r_star_valid.numpy()
+    interior = (data_h.u.numpy() > 0.15) & (data_h.u.numpy() < 0.85)
+    sel = valid_h & interior
+    _assert(int(sel.sum()) > 20, f"healthy valid interior {int(sel.sum())}")
+    mean_r = float(data_h.r_star.numpy()[sel].mean())
+    _assert(2.2 < mean_r < 2.6, f"healthy coaxial r* should be ~2.4 mm, got {mean_r}")
+
+    gt_b = _open_cylinder_surface(radius=2.4, height=20.0, n_th=28, n_z=44, bulge=6.0)
+    data_b = factory.build_scaffold(cl, vessel_mesh=gt_b, template_mesh=tpl)
+    origin = data_b.origin_shift.detach().cpu().numpy().reshape(3)
+    rot = data_b.pose_R.detach().cpu().numpy().reshape(3, 3)
+    posed_gt = transform_vessel_mesh(gt_b, origin, rot)
+    r_loc = data_b.r_local.numpy()
+    packed = template_ray_r_star(
+        data_b.x.numpy(), data_b.normal.numpy(), r_loc, posed_gt
+    )
+    valid_b = data_b.r_star_valid.numpy() & packed["valid"]
+    interior_b = (data_b.u.numpy() > 0.15) & (data_b.u.numpy() < 0.85)
+    live = valid_b & interior_b
+    _assert(int(live.sum()) > 20, f"bulge valid interior {int(live.sum())}")
+    err = np.abs(data_b.r_star.numpy()[live] - packed["r_star"][live])
+    _assert(float(np.median(err)) < 0.15, f"r* vs ray median err {float(np.median(err))}")
+    bulge = live & (packed["r_star"] > 3.5)
+    _assert(int(bulge.sum()) > 3, f"expected ray hits under the bulge, got {int(bulge.sum())}")
+    bulge_r = float(data_b.r_star.numpy()[bulge].mean())
+    _assert(bulge_r > 3.5, f"bulge r* should exceed healthy 2.4, got {bulge_r}")
+    from scipy.spatial import cKDTree
+
+    _, nn = cKDTree(np.asarray(posed_gt.points)).query(data_b.x.numpy()[bulge], k=1)
+    nearest_r = r_loc[bulge] + np.linalg.norm(
+        np.asarray(posed_gt.points)[nn] - data_b.x.numpy()[bulge], axis=1
+    )
+    ray_r = packed["r_star"][bulge]
+    stored = data_b.r_star.numpy()[bulge]
+    ray_err = np.abs(stored - ray_r)
+    nn_err = np.abs(stored - nearest_r)
+    _assert(
+        float(np.median(ray_err)) <= float(np.median(nn_err)) + 0.05,
+        f"r* under the bulge must follow the ray, not nearest-vertex "
+        f"(ray median {float(np.median(ray_err)):.3f} vs nn {float(np.median(nn_err)):.3f})",
+    )
+
+
+def test_scaffold_normals_point_away_from_centerline():
+    factory = _make_factory(n_true=64, latent_len=8)
+    cl, tpl, gt = _template_cylinder_pair()
+    data = factory.build_scaffold(cl, vessel_mesh=gt, template_mesh=tpl)
+    cl_xyz = data.cl_dense.numpy()[:, :3]
+    from scipy.spatial import cKDTree
+
+    def _outward_frac(pos, nrm):
+        _, idx = cKDTree(cl_xyz).query(pos, k=1)
+        radial = pos - cl_xyz[idx]
+        dots = np.einsum("ij,ij->i", nrm, radial)
+        return float(np.mean(dots >= -1e-5)), float(dots.min())
+
+    frac_f, min_f = _outward_frac(data.x.numpy(), data.normal.numpy())
+    frac_m, min_m = _outward_frac(data.pos_mid.numpy(), data.normal_mid.numpy())
+    frac_c, min_c = _outward_frac(data.pos_coarse.numpy(), data.normal_coarse.numpy())
+    _assert(frac_f > 0.98, f"fine outward {frac_f} min={min_f}")
+    _assert(frac_m > 0.98, f"mid outward {frac_m} min={min_m}")
+    _assert(frac_c > 0.98, f"coarse outward {frac_c} min={min_c}")
+
+    inward = np.array([[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float64)
+    pos = np.array([[2.0, 0.0, 0.0], [-2.0, 0.0, 0.0]], dtype=np.float64)
+    cl_line = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+    flipped = factory._orient_normals_outward(inward, pos, cl_line)
+    _assert(float(flipped[0, 0]) > 0.5, flipped[0])
+    _assert(float(flipped[1, 0]) < -0.5, flipped[1])
+
+
+def test_groupid_require_raises_without_arrays():
+    mesh = _polylines_mesh(list(_y_paths()))
+    raised = False
+    try:
+        extract_groupid_tracts(mesh, require_groupids=True)
+    except ValueError as exc:
+        raised = "GroupIds" in str(exc)
+    _assert(raised, "require_groupids=True must refuse the unique-tract fallback")
+
+
+def test_groupid_cell_arrays_blank_and_near_coincident():
+    mesh = _cell_y_centerline()
+    tracts, _endpoints, junctions = extract_groupid_tracts(mesh, require_groupids=True)
+    arcs = sorted((_arc_len(t) for t in tracts), reverse=True)
+    _assert(len(tracts) == 3, f"cell-array Y should be 3 tracts, got {len(tracts)} arcs={arcs}")
+    _assert(len(junctions) == 1, f"expected 1 junction, got {junctions}")
+    _assert(abs(arcs[0] - 88.8) < 1.5, f"parent arc {arcs[0]}")
+    _assert(min(arcs[1], arcs[2]) > 13.0, f"blanked 1.6 mm should attach to daughters {arcs[1:]}")
+
+
+def test_groupid_snf_unclipped_fixture():
+    path = _first_existing(_snf_unclipped_paths())
+    if path is None:
+        raise SkipTest("no SNF00000100 unclipped centerline fixture under scratch/")
+    mesh = pv.read(path)
+    tracts, _endpoints, junctions = extract_groupid_tracts(mesh, require_groupids=True)
+    _assert(len(tracts) == 3, f"{os.path.basename(path)} tracts {len(tracts)}")
+    _assert(len(junctions) == 1, f"{os.path.basename(path)} junctions {junctions}")
+
+
+def test_smoothness_weights_not_all_ones_on_bulge():
+    factory = _make_factory(n_true=64, latent_len=16)
+    cl_pts = np.stack([np.zeros(41), np.zeros(41), np.linspace(0.0, 40.0, 41)], axis=1)
+    cl = _polyline_mesh(cl_pts)
+    tpl = _open_cylinder_surface(radius=2.0, height=40.0, n_th=24, n_z=40, bulge=0.0)
+    gt = _open_cylinder_surface(radius=2.0, height=40.0, n_th=24, n_z=40, bulge=8.0)
+    data = factory.build_scaffold(cl, vessel_mesh=gt, template_mesh=tpl)
+    src, dst = data.edge_index
+    w = smoothness_edge_weights(
+        src, dst, data.r_star, data.r_star_valid, data.r_dth, data.r_du, data.r_ring_med,
+        ambiguous=data.r_star_ambiguous,
+    )
+    _assert(float(w.min()) < 1.0 - 1e-6, f"bulge smoothness weights were all ones: min={float(w.min())}")
+    _assert(float((w < 1.0 - 1e-6).float().mean()) > 0.01, "too few softened edges on the bulge")
+
+
+def test_token_spacing_independent_of_length():
+    factory = _make_factory(latent_len=128)
+    for length in (40.0, 90.0):
+        z = np.linspace(0.0, length, max(8, int(length)))
+        pts = np.stack([np.zeros_like(z), np.zeros_like(z), z], axis=1)
+        dense = factory._fit_dense_tract(pts)
+        tok = factory._build_latent_tokens([dense], {}, {}, [float(dense["arc"])])
+        valid = tok["latent_valid"].numpy()
+        pos = tok["latent_pos"].numpy()[valid]
+        n_tok = int(valid.sum())
+        expect = int(np.floor(float(dense["arc"]) / TOKEN_SPACING_MM) + 1)
+        _assert(n_tok == expect, f"L={length}: n_tok {n_tok} vs floor(L/2)+1={expect}")
+        if n_tok > 1:
+            ds = np.linalg.norm(np.diff(pos, axis=0), axis=1)
+            _assert(abs(float(np.median(ds)) - TOKEN_SPACING_MM) < 0.15, f"L={length} spacing {float(np.median(ds))}")
+        _assert(not bool(tok["token_attend"][~tok["latent_valid"]].any()), f"L={length} pad attend")
+        _assert(n_tok != 96, "must not spread a fixed 96-slot budget")
+
+
+def test_ring_neighbour_eth_at_cube_edge():
+    data = make_synthetic_data(sac=False)
+    r_local = _vertex_r_local(data)
+    e = intrinsic_spline_pseudo_coords(
+        data.u, data.theta, data.tract_id, data.edge_index, data.u_step,
+        r_local=r_local, pos=data.x,
+    )
+    src, dst = data.edge_index
+    same_u = (data.u[src] - data.u[dst]).abs() < 1e-4
+    same_tr = data.tract_id[src] == data.tract_id[dst]
+    dth = (data.theta[dst] - data.theta[src]).abs()
+    ring = same_u & same_tr & (dth > 0.05)
+    _assert(bool(ring.any()), "expected circumferential ring edges")
+    e_th = e[ring, 1]
+    dist01 = torch.minimum(e_th, (1.0 - e_th).abs())
+    _assert(
+        float(dist01.median()) < 0.12,
+        f"ring-neighbour e_th should be ~0 or ~1, median dist={float(dist01.median())} values={e_th[:8]}",
+    )
+
+
+def test_decimation_keeps_profile_loops():
+    factory = _make_factory()
+    mesh = _open_cylinder_surface(radius=2.0, height=20.0, n_th=24, n_z=80, bulge=0.0)
+    _, faces0 = factory._polydata_triangles(mesh)
+    _n0, _nm0, n_loops0 = factory._face_topology(faces0, int(mesh.n_points))
+    _assert(n_loops0 == 2, f"open cylinder should have 2 loops, got {n_loops0}")
+    mid = factory._decimate_keep(mesh, 0.25, 64)
+    coarse = factory._decimate_keep(mesh, 0.08, 32)
+    _, faces_m = factory._polydata_triangles(mid)
+    _, faces_c = factory._polydata_triangles(coarse)
+    _nm_m_unused, nman_m, n_m = factory._face_topology(faces_m, int(mid.n_points))
+    _nm_c_unused, nman_c, n_c = factory._face_topology(faces_c, int(coarse.n_points))
+    del _nm_m_unused, _nm_c_unused
+    _assert(nman_m == 0, f"mid non-manifold {nman_m}")
+    _assert(nman_c == 0, f"coarse non-manifold {nman_c}")
+    _assert(n_m == n_loops0, f"mid loops {n_m} vs {n_loops0}")
+    _assert(n_c == n_loops0, f"coarse loops {n_c} vs {n_loops0}")
+
+
+def test_reparameterize_eval_samples_and_logvar_floor():
+    model = _tiny_model()
+    model.eval()
+    mu = torch.zeros(1, 8, 8)
+    logvar = torch.full((1, 8, 8), 2.0 * math.log(0.4))
+    with torch.no_grad():
+        z_mu = model.reparameterize(mu, logvar, sample=False)
+        torch.manual_seed(11)
+        z_s1 = model.reparameterize(mu, logvar, sample=True)
+        torch.manual_seed(11)
+        z_s2 = model.reparameterize(mu, logvar, sample=True)
+    _assert(torch.allclose(z_mu, mu), "sample=False must return μ")
+    _assert(torch.allclose(z_s1, z_s2), "same seed must match")
+    _assert(not torch.allclose(z_s1, mu), "eval+sample=True must not always equal μ")
+    raw = torch.linspace(-30.0, 30.0, 64)
+    lv = _soft_logvar(raw)
+    _assert((lv >= math.log(0.01) - 1e-5).all(), float(lv.min()))
+    _assert((torch.exp(0.5 * lv) >= SIGMA_MIN - 1e-5).all(), float(torch.exp(0.5 * lv).min()))
+    _assert(abs(float(LOGVAR_MIN) - math.log(0.01)) < 1e-5, LOGVAR_MIN)
+
+
+def test_mixer_before_sampling():
+    data = make_synthetic_data(sac=False)
+    loader = DataLoader([data], batch_size=1, follow_batch=FOLLOW_BATCH)
+    batch = next(iter(loader))
+    model = _tiny_model()
+    model.eval()
+    with torch.no_grad():
+        out_id = model(batch, sample=False)
+    _assert(torch.allclose(out_id.mu, out_id.mu_raw, atol=1e-5), "zero-init mixer is identity")
+    _assert(torch.allclose(out_id.z, out_id.mu, atol=1e-5), "sample=False z is mixed μ")
+    torch.nn.init.xavier_uniform_(model.z_attn.out.weight)
+    with torch.no_grad():
+        out_mix = model(batch, sample=False)
+        out_s = model(batch, sample=True)
+    _assert(not torch.allclose(out_mix.mu, out_mix.mu_raw, atol=1e-5), "mixer must change μ before sampling")
+    _assert(torch.allclose(out_mix.z, out_mix.mu, atol=1e-5), "sample=False z is mixed μ, not raw")
+    _assert(bool(out_s.sampled), "sample=True must set sampled")
+    _assert(not torch.allclose(out_s.z, out_s.mu, atol=1e-6), "eval+sample=True z differs from mixed μ")
+    _assert((out_s.logvar >= math.log(0.01) - 1e-4).all(), float(out_s.logvar.min()))
+
+
+def test_null_code_decodes_to_template():
+    data = make_synthetic_data(sac=False)
+    loader = DataLoader([data], batch_size=1, follow_batch=FOLLOW_BATCH)
+    batch = next(iter(loader))
+    model = _tiny_model()
+    model.eval()
+    z = torch.zeros(1, 8, 8)
+    with torch.no_grad():
+        x = model.decode(z, batch)
+    _assert(x.shape == batch.x.shape, x.shape)
+    _assert(torch.allclose(x, batch.x, atol=1e-3), f"null code Δ max={float((x - batch.x).abs().max())}")
+
+    factory = _make_factory(n_true=64, latent_len=8)
+    cl, tpl, gt = _template_cylinder_pair()
+    tpl_data = factory.build_scaffold(cl, vessel_mesh=gt, template_mesh=tpl)
+    tpl_batch = next(iter(DataLoader([tpl_data], batch_size=1, follow_batch=FOLLOW_BATCH)))
+    with torch.no_grad():
+        x_tpl = model.decode(z, tpl_batch)
+    dmax = float((x_tpl - tpl_batch.x).abs().max())
+    _assert(
+        dmax < 0.02,
+        f"template null-code Δ max={dmax} (identity at init, knn upsample)",
+    )
 
 
 def main():
@@ -1527,18 +1961,34 @@ def main():
         test_full_capacity_model_forward,
         test_gradient_checkpointing_modes,
         test_forward_backward,
+        test_coaxial_rstar_healthy_and_bulge_ray,
+        test_scaffold_normals_point_away_from_centerline,
+        test_groupid_require_raises_without_arrays,
+        test_groupid_cell_arrays_blank_and_near_coincident,
+        test_groupid_snf_unclipped_fixture,
+        test_smoothness_weights_not_all_ones_on_bulge,
+        test_token_spacing_independent_of_length,
+        test_ring_neighbour_eth_at_cube_edge,
+        test_decimation_keeps_profile_loops,
+        test_reparameterize_eval_samples_and_logvar_floor,
+        test_mixer_before_sampling,
+        test_null_code_decodes_to_template,
     ]
     failed = 0
+    skipped = 0
     for fn in tests:
         try:
             fn()
             print(f"PASS  {fn.__name__}")
+        except SkipTest as exc:
+            skipped += 1
+            print(f"SKIP  {fn.__name__}  ({exc})")
         except Exception:
             failed += 1
             print(f"FAIL  {fn.__name__}")
             traceback.print_exc()
             print()
-    print(f"\n{len(tests) - failed}/{len(tests)} passed")
+    print(f"\n{len(tests) - failed - skipped}/{len(tests)} passed, {skipped} skipped, {failed} failed")
     return failed
 
 

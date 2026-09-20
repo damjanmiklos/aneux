@@ -1,14 +1,16 @@
+import math
+
 import torch
 import torch.nn.functional as F
 from pytorch3d.ops import knn_points
 
+import config as _config
 from config import (
     CHAMFER_WEIGHT_CAP,
     CROSS_TRACT_SMOOTH_W,
     LAMBDA_CD_COARSE,
     LAMBDA_CD_MID,
     LAMBDA_RAD_MID,
-    LOGVAR_CLAMP,
     PLANE_HUBER_DELTA_MM,
     PLANE_L2_MIX,
     RADIAL_HUBER_DELTA_MM,
@@ -19,6 +21,11 @@ from config import (
     SMOOTH_W_AMBIGUOUS,
     TUBE_RADIUS_MM,
 )
+from ops import composed_radius
+
+
+def _cfg(name, default):
+    return getattr(_config, name, default)
 
 
 def _flag_true(flag):
@@ -32,15 +39,168 @@ def _flag_true(flag):
     return bool(flag)
 
 
-def vae_kl_loss(mu, logvar):
-    """KL of a diagonal Gaussian posterior against N(0, I).
+class KlLossResult(tuple):
+    """Unpackable ``(loss, info)`` that still accepts ``float()`` in older tests."""
 
-    mu, logvar: [B, L, D] or [B, D]. Averaged over batch and latent tokens.
-    logvar is log(σ²) of a Gaussian, not a lognormal.
+    def __new__(cls, loss, info):
+        return super().__new__(cls, (loss, info))
+
+    def __float__(self):
+        return float(self[0].detach().cpu())
+
+    def item(self):
+        return self[0].item()
+
+
+def _token_valid_weight(mu, latent_valid):
+    """Float mask of shape ``mu.shape[:-1]`` (1 = keep)."""
+    token_shape = mu.shape[:-1]
+    n_tok = int(mu.reshape(-1, mu.size(-1)).size(0))
+    if latent_valid is None:
+        return mu.new_ones(token_shape)
+    if torch.is_tensor(latent_valid):
+        v = latent_valid
+    else:
+        v = mu.new_tensor(1.0 if bool(latent_valid) else 0.0)
+    v = v.to(device=mu.device)
+    if v.dtype == torch.bool:
+        v = v.to(dtype=mu.dtype)
+    else:
+        v = (v != 0).to(dtype=mu.dtype)
+    v = v.reshape(-1)
+    if v.numel() == 1:
+        return v.reshape(()).expand(token_shape)
+    if v.numel() != n_tok:
+        raise ValueError(
+            "vae_kl_loss: latent_valid has "
+            f"{int(v.numel())} values, expected 1 or {n_tok}"
+        )
+    return v.reshape(token_shape)
+
+
+def apply_token_kl_floor(kl_per_token, latent_valid=None, lambda_tok=None):
+    """Masked mean of ``max(λ_tok, Σ_j KL_j)``.
+
+    Apply this to the *accumulated* token batch (``bs × accum``), not to each
+    micro-step, so λ_tok ≈ 0.5 nats is warm-up insurance rather than per-step
+    free bits (§5.3.6 item 3).
     """
-    logvar = torch.clamp(logvar, LOGVAR_CLAMP[0], LOGVAR_CLAMP[1])
-    kl = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp())
-    return kl.sum(dim=-1).mean()
+    kl_per_token = kl_per_token.float()
+    if lambda_tok is None:
+        lambda_tok = _cfg("TOKEN_KL_FLOOR_NATS", 0.5)
+    floored = torch.clamp(kl_per_token, min=float(lambda_tok))
+    w = _token_valid_weight(floored.unsqueeze(-1), latent_valid)
+    return (floored * w).sum() / w.sum().clamp_min(1e-8)
+
+
+def geco_beta_max_for_epoch(epoch, beta_max=None, warmup_epochs=None):
+    """Ramp β_max from 0 at epoch 1 to ``beta_max`` at ``warmup_epochs`` (§5.3.6)."""
+    if beta_max is None:
+        beta_max = _cfg("GECO_BETA_MAX", 10.0)
+    if warmup_epochs is None:
+        warmup_epochs = _cfg("KL_WARMUP_EPOCHS", 20)
+    beta_max = float(beta_max)
+    warmup_epochs = int(warmup_epochs)
+    if warmup_epochs <= 1:
+        return beta_max
+    t = min(1.0, max(0.0, (int(epoch) - 1) / float(warmup_epochs - 1)))
+    return beta_max * t
+
+
+def update_geco_beta(
+    beta,
+    kl_mean_raw,
+    rate_target=None,
+    eta=None,
+    beta_min=None,
+    beta_max=None,
+    epoch=None,
+    warmup_epochs=None,
+):
+    """One optimiser-step dual update: ``β ← clip(β · exp(η · (KL̄_raw − R*)))``.
+
+    Constraint is on the mean raw KL over valid tokens. Pass ``epoch`` so the
+    20-epoch warm-up ramps β_max rather than a fixed λ.
+    """
+    if rate_target is None:
+        rate_target = _cfg("RATE_TARGET_NATS", 12.0)
+    if eta is None:
+        eta = _cfg("GECO_ETA", 1e-3)
+    if beta_min is None:
+        beta_min = _cfg("GECO_BETA_MIN", 1e-4)
+    if beta_max is None:
+        beta_max = _cfg("GECO_BETA_MAX", 10.0)
+    kl = float(kl_mean_raw.detach().cpu()) if torch.is_tensor(kl_mean_raw) else float(kl_mean_raw)
+    b = float(beta.detach().cpu()) if torch.is_tensor(beta) else float(beta)
+    new_b = b * math.exp(float(eta) * (kl - float(rate_target)))
+    hi = float(beta_max)
+    if epoch is not None:
+        hi = geco_beta_max_for_epoch(epoch, beta_max=hi, warmup_epochs=warmup_epochs)
+    lo = min(float(beta_min), hi)
+    new_b = min(hi, max(lo, new_b))
+    if torch.is_tensor(beta):
+        return beta.detach().new_tensor(new_b)
+    return new_b
+
+
+def vae_kl_loss(
+    mu,
+    logvar,
+    latent_valid=None,
+    beta=None,
+    token_floor=None,
+    use_lambda_kl=False,
+):
+    """Per-token KL of a diagonal Gaussian against N(0, I), masked by ``latent_valid``.
+
+    mu, logvar: ``[B, L, D]`` or ``[B, D]``. logvar is log(σ²), not a lognormal.
+    The mean is over *valid* tokens so β and R* mean the same on short and long
+    trees. Raw per-token KL is unclamped and reported before β.
+
+    Returns ``(loss, info_dict)``. ``loss`` is ``β · mean_valid(KL)`` when ``beta``
+    is set; otherwise the unweighted valid-token mean (unit-test fallback).
+    ``LAMBDA_KL`` is not the primary weight; pass ``use_lambda_kl=True`` only
+    for callers that still multiply by the old fixed λ inside this function.
+    Optional ``token_floor`` applies ``max(λ_tok, Σ_j KL_j)`` to this call's
+    tokens — prefer :func:`apply_token_kl_floor` on the accumulated batch.
+    """
+    mu = mu.float()
+    logvar = logvar.float()
+    kl_dim = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp())
+    kl_token = kl_dim.sum(dim=-1)
+    w = _token_valid_weight(mu, latent_valid)
+    w_sum = w.sum().clamp_min(1e-8)
+    kl_mean_raw = (kl_token * w).sum() / w_sum
+    if token_floor is not None:
+        kl_for_loss = (torch.clamp(kl_token, min=float(token_floor)) * w).sum() / w_sum
+    else:
+        kl_for_loss = kl_mean_raw
+    if beta is None and use_lambda_kl:
+        beta = _cfg("LAMBDA_KL", 5e-4)
+    if beta is None:
+        loss = kl_for_loss
+        beta_used = kl_for_loss.new_zeros(())
+    else:
+        if torch.is_tensor(beta):
+            b = beta.to(dtype=kl_for_loss.dtype, device=kl_for_loss.device)
+        else:
+            b = kl_for_loss.new_tensor(float(beta))
+        loss = b * kl_for_loss
+        beta_used = b.detach() if torch.is_tensor(b) else kl_for_loss.new_tensor(float(b))
+    n_valid = w_sum.detach()
+    ln2 = math.log(2.0)
+    token_view = (kl_token * w).reshape(mu.size(0), -1)
+    bits_per_case = token_view.sum(dim=-1).detach() / ln2
+    info = {
+        "kl_raw_per_token": kl_token.detach(),
+        "kl_mean_raw": kl_mean_raw.detach(),
+        "n_valid": n_valid,
+        "beta": beta_used,
+        "rate_target": float(_cfg("RATE_TARGET_NATS", 12.0)),
+        "rate_gap": (kl_mean_raw.detach() - float(_cfg("RATE_TARGET_NATS", 12.0))),
+        "bits_per_case": bits_per_case,
+    }
+    return KlLossResult(loss, info)
 
 
 def displacement_dirichlet(delta_x, edge_index):
@@ -66,9 +226,29 @@ def displacement_dirichlet_local(delta_r, delta_s, edge_index, edge_weight=None)
 
 
 def chamfer_distance_weights(dist, radius, cap=CHAMFER_WEIGHT_CAP):
-    """Linear Chamfer weights 1 + d/R, clamped so a large sac cannot dominate."""
-    r = float(radius)
-    return (1.0 + dist.float() / r).clamp(max=float(cap))
+    """Linear Chamfer weights 1 + d/R, clamped so a large sac cannot dominate.
+
+    ``radius`` is the local healthy radius: a Python float or a tensor
+    broadcastable to ``dist`` (per-vertex ``r_local``).
+    """
+    d = dist.float()
+    cap = float(cap)
+    if torch.is_tensor(radius):
+        r = radius.to(dtype=d.dtype, device=d.device)
+        if r.numel() == 1:
+            w = 1.0 + d / r.reshape(()).clamp_min(1e-8)
+        else:
+            r = r.reshape(-1)
+            d_flat = d.reshape(-1)
+            if r.shape[0] != d_flat.shape[0]:
+                raise ValueError(
+                    "chamfer_distance_weights: radius has "
+                    f"{int(r.shape[0])} values, expected 1 or {int(d_flat.shape[0])}"
+                )
+            w = (1.0 + d_flat / r.clamp_min(1e-8)).reshape(d.shape)
+    else:
+        w = 1.0 + d / float(radius)
+    return w.clamp(max=cap)
 
 
 def huber(diff, delta=RADIAL_HUBER_DELTA_MM):
@@ -78,11 +258,6 @@ def huber(diff, delta=RADIAL_HUBER_DELTA_MM):
     quad = 0.5 * diff.pow(2)
     lin = delta * (abs_d - 0.5 * delta)
     return torch.where(abs_d <= delta, quad, lin)
-
-
-def composed_radius(x, x_tube, normal, tube_radius):
-    """Radial distance from the centerline sample: R + n · (x - x_tube)."""
-    return float(tube_radius) + (normal.float() * (x.float() - x_tube.float())).sum(dim=-1)
 
 
 def radial_huber_loss(r_pred, r_star, valid, delta=RADIAL_HUBER_DELTA_MM):
@@ -337,6 +512,227 @@ def _mesh_normal_consistency(verts, face, batch, num_graphs):
     return (loss * counts[pair_batch].reciprocal()).sum() / float(num_graphs)
 
 
+def _face_normals(verts, face):
+    v0 = verts[face[0]]
+    v1 = verts[face[1]]
+    v2 = verts[face[2]]
+    return torch.cross(v1 - v0, v2 - v0, dim=-1)
+
+
+def _barycentric_interpolate(attr, face, face_idx, bary):
+    """Interpolate a per-vertex field onto surface samples."""
+    if attr is None:
+        return None
+    a0 = attr[face[0, face_idx]]
+    a1 = attr[face[1, face_idx]]
+    a2 = attr[face[2, face_idx]]
+    if attr.dim() == 1:
+        return bary[:, 0] * a0 + bary[:, 1] * a1 + bary[:, 2] * a2
+    b = bary.unsqueeze(-1)
+    return b[:, 0] * a0 + b[:, 1] * a1 + b[:, 2] * a2
+
+
+def _face_areas(verts, face):
+    nrm = _face_normals(verts.float(), face)
+    return 0.5 * nrm.norm(dim=-1)
+
+
+def sample_mesh_surface(
+    verts,
+    face,
+    n_samples,
+    batch=None,
+    num_graphs=1,
+    area_weighted=True,
+):
+    """Uniform or area-weighted samples on triangles. ``face`` is ``[3, F]``.
+
+    Returns ``(points, sample_batch, barycentric, face_index)``. Face indices
+    are detached; barycentric combinations keep a gradient to ``verts``.
+    """
+    face = _as_face_index(face)
+    n_samples = int(n_samples)
+    if (
+        face is None
+        or face.numel() == 0
+        or verts.size(0) == 0
+        or n_samples <= 0
+    ):
+        empty = verts.new_zeros((0, verts.size(-1) if verts.dim() == 2 else 3))
+        idx = verts.new_zeros((0,), dtype=torch.long)
+        return empty, idx, verts.new_zeros((0, 3)), idx
+    if batch is None:
+        batch = verts.new_zeros(verts.size(0), dtype=torch.long)
+        num_graphs = 1
+    n_g = max(int(num_graphs), 1)
+    pts_out, batch_out, bary_out, fidx_out = [], [], [], []
+    face_batch = batch[face[0]]
+    for g in range(n_g):
+        local_ids = (face_batch == g).nonzero(as_tuple=False).reshape(-1)
+        if local_ids.numel() == 0:
+            continue
+        g_face = face[:, local_ids]
+        area = _face_areas(verts, g_face)
+        n_f = max(int(area.numel()), 1)
+        uniform = torch.full_like(area, 1.0 / float(n_f))
+        if area_weighted:
+            total = area.sum().clamp_min(0.0)
+            probs = torch.where(total > 0, area / total.clamp_min(1e-12), uniform)
+        else:
+            probs = uniform
+        pick = torch.multinomial(probs, n_samples, replacement=True)
+        u = torch.rand(n_samples, device=verts.device, dtype=verts.dtype)
+        v = torch.rand(n_samples, device=verts.device, dtype=verts.dtype)
+        fold = (u + v) > 1
+        u = torch.where(fold, 1 - u, u)
+        v = torch.where(fold, 1 - v, v)
+        bary = torch.stack((1 - u - v, u, v), dim=-1)
+        v0 = verts[g_face[0, pick]]
+        v1 = verts[g_face[1, pick]]
+        v2 = verts[g_face[2, pick]]
+        pts = bary[:, 0:1] * v0 + bary[:, 1:2] * v1 + bary[:, 2:3] * v2
+        pts_out.append(pts)
+        batch_out.append(
+            torch.full((n_samples,), g, device=verts.device, dtype=torch.long)
+        )
+        bary_out.append(bary)
+        fidx_out.append(local_ids[pick])
+    if not pts_out:
+        empty = verts.new_zeros((0, verts.size(-1)))
+        idx = verts.new_zeros((0,), dtype=torch.long)
+        return empty, idx, verts.new_zeros((0, 3)), idx
+    return (
+        torch.cat(pts_out, dim=0),
+        torch.cat(batch_out, dim=0),
+        torch.cat(bary_out, dim=0),
+        torch.cat(fidx_out, dim=0),
+    )
+
+
+def _mean_over_faces(per_face, face, batch, num_graphs, like):
+    if per_face.numel() == 0:
+        return like.new_zeros(())
+    if batch is None:
+        return per_face.mean()
+    face_batch = batch[face[0]]
+    counts = torch.bincount(face_batch, minlength=num_graphs).to(dtype=like.dtype).clamp_min(1.0)
+    return (per_face * counts[face_batch].reciprocal()).sum() / float(num_graphs)
+
+
+def fold_penalty(x_pred, x_template, face, batch=None, num_graphs=1):
+    """Hinge on ``n_pred · n_template < 0`` per triangle (§7.5, §11 item 1)."""
+    face = _as_face_index(face)
+    if face is None or face.numel() == 0 or x_pred.size(0) == 0:
+        return x_pred.new_zeros(())
+    n_pred = F.normalize(_face_normals(x_pred.float(), face), dim=-1, eps=1e-8)
+    n_tpl = F.normalize(_face_normals(x_template.float(), face), dim=-1, eps=1e-8)
+    pen = F.relu(-(n_pred * n_tpl).sum(dim=-1))
+    return _mean_over_faces(pen, face, batch, num_graphs, x_pred)
+
+
+def triangle_stretch_loss(
+    x_pred,
+    x_template,
+    face,
+    batch=None,
+    num_graphs=1,
+    method="svd",
+):
+    """Per-triangle stretch against the template (§7.5, §11 item 1).
+
+    ``method='svd'``: singular values of the 2-D deformation gradient
+    (eigenvalues of the rest-metric Cauchy–Green tensor). ``method='edge'``:
+    edge-length ratios. Both use ``σ + 1/σ − 2``, which is 0 at identity.
+    """
+    face = _as_face_index(face)
+    if face is None or face.numel() == 0 or x_pred.size(0) == 0:
+        return x_pred.new_zeros(())
+    pred = x_pred.float()
+    tpl = x_template.float()
+    method = str(method).lower()
+    if method in ("edge", "edge_length", "ratio"):
+        def _el(verts):
+            v0, v1, v2 = verts[face[0]], verts[face[1]], verts[face[2]]
+            return torch.stack(
+                ((v1 - v0).norm(dim=-1), (v2 - v1).norm(dim=-1), (v0 - v2).norm(dim=-1)),
+                dim=-1,
+            )
+        ratio = _el(pred) / _el(tpl).clamp_min(1e-8)
+        per = (ratio + ratio.clamp_min(1e-8).reciprocal() - 2.0).mean(dim=-1)
+        return _mean_over_faces(per, face, batch, num_graphs, x_pred)
+
+    d_tpl = torch.stack(
+        (tpl[face[1]] - tpl[face[0]], tpl[face[2]] - tpl[face[0]]), dim=-1
+    )
+    d_pred = torch.stack(
+        (pred[face[1]] - pred[face[0]], pred[face[2]] - pred[face[0]]), dim=-1
+    )
+    c0 = d_tpl.transpose(-1, -2) @ d_tpl
+    c1 = d_pred.transpose(-1, -2) @ d_pred
+    eye = torch.eye(2, device=pred.device, dtype=pred.dtype).expand(c0.size(0), 2, 2)
+    c0 = c0 + 1e-8 * eye
+    a = torch.linalg.solve(c0, c1)
+    a = 0.5 * (a + a.transpose(-1, -2))
+    ev = torch.linalg.eigvalsh(a).clamp_min(0.0)
+    sigma = ev.sqrt().clamp_min(1e-8)
+    per = (sigma + sigma.reciprocal() - 2.0).mean(dim=-1)
+    area = _face_areas(tpl, face)
+    per = torch.where(area > 1e-12, per, torch.zeros_like(per))
+    per = torch.nan_to_num(per, nan=0.0, posinf=0.0, neginf=0.0)
+    return _mean_over_faces(per, face, batch, num_graphs, x_pred)
+
+
+def _resolve_true_cloud(
+    x_true,
+    batch_x_true,
+    x_true_cl_dist,
+    x_true_normal,
+    has_true_normal,
+    gt_points,
+    gt_normals,
+    gt_batch,
+    gt_cl_dist,
+    num_graphs,
+):
+    """Full GT (``gt_points`` / ``gt_normals``) when present, else ``x_true``."""
+    if gt_points is None:
+        true_pts = x_true
+        true_batch = batch_x_true
+        true_cl = x_true_cl_dist
+        true_n = x_true_normal
+        plane_flag = has_true_normal
+    else:
+        true_pts = gt_points.float()
+        if gt_batch is not None:
+            true_batch = gt_batch
+        elif int(num_graphs) == 1:
+            true_batch = torch.zeros(
+                true_pts.size(0), dtype=torch.long, device=true_pts.device
+            )
+        elif true_pts.size(0) == x_true.size(0):
+            true_batch = batch_x_true
+        else:
+            raise ValueError("gt_points requires gt_batch when num_graphs > 1")
+        true_cl = gt_cl_dist
+        true_n = gt_normals if gt_normals is not None else None
+        plane_flag = True if gt_normals is not None else has_true_normal
+    n_true = None
+    plane = _flag_true(plane_flag)
+    if (
+        true_n is not None
+        and true_n.dim() == 2
+        and true_n.size(0) == true_pts.size(0)
+        and true_n.size(-1) == 3
+        and plane is not False
+    ):
+        nrm = true_n.float()
+        if plane is True:
+            n_true = nrm
+        elif nrm.device.type == "cpu" and torch.isfinite(nrm).all() and nrm.norm(dim=-1).mean() > 0.5:
+            n_true = nrm
+    return true_pts, true_batch, true_cl, n_true
+
+
 def compute_losses(
     x_pred,
     x_true,
@@ -381,6 +777,20 @@ def compute_losses(
     chamfer_weight_cap=CHAMFER_WEIGHT_CAP,
     radial_huber_delta=RADIAL_HUBER_DELTA_MM,
     normal_coarse=None,
+    r_local=None,
+    r_local_mid=None,
+    r_local_coarse=None,
+    latent_valid=None,
+    kl_beta=None,
+    kl_token_floor=None,
+    gt_points=None,
+    gt_normals=None,
+    gt_batch=None,
+    gt_cl_dist=None,
+    x_template=None,
+    chamfer_pred_samples=None,
+    chamfer_face_sample_mode=None,
+    stretch_method="svd",
 ):
     """Return a dict of unweighted loss terms."""
     x_pred = x_pred.float()
@@ -396,37 +806,79 @@ def compute_losses(
         x_pred_mid = x_pred_mid.float()
     if x_pred_coarse is not None:
         x_pred_coarse = x_pred_coarse.float()
+    if r_local is not None:
+        r_local = r_local.float()
+    if r_local_mid is not None:
+        r_local_mid = r_local_mid.float()
+    if r_local_coarse is not None:
+        r_local_coarse = r_local_coarse.float()
 
     if batch_tube is None:
         raise ValueError("compute_losses requires batch_tube (the PyG batch vector for tube nodes)")
     if face is None:
         face = faces
+    face = _as_face_index(face)
+    x_template = x_tube if x_template is None else x_template.float()
 
-    r = float(tube_radius)
+    r_scalar = tube_radius if not torch.is_tensor(tube_radius) else tube_radius
     cap = float(chamfer_weight_cap)
-    if x_true_cl_dist is None:
-        x_true_cl_dist = x_true.new_zeros(x_true.size(0))
-    w_true = chamfer_distance_weights(x_true_cl_dist.float(), r, cap=cap)
+    n_samp = chamfer_pred_samples
+    if n_samp is None:
+        n_samp = _cfg("CHAMFER_PRED_SAMPLES", _cfg("N_TRUE", 16384))
+    n_samp = int(n_samp)
+    mode = chamfer_face_sample_mode
+    if mode is None:
+        mode = _cfg("CHAMFER_FACE_SAMPLE_MODE", "area")
+    area_weighted = str(mode).lower() not in ("uniform", "equal", "faces")
 
+    true_pts, true_batch, true_cl, n_true = _resolve_true_cloud(
+        x_true,
+        batch_x_true,
+        x_true_cl_dist,
+        x_true_normal,
+        has_true_normal,
+        gt_points,
+        gt_normals,
+        gt_batch,
+        gt_cl_dist,
+        num_graphs,
+    )
     cl_xyz = cl_dense
     if cl_xyz is not None and cl_dense_batch is None:
         cl_dense_batch = torch.zeros(cl_xyz.size(0), dtype=torch.long, device=cl_xyz.device)
+    if true_cl is None:
+        if cl_xyz is not None and true_pts.size(0) > 0:
+            if int(num_graphs) == 1:
+                true_cl = _cl_radius(true_pts, cl_xyz)
+            else:
+                true_cl = true_pts.new_zeros(true_pts.size(0))
+                for g in range(int(num_graphs)):
+                    tm = true_batch == g
+                    cm = cl_dense_batch == g if cl_dense_batch is not None else slice(None)
+                    if int(tm.sum()) == 0:
+                        continue
+                    true_cl[tm] = _cl_radius(true_pts[tm], cl_xyz[cm])
+        else:
+            true_cl = true_pts.new_zeros(true_pts.size(0))
+    r_true = r_local.mean() if r_local is not None else r_scalar
+    w_true = chamfer_distance_weights(true_cl.float(), r_true, cap=cap)
 
-    def pred_weights(points, point_batch, tube=None, nrm=None):
+    def pred_weights(points, point_batch, tube=None, nrm=None, rloc=None):
+        radius = rloc if rloc is not None else r_scalar
         if (
             nrm is not None
             and tube is not None
             and nrm.size(0) == points.size(0)
             and tube.size(0) == points.size(0)
         ):
-            rad = composed_radius(points, tube, nrm, r).abs()
-            return chamfer_distance_weights(rad, r, cap=cap)
+            rad = composed_radius(points, tube, nrm, radius).abs()
+            return chamfer_distance_weights(rad, radius, cap=cap)
         w = points.new_ones(points.size(0))
         if cl_xyz is None or points.size(0) == 0:
             return w
         n_g = int(num_graphs)
         if n_g == 1:
-            return chamfer_distance_weights(_cl_radius(points, cl_xyz), r, cap=cap)
+            return chamfer_distance_weights(_cl_radius(points, cl_xyz), radius, cap=cap)
         for g in range(n_g):
             pm = point_batch == g
             cm = cl_dense_batch == g if cl_dense_batch is not None else slice(None)
@@ -434,39 +886,58 @@ def compute_losses(
             if pts.size(0) == 0:
                 continue
             rad = _cl_radius(pts, cl_xyz[cm])
-            w[pm] = chamfer_distance_weights(rad, r, cap=cap)
+            if torch.is_tensor(radius) and radius.numel() == points.size(0):
+                r_g = radius.reshape(-1)[pm]
+            else:
+                r_g = radius
+            w[pm] = chamfer_distance_weights(rad, r_g, cap=cap)
         return w
 
-    w_pred = pred_weights(x_pred, batch_tube, tube=x_tube, nrm=normal)
-    n_true = None
-    plane = _flag_true(has_true_normal)
-    if (
-        x_true_normal is not None
-        and x_true_normal.dim() == 2
-        and x_true_normal.size(0) == x_true.size(0)
-        and x_true_normal.size(-1) == 3
-        and plane is not False
-    ):
-        nrm = x_true_normal.float()
-        if plane is True:
-            n_true = nrm
-        elif nrm.device.type == "cpu" and torch.isfinite(nrm).all() and nrm.norm(dim=-1).mean() > 0.5:
-            n_true = nrm
+    def face_sampled_pred(verts, v_batch, faces, nrm, tube, rloc):
+        if faces is None or n_samp <= 0:
+            return verts, v_batch, nrm, tube, rloc
+        pts, s_batch, bary, fidx = sample_mesh_surface(
+            verts,
+            faces,
+            n_samp,
+            batch=v_batch,
+            num_graphs=num_graphs,
+            area_weighted=area_weighted,
+        )
+        if pts.size(0) == 0:
+            return verts, v_batch, nrm, tube, rloc
+        nrm_s = _barycentric_interpolate(nrm, faces, fidx, bary)
+        if nrm_s is not None:
+            nrm_s = F.normalize(nrm_s, dim=-1, eps=1e-8)
+        tube_s = _barycentric_interpolate(tube, faces, fidx, bary)
+        rloc_s = _barycentric_interpolate(rloc, faces, fidx, bary)
+        return pts, s_batch, nrm_s, tube_s, rloc_s
+
+    pred_cd, batch_cd, nrm_cd, tube_cd, rloc_cd = face_sampled_pred(
+        x_pred, batch_tube, face, normal, x_tube, r_local
+    )
+    w_pred = pred_weights(pred_cd, batch_cd, tube=tube_cd, nrm=nrm_cd, rloc=rloc_cd)
     loss_recon = _weighted_chamfer(
-        x_pred, batch_tube, x_true, batch_x_true, w_pred, w_true, num_graphs, n_true=n_true
+        pred_cd, batch_cd, true_pts, true_batch, w_pred, w_true, num_graphs, n_true=n_true
     )
     if x_pred_mid is not None and batch_mid is not None:
-        w_mid = pred_weights(x_pred_mid, batch_mid, tube=pos_mid, nrm=normal_mid)
+        w_mid = pred_weights(
+            x_pred_mid, batch_mid, tube=pos_mid, nrm=normal_mid, rloc=r_local_mid
+        )
         loss_recon = loss_recon + lambda_cd_mid * _weighted_chamfer(
-            x_pred_mid, batch_mid, x_true, batch_x_true, w_mid, w_true, num_graphs, n_true=n_true
+            x_pred_mid, batch_mid, true_pts, true_batch, w_mid, w_true, num_graphs, n_true=n_true
         )
     if x_pred_coarse is not None and batch_coarse is not None:
-        w_c = pred_weights(x_pred_coarse, batch_coarse, tube=pos_coarse, nrm=normal_coarse)
+        w_c = pred_weights(
+            x_pred_coarse, batch_coarse, tube=pos_coarse, nrm=normal_coarse, rloc=r_local_coarse
+        )
         loss_recon = loss_recon + lambda_cd_coarse * _weighted_chamfer(
-            x_pred_coarse, batch_coarse, x_true, batch_x_true, w_c, w_true, num_graphs, n_true=n_true
+            x_pred_coarse, batch_coarse, true_pts, true_batch, w_c, w_true, num_graphs, n_true=n_true
         )
 
-    loss_kl = vae_kl_loss(mu, logvar)
+    loss_kl, _kl_info = vae_kl_loss(
+        mu, logvar, latent_valid=latent_valid, beta=kl_beta, token_floor=kl_token_floor
+    )
     disp_w = None
     if r_star is not None and r_star_valid is not None and r_dth is not None:
         src_d, dst_d = edge_index[0], edge_index[1]
@@ -492,7 +963,6 @@ def compute_losses(
             else:
                 loss_disp = (disp_w * err).sum() / disp_w.sum().clamp_min(1e-8)
 
-    face = _as_face_index(face)
     lap_w = None
     if face is not None and r_star is not None and r_star_valid is not None and r_dth is not None:
         src_l, dst_l = _unique_undirected_edges(face, x_pred.size(0))
@@ -504,10 +974,15 @@ def compute_losses(
             lap_w = _cross_tract_smooth(lap_w, src_l, dst_l, tract_id)
     loss_lap = _uniform_laplacian_smoothing(x_pred, face, batch_tube, num_graphs, edge_weight=lap_w)
     loss_norm = _mesh_normal_consistency(x_pred, face, batch_tube, num_graphs)
+    loss_fold = fold_penalty(x_pred, x_template, face, batch=batch_tube, num_graphs=num_graphs)
+    loss_stretch = triangle_stretch_loss(
+        x_pred, x_template, face, batch=batch_tube, num_graphs=num_graphs, method=stretch_method
+    )
 
     loss_rad = x_pred.new_zeros(())
     if r_star is not None and normal is not None:
-        r_pred = composed_radius(x_pred, x_tube, normal, r)
+        r_rad = r_local if r_local is not None else r_scalar
+        r_pred = composed_radius(x_pred, x_tube, normal, r_rad)
         loss_rad = radial_huber_loss(r_pred, r_star, r_star_valid, delta=radial_huber_delta)
         if (
             x_pred_mid is not None
@@ -515,7 +990,8 @@ def compute_losses(
             and normal_mid is not None
             and pos_mid is not None
         ):
-            r_pred_m = composed_radius(x_pred_mid, pos_mid, normal_mid, r)
+            r_rad_m = r_local_mid if r_local_mid is not None else r_scalar
+            r_pred_m = composed_radius(x_pred_mid, pos_mid, normal_mid, r_rad_m)
             loss_rad = loss_rad + float(lambda_rad_mid) * radial_huber_loss(
                 r_pred_m, r_star_mid, r_star_valid_mid, delta=radial_huber_delta
             )
@@ -527,4 +1003,6 @@ def compute_losses(
         "lap": loss_lap,
         "norm": loss_norm,
         "rad": loss_rad,
+        "fold": loss_fold,
+        "stretch": loss_stretch,
     }

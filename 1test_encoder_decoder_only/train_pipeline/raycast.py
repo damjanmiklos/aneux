@@ -205,7 +205,11 @@ def r_star_grid_stats(r_star, valid, branch_nl, n_radial):
 
 
 def nearest_normal_offset_r_star(pos, normal, gt_pts, tube_radius=TUBE_RADIUS_MM):
-    """r* = R + n · (nearest GT − scaffold). Matches `composed_radius` at identity."""
+    """Deprecated nearest-GT-vertex offset. Prefer `template_ray_r_star`.
+
+    Kept so older probes can compare against the sac-wrong baseline of §7.1.
+    Does not mark misses: every node is `valid=True`.
+    """
     pos = np.asarray(pos, dtype=np.float64).reshape(-1, 3)
     normal = np.asarray(normal, dtype=np.float64).reshape(-1, 3)
     n = int(pos.shape[0])
@@ -227,6 +231,212 @@ def nearest_normal_offset_r_star(pos, normal, gt_pts, tube_radius=TUBE_RADIUS_MM
     return out
 
 
+def stretch_distance_r_star(r_local, stretch):
+    """r* = r_local + StretchDistance on template vertices (§7.1, §2.3).
+
+    `StretchDistance` is the outward ray from the template to the GT. Missing
+    or non-finite values stay `valid=False` (do not impute).
+    """
+    r_local = np.asarray(r_local, dtype=np.float64).reshape(-1)
+    stretch = np.asarray(stretch, dtype=np.float64).reshape(-1)
+    n = int(r_local.shape[0])
+    out = empty_r_star(n)
+    if n == 0:
+        return out
+    if stretch.shape[0] != n:
+        return out
+    ok = np.isfinite(stretch) & np.isfinite(r_local)
+    out["r_star"] = np.where(ok, r_local + stretch, 0.0)
+    out["valid"] = ok
+    out["ring_med"] = out["r_star"].copy()
+    return out
+
+
+def mesh_r_star_edge_stats(pos, r_star, valid, edges):
+    """Edge-based dθ / du / 1-ring median of r* for an unstructured mesh (§7.2).
+
+    `dth` is the max |r*_i − r*_j| / edge_len over valid 1-ring neighbours
+    (the StretchDistance gradient at the neck). `du` copies that physical
+    gradient so Dirichlet sees it on either axis. `ring_med` is the median of
+    r* over the vertex and its valid neighbours.
+    """
+    pos = np.asarray(pos, dtype=np.float64).reshape(-1, 3)
+    r_star = np.asarray(r_star, dtype=np.float64).reshape(-1)
+    valid = np.asarray(valid, dtype=bool).reshape(-1)
+    n = int(r_star.shape[0])
+    dth = np.zeros(n, dtype=np.float64)
+    du = np.zeros(n, dtype=np.float64)
+    ring_med = r_star.copy()
+    if n == 0:
+        return dth, du, ring_med
+    edges = np.asarray(edges, dtype=np.int64).reshape(-1, 2) if edges is not None else np.zeros((0, 2), dtype=np.int64)
+    nbrs = [[] for _ in range(n)]
+    seen = set()
+    for a, b in edges:
+        a = int(a)
+        b = int(b)
+        if a == b or a < 0 or b < 0 or a >= n or b >= n:
+            continue
+        key = (a, b) if a < b else (b, a)
+        if key in seen:
+            continue
+        seen.add(key)
+        nbrs[a].append(b)
+        nbrs[b].append(a)
+    acc_vals = [[] for _ in range(n)]
+    for i in range(n):
+        if valid[i]:
+            acc_vals[i].append(float(r_star[i]))
+        grad = 0.0
+        pi = pos[i]
+        ri = float(r_star[i])
+        for j in nbrs[i]:
+            if not (valid[i] and valid[j]):
+                continue
+            elen = float(np.linalg.norm(pos[j] - pi))
+            if elen < 1e-8:
+                continue
+            g = abs(ri - float(r_star[j])) / elen
+            if g > grad:
+                grad = g
+            acc_vals[i].append(float(r_star[j]))
+        dth[i] = grad
+        du[i] = grad
+        if acc_vals[i]:
+            ring_med[i] = float(np.median(np.asarray(acc_vals[i], dtype=np.float64)))
+        elif not valid[i]:
+            ring_med[i] = 0.0
+    return dth, du, ring_med
+
+
+def template_ray_r_star(
+    pos,
+    normal,
+    r_local,
+    gt_mesh,
+    t_max=R_STAR_T_MAX_MM,
+    t_inward=R_STAR_INWARD_MM,
+    t_eps=R_STAR_T_EPS_MM,
+    hit_tol=R_STAR_HIT_TOL,
+    normal_dot_min=R_STAR_NORMAL_DOT,
+    ambiguous_mm=R_STAR_AMBIGUOUS_MM,
+):
+    """Outward ray from each template vertex along its normal to the GT.
+
+    `r* = r_local + t_hit` with `t_hit` the signed distance along the already
+    outward template normal. Misses and grazes (`|n · n_cell|` too small) stay
+    `valid=False`. Two accepted hits more than `ambiguous_mm` apart are
+    `ambiguous=True` (neck / double wall). Invalid nodes are never flipped to
+    `valid=True`.
+    """
+    pos = np.asarray(pos, dtype=np.float64).reshape(-1, 3)
+    normal = np.asarray(normal, dtype=np.float64).reshape(-1, 3)
+    r_local = np.asarray(r_local, dtype=np.float64).reshape(-1)
+    n = int(pos.shape[0])
+    out = empty_r_star(n)
+    if n == 0 or gt_mesh is None:
+        return out
+    if r_local.shape[0] != n:
+        r_local = np.zeros(n, dtype=np.float64)
+
+    nn = np.linalg.norm(normal, axis=1, keepdims=True)
+    normal = normal / np.clip(nn, 1e-12, None)
+    tree, cell_normals = _prepare_locator(gt_mesh)
+    if tree is None:
+        return out
+
+    import vtk
+
+    hit_points = vtk.vtkPoints()
+    hit_cells = vtk.vtkIdList()
+    t_max = float(t_max)
+    t_inward = float(t_inward)
+    lo = float(normal_dot_min)
+
+    t_buf = np.full((n, MAX_R_STAR_HITS), np.nan, dtype=np.float64)
+    ok_buf = np.zeros((n, MAX_R_STAR_HITS), dtype=bool)
+    dot_buf = np.zeros((n, MAX_R_STAR_HITS), dtype=np.float64)
+    n_hits = np.zeros(n, dtype=np.int32)
+    for i in range(n):
+        n_v = normal[i]
+        origin = pos[i]
+        p_start = origin - t_inward * n_v
+        p_end = origin + t_max * n_v
+        raw = _collect_hits(tree, p_start, p_end, hit_tol, hit_points, hit_cells)
+        slot = 0
+        for xyz, cid in raw:
+            if slot >= MAX_R_STAR_HITS:
+                break
+            t = float(np.dot(xyz - origin, n_v))
+            if t < -t_inward - 1e-6 or t > t_max + 1e-6:
+                continue
+            cn = _cell_normal(cell_normals, cid)
+            cn_n = float(np.linalg.norm(cn))
+            if cn_n > 1e-8:
+                cn = cn / cn_n
+                # Orientation-agnostic: GT files may still be wound inward (§2.3).
+                nd = abs(float(np.dot(n_v, cn)))
+                graze_ok = nd >= lo
+            else:
+                nd = 1.0
+                graze_ok = True
+            t_buf[i, slot] = t
+            ok_buf[i, slot] = graze_ok
+            dot_buf[i, slot] = nd
+            slot += 1
+        n_hits[i] = slot
+
+    r_star = np.zeros(n, dtype=np.float64)
+    valid = np.zeros(n, dtype=bool)
+    ambiguous = np.zeros(n, dtype=bool)
+    for i in range(n):
+        nh = int(n_hits[i])
+        hits = [
+            {
+                "t": float(t_buf[i, j]),
+                "voronoi_ok": bool(ok_buf[i, j]),
+                "normal_dot": float(dot_buf[i, j]),
+            }
+            for j in range(nh)
+        ]
+        val, ok, amb = select_r_star_from_hits(
+            hits,
+            t_eps=t_eps,
+            ambiguous_mm=ambiguous_mm,
+            normal_dot_min=lo,
+            normal_sign=1.0,
+        )
+        if ok:
+            r_star[i] = float(r_local[i]) + float(val)
+        valid[i] = ok
+        ambiguous[i] = amb
+
+    del tree, hit_points, hit_cells, cell_normals, t_buf, ok_buf, dot_buf
+    out["r_star"] = r_star
+    out["valid"] = valid
+    out["ambiguous"] = ambiguous
+    out["ring_med"] = r_star.copy()
+    return out
+
+
+def signed_distance_to_oriented_surface(query_pts, surf_pts, surf_normals):
+    """Closest-vertex SDF; positive along the already-outward surface normal (sac)."""
+    query_pts = np.asarray(query_pts, dtype=np.float64).reshape(-1, 3)
+    surf_pts = np.asarray(surf_pts, dtype=np.float64).reshape(-1, 3)
+    n = int(query_pts.shape[0])
+    if n == 0 or surf_pts.shape[0] == 0:
+        return np.zeros(n, dtype=np.float64)
+    surf_normals = np.asarray(surf_normals, dtype=np.float64).reshape(-1, 3)
+    if surf_normals.shape[0] != surf_pts.shape[0]:
+        return np.zeros(n, dtype=np.float64)
+    nn = np.linalg.norm(surf_normals, axis=1, keepdims=True)
+    surf_normals = surf_normals / np.clip(nn, 1e-8, None)
+    _, idx = cKDTree(surf_pts).query(query_pts, k=1, workers=1)
+    idx = np.asarray(idx, dtype=np.int64).reshape(-1)
+    delta = query_pts - surf_pts[idx]
+    return np.einsum("ij,ij->i", surf_normals[idx], delta)
+
+
 def transform_vessel_mesh(mesh, origin, rotation):
     """Apply the same COM-center + canonical rotation as the scaffold (in memory)."""
     import pyvista as pv
@@ -243,7 +453,18 @@ def transform_vessel_mesh(mesh, origin, rotation):
     origin = np.asarray(origin, dtype=np.float64).reshape(3)
     rotation = np.asarray(rotation, dtype=np.float64).reshape(3, 3)
     pts = (np.asarray(pv_mesh.points, dtype=np.float64) - origin) @ rotation
-    return pv.PolyData(pts, pv_mesh.faces)
+    out = pv.PolyData(pts, pv_mesh.faces)
+    pdata = getattr(pv_mesh, "point_data", None)
+    if pdata is not None:
+        for name in list(pdata.keys()):
+            arr = np.asarray(pdata[name])
+            if arr.shape[0] != pts.shape[0]:
+                continue
+            if arr.ndim == 2 and arr.shape[1] == 3:
+                out.point_data[name] = arr @ rotation
+            else:
+                out.point_data[name] = arr
+    return out
 
 
 def closest_cell_normals(gt_mesh, query_pts):
@@ -294,13 +515,17 @@ def _prepare_locator(gt_mesh):
     normals_filter.SplittingOff()
     normals_filter.AutoOrientNormalsOff()
     normals_filter.Update()
-    poly = normals_filter.GetOutput()
-    if poly is None or poly.GetNumberOfCells() == 0:
+    src = normals_filter.GetOutput()
+    if src is None or src.GetNumberOfCells() == 0:
         return None, None
+    # Own the output so the locator is not left dangling when the filter is GC'd.
+    poly = vtk.vtkPolyData()
+    poly.ShallowCopy(src)
     tree = vtk.vtkModifiedBSPTree()
     tree.SetDataSet(poly)
     tree.BuildLocator()
     cell_normals = poly.GetCellData().GetNormals()
+    tree._keep_alive = poly
     return tree, cell_normals
 
 

@@ -34,29 +34,107 @@ def wrap_pi(delta: Tensor) -> Tensor:
     return torch.remainder(delta + math.pi, 2.0 * math.pi) - math.pi
 
 
+_THETA_BLIND_PI_MSG = (
+    "intrinsic_spline_pseudo_coords requires per-vertex r_local; "
+    "π-normalised Δθ is θ-blind (STAGE2_REVIEW §6.2) and is not used as a fallback. "
+    "Pass data.r_local, data.r_local_mid, or data.r_local_coarse."
+)
+_EDGE_LEN_REF_MSG = (
+    "intrinsic_spline_pseudo_coords needs per-vertex edge_len_ref "
+    "(mean incident edge length, mm) or pos to compute it; "
+    "π-normalised Δθ is not a fallback (STAGE2_REVIEW §6.2)."
+)
+
+
+def _as_vertex_feature(name: str, value: Tensor, n_vert: int, ref: Tensor) -> Tensor:
+    feat = value.to(dtype=torch.float32, device=ref.device).reshape(-1)
+    if feat.numel() == 1:
+        return feat.expand(n_vert)
+    if feat.numel() != n_vert:
+        raise ValueError(f"{name} must have 1 or {n_vert} values, got {feat.numel()}")
+    return feat
+
+
+def vertex_mean_edge_length(pos: Tensor, edge_index: Tensor) -> Tensor:
+    """Per-vertex mean Euclidean length of outgoing edges (mm)."""
+    pos = pos.to(dtype=torch.float32)
+    if pos.dim() != 2:
+        raise ValueError(f"pos must be [N, D], got {tuple(pos.shape)}")
+    src = edge_index[0].to(device=pos.device)
+    dst = edge_index[1].to(device=pos.device)
+    n = int(pos.shape[0])
+    if src.numel() == 0:
+        return pos.new_full((n,), 1e-4)
+    elen = (pos[dst] - pos[src]).norm(dim=-1)
+    acc = pos.new_zeros(n)
+    cnt = pos.new_zeros(n)
+    acc = acc.scatter_add(0, src, elen)
+    cnt = cnt.scatter_add(0, src, torch.ones_like(elen))
+    mean = acc / cnt.clamp_min(1.0)
+    fill = pos.new_full((n,), 1e-4)
+    return torch.where(cnt > 0, mean, fill).clamp_min(1e-4)
+
+
 def intrinsic_spline_pseudo_coords(
     u: Tensor,
     theta: Tensor,
     tract_id: Tensor,
     edge_index: Tensor,
     u_step: Tensor,
+    r_local: Tensor | None = None,
+    edge_len_ref: Tensor | None = None,
+    pos: Tensor | None = None,
 ) -> Tensor:
     """Open-spline pseudo-coordinates in [0, 1]^3 from intrinsic (Δu, Δθ, kind).
 
     Δu is scaled so one longitudinal ring step maps to the cube edge.
-    Δθ is wrapped to [-π, π] and mapped to [0, 1].
+    Δθ is wrapped to (-π, π] and scaled by the local circumferential step
+    ``edge_len_ref / r_local`` so a ring neighbour at Δθ ≈ edge / r lands at
+    ``e_th ≈ 0`` or ``1``, matching ``e_u`` (STAGE2_REVIEW §6.2):
+
+        e_th = 0.5 + 0.5 · clamp(Δθ · r_local / edge_len_ref, −1, 1)
+
+    Per-edge reduction matches ``u_step``: ``max`` of the two endpoints.
+    ``r_local`` is required (cached on the Data object). ``edge_len_ref`` is the
+    per-vertex mean incident edge length; if omitted, it is computed from ``pos``.
+    There is no π-normalised fallback.
+
     The third channel is 0.5 on same-tract edges and 0 on any cross-tract edge.
+
+    Model-agent call sites (this function does not receive the Data object):
+
+        # fine — pos is data.x
+        intrinsic_spline_pseudo_coords(
+            data.u, data.theta, data.tract_id, data.edge_index, data.u_step,
+            r_local=data.r_local, pos=data.x,
+        )
+        # mid
+        ... r_local=data.r_local_mid, pos=data.pos_mid
+        # coarse
+        ... r_local=data.r_local_coarse, pos=data.pos_coarse
     """
     u = u.to(dtype=torch.float32).reshape(-1)
     theta = theta.to(dtype=torch.float32).reshape(-1)
-    u_step = u_step.to(dtype=torch.float32).reshape(-1).clamp_min(1e-4)
+    n_vert = int(u.shape[0])
+    u_step = _as_vertex_feature("u_step", u_step, n_vert, u).clamp_min(1e-4)
     src, dst = edge_index[0], edge_index[1]
     du = u[dst] - u[src]
     step = torch.maximum(u_step[src], u_step[dst])
     e_u = 0.5 + 0.5 * (du / step).clamp(-1.0, 1.0)
 
+    if r_local is None:
+        raise ValueError(_THETA_BLIND_PI_MSG)
+    r_loc = _as_vertex_feature("r_local", r_local, n_vert, u).clamp_min(1e-4)
+    if edge_len_ref is None:
+        if pos is None:
+            raise ValueError(_EDGE_LEN_REF_MSG)
+        edge_len_ref = vertex_mean_edge_length(pos, edge_index)
+    eref = _as_vertex_feature("edge_len_ref", edge_len_ref, n_vert, u).clamp_min(1e-4)
+    # Circumferential step (rad) = mean edge length / local radius.
+    th_step = (eref / r_loc).clamp_min(1e-4)
+    step_th = torch.maximum(th_step[src], th_step[dst])
     dth = wrap_pi(theta[dst] - theta[src])
-    e_th = 0.5 + 0.5 * (dth / math.pi).clamp(-1.0, 1.0)
+    e_th = 0.5 + 0.5 * (dth / step_th).clamp(-1.0, 1.0)
 
     same = (tract_id[src] == tract_id[dst]).to(dtype=torch.float32)
     e_kind = 0.5 * same

@@ -1,5 +1,9 @@
 """AneuX centerline extraction from remeshed vessel surfaces.
 
+Writes ``original_centerline`` only. ``template_centerline`` is dropped
+(§15 item 3): it matched ``original_centerline`` to within 0.12 mm, and
+training parametrises from the original.
+
 Each run writes debug logs under ``<output-dir>/centerline_logs/run_<timestamp>/``:
 per-case JSON, ``errors/<id>.txt`` with traceback, worker transcripts, and
 ``summary.csv`` / ``summary.xlsx``.
@@ -28,9 +32,34 @@ from batch_run_log import (
     finalize_run_logs,
     run_logged_case,
 )
-from vessel_pipeline import add_shared_cli_args, process_centerline_dataset, run_batch
+from process_case import is_template_centerline_dir
+from vessel_pipeline import (
+    add_shared_cli_args,
+    process_centerline_dataset as _vessel_process_centerline_dataset,
+    run_batch,
+)
 
 LOG_FOLDER = "centerline_logs"
+
+
+def process_centerline_dataset(dataset_id, v_file, output_dir, **kwargs):
+    """Write one original_centerline ``.vtp``. Never write ``template_centerline``."""
+    if is_template_centerline_dir(output_dir):
+        print(
+            f"Skipping {dataset_id}: template_centerline is dropped "
+            "(§15 item 3); parametrise from original_centerline."
+        )
+        return None
+    allowed = {}
+    for key in ("extension_length", "sample_spacing"):
+        if key in kwargs:
+            allowed[key] = kwargs[key]
+    return _vessel_process_centerline_dataset(
+        dataset_id=dataset_id,
+        v_file=v_file,
+        output_dir=output_dir,
+        **allowed,
+    )
 
 
 def _process_one(dataset_id, v_file, args):

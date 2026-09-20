@@ -10,6 +10,8 @@ This script remeshes the *original* raw surface for AI training:
   - as little Taubin as will still let VMTK remesh robustly
   - pipe-section ostia perpendicular to the centerline tangent
     (same cutter as aneurysm-removal / template uncap)
+  - ostium cut frames (origin + unit normal + radius) returned in memory
+    and written as ``{id}.ostium_frames.npz`` next to the GT mesh
   - never writes into ``rawdata/``
 
 Centerlines still use a sanitised working copy (originals have zero-length
@@ -75,6 +77,7 @@ from vessel_pipeline import (
     extract_centerlines_for_tube,
     finalize_surface,
     inspect_openings,
+    load_ostium_frames,
     log_profiles,
     measure_open_profiles,
     opening_clip_frames,
@@ -84,6 +87,7 @@ from vessel_pipeline import (
     resample_centerline,
     run_batch,
     sanitize_vessel_for_vmtk,
+    save_ostium_frames,
     save_polydata,
     seed_points_from_profiles,
     smooth_centerline_preserve_misr,
@@ -116,6 +120,63 @@ OPENING_PLANARITY_STD_MM = 0.25
 LOG_FOLDER = "gt_remesh_logs"
 _set_step = set_step
 _warn = warn
+
+
+def _ostium_frame_parts(frame):
+    """Unpack a clip-frame tuple or a contract dict to origin, normal, radius."""
+    if isinstance(frame, dict):
+        origin = np.asarray(frame["origin"], dtype=np.float64)
+        normal = np.asarray(frame["normal"], dtype=np.float64)
+        radius = float(frame["radius"])
+        return origin, normal, radius
+    origin, outward, radius = frame
+    return (
+        np.asarray(origin, dtype=np.float64),
+        np.asarray(outward, dtype=np.float64),
+        float(radius),
+    )
+
+
+def as_ostium_frame_dicts(frames):
+    """Shared ostium-frame contract used by GT export and the template clip.
+
+    Each item is ``{"origin": (3,) float64, "normal": (3,) unit float64,
+    "radius": float}``. Accepts ``opening_clip_frames`` tuples
+    ``(origin, outward, radius)`` or dicts that already match.
+    """
+    out = []
+    for frame in frames:
+        origin, normal, radius = _ostium_frame_parts(frame)
+        origin = np.array(origin, dtype=np.float64, copy=True).reshape(3)
+        normal = np.array(normal, dtype=np.float64, copy=True).reshape(3)
+        nrm = float(np.linalg.norm(normal))
+        if nrm < 1e-12:
+            raise ValueError("ostium frame normal has zero length")
+        out.append(
+            {
+                "origin": origin,
+                "normal": normal / nrm,
+                "radius": float(radius),
+            }
+        )
+    return out
+
+
+def ostium_frames_npz_path(output_dir, dataset_id):
+    """``{dataset_id}.ostium_frames.npz`` in the caller-specified output directory."""
+    return os.path.join(output_dir, f"{dataset_id}.ostium_frames.npz")
+
+
+def persist_gt_ostium_frames(output_dir, dataset_id, frames):
+    """Write the ostium-frame sidecar next to the GT mesh.
+
+    Returns ``(npz_path, contract_frames)``. Does not recompute a centerline.
+    """
+    contract = as_ostium_frame_dicts(frames)
+    os.makedirs(output_dir, exist_ok=True)
+    path = ostium_frames_npz_path(output_dir, dataset_id)
+    save_ostium_frames(path, contract)
+    return path, contract
 
 
 def prepare_gt_surface(vessel_mesh):
@@ -192,13 +253,14 @@ def log_opening_planarity(surface, frames):
     # radius -- a planar cut cannot do that, so the warning was measuring the
     # wrong hole rather than a malformed one.
     centers = [pts.mean(axis=0) for pts in rims]
+    frame_parts = [_ostium_frame_parts(frame) for frame in frames]
     pairs = sorted(
         (
-            float(np.linalg.norm(centers[j] - np.asarray(frames[i][0], dtype=np.float64))),
+            float(np.linalg.norm(centers[j] - frame_parts[i][0])),
             i,
             j,
         )
-        for i in range(len(frames))
+        for i in range(len(frame_parts))
         for j in range(len(rims))
     )
     assigned = {}
@@ -209,7 +271,7 @@ def log_opening_planarity(surface, frames):
         assigned[i] = (j, dist)
         taken.add(j)
 
-    for i, (origin, outward, radius) in enumerate(frames):
+    for i, (origin, outward, radius) in enumerate(frame_parts):
         origin = np.asarray(origin, dtype=np.float64)
         outward = np.asarray(outward, dtype=np.float64)
         if i not in assigned:
@@ -296,6 +358,13 @@ def process_gt_remesh_dataset(
     extension_length=5.0,
     sample_spacing=0.1,
 ):
+    """Remesh one original vessel to a GT surface; persist ostium cut frames.
+
+    Returns ``(out_vtp_path, ostium_frames)`` where ``ostium_frames`` is the
+    shared contract (list of origin/normal/radius dicts). The same frames are
+    written to ``{dataset_id}.ostium_frames.npz`` in ``output_dir``. The CLI
+    worker unwraps the path for batch logging.
+    """
     print(f"\n=========================================\nProcessing GT remesh: {dataset_id}")
     ensure_cleandata_layout()
     original = pv.read(v_file)
@@ -350,8 +419,10 @@ def process_gt_remesh_dataset(
     # quality gates honest about what the clip left behind.
     opened_gt, min_edge_after_clip = weld_degenerate_vertices(opened_gt)
     print(f"  Min edge after the uncap and weld: {min_edge_after_clip:.6f} mm")
-    frames = opening_clip_frames(branched, gt_profiles)
-    log_opening_planarity(opened_gt, frames)
+    # Same frames clip_flow_extensions_and_uncap just used (same centerline +
+    # profiles). Cheap lookup, not a second Voronoi / VMTK centerline.
+    ostium_frames = as_ostium_frame_dicts(opening_clip_frames(branched, gt_profiles))
+    log_opening_planarity(opened_gt, ostium_frames)
 
     print(
         f"Step 5: Light Taubin (pass_band={GT_TAUBIN_PASS_BAND}, "
@@ -386,17 +457,21 @@ def process_gt_remesh_dataset(
     final_surface, _n_regions = finalize_surface(remeshed, profiles=gt_profiles)
     assert_gt_remesh_scale(final_surface, original, context=dataset_id)
     openings = assert_template_quality(final_surface, context=dataset_id)
-    log_opening_planarity(final_surface, frames)
+    log_opening_planarity(final_surface, ostium_frames)
 
     os.makedirs(output_dir, exist_ok=True)
     out_file = os.path.join(output_dir, f"{dataset_id}.vtp")
     save_polydata(final_surface, out_file)
+    frames_path, ostium_frames = persist_gt_ostium_frames(
+        output_dir, dataset_id, ostium_frames
+    )
     read_back = pv.read(out_file)
     print(f"Successfully saved GT remesh to: {out_file}")
     print(
         f"  -> Verified Saved Mesh: {read_back.n_points} points, {read_back.n_cells} cells, "
         f"disk size={os.path.getsize(out_file)} bytes"
     )
+    print(f"  -> Ostium frames ({len(ostium_frames)}) saved to: {frames_path}")
     print(
         f"  -> Verified Open Boundaries Count: {len(openings)} "
         f"(anatomical profiles {n_in}, pipe-section clipped {n_clipped})"
@@ -417,12 +492,12 @@ def process_gt_remesh_dataset(
             f"the difference is torn rims, not ostia."
         )
     record(n_openings=len(openings), n_profiles=n_in, n_clipped=n_clipped)
-    return out_file
+    return out_file, ostium_frames
 
 
 def _process_one(dataset_id, v_file, args):
     def work():
-        return process_gt_remesh_dataset(
+        out_file, _ostium_frames = process_gt_remesh_dataset(
             dataset_id=dataset_id,
             v_file=v_file,
             output_dir=args.output_dir,
@@ -430,6 +505,7 @@ def _process_one(dataset_id, v_file, args):
             extension_length=args.extension_length,
             sample_spacing=args.sample_spacing,
         )
+        return out_file
 
     return run_logged_case(
         dataset_id,

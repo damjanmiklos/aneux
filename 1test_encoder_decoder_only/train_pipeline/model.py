@@ -20,6 +20,7 @@ from torch import Tensor
 from torch.utils.checkpoint import checkpoint
 from torch_geometric.utils import scatter
 
+import config as _cfg
 from config import (
     ATTN_DIM,
     COARSE_ATTN_HEADS,
@@ -30,17 +31,11 @@ from config import (
     INVRES_EXPANSION,
     LATENT_DIM,
     LATENT_LEN,
-    LOGVAR_CLAMP,
     MAX_TRACTS,
-    N_SPLINE_COARSE,
-    N_SPLINE_FINE,
-    N_SPLINE_MID,
     R_MARGIN_MM,
     SA_STAGES,
     SHEAR_MAX_MM,
     SKIP_GATE_INIT,
-    SPLINE_DEGREE,
-    SPLINE_KERNEL_SIZE,
     STEM_DIM,
     TRACT_EMB_DIM,
     TUBE_RADIUS_MM,
@@ -56,16 +51,60 @@ from config import (
     normalize_gradient_checkpointing,
 )
 from geometry import (
-    clamp_residual_radial,
     decoupled_displacement,
     harmonic_encoding_theta,
     harmonic_encoding_u,
     intrinsic_spline_pseudo_coords,
     knn_weighted_upsample,
-    radial_bias_for_zero_init,
     upsample_branch_concat,
 )
 from ops import ball_query_packed, fps_indices, make_spline_conv, radius_graph_packed
+
+
+def _cfg_get(name: str, default):
+    return getattr(_cfg, name, default)
+
+
+def _spline_kernel_size():
+    ks = _cfg_get("SPLINE_KERNEL_SIZE", (5, 5, 2))
+    if isinstance(ks, int):
+        return (5, 5, 2)
+    return tuple(int(v) for v in ks)
+
+
+def _spline_degree() -> int:
+    """PyG SplineConv.degree is a single int; kernel (5,5,2) already has 2 kind knots."""
+    return int(_cfg_get("SPLINE_DEGREE", 2))
+
+
+def _n_conv_per_level() -> int:
+    n = _cfg_get("N_CONV_PER_LEVEL", None)
+    if n is not None:
+        return int(n)
+    return 6
+
+
+def _narrow_sa_stages(stages):
+    """Item 29: shrink stage-3/4 width when the stale (256, 512) defaults remain."""
+    stages = [list(s) for s in stages]
+    if len(stages) >= 4:
+        if int(stages[2][3]) == 256:
+            stages[2][3] = 128
+        if int(stages[3][3]) == 512:
+            stages[3][3] = 256
+    return tuple(tuple(s) for s in stages)
+
+
+SIGMA_MIN = float(_cfg_get("SIGMA_MIN", 0.1))
+SIGMA_MAX = float(_cfg_get("SIGMA_MAX", math.e))
+TOKEN_ATTEND_K = int(_cfg_get("TOKEN_ATTEND_K", 5))
+OSTIUM_NEIGHBOR_MM = float(_cfg_get("OSTIUM_NEIGHBOR_MM", 4.0))
+RADIAL_FLOOR_FRAC = float(_cfg_get("RADIAL_FLOOR_FRAC", 0.8))
+SHEAR_RLOCAL_K = float(_cfg_get("SHEAR_RLOCAL_K", 1.5))
+LATENT_HEAD_LAYERS = int(_cfg_get("LATENT_HEAD_LAYERS", 3))
+LATENT_HEAD_HEADS = int(_cfg_get("LATENT_HEAD_HEADS", 4))
+LOGVAR_MIN = 2.0 * math.log(SIGMA_MIN)
+LOGVAR_MAX = 2.0 * math.log(SIGMA_MAX)
 
 
 def _ckpt_call(enabled, fn, *args):
@@ -94,6 +133,19 @@ def _attr_batch(data, name: str, n: int) -> Tensor:
     if b is not None:
         return b
     return _ones_batch(n, data.x.device)
+
+
+def _as_bool_mask(t: Tensor) -> Tensor:
+    if t.dtype == torch.bool:
+        return t
+    return t.bool()
+
+
+def _soft_logvar(raw: Tensor, sigma_min: float = SIGMA_MIN, sigma_max: float = SIGMA_MAX) -> Tensor:
+    """log σ² = log σmin² + (log σmax² − log σmin²) · sigmoid(raw). Gradient never dies."""
+    log_min = 2.0 * math.log(float(sigma_min))
+    log_max = 2.0 * math.log(float(sigma_max))
+    return raw.new_tensor(log_min) + (log_max - log_min) * torch.sigmoid(raw)
 
 
 def fps_packed(pos: Tensor, batch: Tensor, n_out: int, n_graphs: int | None = None) -> Tensor:
@@ -155,6 +207,20 @@ def nearest_centerline_attr(
     return u_out, t_out
 
 
+def _reshape_token_field(value: Tensor, n_graphs: int, latent_len: int, trailing: int | None = None):
+    if trailing is None:
+        if value.dim() == 2 and value.size(0) == n_graphs:
+            return value
+        if value.numel() == n_graphs * latent_len:
+            return value.reshape(n_graphs, latent_len)
+        return value.reshape(1, -1)
+    if value.dim() == 3 and value.size(0) == n_graphs:
+        return value
+    if value.numel() == n_graphs * latent_len * trailing:
+        return value.reshape(n_graphs, latent_len, trailing)
+    return value.reshape(1, value.size(0), trailing)
+
+
 def _token_tables(data, n_graphs: int, latent_len: int):
     """Return [B, L] token descriptors from a possibly batched Data object."""
     u = data.latent_u
@@ -163,21 +229,188 @@ def _token_tables(data, n_graphs: int, latent_len: int):
     is_junc = data.latent_is_junction
     if attend.dtype != torch.bool:
         attend = attend.bool()
+    valid = getattr(data, "latent_valid", None)
     if u.dim() == 2 and u.size(0) == n_graphs:
-        return u, tract, attend, is_junc
-    if getattr(data, "latent_u_batch", None) is not None or u.numel() == n_graphs * latent_len:
+        if valid is None:
+            valid = torch.ones(n_graphs, latent_len, dtype=torch.bool, device=u.device)
+        else:
+            valid = _reshape_token_field(_as_bool_mask(valid), n_graphs, latent_len)
+        return u, tract, attend, is_junc, valid
+    packed = getattr(data, "latent_u_batch", None) is not None or u.numel() == n_graphs * latent_len
+    if packed:
         u = u.reshape(n_graphs, latent_len)
         tract = tract.reshape(n_graphs, latent_len)
         is_junc = is_junc.reshape(n_graphs, latent_len)
         attend = attend.reshape(n_graphs, latent_len, attend.size(-1))
-        return u, tract, attend, is_junc
+        if valid is None:
+            valid = torch.ones(n_graphs, latent_len, dtype=torch.bool, device=u.device)
+        else:
+            valid = _reshape_token_field(_as_bool_mask(valid), n_graphs, latent_len)
+        return u, tract, attend, is_junc, valid
     u = u.reshape(1, -1)
     tract = tract.reshape(1, -1)
     is_junc = is_junc.reshape(1, -1)
     attend = attend.reshape(1, attend.size(0), attend.size(-1))
+    if valid is None:
+        valid = torch.ones(1, u.size(1), dtype=torch.bool, device=u.device)
+    else:
+        valid = _as_bool_mask(valid).reshape(1, -1)
     if n_graphs != 1:
         raise ValueError("Missing latent_u_batch for batched tree tokens")
-    return u, tract, attend, is_junc
+    return u, tract, attend, is_junc, valid
+
+
+def _token_pos_table(data, n_graphs: int, latent_len: int):
+    pos = getattr(data, "latent_pos", None)
+    if pos is None or not torch.is_tensor(pos):
+        return None
+    return _reshape_token_field(pos, n_graphs, latent_len, trailing=3)
+
+
+def _token_depth_table(data, n_graphs: int, latent_len: int, device, dtype):
+    depth = getattr(data, "latent_depth", None)
+    if depth is None or not torch.is_tensor(depth):
+        return torch.zeros(n_graphs, latent_len, 1, device=device, dtype=dtype)
+    depth = _reshape_token_field(depth.to(device=device, dtype=dtype), n_graphs, latent_len)
+    return depth.unsqueeze(-1)
+
+
+def _first_matching_tensor(data, names, n: int):
+    for name in names:
+        v = getattr(data, name, None)
+        if torch.is_tensor(v) and v.reshape(-1).numel() == n:
+            return v.to(dtype=torch.float32).reshape(n)
+    return None
+
+
+def _level_r_local(data, n: int, level: str, fallback: float) -> Tensor:
+    names = {
+        "fine": ("r_local",),
+        "mid": ("r_local_mid", "r_local"),
+        "coarse": ("r_local_coarse", "r_local"),
+    }[level]
+    found = _first_matching_tensor(data, names, n)
+    if found is not None:
+        return found.clamp_min(1e-4)
+    device = data.x.device if getattr(data, "x", None) is not None else "cpu"
+    return torch.full((n,), float(fallback), dtype=torch.float32, device=device)
+
+
+def _level_geom_features(data, n: int, level: str, fallback_r: float) -> Tensor:
+    """[r_local, curvature, torsion, ostium distance] with zeros/r fallbacks."""
+    r = _level_r_local(data, n, level, fallback_r)
+    if level == "fine":
+        k_names = ("curvature", "kappa", "curvature_fine", "kappa_fine")
+        t_names = ("torsion", "tau", "torsion_fine")
+        d_names = ("d_ostium", "ostium_dist", "dist_ostium", "ostium_distance")
+    elif level == "mid":
+        k_names = ("curvature_mid", "kappa_mid", "curvature", "kappa")
+        t_names = ("torsion_mid", "tau_mid", "torsion", "tau")
+        d_names = ("d_ostium_mid", "ostium_dist_mid", "d_ostium", "ostium_dist")
+    else:
+        k_names = ("curvature_coarse", "kappa_coarse", "curvature", "kappa")
+        t_names = ("torsion_coarse", "tau_coarse", "torsion", "tau")
+        d_names = ("d_ostium_coarse", "ostium_dist_coarse", "d_ostium", "ostium_dist")
+    device = r.device
+    k = _first_matching_tensor(data, k_names, n)
+    tau = _first_matching_tensor(data, t_names, n)
+    d_ost = _first_matching_tensor(data, d_names, n)
+    if k is None:
+        k = torch.zeros(n, device=device, dtype=r.dtype)
+    if tau is None:
+        tau = torch.zeros(n, device=device, dtype=r.dtype)
+    if d_ost is None:
+        d_ost = torch.zeros(n, device=device, dtype=r.dtype)
+    return torch.stack([r, k, tau, d_ost], dim=-1)
+
+
+def apply_boundary_plane_projection(x: Tensor, data, suffix: str = "") -> Tensor:
+    """Slide rim vertices in their ostium cut plane. No-op when planes are missing.
+
+    Accepts packed [N, 3] origin+normal (optionally with a boolean mask), or a
+    packed-boundary layout [n_boundary, 3] plus a [N] mask of rim vertices.
+    """
+    if x.numel() == 0:
+        return x
+    n = int(x.size(0))
+    origin = None
+    normal = None
+    mask = None
+    for orig_name, nrm_name in (
+        (f"boundary_plane_origin{suffix}", f"boundary_plane_normal{suffix}"),
+        (f"plane_origin{suffix}", f"plane_normal{suffix}"),
+        (f"ostium_plane_origin{suffix}", f"ostium_plane_normal{suffix}"),
+    ):
+        o = getattr(data, orig_name, None)
+        nr = getattr(data, nrm_name, None)
+        if torch.is_tensor(o) and torch.is_tensor(nr):
+            origin, normal = o, nr
+            break
+    if origin is None or normal is None:
+        return x
+    for mask_name in (
+        f"boundary_mask{suffix}",
+        f"is_boundary{suffix}",
+        f"rim_mask{suffix}",
+        f"boundary_vertex{suffix}",
+    ):
+        m = getattr(data, mask_name, None)
+        if torch.is_tensor(m) and m.reshape(-1).numel() == n:
+            mask = _as_bool_mask(m.reshape(-1))
+            break
+    origin = origin.to(device=x.device, dtype=x.dtype)
+    normal = normal.to(device=x.device, dtype=x.dtype)
+    if origin.dim() == 1:
+        origin = origin.unsqueeze(0)
+    if normal.dim() == 1:
+        normal = normal.unsqueeze(0)
+
+    def _project(pts, org, nrm):
+        nrm = F.normalize(nrm, dim=-1, eps=1e-8)
+        return pts - nrm * ((pts - org) * nrm).sum(dim=-1, keepdim=True)
+
+    if origin.size(0) == n and normal.size(0) == n:
+        x_proj = _project(x, origin, normal)
+        if mask is None:
+            live = normal.norm(dim=-1, keepdim=True) > 1e-6
+            return torch.where(live, x_proj, x)
+        return torch.where(mask.unsqueeze(-1), x_proj, x)
+    if mask is not None and origin.size(0) == int(mask.sum()) and normal.size(0) == int(mask.sum()):
+        idx = mask.nonzero(as_tuple=False).view(-1)
+        x = x.clone()
+        x[idx] = _project(x[idx], origin, normal)
+        return x
+    return x
+
+
+def _clamp_residual_radial(delta_r: Tensor, dx_up: Tensor, n_v: Tensor, floor: Tensor) -> Tensor:
+    """Composed radial offset stays ≥ −floor, with per-vertex `floor` (0.8 r_local)."""
+    delta_r = delta_r.to(dtype=torch.float32)
+    if delta_r.dim() == 1:
+        delta_r = delta_r.unsqueeze(-1)
+    floor = floor.to(dtype=torch.float32, device=delta_r.device).reshape(-1, 1)
+    n_v = n_v.to(dtype=torch.float32)
+    dx_up = dx_up.to(dtype=torch.float32)
+    r_up = (n_v * dx_up).sum(dim=-1, keepdim=True)
+    return torch.maximum(delta_r, -(floor + r_up))
+
+
+def _stem_features(data, x_true: Tensor) -> Tensor:
+    """xyz + GT normals + template signed distance (3 → 7). Missing fields → zeros."""
+    n = x_true.size(0)
+    nrm = getattr(data, "x_true_normal", None)
+    if not torch.is_tensor(nrm) or nrm.shape != x_true.shape:
+        nrm = x_true.new_zeros(n, 3)
+    else:
+        nrm = nrm.to(dtype=x_true.dtype, device=x_true.device)
+    sdf = getattr(data, "x_true_template_sdf", None)
+    if sdf is None:
+        sdf = getattr(data, "x_true_sdf", None)
+    if not torch.is_tensor(sdf) or sdf.reshape(-1).numel() != n:
+        sdf = x_true.new_zeros(n, 1)
+    else:
+        sdf = sdf.to(dtype=x_true.dtype, device=x_true.device).reshape(n, 1)
+    return torch.cat([x_true, nrm, sdf], dim=-1)
 
 
 class InvResMLP(nn.Module):
@@ -269,17 +502,71 @@ class SetAbstraction(nn.Module):
         return new_h, new_pos, new_batch
 
 
-class CenterlineLatentHead(nn.Module):
-    """Cross-attention from tree-valued centerline queries onto PointNeXt tokens."""
+class TokenSelfAttentionBlock(nn.Module):
+    """Pre-norm token transformer block over the centerline tree."""
 
-    def __init__(self, in_dim: int, latent_dim: int, latent_len: int, attn_dim: int):
+    def __init__(self, dim: int, n_heads: int, ff_mult: int = 4):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, n_heads, batch_first=True, dropout=0.0)
+        self.ln2 = nn.LayerNorm(dim)
+        hidden = dim * ff_mult
+        self.ff = nn.Sequential(
+            nn.Linear(dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, dim),
+        )
+
+    def forward(self, x: Tensor, key_padding_mask: Tensor | None) -> Tensor:
+        if key_padding_mask is not None and key_padding_mask.all(dim=-1).any():
+            key_padding_mask = key_padding_mask.clone()
+            key_padding_mask[key_padding_mask.all(dim=-1), 0] = False
+        h = self.ln1(x)
+        a, _ = self.attn(h, h, h, key_padding_mask=key_padding_mask, need_weights=False)
+        x = x + a
+        return x + self.ff(self.ln2(x))
+
+
+class CenterlineLatentHead(nn.Module):
+    """Local pool of encoder centres onto tree tokens, then a small token transformer.
+
+    Each encoder centre is assigned to its nearest token along the tree; features
+    are max-pooled per token. 2–4 self-attention layers mix tokens with γ(u),
+    tract, and branch-depth encodings. Soft σ bound replaces the dead-gradient
+    logvar clamp.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        latent_dim: int,
+        latent_len: int,
+        attn_dim: int,
+        n_layers: int = LATENT_HEAD_LAYERS,
+        n_heads: int = LATENT_HEAD_HEADS,
+        sigma_min: float = SIGMA_MIN,
+        sigma_max: float = SIGMA_MAX,
+    ):
         super().__init__()
         self.latent_len = int(latent_len)
         self.attn_dim = int(attn_dim)
+        self.sigma_min = float(sigma_min)
+        self.sigma_max = float(sigma_max)
+        n_heads = int(n_heads)
+        if n_heads < 1 or self.attn_dim % n_heads != 0:
+            n_heads = 1
         self.tract_emb = nn.Embedding(MAX_TRACTS + 1, attn_dim)
-        self.w_q = nn.Linear(GAMMA_U_DIM + attn_dim, attn_dim)
-        self.w_k = nn.Linear(in_dim + GAMMA_U_DIM + attn_dim, attn_dim)
-        self.w_v = nn.Linear(in_dim, attn_dim)
+        pe_dim = GAMMA_U_DIM + attn_dim + 1
+        self.fuse = nn.Sequential(
+            nn.Linear(in_dim + pe_dim, attn_dim),
+            nn.LayerNorm(attn_dim),
+            nn.GELU(),
+        )
+        n_layers = max(2, min(4, int(n_layers)))
+        self.blocks = nn.ModuleList(
+            [TokenSelfAttentionBlock(attn_dim, n_heads) for _ in range(n_layers)]
+        )
+        self.out_ln = nn.LayerNorm(attn_dim)
         self.mu_head = nn.Linear(attn_dim, latent_dim)
         self.logvar_head = nn.Linear(attn_dim, latent_dim)
 
@@ -288,33 +575,90 @@ class CenterlineLatentHead(nn.Module):
         idx = torch.where(idx < 0, torch.full_like(idx, MAX_TRACTS), idx)
         return idx.clamp(0, MAX_TRACTS)
 
-    def forward(self, h: Tensor, u_pts: Tensor, tract_pts: Tensor, batch: Tensor, data):
+    def _assign_centres(
+        self,
+        u_pts: Tensor,
+        tract_pts: Tensor,
+        pos: Tensor | None,
+        token_u: Tensor,
+        token_tract: Tensor,
+        token_pos: Tensor | None,
+        valid: Tensor,
+    ) -> Tensor:
+        """Nearest token along the tree (same-tract |Δu|; 3-D fallback)."""
+        n_c = u_pts.size(0)
+        if n_c == 0:
+            return u_pts.new_zeros((0,), dtype=torch.long)
+        du = (u_pts.unsqueeze(1) - token_u.unsqueeze(0)).abs()
+        same = tract_pts.unsqueeze(1) == token_tract.unsqueeze(0)
+        large = du.new_tensor(1.0e6)
+        dist = torch.where(same, du, large)
+        dist = dist.masked_fill(~valid.unsqueeze(0), large)
+        has_same = (same & valid.unsqueeze(0)).any(dim=1)
+        if pos is not None and token_pos is not None and pos.size(0) == n_c:
+            d3 = torch.cdist(pos, token_pos)
+            d3 = d3.masked_fill(~valid.unsqueeze(0), large)
+            dist = torch.where(has_same.unsqueeze(1), dist, d3)
+        else:
+            du_all = du.masked_fill(~valid.unsqueeze(0), large)
+            dist = torch.where(has_same.unsqueeze(1), dist, du_all)
+        return dist.argmin(dim=1)
+
+    def _pool_graph(self, h, u_pts, tract_pts, pos, token_u, token_tract, token_pos, valid):
+        l = token_u.size(0)
+        pooled = h.new_zeros(l, h.size(-1))
+        if h.size(0) == 0 or not bool(valid.any()):
+            return pooled
+        assign = self._assign_centres(u_pts, tract_pts, pos, token_u, token_tract, token_pos, valid)
+        pooled = scatter(h, assign, dim=0, dim_size=l, reduce="max")
+        return pooled * valid.unsqueeze(-1).to(dtype=pooled.dtype)
+
+    def _encode_tokens(self, pooled, token_u, token_tract, depth, valid):
+        b, l, _ = pooled.shape
+        gamma_u = harmonic_encoding_u(token_u.reshape(-1)).reshape(b, l, -1)
+        te = self.tract_emb(self._tract_index(token_tract))
+        pe = torch.cat([gamma_u, te, depth], dim=-1)
+        h = self.fuse(torch.cat([pooled, pe], dim=-1))
+        pad = ~valid
+        if pad.all():
+            pad = pad.clone()
+            pad[:, 0] = False
+        for blk in self.blocks:
+            h = blk(h, key_padding_mask=pad)
+        h = self.out_ln(h)
+        mu = self.mu_head(h)
+        logvar = _soft_logvar(self.logvar_head(h), self.sigma_min, self.sigma_max)
+        valid_f = valid.unsqueeze(-1).to(dtype=mu.dtype)
+        mu = mu * valid_f
+        logvar = torch.where(valid.unsqueeze(-1), logvar, torch.zeros_like(logvar))
+        return mu, logvar
+
+    def forward(self, h: Tensor, u_pts: Tensor, tract_pts: Tensor, batch: Tensor, data, pos: Tensor | None = None):
         n_graphs = int(getattr(data, "num_graphs", 1) or 1)
-        token_u, token_tract, _, _ = _token_tables(data, n_graphs, self.latent_len)
-        scale = math.sqrt(self.attn_dim)
+        token_u, token_tract, _, _, valid = _token_tables(data, n_graphs, self.latent_len)
+        token_pos = _token_pos_table(data, n_graphs, self.latent_len)
+        depth = _token_depth_table(data, n_graphs, self.latent_len, h.device, h.dtype)
+        valid = valid.to(device=h.device)
+        token_u = token_u.to(device=h.device, dtype=h.dtype)
+        token_tract = token_tract.to(device=h.device)
+        if token_pos is not None:
+            token_pos = token_pos.to(device=h.device, dtype=h.dtype)
+        pooled = h.new_zeros(n_graphs, self.latent_len, h.size(-1))
         if n_graphs == 1:
-            tg = self.tract_emb(self._tract_index(tract_pts))
-            kg = self.w_k(torch.cat([h, harmonic_encoding_u(u_pts), tg], dim=-1))
-            vg = self.w_v(h)
-            tq = self.tract_emb(self._tract_index(token_tract[0]))
-            q = self.w_q(torch.cat([harmonic_encoding_u(token_u[0]), tq], dim=-1))
-            attn = torch.softmax(q @ kg.t() / scale, dim=-1) @ vg
-            return self.mu_head(attn).unsqueeze(0), self.logvar_head(attn).clamp(*LOGVAR_CLAMP).unsqueeze(0)
-        mu_out, lv_out = [], []
-        for g in range(n_graphs):
-            mask = batch == g
-            hg = h[mask]
-            ug = u_pts[mask]
-            tg = self.tract_emb(self._tract_index(tract_pts[mask]))
-            kg = self.w_k(torch.cat([hg, harmonic_encoding_u(ug), tg], dim=-1))
-            vg = self.w_v(hg)
-            uq = token_u[g]
-            tq = self.tract_emb(self._tract_index(token_tract[g]))
-            q = self.w_q(torch.cat([harmonic_encoding_u(uq), tq], dim=-1))
-            attn = torch.softmax(q @ kg.t() / scale, dim=-1) @ vg
-            mu_out.append(self.mu_head(attn))
-            lv_out.append(self.logvar_head(attn).clamp(*LOGVAR_CLAMP))
-        return torch.stack(mu_out, dim=0), torch.stack(lv_out, dim=0)
+            tpos = None if token_pos is None else token_pos[0]
+            pooled[0] = self._pool_graph(
+                h, u_pts, tract_pts, pos, token_u[0], token_tract[0], tpos, valid[0],
+            )
+        else:
+            for g in range(n_graphs):
+                mask = batch == g
+                tpos = None if token_pos is None else token_pos[g]
+                gpos = None if pos is None else pos[mask]
+                pooled[g] = self._pool_graph(
+                    h[mask], u_pts[mask], tract_pts[mask], gpos,
+                    token_u[g], token_tract[g], tpos, valid[g],
+                )
+        return self._encode_tokens(pooled, token_u, token_tract, depth, valid)
 
 
 class PointNeXtEncoder(nn.Module):
@@ -325,14 +669,17 @@ class PointNeXtEncoder(nn.Module):
         stem_dim: int = STEM_DIM,
         stages=SA_STAGES,
         gradient_checkpointing: str = "off",
+        narrow_late_stages: bool = False,
     ):
         super().__init__()
         self.latent_dim = int(latent_dim)
         self.latent_len = int(latent_len)
         self.gradient_checkpointing = normalize_gradient_checkpointing(gradient_checkpointing)
         stages = tuple(stages)
+        if narrow_late_stages:
+            stages = _narrow_sa_stages(stages)
         self.stem = nn.Sequential(
-            nn.Linear(3, stem_dim),
+            nn.Linear(7, stem_dim),
             nn.LayerNorm(stem_dim),
             nn.LeakyReLU(inplace=True),
         )
@@ -346,7 +693,7 @@ class PointNeXtEncoder(nn.Module):
             in_dim = hidden
         self.sa_layers = nn.ModuleList(sa)
         self.inv_layers = nn.ModuleList(inv)
-        self.latent_head = CenterlineLatentHead(in_dim, latent_dim, latent_len, attn_dim=in_dim)
+        self.latent_head = CenterlineLatentHead(in_dim, self.latent_dim, latent_len, attn_dim=in_dim)
 
     def forward(self, data):
         n_graphs = int(getattr(data, "num_graphs", 1) or 1)
@@ -358,7 +705,7 @@ class PointNeXtEncoder(nn.Module):
         )
         cl_batch = _attr_batch(data, "cl_dense", data.cl_dense.size(0))
         cl_tract = data.cl_tract_id
-        h = self.stem(x_true)
+        h = self.stem(_stem_features(data, x_true))
         pos, batch = x_true, x_true_batch
         for sa, inv_blocks in zip(self.sa_layers, self.inv_layers):
             h, pos, batch = sa(h, pos, batch, n_graphs=n_graphs)
@@ -373,16 +720,64 @@ class PointNeXtEncoder(nn.Module):
         u_pts, tract_pts = nearest_centerline_attr(
             pos, batch, data.cl_dense, cl_batch, cl_tract, n_graphs=n_graphs
         )
-        return self.latent_head(h, u_pts, tract_pts, batch, data)
+        return self.latent_head(h, u_pts, tract_pts, batch, data, pos=pos)
+
+
+def _decoder_token_allow(
+    token_attend: Tensor,
+    node_tract: Tensor,
+    token_u: Tensor,
+    latent_valid: Tensor,
+    token_tract: Tensor | None,
+    node_u: Tensor,
+    token_pos: Tensor | None,
+    node_pos: Tensor | None,
+    k: int,
+    ostium_mm: float,
+):
+    """[N, L] mask: K nearest same-branch tokens + ostium-neighbour tokens."""
+    tract = node_tract.clamp(0, MAX_TRACTS - 1)
+    allow = token_attend[:, tract].transpose(0, 1)
+    allow = allow & latent_valid.unsqueeze(0)
+    if token_tract is None:
+        return allow
+    same = tract.unsqueeze(1) == token_tract.unsqueeze(0)
+    cand = allow & same
+    du = (node_u.unsqueeze(1) - token_u.unsqueeze(0)).abs()
+    large = du.new_tensor(1.0e6)
+    dist = torch.where(cand, du, large)
+    kk = min(max(int(k), 1), int(token_u.numel()))
+    knn = torch.zeros_like(allow)
+    if kk > 0 and node_u.numel() > 0:
+        _, idx = dist.topk(kk, dim=-1, largest=False)
+        knn.scatter_(1, idx, True)
+        knn = knn & cand
+    extra = torch.zeros_like(allow)
+    ost_tok = ((token_u <= 0.05) | (token_u >= 0.95)) & latent_valid
+    if token_pos is not None and node_pos is not None and bool(ost_tok.any()):
+        d_tt = torch.cdist(token_pos, token_pos)
+        near_ost = (d_tt <= float(ostium_mm)) & ost_tok.unsqueeze(0)
+        diff_tr = token_tract.unsqueeze(1) != token_tract.unsqueeze(0)
+        nbr = ((near_ost & diff_tr).any(dim=1) & latent_valid)
+        d_vo = torch.cdist(node_pos, token_pos[ost_tok])
+        v_near = (d_vo <= float(ostium_mm)).any(dim=1)
+        extra = v_near.unsqueeze(1) & nbr.unsqueeze(0)
+    else:
+        v_near = (node_u <= 0.15) | (node_u >= 0.85)
+        other = (token_tract.unsqueeze(0) != tract.unsqueeze(1)) & ost_tok.unsqueeze(0)
+        extra = v_near.unsqueeze(1) & other
+    return (knn | extra) & latent_valid.unsqueeze(0)
 
 
 class LatentCrossAttention(nn.Module):
-    """Scaffold nodes query the tree latent via Fourier (u, θ) with a tract mask."""
+    """Scaffold nodes query the tree latent via Fourier (u, θ) with a local token mask."""
 
     def __init__(self, latent_dim: int, hidden_dim: int, attn_dim: int, latent_len: int):
         super().__init__()
         self.latent_len = int(latent_len)
         self.attn_dim = int(attn_dim)
+        self.k_tokens = TOKEN_ATTEND_K
+        self.ostium_mm = OSTIUM_NEIGHBOR_MM
         self.w_q = nn.Linear(GAMMA_U_DIM + GAMMA_THETA_DIM, attn_dim)
         self.w_k = nn.Linear(latent_dim + GAMMA_U_DIM, attn_dim)
         self.w_v = nn.Linear(latent_dim, attn_dim)
@@ -397,6 +792,10 @@ class LatentCrossAttention(nn.Module):
         node_tract: Tensor,
         token_u: Tensor,
         token_attend: Tensor,
+        latent_valid: Tensor | None = None,
+        token_tract: Tensor | None = None,
+        token_pos: Tensor | None = None,
+        node_pos: Tensor | None = None,
     ) -> Tensor:
         gamma_u = harmonic_encoding_u(u)
         gamma_th = harmonic_encoding_theta(theta)
@@ -407,27 +806,47 @@ class LatentCrossAttention(nn.Module):
         v = self.w_v(z)
         scale = math.sqrt(self.attn_dim)
         tract = node_tract.clamp(0, MAX_TRACTS - 1)
-        # Per-graph GEMM: scores = q_g @ k[g].T, a = softmax @ v[g].
-        # Avoids materializing [N, L, D] broadcasts of k/v (~6 GiB at the fine scaffold).
-        if n_graphs == 1:
-            scores = q.matmul(k[0].transpose(0, 1)) / scale
-            allow = token_attend[0][:, tract].transpose(0, 1)
-            scores = scores.masked_fill(~allow, -1.0e4)
-            orphan = ~allow.any(dim=-1)
-            scores = torch.where(orphan.unsqueeze(-1), torch.zeros_like(scores), scores)
-            a = torch.softmax(scores, dim=-1).matmul(v[0])
-            return self.out(torch.cat([a, gamma_u, gamma_th], dim=-1))
-        a = q.new_empty(q.size(0), self.attn_dim)
-        for g in range(n_graphs):
-            mask = node_batch == g
-            qg = q[mask]
-            scores = qg.matmul(k[g].transpose(0, 1)) / scale
-            allow = token_attend[g][:, tract[mask]].transpose(0, 1)
+        if latent_valid is None:
+            latent_valid = torch.ones(n_graphs, self.latent_len, dtype=torch.bool, device=z.device)
+        else:
+            latent_valid = _as_bool_mask(latent_valid).to(device=z.device)
+        restrict = token_tract is not None
+
+        def _scores_and_weights(qg, kg, vg, g, node_idx):
+            scores = qg.matmul(kg.transpose(0, 1)) / scale
+            if restrict:
+                tpos = None if token_pos is None else token_pos[g]
+                npos = None if node_pos is None else node_pos[node_idx]
+                allow = _decoder_token_allow(
+                    token_attend[g],
+                    tract[node_idx],
+                    token_u[g],
+                    latent_valid[g],
+                    token_tract[g],
+                    u[node_idx],
+                    tpos,
+                    npos,
+                    self.k_tokens,
+                    self.ostium_mm,
+                )
+            else:
+                allow = token_attend[g][:, tract[node_idx]].transpose(0, 1)
+                allow = allow & latent_valid[g].unsqueeze(0)
             scores = scores.masked_fill(~allow, -1.0e4)
             orphan = ~allow.any(dim=-1)
             scores = torch.where(orphan.unsqueeze(-1), torch.zeros_like(scores), scores)
             w = torch.softmax(scores, dim=-1)
-            a[mask] = w.matmul(v[g])
+            return w.matmul(vg)
+
+        if n_graphs == 1:
+            node_idx = torch.arange(q.size(0), device=q.device)
+            a = _scores_and_weights(q, k[0], v[0], 0, node_idx)
+            return self.out(torch.cat([a, gamma_u, gamma_th], dim=-1))
+        a = q.new_empty(q.size(0), self.attn_dim)
+        for g in range(n_graphs):
+            mask = node_batch == g
+            node_idx = mask.nonzero(as_tuple=False).view(-1)
+            a[mask] = _scores_and_weights(q[mask], k[g], v[g], g, node_idx)
         return self.out(torch.cat([a, gamma_u, gamma_th], dim=-1))
 
 
@@ -558,10 +977,11 @@ class CoarsePositionalSelfAttention(nn.Module):
 
 
 class LatentTractSelfAttention(nn.Module):
-    """Mild per-tract residual mix of latent tokens after reparameterization.
+    """Mild per-tract residual mix of latent tokens *before* reparameterization.
 
     Q/K concatenate [LN(z), γ(u)]; values come from z. Junction tokens
-    (tract_id < 0) are left unchanged so KL still sees independent stations.
+    (tract_id < 0) and padded tokens (`latent_valid=False`) are left unchanged
+    so KL still sees independent stations on those slots.
     """
 
     def __init__(
@@ -597,11 +1017,12 @@ class LatentTractSelfAttention(nn.Module):
         if z.numel() == 0:
             return z
         n_graphs, latent_len, _ = z.shape
-        token_u, token_tract, _, is_junc = _token_tables(data, n_graphs, latent_len)
+        token_u, token_tract, _, is_junc, valid = _token_tables(data, n_graphs, latent_len)
         is_junc = is_junc.to(device=z.device)
         token_tract = token_tract.to(device=z.device)
         token_u = token_u.to(device=z.device, dtype=z.dtype)
-        junc = is_junc.bool() | (token_tract < 0)
+        valid = valid.to(device=z.device)
+        junc = is_junc.bool() | (token_tract < 0) | ~valid
         z_n = self.ln(z)
         gamma_u = harmonic_encoding_u(token_u).view(n_graphs, latent_len, -1)
         qk = torch.cat([z_n, gamma_u], dim=-1)
@@ -644,43 +1065,92 @@ class ResidualSplineConv(nn.Module):
     def __init__(
         self,
         dim: int,
-        kernel_size: int = SPLINE_KERNEL_SIZE,
-        degree: int = SPLINE_DEGREE,
+        kernel_size=None,
+        degree=None,
     ):
         super().__init__()
+        if kernel_size is None:
+            kernel_size = _spline_kernel_size()
+        if isinstance(kernel_size, int):
+            kernel_size = _spline_kernel_size()
+        if degree is None:
+            degree = _spline_degree()
+        self.norm = nn.LayerNorm(dim)
         self.conv = make_spline_conv(
             dim,
             dim,
             dim=3,
-            kernel_size=kernel_size,
-            degree=degree,
-            aggr="add",
-            root_weight=False,
+            kernel_size=list(kernel_size),
+            degree=int(degree),
+            aggr=str(_cfg_get("SPLINE_AGGR", "mean")),
+            root_weight=bool(_cfg_get("SPLINE_ROOT_WEIGHT", True)),
         )
 
     def forward(self, h: Tensor, edge_index: Tensor, pseudo: Tensor) -> Tensor:
         h = h.to(dtype=torch.float32)
         pseudo = pseudo.to(dtype=torch.float32)
-        return h + F.elu(self.conv(h, edge_index, pseudo))
+        return h + F.elu(self.conv(self.norm(h), edge_index, pseudo))
 
 
 class DecoupledDisplacementHead(nn.Module):
-    def __init__(self, hidden: int, r_margin: float = R_MARGIN_MM, s_max: float = SHEAR_MAX_MM):
+    """Δr / Δs head with r_local-relative floor and shear cap.
+
+    Floor ≈ −RADIAL_FLOOR_FRAC · r_local; shear ≤ max(SHEAR_MAX_MM, k · r_local).
+    Identity at init: W = 0 and a per-vertex softplus offset so Δr = 0 when
+    features are zero. Linear bias stays 0.
+    """
+
+    def __init__(
+        self,
+        hidden: int,
+        r_margin: float = R_MARGIN_MM,
+        s_max: float = SHEAR_MAX_MM,
+        floor_frac: float = RADIAL_FLOOR_FRAC,
+        shear_rlocal_k: float = SHEAR_RLOCAL_K,
+    ):
         super().__init__()
         self.r_margin = float(r_margin)
         self.s_max = float(s_max)
+        self.floor_frac = float(floor_frac)
+        self.shear_rlocal_k = float(shear_rlocal_k)
         self.radial = nn.Linear(hidden, 1)
         self.shear = nn.Linear(hidden, 2)
         nn.init.zeros_(self.radial.weight)
-        self.radial.bias.data.fill_(radial_bias_for_zero_init(self.r_margin))
+        nn.init.zeros_(self.radial.bias)
         nn.init.zeros_(self.shear.weight)
         nn.init.zeros_(self.shear.bias)
 
-    def forward(self, h: Tensor):
+    def _bounds(self, h: Tensor, r_local: Tensor | None):
+        n = h.size(0)
+        if r_local is None:
+            r = h.new_full((n, 1), self.r_margin)
+        else:
+            r = r_local.to(dtype=h.dtype, device=h.device).reshape(n, 1).clamp_min(1e-4)
+        floor = self.floor_frac * r
+        s_max = torch.maximum(r.new_full((n, 1), self.s_max), self.shear_rlocal_k * r)
+        return floor, s_max
+
+    def forward(self, h: Tensor, r_local: Tensor | None = None):
         h = h.to(dtype=torch.float32)
-        delta_r = F.softplus(self.radial(h)) - self.r_margin
-        delta_s = torch.tanh(self.shear(h)) * self.s_max
+        floor, s_max = self._bounds(h, r_local)
+        raw_r = self.radial(h)
+        offset = torch.log(torch.expm1(floor.clamp_min(1e-6)))
+        delta_r = F.softplus(raw_r + offset) - floor
+        delta_s = torch.tanh(self.shear(h)) * s_max
         return delta_r, delta_s
+
+
+class FreeDisplacementHead(nn.Module):
+    """Unconstrained 3-D displacement (coarse level). Identity Δx = 0 at init."""
+
+    def __init__(self, hidden: int):
+        super().__init__()
+        self.disp = nn.Linear(hidden, 3)
+        nn.init.zeros_(self.disp.weight)
+        nn.init.zeros_(self.disp.bias)
+
+    def forward(self, h: Tensor) -> Tensor:
+        return self.disp(h.to(dtype=torch.float32))
 
 
 def _branch_nl(data, name: str, graph: int, num_graphs: int) -> Tensor:
@@ -765,30 +1235,35 @@ class ProgressiveSplineDecoder(nn.Module):
         r_margin: float = R_MARGIN_MM,
         s_max: float = SHEAR_MAX_MM,
         gradient_checkpointing: str = "off",
+        n_conv: int | None = None,
     ):
         super().__init__()
         self.hidden_dim = int(hidden_dim)
         self.latent_len = int(latent_len)
         self.r_margin = float(r_margin)
         self.gradient_checkpointing = normalize_gradient_checkpointing(gradient_checkpointing)
+        n_conv = int(n_conv if n_conv is not None else _n_conv_per_level())
         self.cross_coarse = LatentCrossAttention(latent_dim, hidden_dim, attn_dim, latent_len)
         self.cross_mid = LatentCrossAttention(latent_dim, hidden_dim, attn_dim, latent_len)
         self.cross_fine = LatentCrossAttention(latent_dim, hidden_dim, attn_dim, latent_len)
+        self.geom_fuse_c = nn.Linear(hidden_dim + 4, hidden_dim)
+        self.geom_fuse_m = nn.Linear(hidden_dim + 4, hidden_dim)
+        self.geom_fuse_f = nn.Linear(hidden_dim + 4, hidden_dim)
         self.coarse_attn = CoarsePositionalSelfAttention(hidden_dim)
         self.coarse_convs = nn.ModuleList(
-            [ResidualSplineConv(hidden_dim) for _ in range(N_SPLINE_COARSE)]
+            [ResidualSplineConv(hidden_dim) for _ in range(n_conv)]
         )
         self.mid_convs = nn.ModuleList(
-            [ResidualSplineConv(hidden_dim) for _ in range(N_SPLINE_MID)]
+            [ResidualSplineConv(hidden_dim) for _ in range(n_conv)]
         )
         self.fine_convs = nn.ModuleList(
-            [ResidualSplineConv(hidden_dim) for _ in range(N_SPLINE_FINE)]
+            [ResidualSplineConv(hidden_dim) for _ in range(n_conv)]
         )
         self.mid_init = nn.Linear(3, hidden_dim)
         self.fine_init = nn.Linear(3, hidden_dim)
         self.alpha_c_raw = nn.Parameter(torch.tensor(_logit(SKIP_GATE_INIT)))
         self.alpha_m_raw = nn.Parameter(torch.tensor(_logit(SKIP_GATE_INIT)))
-        self.coarse_head = DecoupledDisplacementHead(hidden_dim, r_margin=r_margin, s_max=s_max)
+        self.coarse_head = FreeDisplacementHead(hidden_dim)
         self.mid_head = DecoupledDisplacementHead(hidden_dim, r_margin=r_margin, s_max=s_max)
         self.head = DecoupledDisplacementHead(hidden_dim, r_margin=r_margin, s_max=s_max)
 
@@ -815,12 +1290,45 @@ class ProgressiveSplineDecoder(nn.Module):
             u_step,
         )
 
-    def _cross(self, layer, z, u, theta, node_batch, tract, token_u, token_attend):
-        return layer(z, u, theta, node_batch, tract, token_u, token_attend)
+    def _cross(
+        self,
+        layer,
+        z,
+        u,
+        theta,
+        node_batch,
+        tract,
+        token_u,
+        token_attend,
+        latent_valid,
+        token_tract,
+        token_pos,
+        node_pos,
+    ):
+        return layer(
+            z, u, theta, node_batch, tract, token_u, token_attend,
+            latent_valid=latent_valid,
+            token_tract=token_tract,
+            token_pos=token_pos,
+            node_pos=node_pos,
+        )
+
+    def _fuse_geom(self, h, fuse, data, n, level):
+        geom = _level_geom_features(data, n, level, self.r_margin)
+        geom = geom.to(device=h.device, dtype=h.dtype)
+        return fuse(torch.cat([h, geom], dim=-1))
 
     def forward(self, z: Tensor, data):
         n_graphs = z.size(0)
-        token_u, _, token_attend, _ = _token_tables(data, n_graphs, self.latent_len)
+        token_u, token_tract, token_attend, _, latent_valid = _token_tables(
+            data, n_graphs, self.latent_len
+        )
+        token_pos = _token_pos_table(data, n_graphs, self.latent_len)
+        if token_pos is not None:
+            token_pos = token_pos.to(device=z.device, dtype=z.dtype)
+        token_u = token_u.to(device=z.device, dtype=z.dtype)
+        token_tract = token_tract.to(device=z.device)
+        latent_valid = latent_valid.to(device=z.device)
 
         pos_c = data.pos_coarse
         batch_c = _attr_batch(data, "pos_coarse", pos_c.size(0))
@@ -833,22 +1341,27 @@ class ProgressiveSplineDecoder(nn.Module):
 
         h_c = self._cross(
             self.cross_coarse, z, data.u_coarse, data.theta_coarse, batch_c,
-            data.tract_id_coarse, token_u, token_attend,
+            data.tract_id_coarse, token_u, token_attend, latent_valid, token_tract,
+            token_pos, pos_c,
         )
+        h_c = self._fuse_geom(h_c, self.geom_fuse_c, data, pos_c.size(0), "coarse")
         h_c = self._run_attn(
             h_c, data.u_coarse, data.theta_coarse, data.tract_id_coarse, batch_c,
             data.u_step_coarse, n_graphs,
         )
+        r_c = _level_r_local(data, pos_c.size(0), "coarse", self.r_margin)
         pseudo_c = intrinsic_spline_pseudo_coords(
             data.u_coarse, data.theta_coarse, data.tract_id_coarse,
             data.edge_index_coarse, data.u_step_coarse,
+            r_local=r_c, pos=pos_c,
         )
         h_c = self._run_convs(
             h_c, data.edge_index_coarse, pseudo_c, self.coarse_convs,
             self.gradient_checkpointing == "all",
         )
-        dr_c, ds_c = self.coarse_head(h_c)
-        dx_c = decoupled_displacement(dr_c, ds_c, data.normal_coarse, data.tangent_coarse, data.binormal_coarse)
+        dx_c = self.coarse_head(h_c)
+        x_c = apply_boundary_plane_projection(pos_c + dx_c, data, suffix="_coarse")
+        dx_c = x_c - pos_c
 
         dx_m0 = _upsample_level(
             dx_c, data,
@@ -864,21 +1377,28 @@ class ProgressiveSplineDecoder(nn.Module):
         )
         h_m = self._cross(
             self.cross_mid, z, data.u_mid, data.theta_mid, batch_m,
-            data.tract_id_mid, token_u, token_attend,
+            data.tract_id_mid, token_u, token_attend, latent_valid, token_tract,
+            token_pos, pos_m,
         ) + self.mid_init(dx_m0) + torch.sigmoid(self.alpha_c_raw) * h_c_up
+        h_m = self._fuse_geom(h_m, self.geom_fuse_m, data, pos_m.size(0), "mid")
+        r_m = _level_r_local(data, pos_m.size(0), "mid", self.r_margin)
         pseudo_m = intrinsic_spline_pseudo_coords(
             data.u_mid, data.theta_mid, data.tract_id_mid,
             data.edge_index_mid, data.u_step_mid,
+            r_local=r_m, pos=pos_m,
         )
         h_m = self._run_convs(
             h_m, data.edge_index_mid, pseudo_m, self.mid_convs,
             self.gradient_checkpointing == "all",
         )
-        dr_m, ds_m = self.mid_head(h_m)
-        dr_m = clamp_residual_radial(dr_m, dx_m0, data.normal_mid, self.r_margin)
+        floor_m = RADIAL_FLOOR_FRAC * r_m
+        dr_m, ds_m = self.mid_head(h_m, r_local=r_m)
+        dr_m = _clamp_residual_radial(dr_m, dx_m0, data.normal_mid, floor_m)
         dx_m = dx_m0 + decoupled_displacement(
             dr_m, ds_m, data.normal_mid, data.tangent_mid, data.binormal_mid
         )
+        x_m = apply_boundary_plane_projection(pos_m + dx_m, data, suffix="_mid")
+        dx_m = x_m - pos_m
 
         dx_f0 = _upsample_level(
             dx_m, data,
@@ -894,23 +1414,29 @@ class ProgressiveSplineDecoder(nn.Module):
         )
         h_f = self._cross(
             self.cross_fine, z, data.u, data.theta, batch_f,
-            data.tract_id, token_u, token_attend,
+            data.tract_id, token_u, token_attend, latent_valid, token_tract,
+            token_pos, pos_f,
         ) + self.fine_init(dx_f0) + torch.sigmoid(self.alpha_m_raw) * h_m_up
+        h_f = self._fuse_geom(h_f, self.geom_fuse_f, data, pos_f.size(0), "fine")
+        r_f = _level_r_local(data, pos_f.size(0), "fine", self.r_margin)
         pseudo_f = intrinsic_spline_pseudo_coords(
             data.u, data.theta, data.tract_id, data.edge_index, data.u_step,
+            r_local=r_f, pos=pos_f,
         )
         h_f = self._run_convs(
             h_f, data.edge_index, pseudo_f, self.fine_convs,
             self.gradient_checkpointing in ("all", "fine"),
         )
-        delta_r, delta_s = self.head(h_f)
-        delta_r = clamp_residual_radial(delta_r, dx_f0, data.normal, self.r_margin)
+        floor_f = RADIAL_FLOOR_FRAC * r_f
+        delta_r, delta_s = self.head(h_f, r_local=r_f)
+        delta_r = _clamp_residual_radial(delta_r, dx_f0, data.normal, floor_f)
         dx_decoupled = decoupled_displacement(
             delta_r, delta_s, data.normal, data.tangent, data.binormal
         )
         delta_x = dx_f0 + dx_decoupled
-        x_pred = pos_f + delta_x
-        return x_pred, delta_x, pos_c + dx_c, pos_m + dx_m, delta_r, delta_s
+        x_pred = apply_boundary_plane_projection(pos_f + delta_x, data, suffix="")
+        delta_x = x_pred - pos_f
+        return x_pred, delta_x, x_c, x_m, delta_r, delta_s, dx_c
 
 
 @dataclass
@@ -924,6 +1450,10 @@ class VAEOutput:
     delta_s: Tensor
     x_pred_coarse: Tensor
     x_pred_mid: Tensor
+    mu_raw: Tensor | None = None
+    logvar_raw: Tensor | None = None
+    sampled: bool = False
+    delta_x_coarse: Tensor | None = None
 
 
 class GraphVAE(nn.Module):
@@ -948,40 +1478,59 @@ class GraphVAE(nn.Module):
         self.gradient_checkpointing = normalize_gradient_checkpointing(gradient_checkpointing)
         r_margin = float(tube_radius if r_margin is None else r_margin)
         self.encoder = PointNeXtEncoder(
-            latent_dim=latent_dim,
-            latent_len=latent_len,
+            latent_dim=self.latent_dim,
+            latent_len=self.latent_len,
             stages=sa_stages or SA_STAGES,
             gradient_checkpointing=self.gradient_checkpointing,
+            narrow_late_stages=sa_stages is None,
         )
         self.decoder = ProgressiveSplineDecoder(
-            latent_dim=latent_dim,
-            latent_len=latent_len,
+            latent_dim=self.latent_dim,
+            latent_len=self.latent_len,
             hidden_dim=hidden_dim,
             r_margin=r_margin,
             gradient_checkpointing=self.gradient_checkpointing,
         )
         self.z_attn = LatentTractSelfAttention(self.latent_dim)
 
-    def reparameterize(self, mu: Tensor, logvar: Tensor) -> Tensor:
-        if self.training:
-            std = torch.exp(0.5 * logvar)
-            return mu + torch.randn_like(std) * std
-        return mu
+    def reparameterize(self, mu: Tensor, logvar: Tensor, sample: bool | None = None) -> Tensor:
+        """If `sample` is True, z = μ + σ·ε even in eval. If False, return μ.
+
+        `sample=None` falls back to `self.training` so existing train.py calls
+        keep working until they pass the flag explicitly.
+        """
+        if sample is None:
+            sample = bool(self.training)
+        if not sample:
+            return mu
+        std = torch.exp(0.5 * logvar)
+        return mu + torch.randn_like(std) * std
 
     def encode(self, data):
         return self.encoder(data)
 
+    def mix_posterior(self, mu: Tensor, logvar: Tensor, data):
+        """Apply the tract mixer to μ before sampling. logvar is already local/soft-bounded."""
+        mu_mixed = self.z_attn(mu, data)
+        return mu_mixed, logvar
+
     def decode(self, z: Tensor, data) -> Tensor:
-        """Stage-2 decoder: map latent Z and scaffold `data` to surface coordinates."""
-        z = self.z_attn(z, data)
-        x_pred, _, _, _, _, _ = self.decoder(z, data)
+        """Stage-2 decoder: map latent Z and scaffold `data` to surface coordinates.
+
+        Does not run the mixer — Stage 1 / `forward` already produce decoder-ready codes.
+        """
+        x_pred, *_ = self.decoder(z, data)
         return x_pred
 
-    def forward(self, data) -> VAEOutput:
-        mu, logvar = self.encode(data)
-        z = self.reparameterize(mu, logvar)
-        z_dec = self.z_attn(z, data)
-        x_pred, delta_x, x_coarse, x_mid, delta_r, delta_s = self.decoder(z_dec, data)
+    def forward(self, data, sample: bool | None = None) -> VAEOutput:
+        if sample is None:
+            sample = bool(self.training)
+        mu_raw, logvar_raw = self.encode(data)
+        mu, logvar = self.mix_posterior(mu_raw, logvar_raw, data)
+        z = self.reparameterize(mu, logvar, sample=sample)
+        unpacked = self.decoder(z, data)
+        x_pred, delta_x, x_coarse, x_mid, delta_r, delta_s = unpacked[:6]
+        dx_c = unpacked[6] if len(unpacked) > 6 else None
         return VAEOutput(
             x_pred=x_pred,
             mu=mu,
@@ -992,4 +1541,8 @@ class GraphVAE(nn.Module):
             delta_s=delta_s,
             x_pred_coarse=x_coarse,
             x_pred_mid=x_mid,
+            mu_raw=mu_raw,
+            logvar_raw=logvar_raw,
+            sampled=bool(sample),
+            delta_x_coarse=dx_c,
         )

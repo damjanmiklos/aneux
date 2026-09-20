@@ -109,3 +109,32 @@ def radius_graph_packed(
 
 def make_spline_conv(in_channels: int, out_channels: int, **kwargs) -> SplineConv:
     return SplineConv(in_channels, out_channels, **kwargs)
+
+
+def composed_radius(
+    x: Tensor,
+    x_tube: Tensor,
+    normal: Tensor,
+    tube_radius: float | Tensor,
+) -> Tensor:
+    """Local radius after displacement: ``r + n · (x − x_tube)``.
+
+    ``tube_radius`` is the healthy radius at each vertex (cached ``r_local``).
+    A Python scalar or a tensor of shape ``()``, ``(N,)``, or ``(N, 1)`` is
+    accepted so existing scalar callers keep working. There is no hardcoded
+    2 mm default inside this function.
+    """
+    offset = (normal.float() * (x.float() - x_tube.float())).sum(dim=-1)
+    if not torch.is_tensor(tube_radius):
+        r = offset.new_tensor(tube_radius)
+    else:
+        r = tube_radius.to(dtype=offset.dtype, device=offset.device)
+    if r.numel() == 1:
+        return r.reshape(()) + offset
+    r = r.reshape(-1)
+    if r.shape[0] != offset.shape[0]:
+        raise ValueError(
+            "composed_radius: tube_radius has "
+            f"{int(r.shape[0])} values, expected 1 or {int(offset.shape[0])}"
+        )
+    return r + offset

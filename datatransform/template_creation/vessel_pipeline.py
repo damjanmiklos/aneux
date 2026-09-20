@@ -596,6 +596,82 @@ def measure_open_profiles(surface):
     return profiles
 
 
+def _as_ostium_frame(frame):
+    """Canonical in-memory ostium frame: origin (3,), unit normal (3,), radius float."""
+    origin = np.ascontiguousarray(frame["origin"], dtype=np.float64).reshape(3)
+    normal = np.ascontiguousarray(_unit(frame["normal"]), dtype=np.float64)
+    return {
+        "origin": origin,
+        "normal": normal,
+        "radius": float(frame["radius"]),
+    }
+
+
+def save_ostium_frames(path, frames):
+    """Write ostium cut frames as ``{stem}.ostium_frames.npz``.
+
+    In-memory contract: ``list[dict]`` with ``origin`` (3,) float64, unit
+    ``normal`` (3,), and ``radius`` float. On disk: keys ``origin`` (K, 3),
+    ``normal`` (K, 3), ``radius`` (K,) float64.
+    """
+    parsed = [_as_ostium_frame(fr) for fr in list(frames)]
+    if parsed:
+        origin = np.ascontiguousarray([fr["origin"] for fr in parsed], dtype=np.float64)
+        normal = np.ascontiguousarray([fr["normal"] for fr in parsed], dtype=np.float64)
+        radius = np.ascontiguousarray([fr["radius"] for fr in parsed], dtype=np.float64)
+    else:
+        origin = np.zeros((0, 3), dtype=np.float64)
+        normal = np.zeros((0, 3), dtype=np.float64)
+        radius = np.zeros((0,), dtype=np.float64)
+    np.savez(path, origin=origin, normal=normal, radius=radius)
+    return path
+
+
+def load_ostium_frames(path):
+    """Load ostium frames saved by :func:`save_ostium_frames`."""
+    with np.load(path) as data:
+        origin = np.ascontiguousarray(data["origin"], dtype=np.float64)
+        normal = np.ascontiguousarray(data["normal"], dtype=np.float64)
+        radius = np.ascontiguousarray(data["radius"], dtype=np.float64)
+    if origin.ndim != 2 or origin.shape[1] != 3:
+        raise ValueError(f"ostium frames origin must be (K, 3), got {origin.shape}")
+    if normal.ndim != 2 or normal.shape[1] != 3:
+        raise ValueError(f"ostium frames normal must be (K, 3), got {normal.shape}")
+    radius = np.atleast_1d(np.ascontiguousarray(radius, dtype=np.float64))
+    k = int(origin.shape[0])
+    if int(normal.shape[0]) != k or int(radius.shape[0]) != k:
+        raise ValueError(
+            f"ostium frames length mismatch: origin={origin.shape[0]}, "
+            f"normal={normal.shape[0]}, radius={radius.shape[0]}"
+        )
+    frames = []
+    for i in range(k):
+        frames.append(
+            {
+                "origin": origin[i].copy(),
+                "normal": np.ascontiguousarray(_unit(normal[i]), dtype=np.float64),
+                "radius": float(radius[i]),
+            }
+        )
+    return frames
+
+
+def _profiles_from_ostium_frames(frames):
+    """Profile dicts so pinhole/spurious-opening match can use GT ostia."""
+    profiles = []
+    for i, fr in enumerate(frames):
+        parsed = _as_ostium_frame(fr)
+        profiles.append(
+            {
+                "index": int(fr["index"]) if "index" in fr else i,
+                "barycenter": parsed["origin"],
+                "normal": parsed["normal"],
+                "radius": parsed["radius"],
+            }
+        )
+    return profiles
+
+
 def log_profiles(profiles, label=""):
     prefix = f"  {label} " if label else "  "
     print(f"{prefix}Boundary profiles found: {len(profiles)}")
@@ -3565,16 +3641,32 @@ def clip_flow_extensions_and_uncap(
     centerline=None,
     unextended_surface=None,
     fast_uncap=True,
+    cut_frames=None,
 ):
+    """Pipe-section uncap at each ostium.
+
+    ``cut_frames``: optional non-empty ``list[dict]`` of GT ostium frames
+    (``origin``, unit ``normal``, ``radius``). When given, those planes are
+    used instead of ``opening_clip_frames(centerline, profiles)``. Empty or
+    ``None`` keeps the previous profile/centerline behaviour.
+    """
     current = to_vtk_poly(base_surface)
-    frames = opening_clip_frames(centerline, profiles) if centerline is not None else None
+    if cut_frames:
+        work_profiles = _profiles_from_ostium_frames(cut_frames)
+        frames = [
+            (p["barycenter"], p["normal"], float(p["radius"])) for p in work_profiles
+        ]
+        print(f"  Uncap: using {len(frames)} supplied ostium cut frame(s)")
+    else:
+        work_profiles = list(profiles)
+        frames = opening_clip_frames(centerline, work_profiles) if centerline is not None else None
     trimmed = False
     if unextended_surface is not None and frames is not None:
         current, _n_trimmed = trim_extension_patches(current, unextended_surface, frames)
         trimmed = True
     body_pt = mesh_body_point(current)
     n_clipped = 0
-    for i, profile in enumerate(profiles):
+    for i, profile in enumerate(work_profiles):
         search_mm = float(extension_length) + 3.0 * max(float(profile["radius"]), 0.5)
         ok = False
         if frames is not None:
@@ -3603,7 +3695,7 @@ def clip_flow_extensions_and_uncap(
         if ok:
             n_clipped += 1
             body_pt = mesh_body_point(current)
-    print(f"  Uncap: clipped {n_clipped}/{len(profiles)} openings")
+    print(f"  Uncap: clipped {n_clipped}/{len(work_profiles)} openings")
     current = clean_triangulate(current)
     current, n_nm = repair_nonmanifold_triangles(current)
     if n_nm > 0:
@@ -3619,9 +3711,9 @@ def clip_flow_extensions_and_uncap(
             )
     current, _n_regions = drop_tiny_islands(current)
     current, _n_pin = close_wall_pinholes(
-        current, label="uncapped surface", profiles=profiles
+        current, label="uncapped surface", profiles=work_profiles
     )
-    current, n_filled = remove_spurious_openings(current, profiles)
+    current, n_filled = remove_spurious_openings(current, work_profiles)
     post = inspect_openings(current)
     print(
         "  Openings after uncap/pinhole-fill: "
@@ -3635,6 +3727,7 @@ def _polyline_cells(centerline):
     vtk_cl = to_vtk_poly(centerline)
     vtk_cl.BuildCells()
     cells = []
+    cell_ids = []
     for ci in range(vtk_cl.GetNumberOfCells()):
         cell = vtk_cl.GetCell(ci)
         if cell.GetCellType() not in (vtk.VTK_LINE, vtk.VTK_POLY_LINE):
@@ -3644,7 +3737,44 @@ def _polyline_cells(centerline):
             continue
         pts = np.array([vtk_cl.GetPoint(cell.GetPointId(j)) for j in range(n)], dtype=np.float64)
         cells.append(pts)
-    return cells, vtk_cl
+        cell_ids.append(ci)
+    return cells, cell_ids, vtk_cl
+
+
+def _copy_cell_arrays_for_kept_cells(src_poly, dst_poly, kept_cell_ids):
+    """Copy VMTK branch cell arrays (GroupIds, Blanking, ...) onto rebuilt cells."""
+    cd = src_poly.GetCellData()
+    n_arr = int(cd.GetNumberOfArrays())
+    if n_arr == 0 or dst_poly.GetNumberOfCells() == 0:
+        return
+    ids = np.asarray(kept_cell_ids, dtype=np.int64)
+    if ids.size != int(dst_poly.GetNumberOfCells()):
+        raise TemplateQualityError(
+            "Centerline clip cell-array copy length mismatch "
+            f"(kept {ids.size} ids, {dst_poly.GetNumberOfCells()} output cells)."
+        )
+    for ai in range(n_arr):
+        src = cd.GetArray(ai)
+        if src is None:
+            continue
+        name = src.GetName()
+        if not name:
+            continue
+        try:
+            values = vtk_to_numpy(src)
+        except (ValueError, TypeError, AttributeError):
+            dst = src.NewInstance()
+            dst.SetName(name)
+            dst.SetNumberOfComponents(src.GetNumberOfComponents())
+            dst.SetNumberOfTuples(int(ids.size))
+            for j, ci in enumerate(ids.tolist()):
+                dst.SetTuple(int(j), src.GetTuple(int(ci)))
+            dst_poly.GetCellData().AddArray(dst)
+            continue
+        kept = np.ascontiguousarray(values[ids])
+        arr = numpy_to_vtk(kept, deep=True)
+        arr.SetName(name)
+        dst_poly.GetCellData().AddArray(arr)
 
 
 def _trim_polyline_end(pts, origin, plane_normal, max_end_dist):
@@ -3666,10 +3796,16 @@ def _trim_polyline_end(pts, origin, plane_normal, max_end_dist):
 
 
 def clip_centerline_at_profiles(centerline, profiles, extension_length=DEFAULT_EXTENSION_LENGTH):
-    """Trim only polyline ends that belong to a nearby opening (never a global AABB)."""
-    cells, vtk_cl = _polyline_cells(centerline)
+    """Trim only polyline ends that belong to a nearby opening (never a global AABB).
+
+    Each kept cell retains its VMTK cell arrays (GroupIds, Blanking,
+    CenterlineIds, TractIds). Point arrays are copied from the nearest original
+    vertex as before.
+    """
+    cells, cell_ids, vtk_cl = _polyline_cells(centerline)
     kept = []
-    for pts in cells:
+    kept_cell_ids = []
+    for pts, ci in zip(cells, cell_ids):
         trimmed = pts
         for profile in profiles:
             origin = profile["barycenter"]
@@ -3680,6 +3816,7 @@ def clip_centerline_at_profiles(centerline, profiles, extension_length=DEFAULT_E
                 break
         if len(trimmed) >= 2:
             kept.append(trimmed)
+            kept_cell_ids.append(ci)
     if not kept:
         raise TemplateQualityError("Centerline clip removed every tract.")
 
@@ -3710,6 +3847,7 @@ def clip_centerline_at_profiles(centerline, profiles, extension_length=DEFAULT_E
             pid = locator.FindClosestPoint(out.GetPoint(i))
             dst.SetTuple(i, src.GetTuple(pid))
         out.GetPointData().AddArray(dst)
+    _copy_cell_arrays_for_kept_cells(vtk_cl, out, kept_cell_ids)
     return out
 
 
@@ -3762,8 +3900,52 @@ def compute_template_local_radii(template_mesh, branched_centerline):
     return r_template
 
 
-def compute_raycast_stretch_distances(template_mesh, ground_truth_mesh, r_template=None, max_ray_length=25.0, tol=1e-4):
-    """Outward MISR-tube stretch vs GT. `n = -template_normals` is required: VTK normals are inward here."""
+def _cell_centroids(poly):
+    n = int(poly.GetNumberOfCells())
+    if n == 0:
+        return np.zeros((0, 3), dtype=np.float64)
+    centers = vtk.vtkCellCenters()
+    centers.SetInputData(poly)
+    centers.VertexCellsOff()
+    centers.Update()
+    out = centers.GetOutput()
+    if out.GetNumberOfPoints() == 0:
+        return np.zeros((0, 3), dtype=np.float64)
+    return np.ascontiguousarray(vtk_to_numpy(out.GetPoints().GetData()), dtype=np.float64)
+
+
+def _orient_along_radial(points, vectors, cl_points):
+    """Flip ``vectors`` so each agrees with (x − nearest centerline vertex)."""
+    from scipy.spatial import cKDTree
+
+    n = int(points.shape[0])
+    if n == 0 or cl_points is None or int(cl_points.shape[0]) == 0:
+        return vectors, False
+    tree = cKDTree(cl_points)
+    _, nn = tree.query(points)
+    nn = np.asarray(nn, dtype=np.int64).reshape(-1)
+    radial = points - cl_points[nn]
+    dots = np.einsum("ij,ij->i", vectors, radial)
+    oriented = np.array(vectors, dtype=np.float64, copy=True)
+    oriented[dots < 0.0] *= -1.0
+    return np.ascontiguousarray(oriented, dtype=np.float64), True
+
+
+def compute_raycast_stretch_distances(
+    template_mesh,
+    ground_truth_mesh,
+    r_template=None,
+    max_ray_length=25.0,
+    tol=1e-4,
+    centerline=None,
+):
+    """Outward MISR-tube stretch vs GT.
+
+    Ray direction and GT cell normals are oriented by the sign of
+    ``n · (x − cl_nearest)`` when a centerline is given, so AneuX files wound
+    inward still count as legitimate outward hits. Without a centerline the
+    hit test falls back to ``abs(dot) > 0.2``.
+    """
     vtk_template = to_vtk_poly(template_mesh)
 
     template_normals_filter = vtk.vtkPolyDataNormals()
@@ -3804,11 +3986,36 @@ def compute_raycast_stretch_distances(template_mesh, ground_truth_mesh, r_templa
     template_normals = np.ascontiguousarray(vtk_to_numpy(nrm_vtk), dtype=np.float64)
     lens = np.linalg.norm(template_normals, axis=1, keepdims=True)
     lens = np.maximum(lens, 1e-12)
-    outward = -template_normals / lens
+    unit_n = template_normals / lens
+
+    cl_pts = None
+    if centerline is not None:
+        _cl_poly, cl_pts = _poly_points(centerline)
+        if cl_pts.shape[0] == 0:
+            cl_pts = None
+
+    radially_oriented = False
+    gt_radially_oriented = False
+    if cl_pts is not None:
+        outward, radially_oriented = _orient_along_radial(template_pts, unit_n, cl_pts)
+        if gt_cell_normals is not None:
+            centroids = _cell_centroids(gt_mesh_with_normals)
+            if centroids.shape[0] == gt_cell_normals.shape[0]:
+                gt_cell_normals, gt_radially_oriented = _orient_along_radial(
+                    centroids, gt_cell_normals, cl_pts
+                )
+    else:
+        # Historical MC surfaces are inward-wound; abs(dot) below covers GT winding.
+        outward = -unit_n
 
     n_pts = template_pts.shape[0]
     r_arr = None if r_template is None else np.ascontiguousarray(r_template, dtype=np.float64)
-    if _stretch_raycast_c is not None:
+    use_c = (
+        radially_oriented
+        and (gt_cell_normals is None or gt_radially_oriented)
+        and _stretch_raycast_c is not None
+    )
+    if use_c:
         try:
             return np.asarray(
                 _stretch_raycast_c(
@@ -3856,7 +4063,8 @@ def compute_raycast_stretch_distances(template_mesh, ground_truth_mesh, r_templa
             if 0.10 < d <= (3.5 * r_local):
                 cid = int(cell_id.get())
                 if gt_cell_normals is not None and 0 <= cid < len(gt_cell_normals):
-                    if float(np.dot(n, gt_cell_normals[cid])) > 0.2:
+                    agree = float(np.dot(n, gt_cell_normals[cid]))
+                    if (agree > 0.2) if gt_radially_oriented else (abs(agree) > 0.2):
                         distances[i] = d
                 else:
                     distances[i] = d
@@ -4442,12 +4650,19 @@ def build_parent_tube(
     reuse_centerline=None,
     skip_mc_decimate=False,
     fast_uncap=True,
+    cut_frames=None,
 ):
     """Shared path: smooth -> extend -> cap -> centerline -> polyball tube -> uncap at anatomy.
 
     Variable remesh may pass ``reuse_centerline`` and ``skip_mc_decimate``.
     Uncap accounting defaults to the fast local-boundary test; the cylinder
     clip is unchanged. Pass ``fast_uncap=False`` for the old full-mesh extract.
+
+    ``cut_frames``: optional non-empty GT ostium frames (``origin``, unit
+    ``normal``, ``radius``). Forwarded to ``clip_flow_extensions_and_uncap`` so
+    the tube is cut in the GT planes instead of ``opening_clip_frames``.
+    ``None`` / empty keeps the measured-profile uncap. Centerline seeding still
+    uses ``measure_open_profiles`` on the vessel; that is not a second cut pass.
     """
     print("Step 1: Applying Taubin surface smoothing...")
     work_vessel = sanitize_vessel_for_vmtk(vessel_mesh)
@@ -4505,25 +4720,27 @@ def build_parent_tube(
 
     print("Step 7: Uncapping open boundaries with pipe-section cuts...")
     t_un = time.perf_counter()
+    uncap_cut_frames = cut_frames if cut_frames else None
+    if uncap_cut_frames:
+        print(
+            f"  Uncap: forwarding {len(uncap_cut_frames)} GT ostium cut frame(s) "
+            "(skip opening_clip_frames)"
+        )
     open_base_surface, n_clipped = clip_flow_extensions_and_uncap(
         base_surface,
         anatomical_profiles,
         extension_length=extension_length,
         centerline=branched_centerline,
         fast_uncap=fast_uncap,
+        cut_frames=uncap_cut_frames,
     )
     print(f"  [t] uncap {time.perf_counter() - t_un:.2f}s")
     print(f"  -> Open base surface points: {open_base_surface.GetNumberOfPoints()}")
-    n_in = len(anatomical_profiles)
-    if n_clipped < n_in:
-        print(
-            f"  WARNING: uncap opened {n_clipped}/{n_in} anatomical ends; "
-            "a branch may be missing from the parent tube."
-        )
-    if n_clipped < 2:
+    n_in = len(uncap_cut_frames) if uncap_cut_frames else len(anatomical_profiles)
+    if n_clipped != n_in:
         raise TemplateQualityError(
-            f"Parent-tube uncap opened {n_clipped}/{n_in} ends "
-            f"(input vessel has {n_in} openings; this is a reconstructed-tube miss, not a sealed input).",
+            f"Parent-tube uncap opened {n_clipped}/{n_in} anatomical ends; "
+            "a template missing an opening the GT has is unusable.",
             dataset_id=dataset_id,
         )
     return {
@@ -4584,7 +4801,10 @@ def process_variable_dataset(
     t_ray = time.perf_counter()
     r_template = compute_template_local_radii(open_base_surface, branched_centerline)
     stretch_distances = compute_raycast_stretch_distances(
-        open_base_surface, vessel_mesh, r_template=r_template
+        open_base_surface,
+        vessel_mesh,
+        r_template=r_template,
+        centerline=branched_centerline,
     )
     print(f"  [t] radii+raycast {time.perf_counter() - t_ray:.2f}s")
     min_edge = REMESH_MIN_EDGE_MM

@@ -10,6 +10,7 @@ from scipy.spatial import cKDTree
 from torch_geometric.data import Data
 from torch.utils.data import Dataset
 
+import config as _config
 from config import (
     CACHE_VERSION,
     DENSE_CL_SPACING_MM,
@@ -20,7 +21,6 @@ from config import (
     LATENT_LEN,
     MAX_TRACTS,
     MIN_RINGS_PER_BRANCH,
-    MIN_TOKENS_PER_TRACT,
     N_TRUE,
     N_TRUE_FAR_FRAC,
     TEMPLATE_COARSE_KEEP,
@@ -46,13 +46,19 @@ from raycast import (
     closest_cell_normals,
     compute_level_r_star,
     empty_r_star,
-    nearest_normal_offset_r_star,
+    mesh_r_star_edge_stats,
+    signed_distance_to_oriented_surface,
+    stretch_distance_r_star,
+    template_ray_r_star,
     transform_vessel_mesh,
 )
 
-# Endpoint merge distance for one-polyline-per-GroupId tracts. VMTK blanked
-# bifurcation blobs are dropped, so daughter ends sit ~1 MISR apart.
-GROUPID_ENDPOINT_SNAP_MM = 1.0
+# Config agent lands LATENT_DIM=16 / LATENT_LEN=128 / TOKEN_SPACING_MM=2.0.
+# getattr keeps this file working if an older config is still imported.
+TOKEN_SPACING_MM = float(getattr(_config, "TOKEN_SPACING_MM", 2.0))
+LATENT_DIM = int(getattr(_config, "LATENT_DIM", 16))  # dataset does not allocate codes
+GROUPID_ENDPOINT_SNAP_MM = float(getattr(_config, "GROUPID_ENDPOINT_SNAP_MM", 1.0))
+_LATENT_PAD_DEFAULT = int(getattr(_config, "LATENT_LEN", 128))
 
 
 def _dedup_polyline(pts):
@@ -157,6 +163,23 @@ _CPU_TENSOR_KEYS = frozenset(
 )
 
 
+# Node sets not listed in config.FOLLOW_BATCH. Store a zeros `{name}_batch`
+# index and increment it by 1 per graph so bs>1 slices stay correct.
+_GT_FOLLOW_ATTRS = (
+    "gt_points",
+    "gt_normals",
+    "gt_points_normal",
+    "gt_points_mirror",
+    "gt_normals_mirror",
+    "gt_points_normal_mirror",
+    "gt_cl_dist",
+    "gt_cl_dist_mirror",
+    "gt_template_sdf",
+    "gt_template_sdf_mirror",
+)
+_GT_FOLLOW_BATCH_KEYS = frozenset(f"{name}_batch" for name in _GT_FOLLOW_ATTRS)
+
+
 class AneurysmData(Data):
     """PyG Data with correct index offsets for the mid/coarse scaffold graphs."""
 
@@ -171,6 +194,11 @@ class AneurysmData(Data):
             return int(self.pos_coarse.size(0))
         if key == "upsample_idx_fine":
             return int(self.pos_mid.size(0))
+        if key in ("gt_faces", "gt_faces_mirror"):
+            n_gt = getattr(self, "gt_points", None)
+            return int(n_gt.size(0)) if n_gt is not None else 0
+        if key in _GT_FOLLOW_BATCH_KEYS:
+            return 1
         return super().__inc__(key, value, *args, **kwargs)
 
     def __cat_dim__(self, key, value, *args, **kwargs):
@@ -181,6 +209,8 @@ class AneurysmData(Data):
             "face",
             "face_mid",
             "face_coarse",
+            "gt_faces",
+            "gt_faces_mirror",
         ):
             return -1
         return super().__cat_dim__(key, value, *args, **kwargs)
@@ -206,6 +236,19 @@ class AneurysmData(Data):
         if flag is not None:
             out.has_true_normal = bool(flag)
         return out
+
+
+def _ensure_gt_follow_indices(data):
+    """Zeros `{attr}_batch` so collate + `__inc__==1` yields graph ids at bs>1."""
+    for name in _GT_FOLLOW_ATTRS:
+        val = getattr(data, name, None)
+        if not torch.is_tensor(val) or val.numel() == 0:
+            continue
+        n = int(val.size(0))
+        key = f"{name}_batch"
+        if getattr(data, key, None) is None:
+            data[key] = torch.zeros(n, dtype=torch.long)
+    return data
 
 
 def _arc_len(pts):
@@ -340,21 +383,6 @@ def _append_knn_pairs(pairs, pos, a, b, k, lim):
             ua, ub = int(a[ia]), int(b[jloc])
             pairs.append((ua, ub))
             pairs.append((ub, ua))
-
-
-def allocate_token_counts(n_tokens, arc_lengths, n_junctions, min_per=MIN_TOKENS_PER_TRACT):
-    """Split a fixed token budget into per-tract tokens plus junction tokens."""
-    n_tracts = len(arc_lengths)
-    if n_tracts == 0:
-        return [], 0
-    min_per = max(1, int(min_per))
-    n_junc = min(int(n_junctions), max(0, int(n_tokens) - n_tracts * min_per))
-    budget = int(n_tokens) - n_junc
-    alloc = allocate_ring_counts(budget, arc_lengths)
-    if min_per != MIN_RINGS_PER_BRANCH:
-        alloc = [max(min_per, a) for a in alloc]
-        alloc = _rebalance_counts(alloc, budget, min_per)
-    return alloc, n_junc
 
 
 def extract_unique_tracts(centerline_mesh, snap=1e-4):
@@ -533,6 +561,21 @@ def _longest_unique_polyline(pieces, snap=5e-2):
     return max(tracts, key=_arc_len)
 
 
+def _select_group_polyline(pieces):
+    """One polyline for a GroupId: longest full copy, or stitch LINE fragments."""
+    pieces = [p for p in pieces if p is not None and len(p) >= 2]
+    if not pieces:
+        return None
+    longest = max(pieces, key=_arc_len)
+    n_full = sum(1 for p in pieces if len(p) >= 4)
+    if n_full >= 1:
+        return longest
+    stitched = _longest_unique_polyline(pieces, snap=1e-4)
+    if stitched is not None and _arc_len(stitched) >= _arc_len(longest) - 1e-9:
+        return stitched
+    return longest
+
+
 def _snap_tract_endpoints(tracts, snap_mm=GROUPID_ENDPOINT_SNAP_MM):
     """Assign shared node ids to tract ends that lie within snap_mm."""
     snap_mm = float(snap_mm)
@@ -561,23 +604,86 @@ def _snap_tract_endpoints(tracts, snap_mm=GROUPID_ENDPOINT_SNAP_MM):
     return endpoints, junctions
 
 
-def extract_groupid_tracts(centerline_mesh, snap=1e-4, endpoint_snap_mm=GROUPID_ENDPOINT_SNAP_MM):
-    """One representative polyline per VMTK GroupId from centerline_creation.py.
+def _missing_groupids_error(centerline_mesh):
+    n_cells = int(getattr(centerline_mesh, "n_cells", 0) or 0)
+    return (
+        "cleandata centerline is missing GroupIds (generator bug: "
+        "clip_centerline_at_profiles dropped cell arrays). "
+        f"Refusing extract_unique_tracts fallback. n_cells={n_cells}."
+    )
 
-    `vmtkBranchExtractor` tags every point with GroupIds / Blanking. Parent
-    segments still appear once per source→target path, but they share a GroupId.
-    Blanking==1 groups are bifurcation blobs and are dropped. Endpoints of the
-    remaining groups are snapped so `_orient_tracts` can rebuild the tree.
 
-    Meshes without GroupIds (synthetic tests) fall back to `extract_unique_tracts`.
+def _polyline_runs_from_point_ids(ids, group_pt, blank_pt):
+    """Split a polyline into consecutive (GroupId, Blanking) runs."""
+    runs = []
+    run_ids = []
+    run_gid = None
+    run_blank = False
+    for pid in ids:
+        gid = int(round(float(group_pt[pid])))
+        blanked = False
+        if blank_pt is not None:
+            blanked = float(blank_pt[pid]) > 0.5
+        if run_ids and (gid != run_gid or blanked != run_blank):
+            runs.append((run_gid, run_blank, run_ids))
+            run_ids = []
+        run_gid = gid
+        run_blank = blanked
+        run_ids.append(pid)
+    if run_ids:
+        runs.append((run_gid, run_blank, run_ids))
+    return runs
+
+
+def _attach_blanked_runs(path_runs, points):
+    """Prepend each blanked run to the daughter that follows it on this path."""
+    pieces = []
+    pending = None
+    for gid, blanked, ids in path_runs:
+        if len(ids) < 2:
+            continue
+        if blanked:
+            pending = ids
+            continue
+        if pending is not None:
+            ids = list(pending) + list(ids)
+            pending = None
+        pts = _dedup_polyline(points[np.asarray(ids, dtype=np.int64)])
+        if len(pts) >= 2:
+            pieces.append((int(gid), pts))
+    return pieces
+
+
+def extract_groupid_tracts(
+    centerline_mesh,
+    snap=1e-4,
+    endpoint_snap_mm=None,
+    require_groupids=False,
+):
+    """Validated GroupId tracts (§2.4.3 / prototype_branch_tracts.py).
+
+    1. Group polyline runs by GroupIds; keep the longest copy per GroupId.
+    2. Attach each blanked run to the daughter that follows it (same
+       CenterlineId / TractId order, or along the polyline for point arrays).
+    3. Snap endpoints at GROUPID_ENDPOINT_SNAP_MM (1 mm) to rebuild the tree.
+
+    `require_groupids=True` (cleandata via `_build_data`) raises if GroupIds are
+    missing. Synthetic tests pass `require_groupids=False` (the default) to keep
+    the `extract_unique_tracts` fallback.
     """
+    if endpoint_snap_mm is None:
+        endpoint_snap_mm = GROUPID_ENDPOINT_SNAP_MM
     group_pt = _point_data_array(centerline_mesh, "GroupIds")
     group_cell = _cell_data_array(centerline_mesh, "GroupIds")
     if group_pt is None and group_cell is None:
+        if require_groupids:
+            raise ValueError(_missing_groupids_error(centerline_mesh))
         return extract_unique_tracts(centerline_mesh, snap=snap)
 
     blank_pt = _point_data_array(centerline_mesh, "Blanking")
     blank_cell = _cell_data_array(centerline_mesh, "Blanking")
+    clid_cell = _cell_data_array(centerline_mesh, "CenterlineIds")
+    tid_cell = _cell_data_array(centerline_mesh, "TractIds")
     points = _as_f64(centerline_mesh.points)
     by_group = defaultdict(list)
 
@@ -586,54 +692,137 @@ def extract_groupid_tracts(centerline_mesh, snap=1e-4, endpoint_snap_mm=GROUPID_
         compact = list(range(len(points)))
         polylines = [(0, compact)] if len(compact) >= 2 else []
 
-    for ci, ids in polylines:
-        runs = []
-        if group_pt is not None:
-            run_ids = []
-            run_gid = None
-            run_blank = False
-            for pid in ids:
-                gid = int(round(float(group_pt[pid])))
-                blanked = False
-                if blank_pt is not None:
-                    blanked = float(blank_pt[pid]) > 0.5
-                if run_ids and (gid != run_gid or blanked != run_blank):
-                    runs.append((run_gid, run_blank, run_ids))
-                    run_ids = []
-                run_gid = gid
-                run_blank = blanked
-                run_ids.append(pid)
-            if run_ids:
-                runs.append((run_gid, run_blank, run_ids))
-        elif group_cell is not None and ci < len(group_cell):
+    use_cell_paths = (
+        group_cell is not None
+        and clid_cell is not None
+        and len(clid_cell) >= max(len(polylines), 1)
+    )
+    if use_cell_paths:
+        per_cl = defaultdict(list)
+        for ci, ids in polylines:
+            if ci >= len(group_cell):
+                continue
+            clid = int(round(float(clid_cell[ci])))
+            tract = int(round(float(tid_cell[ci]))) if tid_cell is not None and ci < len(tid_cell) else ci
             gid = int(round(float(group_cell[ci])))
             blanked = False
             if blank_cell is not None and ci < len(blank_cell):
                 blanked = float(blank_cell[ci]) > 0.5
-            runs.append((gid, blanked, ids))
-        else:
-            continue
-        for gid, blanked, run_ids in runs:
-            if blanked or len(run_ids) < 2:
+            per_cl[clid].append((tract, gid, blanked, ids))
+        for clid in sorted(per_cl):
+            runs = [(g, b, ids) for _, g, b, ids in sorted(per_cl[clid], key=lambda t: t[0])]
+            for gid, pts in _attach_blanked_runs(runs, points):
+                by_group[gid].append(pts)
+    else:
+        for ci, ids in polylines:
+            if group_pt is not None:
+                runs = _polyline_runs_from_point_ids(ids, group_pt, blank_pt)
+            elif group_cell is not None and ci < len(group_cell):
+                gid = int(round(float(group_cell[ci])))
+                blanked = False
+                if blank_cell is not None and ci < len(blank_cell):
+                    blanked = float(blank_cell[ci]) > 0.5
+                runs = [(gid, blanked, ids)]
+            else:
                 continue
-            pts = _dedup_polyline(points[np.asarray(run_ids, dtype=np.int64)])
-            if len(pts) < 2:
-                continue
-            by_group[gid].append(pts)
+            for gid, pts in _attach_blanked_runs(runs, points):
+                by_group[gid].append(pts)
 
     if not by_group:
+        if require_groupids:
+            raise ValueError(
+                "GroupIds present but no non-blanked tract could be built "
+                "(blanked-only centerline or empty runs)."
+            )
         return extract_unique_tracts(centerline_mesh, snap=snap)
 
+    # Longest copy per GroupId. Full VMTK polyline cells are kept as-is;
+    # 2-point VTK_LINE fragments (pyvista.merge of test polylines) are
+    # stitched. Do not snap-merge distinct VMTK copies of the same GroupId.
     tracts = []
     for gid in sorted(by_group):
-        pts = _longest_unique_polyline(by_group[gid])
+        pts = _select_group_polyline(by_group[gid])
         if pts is not None and len(pts) >= 2:
             tracts.append(pts)
     if not tracts:
+        if require_groupids:
+            raise ValueError("GroupIds present but every GroupId copy was degenerate.")
         return extract_unique_tracts(centerline_mesh, snap=snap)
 
     endpoints, junctions = _snap_tract_endpoints(tracts, snap_mm=endpoint_snap_mm)
     return tracts, endpoints, junctions
+
+
+def sample_x_true(
+    gt_points,
+    gt_normals,
+    dense_cl,
+    n_true=N_TRUE,
+    n_far_frac=None,
+    far_margin_mm=None,
+    tube_radius=None,
+):
+    """Per-epoch resample of encoder/Chamfer GT from a cached full surface.
+
+    `N_TRUE` FPS is intentionally *not* frozen in the cache (§2.2.3, §8).
+    `train.py` should call this each epoch. `gt_normals` may be None.
+    """
+    gt_points = np.asarray(gt_points, dtype=np.float64).reshape(-1, 3)
+    cl_xyz = np.asarray(dense_cl, dtype=np.float64).reshape(-1, 3)
+    n_true = int(n_true)
+    if n_far_frac is None:
+        n_far_frac = N_TRUE_FAR_FRAC
+    if far_margin_mm is None:
+        far_margin_mm = FAR_CL_MARGIN_MM
+    if tube_radius is None:
+        tube_radius = TUBE_RADIUS_MM
+    if gt_points.shape[0] == 0 or n_true < 1:
+        empty = np.zeros((max(n_true, 1), 3), dtype=np.float32)
+        return _torch_f32(empty[:1]), _torch_f32(np.zeros((1,), dtype=np.float32)), _torch_f32(empty[:1])
+
+    d_all = point_to_polyline_dist(gt_points.astype(np.float32), cl_xyz).astype(np.float32)
+    n_far = int(round(n_true * float(n_far_frac)))
+    n_uni = max(1, n_true - n_far)
+    uni = fps_metric(gt_points.astype(np.float32), n_uni)
+    d_uni = point_to_polyline_dist(uni, cl_xyz).astype(np.float32)
+
+    far_mask = d_all > (float(tube_radius) + float(far_margin_mm))
+    far_pts = gt_points[far_mask]
+    if far_pts.shape[0] == 0 or n_far <= 0:
+        extra = fps_metric(gt_points.astype(np.float32), max(n_far, 1))[: max(n_far, 0)]
+        d_extra = (
+            point_to_polyline_dist(extra, cl_xyz).astype(np.float32)
+            if len(extra)
+            else np.zeros((0,), dtype=np.float32)
+        )
+    else:
+        extra = fps_metric(far_pts.astype(np.float32), min(n_far, far_pts.shape[0]))
+        d_extra = point_to_polyline_dist(extra, cl_xyz).astype(np.float32)
+        if extra.shape[0] < n_far:
+            pad = fps_metric(gt_points.astype(np.float32), n_far - extra.shape[0])
+            extra = np.concatenate([extra, pad], axis=0)
+            d_extra = np.concatenate(
+                [d_extra, point_to_polyline_dist(pad, cl_xyz).astype(np.float32)], axis=0
+            )
+
+    x_true = np.concatenate([uni, extra], axis=0)[:n_true]
+    d_true = np.concatenate([d_uni, d_extra], axis=0)[:n_true]
+    if x_true.shape[0] < n_true:
+        reps = int(np.ceil(n_true / max(x_true.shape[0], 1)))
+        x_true = np.tile(x_true, (reps, 1))[:n_true]
+        d_true = np.tile(d_true, reps)[:n_true]
+
+    nrm_out = None
+    if gt_normals is not None:
+        gt_normals = np.asarray(gt_normals, dtype=np.float64).reshape(-1, 3)
+        if gt_normals.shape[0] == gt_points.shape[0] and gt_normals.shape[0] > 0:
+            _, idx = cKDTree(gt_points).query(np.asarray(x_true, dtype=np.float64), k=1, workers=1)
+            nrm_out = gt_normals[np.asarray(idx, dtype=np.int64)]
+            nrm_out = nrm_out / np.clip(np.linalg.norm(nrm_out, axis=1, keepdims=True), 1e-8, None)
+    if nrm_out is None:
+        nrm_out = np.zeros_like(x_true, dtype=np.float64)
+        nrm_out[:, 2] = 1.0
+    return _torch_f32(x_true), _torch_f32(d_true), _torch_f32(nrm_out)
 
 
 def _choose_inlet(tracts, endpoints):
@@ -772,7 +961,8 @@ class AneurysmDataset(Dataset):
         )
         self.tube_radius = float(tube_radius)
         self.n_true = int(n_true)
-        self.latent_len = int(latent_len)
+        self.latent_len = int(latent_len) if latent_len is not None else _LATENT_PAD_DEFAULT
+        self.token_spacing_mm = TOKEN_SPACING_MM
         self.hierarchy = tuple(tuple(lv) for lv in hierarchy)
         if n_length is not None or n_radial is not None:
             fine = list(self.hierarchy[-1])
@@ -993,6 +1183,23 @@ class AneurysmDataset(Dataset):
             deriv = np.where(dnorm < 1e-8, fd, deriv)
         tangents, normals, binormals = self._compute_parallel_transport_frames(deriv)
         u_arc, arc = self._arc_length_parameter(xyz)
+        kappa = np.zeros(n_dense, dtype=np.float64)
+        tau = np.zeros(n_dense, dtype=np.float64)
+        try:
+            d2 = np.vstack(splev(u_sp, tck, der=2)).T.astype(np.float64, copy=False)
+            try:
+                d3 = np.vstack(splev(u_sp, tck, der=3)).T.astype(np.float64, copy=False)
+            except TypeError:
+                d3 = np.zeros_like(d2)
+            c12 = np.cross(deriv, d2)
+            n12 = np.linalg.norm(c12, axis=1)
+            n1 = np.linalg.norm(deriv, axis=1)
+            kappa = n12 / np.clip(np.power(n1, 3), 1e-12, None)
+            tau = np.einsum("ij,ij->i", c12, d3) / np.clip(n12 * n12, 1e-12, None)
+            kappa = np.nan_to_num(kappa, nan=0.0, posinf=0.0, neginf=0.0)
+            tau = np.nan_to_num(tau, nan=0.0, posinf=0.0, neginf=0.0)
+        except Exception:
+            pass
         return {
             "xyz": xyz,
             "t": tangents,
@@ -1000,6 +1207,8 @@ class AneurysmDataset(Dataset):
             "b": binormals,
             "u": u_arc,
             "arc": arc,
+            "kappa": kappa,
+            "tau": tau,
         }
 
     def _generate_branch_tube(self, branch_points, n_length_branch, n_radial):
@@ -1173,36 +1382,14 @@ class AneurysmDataset(Dataset):
         }
 
     def _hybrid_true_points(self, vessel_pts, cl_xyz):
-        vessel_pts = np.asarray(vessel_pts, dtype=np.float32)
-        cl_xyz = np.asarray(cl_xyz, dtype=np.float64)
-        d_all = point_to_polyline_dist(vessel_pts, cl_xyz).astype(np.float32)
-        n_far = int(round(self.n_true * N_TRUE_FAR_FRAC))
-        n_uni = max(1, self.n_true - n_far)
-        uni = fps_metric(vessel_pts, n_uni)
-        d_uni = point_to_polyline_dist(uni, cl_xyz).astype(np.float32)
-
-        far_mask = d_all > (self.tube_radius + FAR_CL_MARGIN_MM)
-        far_pts = vessel_pts[far_mask]
-        if far_pts.shape[0] == 0 or n_far <= 0:
-            extra = fps_metric(vessel_pts, max(n_far, 1))[: max(n_far, 0)]
-            d_extra = point_to_polyline_dist(extra, cl_xyz).astype(np.float32) if len(extra) else np.zeros((0,), dtype=np.float32)
-        else:
-            extra = fps_metric(far_pts, min(n_far, far_pts.shape[0]))
-            d_extra = point_to_polyline_dist(extra, cl_xyz).astype(np.float32)
-            if extra.shape[0] < n_far:
-                pad = fps_metric(vessel_pts, n_far - extra.shape[0])
-                extra = np.concatenate([extra, pad], axis=0)
-                d_extra = np.concatenate(
-                    [d_extra, point_to_polyline_dist(pad, cl_xyz).astype(np.float32)], axis=0
-                )
-
-        x_true = np.concatenate([uni, extra], axis=0)[: self.n_true]
-        d_true = np.concatenate([d_uni, d_extra], axis=0)[: self.n_true]
-        if x_true.shape[0] < self.n_true:
-            reps = int(np.ceil(self.n_true / max(x_true.shape[0], 1)))
-            x_true = np.tile(x_true, (reps, 1))[: self.n_true]
-            d_true = np.tile(d_true, reps)[: self.n_true]
-        return _torch_f32(x_true), _torch_f32(d_true)
+        x_true, d_true, _ = sample_x_true(
+            vessel_pts,
+            None,
+            cl_xyz,
+            n_true=self.n_true,
+            tube_radius=self.tube_radius,
+        )
+        return x_true, d_true
 
     def _true_normals_at_points(self, query_pts, mesh_pts, mesh_normals):
         query_pts = np.asarray(query_pts, dtype=np.float64).reshape(-1, 3)
@@ -1238,68 +1425,79 @@ class AneurysmDataset(Dataset):
         return pts, nrm
 
     def _build_latent_tokens(self, dense_tracts, junction_incidents, junc_xyz, arc_lengths):
-        n_junc_avail = len(junction_incidents)
-        alloc, n_junc = allocate_token_counts(self.latent_len, arc_lengths, n_junc_avail)
+        """Arc-length tokens at TOKEN_SPACING_MM; pad with zeros / False (§5.4).
+
+        Per branch `n_tok = floor(L / spacing) + 1` at arc positions `k · 2 mm`
+        (first token at the branch start). The daughter's first token *is* the
+        junction — no separate junction slots. `LATENT_LEN` is a padding max.
+        """
+        del junction_incidents, junc_xyz  # no extra junction tokens (§5.4)
+        spacing = float(getattr(self, "token_spacing_mm", TOKEN_SPACING_MM))
+        pad = int(self.latent_len)
         n_tracts = min(len(dense_tracts), MAX_TRACTS)
-        alloc = alloc[:n_tracts]
         dense_tracts = dense_tracts[:n_tracts]
-        arc_lengths = arc_lengths[:n_tracts]
+        arc_lengths = list(arc_lengths[:n_tracts])
 
-        token_u = []
-        token_tract = []
-        token_is_junc = []
-        token_pos = []
-        attend = np.zeros((self.latent_len, MAX_TRACTS), dtype=np.bool_)
-
-        slot = 0
-        for tid, (dense, n_tok) in enumerate(zip(dense_tracts, alloc)):
-            n_tok = max(1, int(n_tok))
-            u_q = np.linspace(0.0, 1.0, n_tok, dtype=np.float64)
-            xyz = self._interp_by_u(dense["u"], dense["xyz"], u_q)
+        per_tract = []
+        for tid, (dense, arc) in enumerate(zip(dense_tracts, arc_lengths)):
+            arc = float(arc)
+            n_tok = int(np.floor(arc / max(spacing, 1e-6))) + 1
+            n_tok = max(1, n_tok)
+            slots = []
             for k in range(n_tok):
-                if slot >= self.latent_len:
-                    break
-                token_u.append(u_q[k])
-                token_tract.append(tid)
-                token_is_junc.append(0)
-                token_pos.append(xyz[k])
-                attend[slot, tid] = True
-                slot += 1
+                s_mm = k * spacing
+                u = 0.0 if arc <= 1e-12 else float(min(s_mm / arc, 1.0))
+                xyz = self._interp_by_u(dense["u"], dense["xyz"], np.asarray([u], dtype=np.float64))
+                slots.append((k, u, xyz[0], tid))
+            per_tract.append(slots)
 
-        junc_items = list(junction_incidents.items())[:n_junc]
-        for nid, incident in junc_items:
-            if slot >= self.latent_len:
-                break
-            xyz = np.asarray(junc_xyz[nid], dtype=np.float64).reshape(3)
-            token_u.append(1.0)
-            token_tract.append(-1)
-            token_is_junc.append(1)
-            token_pos.append(xyz)
-            for tid in incident:
-                if 0 <= tid < MAX_TRACTS:
-                    attend[slot, tid] = True
-            slot += 1
+        # Fill k=0 of every tract first so a short LATENT_LEN still covers the tree.
+        ordered = []
+        max_k = max((len(s) for s in per_tract), default=0)
+        for k in range(max_k):
+            for slots in per_tract:
+                if k < len(slots):
+                    ordered.append(slots[k])
 
-        while slot < self.latent_len:
-            token_u.append(token_u[-1] if token_u else 0.0)
-            token_tract.append(token_tract[-1] if token_tract else 0)
-            token_is_junc.append(0)
-            token_pos.append(token_pos[-1] if token_pos else np.zeros(3))
-            if token_tract[-1] >= 0:
-                attend[slot, min(int(token_tract[-1]), MAX_TRACTS - 1)] = True
-            slot += 1
+        token_u = np.zeros(pad, dtype=np.float64)
+        token_tract = np.zeros(pad, dtype=np.int64)
+        token_is_junc = np.zeros(pad, dtype=np.int64)
+        token_pos = np.zeros((pad, 3), dtype=np.float64)
+        attend = np.zeros((pad, MAX_TRACTS), dtype=np.bool_)
+        valid = np.zeros(pad, dtype=bool)
+        n_keep = min(len(ordered), pad)
+        for slot in range(n_keep):
+            _k, u, xyz, tid = ordered[slot]
+            token_u[slot] = u
+            token_tract[slot] = int(tid)
+            token_pos[slot] = xyz
+            if 0 <= int(tid) < MAX_TRACTS:
+                attend[slot, int(tid)] = True
+            valid[slot] = True
 
+        latent_u = _torch_f32(token_u)
+        latent_pos = _torch_f32(token_pos)
+        latent_tract = _torch_long(token_tract)
+        latent_valid = torch.from_numpy(valid.copy()).bool()
         return {
-            "latent_u": _torch_f32(np.asarray(token_u[: self.latent_len])),
-            "latent_tract_id": _torch_long(np.asarray(token_tract[: self.latent_len])),
-            "latent_is_junction": _torch_long(np.asarray(token_is_junc[: self.latent_len])),
-            "latent_pos": _torch_f32(np.stack(token_pos[: self.latent_len], axis=0)),
+            "latent_u": latent_u,
+            "latent_tract_id": latent_tract,
+            "latent_is_junction": _torch_long(token_is_junc),
+            "latent_pos": latent_pos,
+            "latent_valid": latent_valid,
+            "token_u": latent_u.clone(),
+            "token_pos": latent_pos.clone(),
+            "token_tract_id": latent_tract.clone(),
             "token_attend": torch.from_numpy(attend.copy()).bool(),
             "n_tracts": torch.tensor(n_tracts, dtype=torch.long),
         }
 
-    def _prepare_tracts(self, centerline_mesh):
-        tracts, endpoints, _ = extract_groupid_tracts(centerline_mesh)
+    def _prepare_tracts(self, centerline_mesh, require_groupids=False):
+        tracts, endpoints, _ = extract_groupid_tracts(
+            centerline_mesh,
+            endpoint_snap_mm=GROUPID_ENDPOINT_SNAP_MM,
+            require_groupids=require_groupids,
+        )
         if len(tracts) > MAX_TRACTS:
             order = np.argsort([-_arc_len(t) for t in tracts])[:MAX_TRACTS]
             tracts = [tracts[i] for i in order]
@@ -1343,13 +1541,47 @@ class AneurysmDataset(Dataset):
             "ring_med": _torch_f32(packed["ring_med"]),
         }
 
-    def _template_r_star(self, level, gt_pts):
-        packed = nearest_normal_offset_r_star(
-            level["pos"].numpy(),
-            level["normal"].numpy(),
-            gt_pts,
-            tube_radius=self.tube_radius,
+    def _attach_mesh_r_star_stats(self, packed, level):
+        pos = level["pos"].numpy() if torch.is_tensor(level["pos"]) else np.asarray(level["pos"])
+        edges = level["edge_index"].numpy().T if torch.is_tensor(level["edge_index"]) else np.asarray(level["edge_index"]).T
+        if edges.ndim != 2 or edges.shape[1] != 2:
+            edges = np.zeros((0, 2), dtype=np.int64)
+        dth, du, ring_med = mesh_r_star_edge_stats(
+            pos, packed["r_star"], packed["valid"], edges
         )
+        packed["dth"] = dth
+        packed["du"] = du
+        packed["ring_med"] = ring_med
+        return packed
+
+    def _resample_point_scalar(self, src_pos, values, dst_pos):
+        src_pos = _as_f64(src_pos).reshape(-1, 3)
+        values = np.asarray(values, dtype=np.float64).reshape(-1)
+        dst_pos = _as_f64(dst_pos).reshape(-1, 3)
+        if src_pos.shape[0] == 0 or values.shape[0] != src_pos.shape[0] or dst_pos.shape[0] == 0:
+            return None
+        _, idx = cKDTree(src_pos).query(dst_pos, k=1, workers=1)
+        return values[np.asarray(idx, dtype=np.int64)]
+
+    def _template_r_star(self, level, gt_mesh=None, stretch=None):
+        pos = level["pos"].numpy()
+        normal = level["normal"].numpy()
+        r_local = level["r_local"].numpy() if "r_local" in level else np.zeros(pos.shape[0])
+        n = int(pos.shape[0])
+        packed = empty_r_star(n)
+        stretch_arr = None if stretch is None else np.asarray(stretch, dtype=np.float64).reshape(-1)
+        used_stretch = False
+        if stretch_arr is not None and stretch_arr.shape[0] == n and np.isfinite(stretch_arr).any():
+            mag = np.abs(stretch_arr[np.isfinite(stretch_arr)])
+            frac = float(np.mean(mag > 0.3)) if mag.size else 0.0
+            peak = float(np.max(mag)) if mag.size else 0.0
+            # All-zero / 1-vertex exports are the §2.3 orientation bug, not a true field.
+            used_stretch = frac > 0.005 or peak > 2.0
+        if used_stretch:
+            packed = stretch_distance_r_star(r_local, stretch_arr)
+        elif gt_mesh is not None:
+            packed = template_ray_r_star(pos, normal, r_local, gt_mesh)
+        packed = self._attach_mesh_r_star_stats(packed, level)
         return {
             "r_star": _torch_f32(packed["r_star"]),
             "valid": torch.from_numpy(np.ascontiguousarray(packed["valid"])).bool(),
@@ -1382,6 +1614,18 @@ class AneurysmDataset(Dataset):
         tract_id = np.concatenate(
             [np.full(len(d["xyz"]), tid, dtype=np.int64) for tid, d in enumerate(dense_tracts)]
         )
+        kappa = np.concatenate(
+            [
+                np.asarray(d.get("kappa", np.zeros(len(d["xyz"]))), dtype=np.float64).reshape(-1)
+                for d in dense_tracts
+            ]
+        )
+        tau = np.concatenate(
+            [
+                np.asarray(d.get("tau", np.zeros(len(d["xyz"]))), dtype=np.float64).reshape(-1)
+                for d in dense_tracts
+            ]
+        )
         _, idx = cKDTree(xyz).query(points, k=1, workers=1)
         idx = np.asarray(idx, dtype=np.int64).reshape(-1)
         cl = xyz[idx]
@@ -1399,6 +1643,8 @@ class AneurysmDataset(Dataset):
             "b_cl": b_i,
             "r_local": np.linalg.norm(rel, axis=1),
             "cl": cl,
+            "kappa": kappa[idx],
+            "tau": tau[idx],
         }
 
     def _vertex_frames_from_mesh(self, mesh_n, t_cl, n_cl, b_cl, theta):
@@ -1538,6 +1784,285 @@ class AneurysmDataset(Dataset):
         nrm = nrm / np.clip(np.linalg.norm(nrm, axis=1, keepdims=True), 1e-8, None)
         return nrm
 
+    def _orient_normals_outward(self, normals, pos, cl_xyz):
+        """Flip n so n · (x − cl_nearest) ≥ 0 at every vertex (§10.2 step 2)."""
+        normals = _as_f64(normals).reshape(-1, 3)
+        pos = _as_f64(pos).reshape(-1, 3)
+        cl_xyz = _as_f64(cl_xyz).reshape(-1, 3)
+        if normals.shape[0] == 0:
+            return normals
+        if cl_xyz.shape[0] == 0:
+            return normals
+        _, idx = cKDTree(cl_xyz).query(pos, k=1, workers=1)
+        radial = pos - cl_xyz[np.asarray(idx, dtype=np.int64)]
+        sign = np.sign(np.einsum("ij,ij->i", normals, radial))
+        sign[sign == 0.0] = 1.0
+        out = normals * sign[:, None]
+        nn = np.linalg.norm(out, axis=1, keepdims=True)
+        return out / np.clip(nn, 1e-8, None)
+
+    def _face_topology(self, faces, n_points):
+        """Return (n_components, n_nonmanifold_edges, n_boundary_loops)."""
+        faces = np.asarray(faces, dtype=np.int64).reshape(-1, 3) if faces is not None else np.zeros((0, 3), dtype=np.int64)
+        n_points = int(n_points)
+        if faces.size == 0 or n_points < 1:
+            return 0, 0, 0
+        e = np.sort(
+            np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]], axis=0),
+            axis=1,
+        )
+        uniq, counts = np.unique(e, axis=0, return_counts=True)
+        n_nonman = int(np.sum(counts > 2))
+        parent = np.arange(n_points, dtype=np.int64)
+
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        def union(a, b):
+            ra, rb = find(int(a)), find(int(b))
+            if ra != rb:
+                parent[rb] = ra
+
+        used = np.zeros(n_points, dtype=bool)
+        for a, b, c in faces:
+            union(a, b)
+            union(b, c)
+            used[int(a)] = True
+            used[int(b)] = True
+            used[int(c)] = True
+        roots = {int(find(i)) for i in range(n_points) if used[i]}
+        n_comp = int(len(roots))
+        bmask = counts == 1
+        bedges = uniq[bmask]
+        if bedges.shape[0] == 0:
+            return n_comp, n_nonman, 0
+        adj = defaultdict(list)
+        for a, b in bedges:
+            a, b = int(a), int(b)
+            adj[a].append(b)
+            adj[b].append(a)
+        seen = set()
+        n_loops = 0
+        for start in adj:
+            if start in seen:
+                continue
+            n_loops += 1
+            stack = [start]
+            seen.add(start)
+            while stack:
+                u = stack.pop()
+                for v in adj[u]:
+                    if v not in seen:
+                        seen.add(v)
+                        stack.append(v)
+        return n_comp, n_nonman, n_loops
+
+    def _assert_surface_topology(self, faces, n_points, name="template"):
+        n_comp, n_nonman, n_loops = self._face_topology(faces, n_points)
+        # Caps on VTK cylinders can be disconnected vertex islands; do not
+        # fail the whole sample on component count. Non-manifold edges are
+        # a hard topology break (§10.2 step 5).
+        if n_nonman > 0:
+            raise ValueError(f"{name}: {n_nonman} non-manifold edges")
+        return n_comp, n_nonman, n_loops
+
+    def _boundary_loop_vertices(self, faces, n_points):
+        """Connected components of boundary edges as vertex-id arrays."""
+        faces = np.asarray(faces, dtype=np.int64).reshape(-1, 3) if faces is not None else np.zeros((0, 3), dtype=np.int64)
+        n_points = int(n_points)
+        if faces.size == 0 or n_points < 1:
+            return []
+        e = np.sort(
+            np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]], axis=0),
+            axis=1,
+        )
+        uniq, counts = np.unique(e, axis=0, return_counts=True)
+        bedges = uniq[counts == 1]
+        if bedges.shape[0] == 0:
+            return []
+        adj = defaultdict(list)
+        for a, b in bedges:
+            a, b = int(a), int(b)
+            adj[a].append(b)
+            adj[b].append(a)
+        seen = set()
+        loops = []
+        for start in adj:
+            if start in seen:
+                continue
+            comp = []
+            stack = [start]
+            seen.add(start)
+            while stack:
+                u = stack.pop()
+                comp.append(u)
+                for v in adj[u]:
+                    if v not in seen:
+                        seen.add(v)
+                        stack.append(v)
+            if len(comp) >= 3:
+                loops.append(np.asarray(comp, dtype=np.int64))
+        return loops
+
+    def _fit_loop_plane(self, pts, cl_xyz, cl_t):
+        pts = _as_f64(pts).reshape(-1, 3)
+        origin = pts.mean(axis=0)
+        if pts.shape[0] < 3:
+            nrm = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        else:
+            c = pts - origin
+            cov = (c.T @ c) / max(float(pts.shape[0]), 1.0)
+            w, v = np.linalg.eigh(cov)
+            nrm = v[:, int(np.argmin(w))]
+        nrm = nrm / (np.linalg.norm(nrm) + 1e-12)
+        if cl_xyz is not None and len(cl_xyz) > 0:
+            _, idx = cKDTree(_as_f64(cl_xyz).reshape(-1, 3)).query(origin.reshape(1, 3), k=1)
+            idx = int(np.asarray(idx).reshape(-1)[0])
+            if cl_t is not None and len(cl_t) == len(cl_xyz):
+                tang = _as_f64(cl_t)[idx]
+            else:
+                tang = origin - _as_f64(cl_xyz)[idx]
+            if float(np.dot(nrm, tang)) < 0.0:
+                nrm = -nrm
+        return origin, nrm
+
+    def _pose_ostium_frames(self, frames, origin, R):
+        if frames is None:
+            return None
+        orig, nrm = frames
+        orig = _as_f64(orig).reshape(-1, 3)
+        nrm = _as_f64(nrm).reshape(-1, 3)
+        if orig.shape[0] == 0:
+            return None
+        origin = _as_f64(origin).reshape(3)
+        R = _as_f64(R).reshape(3, 3)
+        orig_p = (orig - origin) @ R
+        nrm_p = nrm @ R
+        nn = np.linalg.norm(nrm_p, axis=1, keepdims=True)
+        nrm_p = nrm_p / np.clip(nn, 1e-8, None)
+        return orig_p, nrm_p
+
+    def _match_frame_to_loop(self, centroid, frames, max_mm=8.0):
+        if frames is None:
+            return None, None
+        orig, nrm = frames
+        if orig.shape[0] == 0:
+            return None, None
+        d = np.linalg.norm(orig - centroid.reshape(1, 3), axis=1)
+        j = int(np.argmin(d))
+        if float(d[j]) > float(max_mm):
+            return None, None
+        return orig[j], nrm[j]
+
+    def _level_boundary_and_geom(self, level, dense_tracts, suffix="", ostium_frames=None):
+        """Planes + [curvature, torsion, d_ostium] for one scaffold level.
+
+        Curvature/torsion are CL Frenet values at the nearest dense sample
+        (not a per-vertex surface Frenet). Ostium distance is to the nearest
+        boundary-loop vertex.
+        """
+        pos = level["pos"].numpy() if torch.is_tensor(level["pos"]) else np.asarray(level["pos"])
+        n = int(pos.shape[0])
+        face = level.get("face")
+        if torch.is_tensor(face):
+            faces = face.numpy().T if face.dim() == 2 and int(face.size(0)) == 3 else face.numpy()
+        else:
+            faces = np.zeros((0, 3), dtype=np.int64)
+        faces = np.asarray(faces, dtype=np.int64).reshape(-1, 3)
+        cl_xyz = np.concatenate([d["xyz"] for d in dense_tracts], axis=0) if dense_tracts else np.zeros((0, 3))
+        cl_t = np.concatenate([d["t"] for d in dense_tracts], axis=0) if dense_tracts else np.zeros((0, 3))
+        loops = self._boundary_loop_vertices(faces, n)
+        origin_out = np.zeros((n, 3), dtype=np.float64)
+        normal_out = np.zeros((n, 3), dtype=np.float64)
+        mask = np.zeros(n, dtype=bool)
+        rim_pts = []
+        for loop in loops:
+            loop = np.asarray(loop, dtype=np.int64)
+            loop = loop[(loop >= 0) & (loop < n)]
+            if loop.size < 3:
+                continue
+            centroid = pos[loop].mean(axis=0)
+            fo, fn = self._match_frame_to_loop(centroid, ostium_frames)
+            if fo is None:
+                fo, fn = self._fit_loop_plane(pos[loop], cl_xyz, cl_t)
+            origin_out[loop] = fo
+            normal_out[loop] = fn
+            mask[loop] = True
+            rim_pts.append(pos[loop])
+        d_ost = np.zeros(n, dtype=np.float64)
+        if rim_pts:
+            rim = np.concatenate(rim_pts, axis=0)
+            _, idx = cKDTree(rim).query(pos, k=1, workers=1)
+            d_ost = np.linalg.norm(pos - rim[np.asarray(idx, dtype=np.int64)], axis=1)
+        elif n > 0 and "u" in level:
+            u = level["u"].numpy() if torch.is_tensor(level["u"]) else np.asarray(level["u"])
+            end = (u <= 0.02) | (u >= 0.98)
+            if np.any(end):
+                _, idx = cKDTree(pos[end]).query(pos, k=1, workers=1)
+                d_ost = np.linalg.norm(pos - pos[end][np.asarray(idx, dtype=np.int64)], axis=1)
+        proj = self._project_points_to_tracts(pos, dense_tracts) if dense_tracts else None
+        kappa = proj["kappa"] if proj is not None else np.zeros(n)
+        tau = proj["tau"] if proj is not None else np.zeros(n)
+        out = {
+            f"boundary_plane_origin{suffix}": _torch_f32(origin_out),
+            f"boundary_plane_normal{suffix}": _torch_f32(normal_out),
+            f"boundary_mask{suffix}": torch.from_numpy(np.ascontiguousarray(mask)).bool(),
+            f"d_ostium{suffix}": _torch_f32(d_ost),
+        }
+        if suffix == "":
+            out["curvature"] = _torch_f32(kappa)
+            out["torsion"] = _torch_f32(tau)
+        else:
+            out[f"curvature{suffix}"] = _torch_f32(kappa)
+            out[f"torsion{suffix}"] = _torch_f32(tau)
+        return out
+
+    def _load_ostium_frames_sidecar(self, sample):
+        """Read `{id}.ostium_frames.npz` next to GT/template if present (read-only)."""
+        dataset_id = str(sample.get("dataset_id", "") or "")
+        if not dataset_id:
+            return None
+        name = f"{dataset_id}.ostium_frames.npz"
+        candidates = []
+        for key in ("vessel_file", "template_mesh_file"):
+            path = sample.get(key)
+            if path:
+                candidates.append(os.path.join(os.path.dirname(os.path.abspath(path)), name))
+        for path in candidates:
+            if not os.path.isfile(path):
+                continue
+            try:
+                blob = np.load(path)
+                origin = np.asarray(blob["origin"], dtype=np.float64).reshape(-1, 3)
+                normal = np.asarray(blob["normal"], dtype=np.float64).reshape(-1, 3)
+                if origin.shape[0] == 0:
+                    continue
+                return origin, normal
+            except Exception:
+                continue
+        return None
+
+    def _ostium_frames_from_mesh(self, mesh):
+        if mesh is None:
+            return None
+        fd = getattr(mesh, "field_data", None)
+        if fd is None:
+            return None
+        for o_name, n_name in (
+            ("ostium_origin", "ostium_normal"),
+            ("cut_origin", "cut_normal"),
+            ("plane_origin", "plane_normal"),
+        ):
+            if o_name in fd and n_name in fd:
+                orig = np.asarray(fd[o_name], dtype=np.float64).reshape(-1, 3)
+                nrm = np.asarray(fd[n_name], dtype=np.float64).reshape(-1, 3)
+                if orig.shape[0] > 0:
+                    return orig, nrm
+        return None
+
     def _level_from_surface(self, mesh, dense_tracts):
         mesh, faces = self._polydata_triangles(mesh)
         pts = _as_f64(mesh.points)
@@ -1546,6 +2071,7 @@ class AneurysmDataset(Dataset):
             raise ValueError("template surface has fewer than 4 vertices")
         proj = self._project_points_to_tracts(pts, dense_tracts)
         nrm = self._surface_normals(mesh, n)
+        nrm = self._orient_normals_outward(nrm, pts, proj["cl"])
         n_v, t_v, b_v = self._vertex_frames_from_mesh(
             nrm, proj["t"], proj["n_cl"], proj["b_cl"], proj["theta"]
         )
@@ -1576,6 +2102,8 @@ class AneurysmDataset(Dataset):
             "tract_id": _torch_long(proj["tract_id"]),
             "u_step": _torch_f32(u_step),
             "r_local": _torch_f32(proj["r_local"]),
+            "kappa": _torch_f32(proj["kappa"]),
+            "tau": _torch_f32(proj["tau"]),
         }
 
     def _gt_and_tokens(
@@ -1597,23 +2125,60 @@ class AneurysmDataset(Dataset):
         gt_mesh = transform_vessel_mesh(vessel_mesh, origin, R) if vessel_mesh is not None else None
         if vessel_mesh is not None:
             vessel_points = np.asarray(vessel_mesh.points)
+        gt_extra = {}
         if vessel_points is not None:
             vessel = (_as_f64(vessel_points) - origin) @ R
-            x_true, x_true_cl_dist = self._hybrid_true_points(vessel, cl_xyz)
-            nrm = closest_cell_normals(gt_mesh, x_true.numpy()) if gt_mesh is not None else None
-            if nrm is not None and float(np.linalg.norm(nrm, axis=1).mean()) > 0.5:
-                x_true_normal = _torch_f32(nrm)
+            if gt_mesh is not None:
+                gt_pts = _as_f64(gt_mesh.points)
             else:
+                gt_pts = vessel
+            nrm = None
+            if gt_mesh is not None:
+                nrm = closest_cell_normals(gt_mesh, gt_pts)
+            if nrm is None or float(np.linalg.norm(nrm, axis=1).mean()) <= 0.5:
                 posed_pts, posed_nrm = self._posed_mesh_normals(vessel_mesh, origin, R)
                 if posed_nrm is not None:
-                    x_true_normal = self._true_normals_at_points(x_true.numpy(), posed_pts, posed_nrm)
-                else:
-                    x_true_normal = torch.zeros_like(x_true)
+                    nrm = posed_nrm
+                    if posed_pts.shape[0] == gt_pts.shape[0]:
+                        gt_pts = posed_pts
+            if nrm is None or nrm.shape[0] != gt_pts.shape[0]:
+                nrm = np.zeros_like(gt_pts)
+                nrm[:, 2] = 1.0
+            nrm = self._orient_normals_outward(nrm, gt_pts, cl_xyz)
+            gt_faces = None
+            if gt_mesh is not None:
+                _, gt_faces = self._polydata_triangles(gt_mesh)
+            flip = np.array([-1.0, 1.0, 1.0], dtype=np.float64)
+            gt_pts_m = gt_pts * flip
+            nrm_m = nrm * flip
+            nrm_m = self._orient_normals_outward(nrm_m, gt_pts_m, cl_xyz * flip)
+            gt_extra = {
+                "gt_points": _torch_f32(gt_pts),
+                "gt_normals": _torch_f32(nrm),
+                "gt_points_normal": _torch_f32(nrm),
+                "gt_points_mirror": _torch_f32(gt_pts_m),
+                "gt_normals_mirror": _torch_f32(nrm_m),
+                "gt_points_normal_mirror": _torch_f32(nrm_m),
+            }
+            cl_dist = point_to_polyline_dist(gt_pts.astype(np.float32), cl_xyz).astype(np.float64)
+            gt_extra["gt_cl_dist"] = _torch_f32(cl_dist)
+            gt_extra["gt_cl_dist_mirror"] = _torch_f32(cl_dist)
+            if gt_faces is not None and len(gt_faces) > 0:
+                face_t = torch.from_numpy(np.ascontiguousarray(np.asarray(gt_faces, dtype=np.int64).T)).long()
+                gt_extra["gt_faces"] = face_t
+                gt_extra["gt_faces_mirror"] = face_t.clone()
+            x_true, x_true_cl_dist, x_true_normal = sample_x_true(
+                gt_pts, nrm, cl_xyz, n_true=self.n_true, tube_radius=self.tube_radius
+            )
+            if float(x_true_normal.float().norm(dim=-1).mean()) <= 0.5:
+                query_nrm = closest_cell_normals(gt_mesh, x_true.numpy()) if gt_mesh is not None else None
+                if query_nrm is not None and float(np.linalg.norm(query_nrm, axis=1).mean()) > 0.5:
+                    x_true_normal = _torch_f32(query_nrm)
         else:
             x_true = torch.zeros((1, 3), dtype=torch.float32)
             x_true_cl_dist = torch.zeros((1,), dtype=torch.float32)
             x_true_normal = torch.zeros((1, 3), dtype=torch.float32)
-        return tokens, cl_pack, gt_mesh, x_true, x_true_cl_dist, x_true_normal
+        return tokens, cl_pack, gt_mesh, x_true, x_true_cl_dist, x_true_normal, gt_extra
 
     def _assemble_scaffold_data(
         self,
@@ -1690,6 +2255,7 @@ class AneurysmDataset(Dataset):
         if extra:
             for key, value in extra.items():
                 data[key] = value
+        _ensure_gt_follow_indices(data)
         data.has_true_normal = torch.tensor(
             1
             if (
@@ -1702,24 +2268,57 @@ class AneurysmDataset(Dataset):
         )
         return data
 
-    def _build_template_scaffold(self, centerline_mesh, template_mesh, vessel_points=None, vessel_mesh=None):
-        tracts, junc_inc, junc_xyz, origin, R, _ = self._prepare_tracts(centerline_mesh)
+    def _attach_sdf_and_level_geom(
+        self, extra, fine, mid, coarse, dense_tracts, x_true, ostium_frames_posed=None, gt_pts=None
+    ):
+        extra.update(self._level_boundary_and_geom(fine, dense_tracts, "", ostium_frames_posed))
+        extra.update(self._level_boundary_and_geom(mid, dense_tracts, "_mid", ostium_frames_posed))
+        extra.update(self._level_boundary_and_geom(coarse, dense_tracts, "_coarse", ostium_frames_posed))
+        tpl_pos = fine["pos"].numpy() if torch.is_tensor(fine["pos"]) else np.asarray(fine["pos"])
+        tpl_nrm = fine["normal"].numpy() if torch.is_tensor(fine["normal"]) else np.asarray(fine["normal"])
+        if gt_pts is not None:
+            gt_pts = np.asarray(gt_pts, dtype=np.float64).reshape(-1, 3)
+            if gt_pts.shape[0] > 0:
+                sdf = signed_distance_to_oriented_surface(gt_pts, tpl_pos, tpl_nrm)
+                extra["gt_template_sdf"] = _torch_f32(sdf)
+                extra["gt_template_sdf_mirror"] = _torch_f32(sdf)
+        if x_true is not None and torch.is_tensor(x_true) and x_true.numel() > 0:
+            extra["x_true_template_sdf"] = _torch_f32(
+                signed_distance_to_oriented_surface(x_true.detach().cpu().numpy(), tpl_pos, tpl_nrm)
+            )
+        return extra
+
+    def _build_template_scaffold(
+        self,
+        centerline_mesh,
+        template_mesh,
+        vessel_points=None,
+        vessel_mesh=None,
+        require_groupids=False,
+        ostium_frames=None,
+    ):
+        tracts, junc_inc, junc_xyz, origin, R, _ = self._prepare_tracts(
+            centerline_mesh, require_groupids=require_groupids
+        )
         dense_tracts = [self._fit_dense_tract(t) for t in tracts]
         arc_lengths = [float(d["arc"]) if d["arc"] > 1e-12 else _arc_len(t) for d, t in zip(dense_tracts, tracts)]
 
         posed_tpl = transform_vessel_mesh(template_mesh, origin, R)
         if posed_tpl is None:
             raise ValueError("template_mesh has no triangulated surface")
-        try:
-            posed_tpl = posed_tpl.compute_normals(point_normals=True, cell_normals=False, inplace=False)
-        except Exception:
-            pass
+        stretch = _point_data_array(posed_tpl, "StretchDistance")
 
         fine = self._level_from_surface(posed_tpl, dense_tracts)
+        _, fine_faces = self._polydata_triangles(posed_tpl)
+        self._assert_surface_topology(fine_faces, int(fine["pos"].size(0)), name="template fine")
         mid_mesh = self._decimate_keep(posed_tpl, TEMPLATE_MID_KEEP, TEMPLATE_MIN_MID)
         coarse_mesh = self._decimate_keep(posed_tpl, TEMPLATE_COARSE_KEEP, TEMPLATE_MIN_COARSE)
         mid = self._level_from_surface(mid_mesh, dense_tracts)
         coarse = self._level_from_surface(coarse_mesh, dense_tracts)
+        _, mid_faces = self._polydata_triangles(mid_mesh)
+        self._assert_surface_topology(mid_faces, int(mid["pos"].size(0)), name="template mid")
+        _, coarse_faces = self._polydata_triangles(coarse_mesh)
+        self._assert_surface_topology(coarse_faces, int(coarse["pos"].size(0)), name="template coarse")
 
         idx_mid, w_mid = knn_upsample_tables(coarse["pos"].numpy(), mid["pos"].numpy(), TEMPLATE_UPSAMPLE_K)
         idx_fine, w_fine = knn_upsample_tables(mid["pos"].numpy(), fine["pos"].numpy(), TEMPLATE_UPSAMPLE_K)
@@ -1733,24 +2332,60 @@ class AneurysmDataset(Dataset):
             "r_local_coarse": coarse["r_local"],
         }
 
-        tokens, cl_pack, gt_mesh, x_true, x_true_cl_dist, x_true_normal = self._gt_and_tokens(
+        tokens, cl_pack, gt_mesh, x_true, x_true_cl_dist, x_true_normal, gt_extra = self._gt_and_tokens(
             dense_tracts, junc_inc, junc_xyz, arc_lengths, origin, R, vessel_points, vessel_mesh
         )
-        gt_pts = None if gt_mesh is None else np.asarray(gt_mesh.points, dtype=np.float64)
-        r_fine = self._template_r_star(fine, gt_pts)
-        r_mid = self._template_r_star(mid, gt_pts)
+        extra.update(gt_extra)
+        frames = ostium_frames if ostium_frames is not None else self._ostium_frames_from_mesh(template_mesh)
+        posed_frames = self._pose_ostium_frames(frames, origin, R)
+        gt_pts = None
+        if "gt_points" in extra:
+            gt_pts = extra["gt_points"].numpy()
+        extra = self._attach_sdf_and_level_geom(
+            extra, fine, mid, coarse, dense_tracts, x_true,
+            ostium_frames_posed=posed_frames, gt_pts=gt_pts,
+        )
+        stretch_fine = stretch
+        tpl_pts = _as_f64(posed_tpl.points)
+        if stretch is not None and stretch.shape[0] == tpl_pts.shape[0] and stretch.shape[0] != int(fine["pos"].size(0)):
+            stretch_fine = self._resample_point_scalar(tpl_pts, stretch, fine["pos"].numpy())
+        stretch_mid = None
+        if stretch_fine is not None:
+            stretch_mid = self._resample_point_scalar(
+                fine["pos"].numpy(), stretch_fine, mid["pos"].numpy()
+            )
+        r_fine = self._template_r_star(fine, gt_mesh=gt_mesh, stretch=stretch_fine)
+        r_mid = self._template_r_star(mid, gt_mesh=gt_mesh, stretch=stretch_mid)
+        extra["r_dth_mid"] = r_mid["dth"]
+        extra["r_du_mid"] = r_mid["du"]
+        extra["r_ring_med_mid"] = r_mid["ring_med"]
         return self._assemble_scaffold_data(
             fine, mid, coarse, tokens, cl_pack, x_true, x_true_cl_dist, x_true_normal,
             r_fine, r_mid, origin, R, extra=extra,
         )
 
-    def build_scaffold(self, centerline_mesh, vessel_points=None, vessel_mesh=None, template_mesh=None):
+    def build_scaffold(
+        self,
+        centerline_mesh,
+        vessel_points=None,
+        vessel_mesh=None,
+        template_mesh=None,
+        require_groupids=False,
+        ostium_frames=None,
+    ):
         """Build decoder tensors. With `template_mesh`, identity stays on that surface."""
         if template_mesh is not None:
             return self._build_template_scaffold(
-                centerline_mesh, template_mesh, vessel_points=vessel_points, vessel_mesh=vessel_mesh
+                centerline_mesh,
+                template_mesh,
+                vessel_points=vessel_points,
+                vessel_mesh=vessel_mesh,
+                require_groupids=require_groupids,
+                ostium_frames=ostium_frames,
             )
-        tracts, junc_inc, junc_xyz, origin, R, _ = self._prepare_tracts(centerline_mesh)
+        tracts, junc_inc, junc_xyz, origin, R, _ = self._prepare_tracts(
+            centerline_mesh, require_groupids=require_groupids
+        )
         dense_tracts = [self._fit_dense_tract(t) for t in tracts]
         arc_lengths = [float(d["arc"]) if d["arc"] > 1e-12 else _arc_len(t) for d, t in zip(dense_tracts, tracts)]
 
@@ -1762,7 +2397,7 @@ class AneurysmDataset(Dataset):
             )
 
         fine, mid, coarse = levels["fine"], levels["mid"], levels["coarse"]
-        tokens, cl_pack, gt_mesh, x_true, x_true_cl_dist, x_true_normal = self._gt_and_tokens(
+        tokens, cl_pack, gt_mesh, x_true, x_true_cl_dist, x_true_normal, gt_extra = self._gt_and_tokens(
             dense_tracts,
             junc_inc,
             junc_xyz,
@@ -1783,9 +2418,27 @@ class AneurysmDataset(Dataset):
         except Exception:
             r_fine = self._level_r_star(fine, dense_tracts, None)
             r_mid = self._level_r_star(mid, dense_tracts, None)
+        extra = dict(gt_extra)
+        if "edge_index" in fine:
+            r_fine_pack = {
+                "r_star": r_fine["r_star"].numpy(),
+                "valid": r_fine["valid"].numpy(),
+                "dth": r_fine["dth"].numpy(),
+                "du": r_fine["du"].numpy(),
+                "ring_med": r_fine["ring_med"].numpy(),
+            }
+            r_fine_pack = self._attach_mesh_r_star_stats(r_fine_pack, fine)
+            r_fine["dth"] = _torch_f32(r_fine_pack["dth"])
+            r_fine["du"] = _torch_f32(r_fine_pack["du"])
+            r_fine["ring_med"] = _torch_f32(r_fine_pack["ring_med"])
+        extra = self._attach_sdf_and_level_geom(
+            extra, fine, mid, coarse, dense_tracts, x_true,
+            ostium_frames_posed=self._pose_ostium_frames(ostium_frames, origin, R),
+            gt_pts=extra["gt_points"].numpy() if "gt_points" in extra else None,
+        )
         return self._assemble_scaffold_data(
             fine, mid, coarse, tokens, cl_pack, x_true, x_true_cl_dist, x_true_normal,
-            r_fine, r_mid, origin, R,
+            r_fine, r_mid, origin, R, extra=extra,
         )
 
     def build_scaffold_from_centerline(self, centerline_mesh):
@@ -1815,36 +2468,27 @@ class AneurysmDataset(Dataset):
         vessel_mesh = pv.read(sample["vessel_file"])
         centerline_mesh = pv.read(sample["centerline_file"])
         tpl_mesh_path = sample.get("template_mesh_file")
-        tpl_cl_path = sample.get("template_centerline_file")
-        has_template = bool(
-            tpl_mesh_path
-            and os.path.isfile(tpl_mesh_path)
-            and tpl_cl_path
-            and os.path.isfile(tpl_cl_path)
-        )
+        has_template = bool(tpl_mesh_path and os.path.isfile(tpl_mesh_path))
         if getattr(self, "require_templates", False) and not has_template:
             raise FileNotFoundError(
-                f"{sample['dataset_id']}: template_mesh / template_centerline missing. "
-                "Write them with variable_remeshing.py and centerline_creation.py "
-                "into cleandata/template_mesh and cleandata/template_centerline."
+                f"{sample['dataset_id']}: template_mesh missing. "
+                "Write it with variable_remeshing.py into cleandata/template_mesh. "
+                "Tracts / pose / tokens use original_centerline (§2.5)."
             )
-        template_mesh = None
-        template_cl = None
-        if has_template:
-            template_mesh = pv.read(tpl_mesh_path)
-            template_cl = pv.read(tpl_cl_path)
+        template_mesh = pv.read(tpl_mesh_path) if has_template else None
+        ostium_frames = self._load_ostium_frames_sidecar(sample)
         try:
             return self.build_scaffold(
-                template_cl if template_cl is not None else centerline_mesh,
+                centerline_mesh,
                 vessel_mesh=vessel_mesh,
                 template_mesh=template_mesh,
+                require_groupids=True,
+                ostium_frames=ostium_frames,
             )
         finally:
             del vessel_mesh, centerline_mesh
             if template_mesh is not None:
                 del template_mesh
-            if template_cl is not None:
-                del template_cl
             gc.collect()
 
     def _write_cache(self, idx):

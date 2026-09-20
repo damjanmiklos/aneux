@@ -5,7 +5,11 @@ Folders (each `{dataset_id}.vtp`):
 - uniformly_remeshed: original vessels remeshed finely (GT surface)
 - template_mesh: `variable_remeshing.py` parent templates (decoder baseline)
 - original_centerline: `centerline_creation.py` on uniformly_remeshed
-- template_centerline: `centerline_creation.py` on template_mesh
+
+`template_centerline` is dropped (§15 item 3). Completeness gating does not
+require it; parametrisation uses `original_centerline`. Sample records still
+expose `template_centerline_file` as an alias of that path so older
+`dataset.py` loaders keep working.
 
 Training never reads `rawdata/`. Missing centerlines can be filled with the
 VMTK helpers in `datatransform/template_creation/` (`vmtk_env`).
@@ -23,7 +27,6 @@ from aneux_paths import (
     CLEANDATA,
     CLEANDATA_FOLDER_NAMES,
     CLEANDATA_ORIGINAL_CENTERLINE,
-    CLEANDATA_TEMPLATE_CENTERLINE,
     CLEANDATA_TEMPLATE_MESH,
     CLEANDATA_UNIFORM,
     TEMPLATE_DIR,
@@ -71,14 +74,16 @@ def vtp_path(folder, dataset_id):
 
 
 def cleandata_layout(root=None):
-    """Absolute paths for the training folders under `root`."""
+    """Absolute paths for the three training folders under `root`."""
     base = CLEANDATA if root is None else os.path.abspath(root)
+    original_cl = os.path.join(base, "original_centerline")
     return {
         "root": base,
         "uniform": os.path.join(base, "uniformly_remeshed"),
         "template_mesh": os.path.join(base, "template_mesh"),
-        "original_centerline": os.path.join(base, "original_centerline"),
-        "template_centerline": os.path.join(base, "template_centerline"),
+        "original_centerline": original_cl,
+        # Alias only: folder dropped; dataset.py still reads this key.
+        "template_centerline": original_cl,
     }
 
 
@@ -88,17 +93,18 @@ def default_layout():
         "uniform": CLEANDATA_UNIFORM,
         "template_mesh": CLEANDATA_TEMPLATE_MESH,
         "original_centerline": CLEANDATA_ORIGINAL_CENTERLINE,
-        "template_centerline": CLEANDATA_TEMPLATE_CENTERLINE,
+        "template_centerline": CLEANDATA_ORIGINAL_CENTERLINE,
     }
 
 
 def sample_record(dataset_id, layout):
+    centerline = vtp_path(layout["original_centerline"], dataset_id)
     return {
         "dataset_id": str(dataset_id),
         "vessel_file": vtp_path(layout["uniform"], dataset_id),
-        "centerline_file": vtp_path(layout["original_centerline"], dataset_id),
+        "centerline_file": centerline,
         "template_mesh_file": vtp_path(layout["template_mesh"], dataset_id),
-        "template_centerline_file": vtp_path(layout["template_centerline"], dataset_id),
+        "template_centerline_file": centerline,
     }
 
 
@@ -109,7 +115,7 @@ def _has_file(path):
 def sample_is_complete(sample, require_templates=True):
     needed = ["vessel_file", "centerline_file"]
     if require_templates:
-        needed.extend(["template_mesh_file", "template_centerline_file"])
+        needed.append("template_mesh_file")
     return all(_has_file(sample.get(key)) for key in needed)
 
 
@@ -132,28 +138,26 @@ def reject_rawdata_paths(sample):
             )
 
 
-def _vessel_pipeline():
-    """Lazy import: centerline/remesh helpers require the vmtk conda env."""
+def write_centerline(dataset_id, vessel_vtp, output_dir):
+    """Run the template-creation Voronoi centerline pipeline on an existing mesh.
+
+    Refuses ``template_centerline`` output dirs (dropped, §15 item 3).
+    """
     template_dir = os.path.abspath(TEMPLATE_DIR)
     if template_dir not in sys.path:
         sys.path.insert(0, template_dir)
     try:
-        import vessel_pipeline as vp
+        from centerline_creation import process_centerline_dataset
     except ImportError as exc:
         raise RuntimeError(
             "Creating derived cleandata files needs VMTK. "
             "Activate the vmtk_env conda environment and rerun, or write the "
             ".vtp files with datatransform/template_creation/"
-            "centerline_creation.py and uniform_remeshing.py first."
+            "centerline_creation.py first."
         ) from exc
-    return vp
 
-
-def write_centerline(dataset_id, vessel_vtp, output_dir):
-    """Run the template-creation Voronoi centerline pipeline on an existing mesh."""
-    vp = _vessel_pipeline()
     os.makedirs(output_dir, exist_ok=True)
-    return vp.process_centerline_dataset(
+    return process_centerline_dataset(
         dataset_id=str(dataset_id),
         v_file=vessel_vtp,
         output_dir=output_dir,
@@ -161,10 +165,10 @@ def write_centerline(dataset_id, vessel_vtp, output_dir):
 
 
 def ensure_sample_derived(sample, overwrite=False):
-    """Fill missing original/template centerlines in place.
+    """Fill a missing original_centerline in place.
 
-    Sources must already live in cleandata (uniform GT and template mesh).
-    Never reads rawdata.
+    Sources must already live in cleandata (uniform GT). Never reads rawdata.
+    Does not write ``template_centerline``.
     """
     reject_rawdata_paths(sample)
     sample = dict(sample)
@@ -179,11 +183,6 @@ def ensure_sample_derived(sample, overwrite=False):
     if overwrite or not _has_file(cl_path):
         write_centerline(dataset_id, sample["vessel_file"], os.path.dirname(cl_path))
 
-    tpl = sample.get("template_mesh_file")
-    tpl_cl = sample.get("template_centerline_file")
-    if _has_file(tpl) and tpl_cl and (overwrite or not _has_file(tpl_cl)):
-        write_centerline(dataset_id, tpl, os.path.dirname(tpl_cl))
-
     return sample
 
 
@@ -195,9 +194,9 @@ def list_cleandata_samples(
     """Every `{id}.vtp` already present under `cleandata`.
 
     The folder is pre-curated; this does not filter by clinical location or CSV.
-    A sample is loadable when GT, original centerline, template mesh and
-    template centerline all exist. Incomplete ids are reported, not dropped as
-    unwanted.
+    A sample is loadable when GT, original centerline, and (when
+    ``require_templates``) template mesh exist. ``template_centerline`` is not
+    required. Incomplete ids are reported, not dropped as unwanted.
     """
     layout = cleandata_layout(root)
     ensure_cleandata_layout(layout["root"])
@@ -206,7 +205,6 @@ def list_cleandata_samples(
     if require_templates:
         candidate_ids |= list_vtp_ids(layout["template_mesh"])
     candidate_ids |= list_vtp_ids(layout["original_centerline"])
-    candidate_ids |= list_vtp_ids(layout["template_centerline"])
 
     samples = []
     incomplete = []
@@ -229,7 +227,6 @@ def summarize_cleandata(root=None):
         ("uniform", "uniformly_remeshed"),
         ("template_mesh", "template_mesh"),
         ("original_centerline", "original_centerline"),
-        ("template_centerline", "template_centerline"),
     )}
     return layout, counts
 

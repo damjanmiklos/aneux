@@ -56,28 +56,32 @@ EXTRA_CENTERLINES = os.path.join(EXPERIMENT_DIR, "centerlines")
 # uniformly_remeshed: original vessels remeshed finely (GT surface).
 # template_mesh: parent templates from variable_remeshing.py (decoder baseline).
 # original_centerline: centerline_creation.py on uniformly_remeshed.
-# template_centerline: centerline_creation.py on template_mesh.
+# template_centerline was dropped (§15 item 3 / STAGE2 §2.5): same curve as
+# original_centerline; training parametrises from original_centerline.
 CLEANDATA = os.path.join(REPO_ROOT, "cleandata")
 CLEANDATA_UNIFORM = os.path.join(CLEANDATA, "uniformly_remeshed")
 CLEANDATA_TEMPLATE_MESH = os.path.join(CLEANDATA, "template_mesh")
 CLEANDATA_ORIGINAL_CENTERLINE = os.path.join(CLEANDATA, "original_centerline")
+# Deprecated alias only. Not a training folder; not created by ensure_cleandata_layout.
 CLEANDATA_TEMPLATE_CENTERLINE = os.path.join(CLEANDATA, "template_centerline")
 CLEANDATA_SUBDIRS = (
     CLEANDATA_UNIFORM,
     CLEANDATA_TEMPLATE_MESH,
     CLEANDATA_ORIGINAL_CENTERLINE,
-    CLEANDATA_TEMPLATE_CENTERLINE,
 )
 CLEANDATA_FOLDER_NAMES = (
     "uniformly_remeshed",
     "template_mesh",
     "original_centerline",
-    "template_centerline",
 )
 
 
 def ensure_cleandata_layout(root=None):
-    """Create the training data folders if they are missing."""
+    """Create the three training data folders if they are missing.
+
+    Does not create ``template_centerline`` (dropped, §15 item 3). Existing
+    files in a live copy of that folder are left untouched.
+    """
     base = CLEANDATA if root is None else os.path.abspath(root)
     os.makedirs(base, exist_ok=True)
     folders = [os.path.join(base, name) for name in CLEANDATA_FOLDER_NAMES]

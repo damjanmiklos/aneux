@@ -41,6 +41,7 @@ from vessel_pipeline import (
     fill_pinholes,
     inspect_openings,
     inspect_surface_topology,
+    measure_open_profiles,
     remesh_surface_isotropically,
     remove_spurious_openings,
     sanitize_vessel_for_vmtk,
@@ -434,4 +435,73 @@ def test_worker_transcript_records_crash_without_json(tmp_path):
     assert any("degenerate triangles" in w for w in rec["warnings"])
     transcript = (log_dir / "transcripts" / "p376.txt").read_text(encoding="utf-8")
     assert "Bailing out" in transcript
+
+
+def _gt_remesh_fixture_pair():
+    """Read-only original + remeshed GT. Never writes to cleandata/ or rawdata/."""
+    repo = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    case = "SNF00000100"
+    remesh_candidates = [
+        os.path.join(repo, "scratch", "uniform_probe", "gt_remesh", f"{case}.vtp"),
+        os.path.join(repo, "scratch", "gt_remesh", f"{case}.vtp"),
+        os.path.join(repo, "cleandata", "uniformly_remeshed", f"{case}.vtp"),
+        os.path.join(repo, "datatransform", "cleaned_data", "clean_uniform_mesh", f"{case}.vtp"),
+    ]
+    original_candidates = [
+        os.path.join(repo, "scratch", "uniform_probe", "original", f"{case}.vtp"),
+        os.path.join(repo, "scratch", "gt_remesh", f"{case}_original.vtp"),
+        os.path.join(repo, "datatransform", "cleaned_data", "total_clean_original_mesh", f"{case}.vtp"),
+        os.path.join(repo, "rawdata", "models-v1.0", "models", "vessels", "original", f"{case}.vtp"),
+        os.path.join(repo, "rawdata", "rawdata", "models-v1.0", "models", "vessels", "original", f"{case}.vtp"),
+    ]
+    remesh = next((p for p in remesh_candidates if os.path.isfile(p)), None)
+    original = next((p for p in original_candidates if os.path.isfile(p)), None)
+    if remesh is None or original is None:
+        return None
+    return original, remesh
+
+
+def test_gt_remesh_sac_preservation_on_fixture():
+    """§13: real GT remesh keeps the sac. Skip unless a fixture pair exists.
+
+    Does not run the 999 s generator. Reads original + remesh as already produced.
+    """
+    pair = _gt_remesh_fixture_pair()
+    if pair is None:
+        pytest.skip(
+            "No SNF00000100 original+remesh fixture "
+            "(scratch/uniform_probe/gt_remesh or cleandata uniformly_remeshed)"
+        )
+    original_path, remesh_path = pair
+    original = pv.read(original_path)
+    remesh = pv.read(remesh_path)
+    if not bool(original.is_all_triangles):
+        original = original.triangulate()
+    if not bool(remesh.is_all_triangles):
+        remesh = remesh.triangulate()
+    orig_area = float(original.area)
+    gt_area = float(remesh.area)
+    assert orig_area > 1.0
+    ratio = gt_area / orig_area
+    assert GT_MIN_AREA_RATIO <= ratio <= GT_MAX_AREA_RATIO, (
+        f"area ratio {ratio:.3f} outside [{GT_MIN_AREA_RATIO}, {GT_MAX_AREA_RATIO}]"
+    )
+    n_open = len(inspect_openings(remesh))
+    n_profiles = len(measure_open_profiles(remesh))
+    assert n_open == n_profiles, f"openings {n_open} vs profiles {n_profiles}"
+    if "SNF00000100" in os.path.basename(remesh_path):
+        assert n_open == 3, f"SNF00000100 should keep 3 ostia, got {n_open}"
+    from scipy.spatial import cKDTree
+
+    orig_pts = np.asarray(original.points, dtype=np.float64)
+    gt_pts = np.asarray(remesh.points, dtype=np.float64)
+    if orig_pts.shape[0] > 25000:
+        rng = np.random.default_rng(0)
+        orig_pts = orig_pts[rng.choice(orig_pts.shape[0], 25000, replace=False)]
+    dist, _ = cKDTree(gt_pts).query(orig_pts, k=1)
+    frac_gt_1mm = float(np.mean(dist > 1.0))
+    assert frac_gt_1mm < 0.02, (
+        f"original→GT fraction >1 mm is {frac_gt_1mm:.4f}; "
+        "a lost sac is ~0.09, a kept sac is ~0.00035"
+    )
 
