@@ -29,12 +29,23 @@ def _process_one(dataset_id, v_file, args):
         sample_spacing=args.sample_spacing,
         grid_spacing=args.grid_spacing,
         max_grid_size=args.max_grid_size,
+        speedups=args.speedups,
     )
 
 
 def main():
     parser = argparse.ArgumentParser(description="AneuX variable (MISR-stretch) surface remeshing pipeline")
     add_shared_cli_args(parser, DEFAULT_OUTPUT_DIR, default_workers=20, include_remesh_grid=True)
+    parser.add_argument(
+        "--speedups",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Variable-only experimental path (reuse original_centerline, post-uncap 8k "
+            "decimate). Off by default: it drops ostia when a reused centerline is "
+            "fragmented. Fast uncap is the shared default; compiled raycast is on."
+        ),
+    )
     parser.set_defaults(vessel_dir=CLEANDATA_UNIFORM, from_folder=True)
     args = parser.parse_args()
     extra = [
@@ -43,6 +54,7 @@ def main():
         "--sample-spacing", str(args.sample_spacing),
         "--grid-spacing", str(args.grid_spacing),
         "--max-grid-size", str(args.max_grid_size),
+        "--speedups" if args.speedups else "--no-speedups",
     ]
     run_batch(os.path.abspath(__file__), _process_one, args, extra)
 

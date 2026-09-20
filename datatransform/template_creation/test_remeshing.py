@@ -50,7 +50,7 @@ from vessel_pipeline import (
 
 
 def _capped_tube(p0, p1, radius=2.0, n_sides=24):
-    line = pv.Line(p0, p1)
+    line = pv.Line(p0, p1, resolution=40)
     tube = to_vtk_poly(line.tube(radius=radius, n_sides=n_sides, capping=True))
     return fill_pinholes(tube, hole_size=20.0)
 
@@ -138,6 +138,20 @@ def test_pipe_section_then_edge_remesh_keeps_planar_rim():
     rim = min(loops, key=lambda p: np.linalg.norm(p.mean(axis=0) - origin))
     axial = (rim - origin) @ outward
     assert float(np.std(axial)) < 0.20
+
+
+def test_fast_pipe_section_opens_the_same_capped_tube():
+    """Fast accounting must still open the ostium on the same cylinder cut."""
+    tube = _capped_tube((0, 0, 0), (0, 0, 20), radius=2.0)
+    origin = np.array([0.0, 0.0, 0.0])
+    outward = np.array([0.0, 0.0, -1.0])
+    slow, ok_slow = clip_one_opening_pipe_section(
+        tube, origin, outward, 2.0, origin, fast=False
+    )
+    fast, ok_fast = clip_one_opening_pipe_section(tube, origin, outward, 2.0, origin)
+    assert ok_slow and ok_fast
+    assert len(inspect_openings(fast)) >= 1
+    assert abs(slow.GetNumberOfPoints() - fast.GetNumberOfPoints()) <= max(5, 0.02 * slow.GetNumberOfPoints())
 
 
 def test_cli_defaults_to_originals_and_cleandata():

@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from queue import Empty, Queue
 
 import numpy as np
@@ -38,8 +39,23 @@ except ImportError as exc:
         "(e.g. conda install -c vmtk vmtk)."
     ) from exc
 
+try:
+    from stretch_raycast import compute as _stretch_raycast_c
+except ImportError:
+    try:
+        from .stretch_raycast import compute as _stretch_raycast_c
+    except ImportError:
+        _stretch_raycast_c = None
+
+if _stretch_raycast_c is None:
+    print("WARNING: stretch_raycast C extension not loaded; variable remesh uses the Python raycast loop")
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
-from aneux_paths import CSV_PATH as DEFAULT_CSV_PATH, VESSELS_AREA005 as DEFAULT_VESSEL_DIR
+from aneux_paths import (
+    CLEANDATA_ORIGINAL_CENTERLINE,
+    CSV_PATH as DEFAULT_CSV_PATH,
+    VESSELS_AREA005 as DEFAULT_VESSEL_DIR,
+)
 
 DEFAULT_TARGET_EDGE_LENGTH = 0.5
 DEFAULT_EXTENSION_LENGTH = 5.0
@@ -56,6 +72,11 @@ MAX_GRID_SIZE_HARD_CAP = 420
 # collapse below MC_DECIMATE_MIN_POINTS (thin branches need samples for remesh).
 MC_DECIMATE_REDUCTION = 0.50
 MC_DECIMATE_MIN_POINTS = 20000
+# Variable remesh only (not remeshing.py, not sanitize). After uncap, collapse
+# the MC staircase toward this count so VMTK is not chewing a 20k wall. 8000
+# is below the median shipped template (~12.6k points) and above the p5 (~6.7k),
+# and still leaves ~11 tris around a R<0.7 mm branch via CIRCUMFERENTIAL_EDGE_OVER_RADIUS.
+VAR_MC_DECIMATE_MIN_POINTS = 8000
 # Original STLs are 5–8× denser and carry zero-length edges. Voronoi on that
 # tessellation misses thin outlets. Decimate a working copy for VMTK; keep the
 # caller's mesh as GT for stretch/raycast. Do NOT key this off point count:
@@ -257,6 +278,20 @@ def to_vtk_poly(mesh):
     vtk_poly = vtk.vtkPolyData()
     vtk_poly.DeepCopy(mesh)
     return vtk_poly
+
+
+def _as_poly(mesh):
+    """vtkPolyData view without a DeepCopy when the input is already polydata."""
+    if mesh is None:
+        return vtk.vtkPolyData()
+    if isinstance(mesh, vtk.vtkPolyData):
+        return mesh
+    return to_vtk_poly(mesh)
+
+
+def _vtk_c_address(obj, class_name):
+    text = obj.GetAddressAsString(class_name)
+    return int(str(text).split("=")[-1], 16)
 
 
 def clean_triangulate(surface):
@@ -1412,11 +1447,33 @@ def stamp_polyball_image(pts, radii, model_bounds, dims, spacing):
     return img
 
 
-def _triangle_points_faces(surface):
-    """Point coordinates and triangle vertex ids after a clean triangulate."""
-    poly = clean_triangulate(surface)
+def _triangle_points_faces(surface, clean=True):
+    """Point coordinates and triangle vertex ids.
+
+    ``clean=True`` (default) welds and triangulates, matching every existing
+    caller. ``clean=False`` still runs TriangleFilter when the mesh is stored
+    as strips, but skips vtkCleanPolyData.
+    """
+    if clean:
+        poly = clean_triangulate(surface)
+    else:
+        poly = _as_poly(surface)
+        strips = poly.GetStrips()
+        n_strips = 0 if strips is None else int(strips.GetNumberOfCells())
+        n_polys = 0 if poly.GetPolys() is None else int(poly.GetPolys().GetNumberOfCells())
+        if n_strips > 0 or n_polys == 0:
+            tri = vtk.vtkTriangleFilter()
+            tri.SetInputData(poly)
+            tri.PassLinesOff()
+            tri.PassVertsOff()
+            tri.Update()
+            poly = to_vtk_poly(tri.GetOutput())
+    if poly.GetPoints() is None or poly.GetNumberOfPoints() == 0:
+        return poly, np.zeros((0, 3), dtype=np.float64), np.zeros((0, 3), dtype=np.int64)
     pts = np.ascontiguousarray(vtk_to_numpy(poly.GetPoints().GetData()), dtype=np.float64)
     polys = poly.GetPolys()
+    if polys is None or polys.GetNumberOfCells() == 0:
+        return poly, pts, np.zeros((0, 3), dtype=np.int64)
     offsets = vtk_to_numpy(polys.GetOffsetsArray())
     conn = vtk_to_numpy(polys.GetConnectivityArray())
     sizes = np.diff(offsets)
@@ -1459,6 +1516,36 @@ def _triangle_areas(pts, faces):
     a = pts[faces[:, 1]] - pts[faces[:, 0]]
     b = pts[faces[:, 2]] - pts[faces[:, 0]]
     return 0.5 * np.linalg.norm(np.cross(a, b), axis=1)
+
+
+def _mesh_area_fast(surface):
+    _poly, pts, faces = _triangle_points_faces(surface, clean=False)
+    if faces.size == 0:
+        return 0.0
+    return float(_triangle_areas(pts, faces).sum())
+
+
+def _n_boundary_points_near(pts, faces, origin, radius):
+    """How many boundary vertices sit inside 2R of origin. No VMTK extract."""
+    if faces.size == 0 or pts.size == 0:
+        return 0
+    edges = np.concatenate(
+        (
+            np.sort(faces[:, [0, 1]], axis=1),
+            np.sort(faces[:, [1, 2]], axis=1),
+            np.sort(faces[:, [2, 0]], axis=1),
+        ),
+        axis=0,
+    )
+    uniq, counts = np.unique(edges, axis=0, return_counts=True)
+    bdry = uniq[counts == 1]
+    if bdry.size == 0:
+        return 0
+    vids = np.unique(bdry.ravel())
+    origin = np.asarray(origin, dtype=np.float64).reshape(1, 3)
+    d2 = np.sum((pts[vids] - origin) ** 2, axis=1)
+    r2 = (2.0 * float(radius)) ** 2
+    return int(np.count_nonzero(d2 < r2))
 
 
 def _drop_duplicate_triangles(faces):
@@ -2462,8 +2549,14 @@ def generate_base_surface(
     profiles=None,
     extension_length=DEFAULT_EXTENSION_LENGTH,
     extra_spheres=None,
+    min_points=None,
+    skip_decimate=False,
 ):
-    """Parent tube via a narrow-band polyball image + marching cubes."""
+    """Parent tube via a narrow-band polyball image + marching cubes.
+
+    ``min_points`` / ``skip_decimate`` are for the variable-remesh path.
+    Defaults keep remeshing.py and ``sanitize_vessel_for_vmtk`` on the 20k floor.
+    """
     if not isinstance(branched_centerline, vtk.vtkPolyData):
         branched_centerline = to_vtk_poly(branched_centerline)
     misr_array = _misr_array_or_raise(branched_centerline)
@@ -2507,12 +2600,15 @@ def generate_base_surface(
     mc.Execute()
     raw = to_vtk_poly(mc.Surface)
     kept = keep_largest_region(raw)
-    pre_decimate = kept
-    kept = decimate_dense_mc(kept)
-    kept, n_nm = repair_nonmanifold_triangles(kept)
-    if n_nm > 0 and kept.GetNumberOfPoints() < pre_decimate.GetNumberOfPoints():
-        print("  Decimate left non-manifold edges; keeping the full marching-cubes surface")
-        kept, n_nm = repair_nonmanifold_triangles(pre_decimate)
+    if skip_decimate:
+        kept, n_nm = repair_nonmanifold_triangles(kept)
+    else:
+        pre_decimate = kept
+        kept = decimate_dense_mc(kept, min_points=min_points)
+        kept, n_nm = repair_nonmanifold_triangles(kept)
+        if n_nm > 0 and kept.GetNumberOfPoints() < pre_decimate.GetNumberOfPoints():
+            print("  Decimate left non-manifold edges; keeping the full marching-cubes surface")
+            kept, n_nm = repair_nonmanifold_triangles(pre_decimate)
     if n_nm > 0:
         raise TemplateQualityError(
             f"Parent-tube surface has {n_nm} non-manifold edges after marching cubes"
@@ -2533,6 +2629,28 @@ def generate_base_surface(
                 f"(surface {s_lo:.1f}..{s_hi:.1f} vs vessel {v_lo:.1f}..{v_hi:.1f}, slack={slack:.1f} mm)."
             )
     return kept
+
+
+def decimate_variable_parent_tube(surface, min_points=VAR_MC_DECIMATE_MIN_POINTS):
+    """Post-uncap collapse of the MC staircase. Variable remesh only.
+
+    Uncap already cut the ostia on the fine MC surface. BoundaryVertexDeletionOff
+    keeps those rims; the interior is allowed down to ``min_points``. Non-manifold
+    output is thrown away and the pre-decimate surface is kept.
+    """
+    poly = _as_poly(surface)
+    pre = poly
+    n = poly.GetNumberOfPoints()
+    floor = int(min_points)
+    if n <= floor:
+        return poly
+    reduction = 1.0 - float(floor) / float(n)
+    out = decimate_dense_mc(poly, target_reduction=reduction, min_points=floor)
+    out, n_nm = repair_nonmanifold_triangles(out)
+    if n_nm > 0 and out.GetNumberOfPoints() < pre.GetNumberOfPoints():
+        print("  Decimate left non-manifold edges; keeping the pre-decimate surface")
+        return pre
+    return out
 
 
 def keep_largest_region(surface):
@@ -2923,6 +3041,47 @@ def _drop_small_fragments(surface, min_fraction=0.05):
     return to_vtk_poly(kept.triangulate().clean())
 
 
+def _drop_small_fragments_fast(surface, min_fraction=0.05):
+    """Same keep/drop rule as ``_drop_small_fragments``, VTK-only (variable uncap)."""
+    poly = _as_poly(surface)
+    n_pts = poly.GetNumberOfPoints()
+    if n_pts == 0:
+        return poly
+    conn = vtk.vtkPolyDataConnectivityFilter()
+    conn.SetInputData(poly)
+    conn.SetExtractionModeToAllRegions()
+    conn.ColorRegionsOn()
+    conn.Update()
+    n_regions = int(conn.GetNumberOfExtractedRegions())
+    if n_regions <= 1:
+        return poly
+    labelled = conn.GetOutput()
+    region = labelled.GetPointData().GetArray("RegionId")
+    if region is None:
+        return poly
+    ids = np.ascontiguousarray(vtk_to_numpy(region), dtype=np.int64)
+    uniq, counts = np.unique(ids, return_counts=True)
+    largest = int(counts.max())
+    threshold = max(
+        int(min_fraction * n_pts),
+        int(FRAGMENT_RELATIVE_TO_LARGEST * largest),
+        3,
+    )
+    keep_ids = uniq[counts >= threshold]
+    if keep_ids.size == 0:
+        return keep_largest_region(poly)
+    if keep_ids.size == uniq.size:
+        return poly
+    keep_set = np.asarray(keep_ids, dtype=np.int64)
+    _p, pts, faces = _triangle_points_faces(labelled, clean=False)
+    if faces.size == 0:
+        return poly
+    keep_face = np.isin(ids[faces[:, 0]], keep_set)
+    if int(keep_face.sum()) == len(faces):
+        return poly
+    return _polydata_from_triangles(pts, faces[keep_face])
+
+
 def _keep_region_with_point(surface, point):
     """Keep only the connected component that contains ``point``.
 
@@ -2942,8 +3101,8 @@ def _keep_region_with_point(surface, point):
     return clean_triangulate(conn.GetOutput())
 
 
-def _delete_outboard_leftover(surface, origin, outward, radius, outboard_mm=0.0):
-    poly, pts, faces = _triangle_points_faces(surface)
+def _delete_outboard_leftover(surface, origin, outward, radius, outboard_mm=0.0, clean=True):
+    poly, pts, faces = _triangle_points_faces(surface, clean=clean)
     if faces.size == 0:
         return poly
     origin = np.asarray(origin, dtype=np.float64)
@@ -2958,25 +3117,27 @@ def _delete_outboard_leftover(surface, origin, outward, radius, outboard_mm=0.0)
     return _polydata_from_triangles(pts, faces[~bad])
 
 
-def _clip_opening_cap_locally(surface, origin, outward, radius, extension_length=None, trimmed=False):
+def _clip_opening_cap_locally(
+    surface, origin, outward, radius, extension_length=None, trimmed=False, fast=False
+):
     """Delete the outboard stub of one opening with a bounded cylinder."""
     region = _outboard_cap_implicit(
         origin, outward, radius, extension_length=extension_length, trimmed=trimmed
     )
     clipper = vtk.vtkClipPolyData()
-    clipper.SetInputData(to_vtk_poly(surface))
+    clipper.SetInputData(_as_poly(surface) if fast else to_vtk_poly(surface))
     clipper.SetClipFunction(region)
     clipper.InsideOutOff()
     clipper.GenerateClippedOutputOff()
     clipper.Update()
     clipped = weld_clip_slivers(clean_triangulate(clipper.GetOutput()))
     if clipped.GetNumberOfPoints() == 0:
-        return to_vtk_poly(surface)
-    return _delete_outboard_leftover(clipped, origin, outward, radius)
+        return _as_poly(surface) if fast else to_vtk_poly(surface)
+    return _delete_outboard_leftover(clipped, origin, outward, radius, clean=not fast)
 
 
 def clip_one_opening_pipe_section(
-    surface, origin, outward, radius, body_point, extension_length=None, trimmed=False
+    surface, origin, outward, radius, body_point, extension_length=None, trimmed=False, fast=True
 ):
     """Open one ostium with a pipe-section cut; inset slightly if the cutter misses.
 
@@ -2984,39 +3145,64 @@ def clip_one_opening_pipe_section(
     means the bounded cylinder reached a different part of a tortuous vessel, so
     the candidate is rejected and the cutter is moved inward instead of silently
     deleting a branch.
+
+    ``fast=True`` (default) keeps the same cylinder clip. It skips the dual
+    full-mesh loop extract on every inset and asks a local boundary question
+    instead. ``fast=False`` is the old full-mesh extract, kept for comparison.
     """
     origin0 = np.asarray(origin, dtype=np.float64)
     outward = _unit(outward)
     radius = max(float(radius), 1e-3)
-    before = _n_boundary_loops(surface)
     n_prev = surface.GetNumberOfPoints()
-    area_prev = float(pv.wrap(to_vtk_poly(surface)).area)
+    if fast:
+        before = None
+        area_prev = _mesh_area_fast(surface) if trimmed else 0.0
+        _p0, pts0, faces0 = _triangle_points_faces(surface, clean=False)
+        n_local_before = _n_boundary_points_near(pts0, faces0, origin0, radius)
+    else:
+        before = _n_boundary_loops(surface)
+        area_prev = float(pv.wrap(to_vtk_poly(surface)).area)
+        n_local_before = 0
     inset = 0.0
     while inset <= OPENING_CLIP_INSET_MAX_MM + 1e-12:
         origin_i = origin0 - inset * outward
         clipped = _clip_opening_cap_locally(
-            surface, origin_i, outward, radius, extension_length=extension_length, trimmed=trimmed
+            surface, origin_i, outward, radius, extension_length=extension_length, trimmed=trimmed, fast=fast
         )
+        if fast:
+            n_cand = clipped.GetNumberOfPoints()
+            if n_cand < 50 or n_cand < 0.45 * n_prev or n_cand >= n_prev:
+                inset += OPENING_CLIP_INSET_STEP_MM
+                continue
         clipped = (
             _keep_region_with_point(clipped, body_point)
             if trimmed
-            else _drop_small_fragments(clipped)
+            else (_drop_small_fragments_fast(clipped) if fast else _drop_small_fragments(clipped))
         )
         n_cand = clipped.GetNumberOfPoints()
         if n_cand < 50 or n_cand < 0.45 * n_prev:
             inset += OPENING_CLIP_INSET_STEP_MM
             continue
         if trimmed and area_prev > 1e-9:
-            lost = 1.0 - float(pv.wrap(to_vtk_poly(clipped)).area) / area_prev
+            cand_area = _mesh_area_fast(clipped) if fast else float(pv.wrap(to_vtk_poly(clipped)).area)
+            lost = 1.0 - cand_area / area_prev
             if lost > CLIP_MAX_AREA_LOSS_FRACTION:
                 inset += OPENING_CLIP_INSET_STEP_MM
                 continue
-        loops_after = _n_boundary_loops(clipped)
-        near = any(
-            float(np.linalg.norm(np.asarray(op["center"]) - origin_i)) < 2.0 * radius
-            for op in inspect_openings(clipped)
-        )
-        if loops_after > before or (near and n_cand < n_prev):
+        if fast:
+            _pc, pts_c, faces_c = _triangle_points_faces(clipped, clean=False)
+            n_local = _n_boundary_points_near(pts_c, faces_c, origin_i, radius)
+            opened = n_local >= MIN_OPENING_LOOP_POINTS and n_cand < n_prev
+            if n_local_before >= MIN_OPENING_LOOP_POINTS:
+                opened = opened and n_local > n_local_before
+        else:
+            loops_after = _n_boundary_loops(clipped)
+            near = any(
+                float(np.linalg.norm(np.asarray(op["center"]) - origin_i)) < 2.0 * radius
+                for op in inspect_openings(clipped)
+            )
+            opened = loops_after > before or (near and n_cand < n_prev)
+        if opened:
             if inset > 0:
                 print(f"  [Uncap] Pipe-section clip inset {inset:.1f} mm to create a hole")
             return clipped, True
@@ -3378,6 +3564,7 @@ def clip_flow_extensions_and_uncap(
     extension_length=DEFAULT_EXTENSION_LENGTH,
     centerline=None,
     unextended_surface=None,
+    fast_uncap=True,
 ):
     current = to_vtk_poly(base_surface)
     frames = opening_clip_frames(centerline, profiles) if centerline is not None else None
@@ -3400,6 +3587,7 @@ def clip_flow_extensions_and_uncap(
                 body_pt,
                 extension_length=extension_length,
                 trimmed=trimmed,
+                fast=fast_uncap,
             )
             if ok:
                 print(
@@ -3619,13 +3807,30 @@ def compute_raycast_stretch_distances(template_mesh, ground_truth_mesh, r_templa
     outward = -template_normals / lens
 
     n_pts = template_pts.shape[0]
+    r_arr = None if r_template is None else np.ascontiguousarray(r_template, dtype=np.float64)
+    if _stretch_raycast_c is not None:
+        try:
+            return np.asarray(
+                _stretch_raycast_c(
+                    _vtk_c_address(locator, "vtkCellLocator"),
+                    template_pts,
+                    outward,
+                    r_arr if r_arr is not None else None,
+                    gt_cell_normals,
+                    float(max_ray_length),
+                    float(tol),
+                ),
+                dtype=np.float64,
+            )
+        except Exception as exc:
+            print(f"  WARNING: compiled raycast failed ({exc}); using Python loop")
+
     distances = np.zeros(n_pts, dtype=np.float64)
     t = vtk.mutable(0.0)
     x = [0.0, 0.0, 0.0]
     pcoords = [0.0, 0.0, 0.0]
     sub_id = vtk.mutable(0)
     cell_id = vtk.mutable(0)
-    r_arr = None if r_template is None else np.asarray(r_template, dtype=np.float64)
 
     for i in range(n_pts):
         p = template_pts[i]
@@ -3661,17 +3866,13 @@ def compute_raycast_stretch_distances(template_mesh, ground_truth_mesh, r_templa
 def build_target_edge_array(template_mesh, distances, r_template, base_edge=0.50, min_edge=0.01):
     """Stretch densifies aneurysms; local radius caps edge length so thin tubes stay round."""
     vtk_poly = to_vtk_poly(template_mesh)
-    n_pts = vtk_poly.GetNumberOfPoints()
     r = np.maximum(R_TEMPLATE_FLOOR_MM, np.asarray(r_template, dtype=np.float64))
     stretch_factors = 1.0 + (distances / r)
     radius_limited = np.minimum(base_edge, np.maximum(min_edge, CIRCUMFERENTIAL_EDGE_OVER_RADIUS * r))
     target_edge_lengths = np.maximum(min_edge, radius_limited / (stretch_factors ** 1.5))
 
-    vtk_target_array = vtk.vtkDoubleArray()
+    vtk_target_array = numpy_to_vtk(np.ascontiguousarray(target_edge_lengths, dtype=np.float64), deep=True)
     vtk_target_array.SetName("TargetEdgeLength")
-    vtk_target_array.SetNumberOfTuples(n_pts)
-    for i in range(n_pts):
-        vtk_target_array.SetValue(i, float(target_edge_lengths[i]))
     vtk_poly.GetPointData().AddArray(vtk_target_array)
     return vtk_poly, target_edge_lengths, stretch_factors
 
@@ -4209,6 +4410,28 @@ def save_polydata(surface, out_file):
         raise TemplateQualityError(f"Failed to write {out_file}")
 
 
+def _try_reuse_centerline(reuse_centerline, reference_bounds):
+    """Load a precomputed original_centerline. None means extract Voronoi as today."""
+    if reuse_centerline is None:
+        return None
+    if isinstance(reuse_centerline, str):
+        if not os.path.isfile(reuse_centerline):
+            return None
+        cl = to_vtk_poly(pv.read(reuse_centerline))
+        source = reuse_centerline
+    else:
+        cl = to_vtk_poly(reuse_centerline)
+        source = "in-memory centerline"
+    if cl.GetPointData().GetArray("MaximumInscribedSphereRadius") is None:
+        print(f"  WARNING: reused centerline has no MISR ({source}); extracting Voronoi")
+        return None
+    if not centerline_looks_valid(cl, reference_bounds):
+        print(f"  WARNING: reused centerline failed the lumen check ({source}); extracting Voronoi")
+        return None
+    print(f"  Reusing original centerline ({cl.GetNumberOfPoints()} points, skip dual Voronoi)")
+    return cl
+
+
 def build_parent_tube(
     vessel_mesh,
     extension_length=DEFAULT_EXTENSION_LENGTH,
@@ -4216,8 +4439,16 @@ def build_parent_tube(
     grid_spacing=DEFAULT_GRID_SPACING,
     max_grid_size=DEFAULT_MAX_GRID_SIZE,
     dataset_id=None,
+    reuse_centerline=None,
+    skip_mc_decimate=False,
+    fast_uncap=True,
 ):
-    """Shared path: smooth -> extend -> cap -> centerline -> polyball tube -> uncap at anatomy."""
+    """Shared path: smooth -> extend -> cap -> centerline -> polyball tube -> uncap at anatomy.
+
+    Variable remesh may pass ``reuse_centerline`` and ``skip_mc_decimate``.
+    Uncap accounting defaults to the fast local-boundary test; the cylinder
+    clip is unchanged. Pass ``fast_uncap=False`` for the old full-mesh extract.
+    """
     print("Step 1: Applying Taubin surface smoothing...")
     work_vessel = sanitize_vessel_for_vmtk(vessel_mesh)
     smoothed_vessel = apply_taubin_smoothing(work_vessel)
@@ -4227,29 +4458,35 @@ def build_parent_tube(
     log_profiles(anatomical_profiles, label="Anatomical")
     _inlet, _outlets = seed_points_from_profiles(anatomical_profiles)
 
-    print("Step 2: Adding flow extensions on the open surface...")
-    extended_vessel = add_flow_extensions(smoothed_vessel, extension_length=extension_length)
+    branched_centerline = _try_reuse_centerline(reuse_centerline, smoothed_vessel.GetBounds())
+    if branched_centerline is None:
+        print("Step 2: Adding flow extensions on the open surface...")
+        extended_vessel = add_flow_extensions(smoothed_vessel, extension_length=extension_length)
 
-    print("Step 2b: Detecting extended-end seeds...")
-    extended_profiles = measure_open_profiles(extended_vessel)
-    log_profiles(extended_profiles, label="Extended")
-    if len(extended_profiles) != len(anatomical_profiles):
-        print(
-            f"  WARNING: opening count changed after extensions "
-            f"({len(anatomical_profiles)} -> {len(extended_profiles)}). Using extended ends as seeds."
+        print("Step 2b: Detecting extended-end seeds...")
+        extended_profiles = measure_open_profiles(extended_vessel)
+        log_profiles(extended_profiles, label="Extended")
+        if len(extended_profiles) != len(anatomical_profiles):
+            print(
+                f"  WARNING: opening count changed after extensions "
+                f"({len(anatomical_profiles)} -> {len(extended_profiles)}). Using extended ends as seeds."
+            )
+
+        print("Step 3: Extracting Voronoi centerline and MISR...")
+        t_cl = time.perf_counter()
+        centerline = extract_centerlines_for_tube(
+            extended_vessel, smoothed_vessel, anatomical_profiles, extended_profiles
         )
+        print(f"  [t] Voronoi extract {time.perf_counter() - t_cl:.2f}s")
 
-    print("Step 3: Extracting Voronoi centerline and MISR...")
-    centerline = extract_centerlines_for_tube(
-        extended_vessel, smoothed_vessel, anatomical_profiles, extended_profiles
-    )
+        print(f"Step 4: Spline resampling ({sample_spacing} mm) and trajectory smoothing...")
+        resampled = resample_centerline(centerline, sample_spacing=sample_spacing)
+        smooth_centerline = smooth_centerline_preserve_misr(resampled)
 
-    print(f"Step 4: Spline resampling ({sample_spacing} mm) and trajectory smoothing...")
-    resampled = resample_centerline(centerline, sample_spacing=sample_spacing)
-    smooth_centerline = smooth_centerline_preserve_misr(resampled)
-
-    print("Step 5: Extracting branches...")
-    branched_centerline = extract_branches(smooth_centerline)
+        print("Step 5: Extracting branches...")
+        branched_centerline = extract_branches(smooth_centerline)
+    else:
+        print("Step 2-5: skipped flow extensions and Voronoi (original_centerline reused)")
 
     print("Step 5b: Constant-radius polyball stubs past anatomical openings...")
     extra_pts, extra_r = extra_opening_spheres(branched_centerline, anatomical_profiles)
@@ -4263,15 +4500,19 @@ def build_parent_tube(
         profiles=anatomical_profiles,
         extension_length=extension_length,
         extra_spheres=(extra_pts, extra_r),
+        skip_decimate=skip_mc_decimate,
     )
 
     print("Step 7: Uncapping open boundaries with pipe-section cuts...")
+    t_un = time.perf_counter()
     open_base_surface, n_clipped = clip_flow_extensions_and_uncap(
         base_surface,
         anatomical_profiles,
         extension_length=extension_length,
         centerline=branched_centerline,
+        fast_uncap=fast_uncap,
     )
+    print(f"  [t] uncap {time.perf_counter() - t_un:.2f}s")
     print(f"  -> Open base surface points: {open_base_surface.GetNumberOfPoints()}")
     n_in = len(anatomical_profiles)
     if n_clipped < n_in:
@@ -4304,9 +4545,18 @@ def process_variable_dataset(
     sample_spacing=DEFAULT_SAMPLE_SPACING,
     grid_spacing=DEFAULT_GRID_SPACING,
     max_grid_size=DEFAULT_MAX_GRID_SIZE,
+    speedups=False,
 ):
     print(f"\n=========================================\nProcessing Adaptive Variable Remeshing Case: {dataset_id}")
+    t_all = time.perf_counter()
     vessel_mesh = pv.read(v_file)
+    reuse = None
+    if speedups:
+        cl_path = os.path.join(CLEANDATA_ORIGINAL_CENTERLINE, f"{dataset_id}.vtp")
+        if os.path.isfile(cl_path):
+            reuse = cl_path
+        else:
+            print("  original_centerline missing; will extract Voronoi")
     built = build_parent_tube(
         vessel_mesh,
         extension_length=extension_length,
@@ -4314,16 +4564,29 @@ def process_variable_dataset(
         grid_spacing=grid_spacing,
         max_grid_size=max_grid_size,
         dataset_id=dataset_id,
+        reuse_centerline=reuse,
+        skip_mc_decimate=bool(speedups),
     )
     open_base_surface = built["open_base_surface"]
     branched_centerline = built["branched_centerline"]
     anatomical_profiles = built["anatomical_profiles"]
+    if speedups:
+        n_pre = open_base_surface.GetNumberOfPoints()
+        t_dec = time.perf_counter()
+        open_base_surface = decimate_variable_parent_tube(open_base_surface)
+        print(
+            f"  Post-uncap decimate {n_pre} -> {open_base_surface.GetNumberOfPoints()} "
+            f"points in {time.perf_counter() - t_dec:.2f}s "
+            f"(floor {VAR_MC_DECIMATE_MIN_POINTS})"
+        )
 
     print("Step 8a: Computing local tube radius and raycasting stretch vs ground truth...")
+    t_ray = time.perf_counter()
     r_template = compute_template_local_radii(open_base_surface, branched_centerline)
     stretch_distances = compute_raycast_stretch_distances(
         open_base_surface, vessel_mesh, r_template=r_template
     )
+    print(f"  [t] radii+raycast {time.perf_counter() - t_ray:.2f}s")
     min_edge = REMESH_MIN_EDGE_MM
     print(
         f"Step 8b: Building stretch metric k = 1 + d / R_template "
@@ -4354,7 +4617,9 @@ def process_variable_dataset(
     )
 
     print("Step 8c: Adaptively remeshing surface (ElementSizeMode='edgelengtharray')...")
+    t_rm = time.perf_counter()
     remeshed_surface = remesh_surface_adaptively(surface_with_array, edge_array_name="TargetEdgeLength")
+    print(f"  [t] remesh {time.perf_counter() - t_rm:.2f}s")
     print(f"  -> Adaptive remeshed surface points: {remeshed_surface.GetNumberOfPoints()}")
     remesh_openings = inspect_openings(remeshed_surface)
     print(
@@ -4380,6 +4645,7 @@ def process_variable_dataset(
         f"(pipe-section clipped {int(built['n_clipped'])}; "
         f"{len(anatomical_profiles)} anatomical profiles)"
     )
+    print(f"  [t] case total {time.perf_counter() - t_all:.2f}s")
     return out_file
 
 
