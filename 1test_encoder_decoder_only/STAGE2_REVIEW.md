@@ -998,4 +998,68 @@ Everything that is a number in this review was produced by a script in `scratch/
 | `SNF00000100.vtp`, `C0002.vtp` (parent-tube uniform remesh) + `*_distance.json` + `*_uniform_vs_original.png` | `probe_uniform_gt.py`, `render_uniform_probe.py` | §2.2 contrast |
 | `test_remeshing_log.txt` | `run_test_remeshing_nopytest.py` | §2.2.4, §13 |
 | `latent_dim/patches_all/*.npz` (38 689 token patches, 708 cases), `latent_dim/patches32/` (178 cases at 32 θ bins), `latent_dim/report.txt` | `latent_dim/extract.py` + `run_all.py` (extraction), `analyze.py`–`analyze4.py` (PCA / parametric fit / intrinsic dimension / calibration) | §2.4.2a, §5.3.3a, §5.3.5, §5.3.8 |
+---
 
+## Appendix B. Everything that needs a code change
+
+Only code. Everything else in this review is a measurement or a decision.
+
+### A. Broken today
+
+**`datatransform/template_creation/`**
+
+1. `vessel_pipeline.py::clip_centerline_at_profiles` — carry the cell arrays (`GroupIds`, `Blanking`, `CenterlineIds`, `TractIds`) through the rebuild (§2.4.3).
+2. `vessel_pipeline.py::compute_raycast_stretch_distances` — orientation-agnostic hit test (radial sign), then regenerate `template_mesh` (§2.3). **Blocking.**
+3. `vessel_pipeline.py::build_parent_tube` — `n_clipped == n_profiles` as a hard gate, not a warning (§2.3.2).
+
+**`1test_encoder_decoder_only/train_pipeline/`**
+
+4. `dataset.py::extract_groupid_tracts` — replace the body with the validated GroupId rule; raise instead of falling back on `cleandata` inputs (§2.4.3).
+5. `dataset.py::_template_r_star` / `raycast.py` — `r*` from an outward ray-cast or the exported `StretchDistance`, with validity and ambiguity flags (§7.1).
+6. `dataset.py` (§3.7) — real `dth`, `du`, `ring_med` so `smoothness_edge_weights` is not identically 1.0 (§7.2).
+7. `composed_radius`, Chamfer weights, head floor — use the cached `r_local`, not `TUBE_RADIUS_MM = 2.0` (§6.7, §7.3).
+8. `dataset.py` level build — orient normals outward by the radial direction at every level (§10.2 step 2).
+9. `model.py::reparameterize` + `train.py::evaluate_epoch` — explicit `sample` flag; sample at evaluation and report both paths (§5.1, §5.3.6 item 6).
+10. `geometry.py` — θ pseudo-coordinate in physical units (§6.2).
+11. `aneuxai.py` / `train.py` — resume from `last.pt`; EMA 0.99–0.995 with warm-up; weight-decay exclusions; LR warm-up; device from the environment (§8).
+
+### B. Decided, still to be written
+
+**Generators**
+
+12. `remeshing.py` exports its ostium cut frames; the template's `clip_flow_extensions_and_uncap` consumes them instead of `measure_open_profiles`; frames persisted per case (§2.2.4).
+13. Export `R_template`, `StretchDistance`, `TargetEdgeLength` on the final template vertices (§14 item 2).
+14. One process per case for centerline + GT + template; `hascap.csv` exclusions (§2.9).
+15. `centerline_creation.py::process_centerline_dataset` stops writing `template_centerline`; `aneux_paths.py` / `cleaned_io.py` stop expecting it (§15 item 3).
+
+**Latent (§5.3.6)**
+
+16. `config.py` — `LATENT_DIM` 128 → 16; `LATENT_LEN` becomes a padding maximum; `TOKEN_SPACING_MM = 2.0`, `CL_SAMPLE_MM = 1.0`.
+17. `model.py::CenterlineLatentHead` — local pooling instead of softmax over all encoder centres; soft σ bound (σ_min = 0.1) replacing `LOGVAR_CLAMP`.
+18. `model.py::forward` / `decode` — `z_attn` before reparameterisation.
+19. `losses.py::vae_kl_loss` — mask and normalise by `latent_valid`; per-token rate target with a GECO-style adaptive β replacing the fixed `LAMBDA_KL`.
+20. Post-training standardisation pass: drop inactive dimensions, store statistics and the surviving count in the checkpoint (§5.3.6 item 7).
+21. The §5.3.7 instrumentation: raw per-token KL, bits per case, β and rate gap, active units split healthy / sac, KL profile along the tree, noise-robustness curve.
+
+**Tokens (§5.4)**
+
+22. Remove `allocate_token_counts` and the fixed-slot logic; remove padding-by-duplication in `_build_latent_tokens`; thread `latent_valid` through head, mixer, cross-attention and KL; restrict decoder cross-attention to the ~5 nearest tokens on the branch.
+
+**Geometry and CFD (§11)**
+
+23. Boundary-plane projection for rim vertices, applied after the displacement head (§11 item 5).
+24. Fold penalty (`n_pred · n_template < 0`) and triangle-stretch regulariser (§7.5).
+25. `r_local`-relative displacement bounds; free 3-D at the coarse level (§6.7).
+26. `postprocess.py` — self-intersection count, boundary loops, component count, minimum angle as metrics; final isotropic remesh (§11, §12).
+
+**Data plumbing**
+
+27. Cache the full GT (vertices + normals); resample `x_true` every epoch; face-sampled Chamfer against it (§2.2.3, §8).
+
+### C. Improvements, measured but optional
+
+28. SplineConv kernel `(5, 5, 2)`; `aggr="mean"`, pre-norm, `root_weight=True`; 6–8 convs per level (§6).
+29. Encoder: normals and template signed distance as inputs; stage-3/4 width down, the parameters given to the latent head; node features `r_local`, curvature, torsion, ostium distance (§4, §6.6).
+30. Augmentation: L/R mirror, θ-phase, ±5° pose jitter (§8).
+31. Batch size above 1 × 8; 5-fold harness on the A100s (§9).
+32. The tests of §13.
