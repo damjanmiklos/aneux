@@ -752,7 +752,7 @@ Fix: normalise `Δθ` by the local circumferential step, `e_th = 0.5 + 0.5 · cl
 | peak VRAM | 2.7 GiB | **0.74 GiB** |
 | cache build per case | — | 2.0 s (no ray-casting) |
 
-The 5 × 5 × 5 SplineConv (24.6 M of 43.4 M parameters) is still the bulk of the time, but the template's physical resolution removed the 8× node excess of the tube. On the A100s this is comfortably a batch of 8–16 per GPU; the point is not speed but being able to afford 2–5 · 10⁴ optimisation steps, deeper decoders and k-fold sweeps (§9). Kernel `(5, 5, 2)` and 64-channel fine-level convs are still worth taking.
+The 5 × 5 × 5 SplineConv (24.6 M of 43.4 M parameters) is still the bulk of the time, but the template's physical resolution removed the 8× node excess of the tube. On the A100s this is comfortably a batch of 8–16 per GPU; the point is not speed but being able to afford 2–5 · 10⁴ optimisation steps and deeper decoders (§9). Kernel `(5, 5, 2)` and 64-channel fine-level convs are still worth taking.
 
 ### 6.4 Aggregation and normalisation
 
@@ -832,14 +832,14 @@ A **triangle-stretch / edge-length-ratio** regulariser and a **normal-flip penal
 | batch | bs 1 × accum 8 → ~21 steps/epoch on ~170 train cases, **4.3 k steps in 200 epochs** | plan 2–5 · 10⁴ steps; real bs 4–8 now fits easily (0.74 GiB/sample) |
 | optimizer / schedule | AdamW 2e-4, wd 1e-4 on everything, cosine, no warm-up | exclude LayerNorms, biases and gates from wd; 200–500-step LR warm-up |
 | EMA | 0.999 per step | horizon `1 / (1 − 0.999) = 1 000` steps ≈ **47 epochs** at 21 steps/epoch: early `best.pt` selection uses near-initial weights. 0.99–0.995 with a warm-up `min(d, (1 + n) / (10 + n))` |
-| validation | every 5 epochs, EMA only, ~15 % random split, deterministic μ path only (`reparameterize` returns μ in eval) | also log non-EMA val; report recon at σ = 0 *and* with posterior sampling (§5.3.6 item 6); k-fold (§9) |
+| validation | every 5 epochs, EMA only, ~15 % random split, deterministic μ path only (`reparameterize` returns μ in eval) | also log non-EMA val; report recon at σ = 0 *and* with posterior sampling (§5.3.6 item 6) |
 | augmentation | none | L/R mirror (before scaffold build — flips Bishop handedness consistently), per-epoch resampling of `x_true` from the full GT (cache all vertices, not 16 384 — 3 099 of the 16 384 are duplicates on the 22 k-vertex stand-in), θ-phase and ±5° pose jitter |
 | resume | `last.pt` is written, never read | load model / EMA / opt / sched / epoch / RNG |
 | logging | `print`, history at the end | per-epoch CSV / TensorBoard: raw per-token KL, bits per case, β and rate gap, active units (healthy / sac), KL profile along the tree, noise-robustness curve (§5.3.7) |
 | device | `gpu_index = 1 if n_gpu > 1 else 0` | `CUDA_VISIBLE_DEVICES` or an argument |
-| multi-GPU | none | 4 × A100 as 4 independent configs / folds |
+| multi-GPU | none | 4 × A100 as 4 independent configs |
 | precision | FP32 tensors, TF32 matmuls | correct; keep it |
-| split | random 85/15, no test set | 5-fold CV + a held-out test fold |
+| split | random 85/15, no test set | one fixed train / validation / test split, seeded and stored, so every configuration is compared on the same cases. Cross-validation is dropped for now (Damján, 20 Sep) — it multiplies every experiment by k and the design decisions are still large enough to read off a single split |
 
 The EMA horizon is the one that silently wastes early validation: at decay 0.999 the shadow is a 1 000-step box filter, so the "best" checkpoint of the first 50 epochs is still mostly the initial weights. Combined with `val_every = 5` and a 4.3 k-step budget, the training loop as written cannot tell a working model from an identity decoder.
 
@@ -853,14 +853,13 @@ HPC wall-time is effectively unlimited; VRAM on the 3080 Ti already has headroom
 |---|---|---|
 | full GT point set + face-sampled predicted points, resampled every epoch | removes the 16 k sampling floor and the dome vertex-density bias (§2.2.3, §7.3) | memory only |
 | augmentation set of §8 | largest single generalisation gain on ~200–680 samples | free |
-| 5–10× more optimisation steps | nowhere near convergence at 4.3 k steps | time, now cheap (0.79 s/step → 2–5 · 10⁴ steps is 4–11 GPU-hours per fold) |
+| 5–10× more optimisation steps | nowhere near convergence at 4.3 k steps | time, now cheap (0.79 s/step → 2–5 · 10⁴ steps is 4–11 GPU-hours per run) |
 | decoder depth (6–8 residual convs/level, pre-norm) and multi-head cross-attention + FFN instead of the 5³ kernel | capacity where it is used (§6.2, §6.4) | modest |
 | rate–distortion sweep, D ∈ {4, 8, 16, 32} × R* ∈ {2, 8, 16, 32} nats/token on 50 cases (§5.3.7) | confirms `LATENT_DIM = 16` (measured in §5.3.3a) and fixes the rate before the full run; the decision everything in Stage 1 inherits | 16 short runs, local GPU |
 | local-pooling transformer latent head (§4.2, §5.4) | local tokens, better latent, less overfitting | small |
 | normals + template signed distance into the encoder (§4.2) | cheap accuracy | free |
 | densified templates under the sac (§2.3 fix) | fine resolution where the residual lives | regenerate templates |
 | curriculum: radial-only warm-start on the parent, then unlock sac terms | stable convergence against the currently opposing radial Huber | free |
-| 5-fold CV | error bars on every design decision | 5× per config — what the A100s are for |
 
 ---
 
@@ -911,7 +910,7 @@ Topology is now inherited from the template (§6.8): one component, `n_profiles`
 
 ## 12. Evaluation protocol
 
-Held-out folds, millimetre units, non-Huber (the training Chamfer's Huber δ = 1 mm hides the tail that CFD cares about):
+On the held-out cases of the fixed split (§8), millimetre units, non-Huber (the training Chamfer's Huber δ = 1 mm hides the tail that CFD cares about):
 
 - **Global:** symmetric Chamfer mean and p95, Hausdorff, normal-angle error.
 - **Sac-specific** versions of the same, using a sac mask. Two equivalent definitions, both already measurable: template vertices whose outward ray to the GT exceeds 1 mm (304 of 7 909 on SNF00000100), or GT points farther than `r_local + 1 mm` from the centerline. Report both so a model that grows the sac in the wrong place cannot hide in the global Chamfer.
@@ -964,7 +963,7 @@ Earlier scratch probes still relevant: `analyze_stage2_pipeline.py`, `scan_tract
 
 **P2 — training framework and evaluation**
 
-13. Resume; per-epoch logging; EMA 0.99–0.995 with warm-up; LR warm-up; wd exclusions; device via env; augmentation set; curriculum; 5-fold harness on the A100s (§8, §9).
+13. Resume; per-epoch logging; EMA 0.99–0.995 with warm-up; LR warm-up; wd exclusions; device via env; augmentation set; curriculum; one fixed seeded train / validation / test split (§8, §9).
 14. Metrics of §12 and validity checks of §11 in `postprocess.py`; final isotropic remesh step.
 15. Tests of §13.
 
@@ -1061,5 +1060,5 @@ Only code. Everything else in this review is a measurement or a decision.
 28. SplineConv kernel `(5, 5, 2)`; `aggr="mean"`, pre-norm, `root_weight=True`; 6–8 convs per level (§6).
 29. Encoder: normals and template signed distance as inputs; stage-3/4 width down, the parameters given to the latent head; node features `r_local`, curvature, torsion, ostium distance (§4, §6.6).
 30. Augmentation: L/R mirror, θ-phase, ±5° pose jitter (§8).
-31. Batch size above 1 × 8; 5-fold harness on the A100s (§9).
+31. Batch size above 1 × 8; one fixed seeded train / validation / test split (§8).
 32. The tests of §13.
