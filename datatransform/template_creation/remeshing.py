@@ -77,6 +77,7 @@ from vessel_pipeline import (
     clean_triangulate,
     clip_flow_extensions_and_uncap,
     drop_boundary_ear_triangles,
+    drop_disconnected_debris,
     drop_degenerate_triangles,
     drop_tiny_islands,
     extract_boundary_loops,
@@ -200,6 +201,9 @@ def prepare_gt_surface(vessel_mesh, tears_out=None):
     grow a spurious 5 mm tube out of them.
     """
     poly = clean_triangulate(vessel_mesh)
+    # Before anything is measured: a free-floating scrap has a rim too, and the
+    # openings are counted on this surface.
+    poly, _n_debris = drop_disconnected_debris(poly, label="original")
     # Every rim the input actually has, before a single triangle is removed.
     # Everything below can open a hole where it cuts, and the openings are
     # measured after this function returns, so without this the preparation's

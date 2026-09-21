@@ -3130,6 +3130,62 @@ def keep_largest_region(surface):
     return main
 
 
+# A shell this small, floating free of the vessel, is debris. Measured over all
+# 740 inputs, twelve are disconnected and the largest stray shell in any of them
+# is 61 points out of 13071 -- 0.47% -- with every other one at 21 points or
+# fewer. Nothing in the corpus sits anywhere near this line, so it separates
+# debris from a branch without having to guess.
+INPUT_DEBRIS_MAX_FRACTION = 0.02
+
+
+def drop_disconnected_debris(surface, label="original", max_fraction=INPUT_DEBRIS_MAX_FRACTION):
+    """Remove free-floating shells before the openings are counted.
+
+    A shell that touches nothing has a rim, and a rim measured on the detailed
+    original becomes an anatomical ostium that the whole run then tries to keep.
+    UPF_P0194 carries a 61-point scrap whose 0.629 mm loop was counted as its
+    seventh profile; the scrap is dropped by the first clip that runs, because
+    every clip keeps one connected region, and the case failed six against
+    seven every time. It is not an ostium and it cannot be opened, welded or
+    traced -- the only honest thing to do with it is to leave it out of the
+    count.
+
+    A large disconnected shell is a different matter: it could be a second
+    vessel, and dropping it silently would throw away anatomy. That raises.
+    """
+    poly = to_vtk_poly(surface)
+    n_regions = count_connected_regions(poly)
+    if n_regions <= 1:
+        return poly, 0
+    conn = vtk.vtkPolyDataConnectivityFilter()
+    conn.SetInputData(poly)
+    conn.SetExtractionModeToAllRegions()
+    conn.ColorRegionsOn()
+    conn.Update()
+    from vtk.util.numpy_support import vtk_to_numpy
+
+    region_ids = vtk_to_numpy(conn.GetOutput().GetPointData().GetArray("RegionId"))
+    sizes = np.bincount(np.asarray(region_ids, dtype=np.int64), minlength=n_regions)
+    n_total = int(sizes.sum())
+    main = int(np.argmax(sizes))
+    biggest_other = int(np.max(np.delete(sizes, main))) if n_total else 0
+    if n_total > 0 and biggest_other > max_fraction * n_total:
+        raise TemplateQualityError(
+            f"the {label} is in {n_regions} disconnected pieces, the second of them "
+            f"{biggest_other} of {n_total} points ({100.0 * biggest_other / n_total:.1f}%). "
+            "That is too large to treat as debris and nothing downstream can trace or "
+            "clip a second vessel, so it is not dropped quietly."
+        )
+    kept = keep_largest_region(poly)
+    dropped = n_regions - 1
+    print(
+        f"  Dropped {dropped} free-floating shell(s) from the {label} "
+        f"({n_total - kept.GetNumberOfPoints()} of {n_total} points); "
+        "they carry rims but no anatomy"
+    )
+    return kept, dropped
+
+
 def fill_pinholes(surface, hole_size=PINHOLE_HOLE_SIZE_MM):
     filler = vtk.vtkFillHolesFilter()
     filler.SetInputData(to_vtk_poly(surface))
@@ -4202,6 +4258,50 @@ def trim_extension_patches(extended_surface, original_surface, frames):
     return merged, n_trimmed
 
 
+# How much of an ostium's own neighbourhood a clip somewhere else is allowed to
+# take. A clip keeps one connected region, so a cut that severs a branch throws
+# the whole branch away with it -- measured, the ostium on the severed branch
+# keeps 0% of its points while every legitimate clip elsewhere leaves 86-95%.
+# Half is well clear of both.
+CLIP_NEIGHBOUR_KEEP_FRACTION = 0.5
+
+
+def _ostium_neighbourhoods(surface, ostia):
+    """How many mesh points sit inside each ostium's own neighbourhood."""
+    if not ostia:
+        return np.zeros(0, dtype=np.int64)
+    _poly, pts = _poly_points(surface)
+    if pts.size == 0:
+        return np.zeros(len(ostia), dtype=np.int64)
+    from scipy.spatial import cKDTree
+
+    tree = cKDTree(pts)
+    return np.asarray(
+        [len(tree.query_ball_point(origin, radius)) for origin, radius in ostia],
+        dtype=np.int64,
+    )
+
+
+def _clip_took_another_ostium(before, after, mine, ostia):
+    """Which other ostium this clip destroyed, if any.
+
+    Each clip keeps the one connected region holding the body point, so a cut
+    that happens to sever a branch deletes that branch entire -- with its
+    ostium. UPF_P0258's inlet cut took the whole stub carrying the 0.658 mm
+    ostium nine millimetres away and left one 2.76 mm crater where two openings
+    had been, and SNF00000143 keep 1 lost a 0.713 mm ostium the same way. The
+    old radius band could not see it: it allows r_gt + 2.5 mm, which is wider
+    than the crater. What it cannot allow is another ostium's surface going
+    missing, and that is what this asks.
+    """
+    for j in range(len(ostia)):
+        if j == mine or before[j] == 0:
+            continue
+        if after[j] < CLIP_NEIGHBOUR_KEEP_FRACTION * before[j]:
+            return j, float(after[j]) / float(before[j])
+    return None, 0.0
+
+
 def clip_flow_extensions_and_uncap(
     base_surface,
     profiles,
@@ -4234,12 +4334,39 @@ def clip_flow_extensions_and_uncap(
         trimmed = True
     body_pt = mesh_body_point(current)
     n_clipped = 0
+    # Each ostium's own patch of surface, so a clip can be asked whether it took
+    # one of the others with it. The radius is generous on purpose: a clip is
+    # rejected only when a neighbour's surface is gone, not when it is nicked.
+    if frames is not None:
+        ostia = [(np.asarray(o, dtype=np.float64), max(1.0, 2.0 * float(r)))
+                 for o, _n, r in frames]
+    else:
+        ostia = [(np.asarray(p["barycenter"], dtype=np.float64),
+                  max(1.0, 2.0 * float(p["radius"]))) for p in work_profiles]
+    near_before = _ostium_neighbourhoods(current, ostia)
+
+    def _accept(candidate, i, what):
+        """Take the clip unless it took another ostium's surface away."""
+        nonlocal near_before
+        near_after = _ostium_neighbourhoods(candidate, ostia)
+        j, frac = _clip_took_another_ostium(near_before, near_after, i, ostia)
+        if j is not None:
+            print(
+                f"  [Uncap] Profile {work_profiles[i]['index']} {what} rejected: it "
+                f"takes away {100.0 * (1.0 - frac):.0f}% of the surface around the "
+                f"r={0.5 * ostia[j][1]:.3f} mm ostium at {np.round(ostia[j][0], 2)}, "
+                "so it would sever that branch rather than open this end."
+            )
+            return False
+        near_before = near_after
+        return True
+
     for i, profile in enumerate(work_profiles):
         search_mm = float(extension_length) + 3.0 * max(float(profile["radius"]), 0.5)
         ok = False
         if frames is not None:
             origin, outward, radius = frames[i]
-            current, ok = clip_one_opening_pipe_section(
+            candidate, ok = clip_one_opening_pipe_section(
                 current,
                 origin,
                 outward,
@@ -4250,13 +4377,19 @@ def clip_flow_extensions_and_uncap(
                 fast=fast_uncap,
             )
             if ok:
+                ok = _accept(candidate, i, "pipe-section cut")
+            if ok:
+                current = candidate
                 print(
                     f"  [Uncap] Profile {profile['index']} pipe-section cut "
                     f"r={radius:.3f} mm at {np.round(origin, 2)}"
                 )
         if not ok:
-            current, ok = clip_one_profile(current, profile, body_pt, search_mm)
+            candidate, ok = clip_one_profile(current, profile, body_pt, search_mm)
             if ok:
+                ok = _accept(candidate, i, "anatomical plane clip")
+            if ok:
+                current = candidate
                 print(
                     f"  [Uncap] Profile {profile['index']} fell back to anatomical plane clip"
                 )
