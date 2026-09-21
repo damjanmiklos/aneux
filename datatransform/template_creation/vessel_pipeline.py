@@ -12,6 +12,13 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("VTK_NUMBER_OF_THREADS", "1")
+# VTK_NUMBER_OF_THREADS only caps the old vtkMultiThreader. VTK 9 runs its
+# filters on vtkSMPTools, which is built here against TBB and sizes itself
+# from the machine (32 threads), so with 20 workers the partitioning varies
+# with load and the arithmetic comes out slightly differently each time. That
+# is enough to move a cutter radius and flip a verdict: 20 identical runs of
+# p398 split 3 passed / 17 failed. This is the variable that pins the pool.
+os.environ.setdefault("VTK_SMP_MAX_THREADS", "1")
 
 import argparse
 import json
@@ -28,6 +35,11 @@ import pyvista as pv
 import vtk
 from tqdm import tqdm
 from vtk.util.numpy_support import numpy_to_vtk, numpy_to_vtkIdTypeArray, vtk_to_numpy
+
+# The env var above only lands if nothing imported vtk first, and a worker that
+# reaches this module through another import does exactly that. Saying it again
+# here costs nothing and makes the pool size independent of import order.
+vtk.vtkSMPTools.Initialize(1)
 
 try:
     from vmtk import vmtkscripts
@@ -1045,6 +1057,77 @@ def extract_voronoi_centerlines(closed_surface, source_points, target_points):
     return result
 
 
+def drop_degenerate_tracts(centerline, max_edge_mm=10.0, min_length_mm=1.0):
+    """Delete the Voronoi stubs so one bad tract cannot condemn a whole trace.
+
+    vmtkCenterlines writes one polyline per inlet-to-outlet path, and when the
+    descent fails for one outlet it still writes a polyline -- just not a
+    centerline. On p463 the extended trace came back with six tracts of which
+    four are immaculate (450 to 876 points, median step 0.09 to 0.12 mm, no
+    step over 0.69 mm, 64 to 99 mm long) and two are debris: a four-point stub
+    whose last step jumps 96 mm to y=121, far outside the head, and a two-point
+    tract of zero length sitting on the inlet. centerline_looks_valid then
+    rejects the entire trace on its worst step, both candidates are discarded,
+    and the case dies with "Voronoi centerline left the vessel lumen" while four
+    perfectly good tracts are sitting in the object.
+
+    A tract with a step of several centimetres is not a path down a vessel whose
+    own resampling is 0.1 mm, and a tract of zero length is not a path at all.
+    Removing them is a repair of the trace rather than a relaxation of the test:
+    what is left still has to pass centerline_looks_valid on its own merits, and
+    the arrival test still decides which openings were really reached.
+
+    The point arrays come along -- MaximumInscribedSphereRadius lives there and
+    the whole tube is built from it.
+    """
+    poly = to_vtk_poly(centerline)
+    poly.BuildCells()
+    n_cells = int(poly.GetNumberOfCells())
+    keep = []
+    for ci in range(n_cells):
+        cell = poly.GetCell(ci)
+        n = cell.GetNumberOfPoints()
+        if n < 2:
+            continue
+        ids = [int(cell.GetPointId(j)) for j in range(n)]
+        pts = np.array([poly.GetPoint(i) for i in ids], dtype=np.float64)
+        segs = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+        if segs.size == 0:
+            continue
+        if float(segs.max()) > float(max_edge_mm):
+            continue
+        if float(segs.sum()) < float(min_length_mm):
+            continue
+        keep.append(ids)
+    if not keep or len(keep) == n_cells:
+        return centerline, 0
+
+    used = sorted({i for ids in keep for i in ids})
+    remap = {old: new for new, old in enumerate(used)}
+    new_pts = vtk.vtkPoints()
+    for i in used:
+        new_pts.InsertNextPoint(poly.GetPoint(i))
+    lines = vtk.vtkCellArray()
+    for ids in keep:
+        lines.InsertNextCell(len(ids))
+        for i in ids:
+            lines.InsertCellPoint(remap[i])
+    out = vtk.vtkPolyData()
+    out.SetPoints(new_pts)
+    out.SetLines(lines)
+    idx = np.asarray(used, dtype=np.int64)
+    pd_in = poly.GetPointData()
+    for a in range(pd_in.GetNumberOfArrays()):
+        arr = pd_in.GetArray(a)
+        if arr is None:
+            continue
+        vals = vtk_to_numpy(arr)
+        sub = numpy_to_vtk(np.ascontiguousarray(vals[idx]), deep=True)
+        sub.SetName(arr.GetName())
+        out.GetPointData().AddArray(sub)
+    return out, n_cells - len(keep)
+
+
 def centerline_looks_valid(centerline, reference_bounds, max_edge_mm=10.0, pad_mm=15.0):
     """Reject Voronoi spikes that leave the vessel (common on looping siphons)."""
     vtk_cl = to_vtk_poly(centerline)
@@ -1082,6 +1165,29 @@ def centerline_looks_valid(centerline, reference_bounds, max_edge_mm=10.0, pad_m
     if max_edge > max_edge_mm or n_ok < 1 or max_path < 5.0:
         return False
     return True
+
+
+def _rescue_trace(centerline, ref_bounds, label):
+    """Last resort for a trace about to be thrown away: drop its debris tracts.
+
+    Only ever reached by a trace that has already failed centerline_looks_valid,
+    and only kept when what is left passes the test on its own merits.
+
+    Pruning unconditionally is not free, and it cost six cases to find out:
+    applied to every trace it took SNF00000208, both SNF00000259 keeps,
+    UPF_P0171, UPF_P0194 and SNF00000228 -- all of which had produced a surface
+    -- under _centerline_reaches_targets, because a tract that looks like debris
+    by length alone was the only tract reaching some outlet. So the prune runs
+    where the alternative is losing the trace altogether, and nowhere else.
+    """
+    repaired, n_junk = drop_degenerate_tracts(centerline)
+    if not n_junk or not centerline_looks_valid(repaired, ref_bounds):
+        return centerline
+    print(
+        f"  Dropped {n_junk} degenerate tract(s) from the {label} trace, "
+        "which is otherwise discarded entirely"
+    )
+    return repaired
 
 
 def _centerline_reaches_targets(centerline, n_targets):
@@ -1243,9 +1349,7 @@ def extract_centerlines_for_tube(extended_vessel, smoothed_vessel, anatomical_pr
     Counting cells cannot catch that, so it is no longer asked to. Both traces
     are computed and the one covering more anatomy wins. On a healthy vessel
     that costs a second trace and changes nothing -- on C0010 the two agree to a
-    median of 0.015 mm, covering 99.5% and 98.7% of each other -- and the bare
-    trace is the cheap one anyway, seconds against the minutes the extended
-    trace can take.
+    median of 0.015 mm, covering 99.5% and 98.7% of each other.
     """
     ref_bounds = smoothed_vessel.GetBounds()
     source_ext, target_ext = seed_points_from_profiles(extended_profiles)
@@ -1256,6 +1360,8 @@ def extract_centerlines_for_tube(extended_vessel, smoothed_vessel, anatomical_pr
         cap_surface(extended_vessel), source_ext, target_ext, CENTERLINE_TIMEOUT_S,
         label="extended surface",
     )
+    if extended_cl is not None and not centerline_looks_valid(extended_cl, ref_bounds):
+        extended_cl = _rescue_trace(extended_cl, ref_bounds, "extended-surface")
     if extended_cl is not None and centerline_looks_valid(extended_cl, ref_bounds):
         candidates.append(("extended surface", extended_cl, n_targets))
     elif extended_cl is not None:
@@ -1279,6 +1385,8 @@ def extract_centerlines_for_tube(extended_vessel, smoothed_vessel, anatomical_pr
             closed_anat, source_anat, target_anat, CENTERLINE_TIMEOUT_S,
             label="un-extended vessel",
         )
+        if bare_cl is not None and not centerline_looks_valid(bare_cl, ref_bounds):
+            bare_cl = _rescue_trace(bare_cl, ref_bounds, "bare-vessel")
         if bare_cl is not None and centerline_looks_valid(bare_cl, ref_bounds):
             candidates.append(("bare vessel", bare_cl, len(target_anat)))
         elif bare_cl is not None:
@@ -1775,6 +1883,228 @@ def force_manifold_triangles(surface, max_passes=6):
     return out, n_dropped
 
 
+def _unpinch_split(points, faces, cand, nbr, apex, floor):
+    """Split one edge per pinch so the fold becomes legal on the next sweep.
+
+    A short edge whose endpoints share a neighbour that is not one of its own
+    apexes cannot be folded -- the fold would weld two sheets together along
+    that neighbour -- so collapse_tiny_edges refuses it and the edge survives to
+    the quality gate. That is what is left of p305 keep 3: welding on the way
+    into finalize_surface takes it from 3.3e-05 to 7.6e-05 mm, but 16 of its 28
+    short edges arrive from the remesher already pinched, and no amount of
+    welding moves them.
+
+    Splitting the edge that runs from an endpoint to the offending neighbour
+    inserts a vertex at the midpoint of a segment that is already part of the
+    surface, so the geometry does not move at all, and it removes the adjacency
+    that made the fold illegal. The next sweep then collapses the short edge the
+    ordinary way, link condition satisfied on its merits.
+
+    Only edges comfortably longer than the floor are split, so a split can never
+    manufacture a new degenerate edge, and no triangle is given two splits,
+    which keeps the retriangulation to the one-in-two-out case. Whatever is left
+    over is picked up on a later sweep.
+    """
+    edge_faces = {}
+    for fi, (a, b, c) in enumerate(faces):
+        for x, y in ((a, b), (b, c), (c, a)):
+            k = (int(x), int(y)) if x <= y else (int(y), int(x))
+            edge_faces.setdefault(k, []).append(fi)
+
+    used_faces = set()
+    targets = []
+    seen = set()
+    for e in cand:
+        u, v = int(e[0]), int(e[1])
+        key = (min(u, v), max(u, v))
+        if key in seen:
+            continue
+        seen.add(key)
+        extra = (nbr[u] & nbr[v]) - apex.get(key, set())
+        for w in sorted(int(x) for x in extra):
+            opts = []
+            for a in (u, v):
+                k = (min(a, w), max(a, w))
+                opts.append((float(np.linalg.norm(points[a] - points[w])), k))
+            opts.sort(reverse=True)
+            d, k = opts[0]
+            if d <= 4.0 * float(floor):
+                continue
+            fs = edge_faces.get(k, [])
+            if not fs or any(f in used_faces for f in fs):
+                continue
+            used_faces.update(fs)
+            targets.append(k)
+    if not targets:
+        return None
+
+    pts = [points[i] for i in range(len(points))]
+    mid = {}
+    for k in targets:
+        mid[k] = len(pts)
+        pts.append(0.5 * (points[k[0]] + points[k[1]]))
+
+    out = []
+    for a, b, c in faces:
+        tri = (int(a), int(b), int(c))
+        hit = None
+        for i in range(3):
+            x, y = tri[i], tri[(i + 1) % 3]
+            k = (min(x, y), max(x, y))
+            if k in mid:
+                hit = (i, k)
+                break
+        if hit is None:
+            out.append(tri)
+            continue
+        i, k = hit
+        x, y, z = tri[i], tri[(i + 1) % 3], tri[(i + 2) % 3]
+        m = mid[k]
+        out.append((x, m, z))
+        out.append((m, y, z))
+    return np.asarray(pts, dtype=np.float64), np.asarray(out, dtype=np.int64)
+
+
+def _boundary_loop_count(faces):
+    """How many separate rims the triangle soup has."""
+    usage = {}
+    for a, b, c in faces:
+        for x, y in ((int(a), int(b)), (int(b), int(c)), (int(c), int(a))):
+            k = (x, y) if x <= y else (y, x)
+            usage[k] = usage.get(k, 0) + 1
+    rim = [k for k, n in usage.items() if n == 1]
+    if not rim:
+        return 0
+    parent = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for a, b in rim:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+    return len({find(x) for x in parent})
+
+
+def _faces_are_clean(faces):
+    """No triangle repeated and no edge carrying more than two triangles."""
+    seen = set()
+    usage = {}
+    for a, b, c in faces:
+        tri = (int(a), int(b), int(c))
+        key = tuple(sorted(tri))
+        if key in seen:
+            return False
+        seen.add(key)
+        for x, y in ((tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])):
+            k = (x, y) if x <= y else (y, x)
+            usage[k] = usage.get(k, 0) + 1
+            if usage[k] > 2:
+                return False
+    return True
+
+
+def _collapse_micro_clusters(points, faces, floor):
+    """Merge a blob of near-coincident vertices in one go.
+
+    The pairwise link condition cannot clear these, and neither can a split.
+    p305 keep 3 comes to rest on six vertices -- 2150, 2151, 2152, 7256, 8645
+    and 8646 -- inside a blob about a micron across, where every pair is joined
+    by an edge under the floor and every pair shares the rest of the blob as
+    neighbours. Every fold is therefore a pinch by the pairwise test, and every
+    edge that might be split to break the pinch is itself under the floor, so
+    there is nothing to split either. That blob is not two sheets touching at a
+    point; it is one vertex the remesher wrote six times.
+
+    So the whole component of the short-edge graph is merged as a unit, onto its
+    own centroid, which moves the surface by less than the blob is wide. The
+    result is checked rather than predicted: a merge that produces a repeated
+    triangle or an edge with three faces is reverted and that blob is left
+    alone, so the sheet-fusion the link condition exists to prevent still cannot
+    happen. Components are tried one at a time, so one bad blob does not cost
+    the good ones.
+    """
+    ev = np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
+    length = np.linalg.norm(points[ev[:, 0]] - points[ev[:, 1]], axis=1)
+    short = ev[length < float(floor)]
+    if not len(short):
+        return None
+
+    parent = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for u, v in short:
+        u, v = int(u), int(v)
+        ru, rv = find(u), find(v)
+        if ru != rv:
+            parent[ru] = rv
+
+    groups = {}
+    for x in list(parent):
+        groups.setdefault(find(x), []).append(x)
+    comps = [sorted(g) for g in groups.values() if len(g) > 1]
+    if not comps:
+        return None
+    comps.sort(key=len, reverse=True)
+
+    pts = np.array(points, dtype=np.float64, copy=True)
+    remap = np.arange(len(points))
+    rims_before = _boundary_loop_count(faces)
+    merged = 0
+    for comp in comps:
+        trial = remap.copy()
+        rep = comp[0]
+        for x in comp:
+            trial[x] = rep
+        kept = trial[faces]
+        alive = (
+            (kept[:, 0] != kept[:, 1])
+            & (kept[:, 1] != kept[:, 2])
+            & (kept[:, 2] != kept[:, 0])
+        )
+        if not alive.any():
+            continue
+        if not _faces_are_clean(kept[alive]):
+            continue
+        # An opening must survive the merge. _faces_are_clean does not see this:
+        # pulling a narrow rim into a single point leaves no repeated triangle
+        # and no three-faced edge, it just quietly drops the degenerate faces
+        # and seals the hole. p398 keep 2 lost its 0.53 mm opening exactly that
+        # way, coming out with 7 against 8 anatomical profiles. Openings are the
+        # point of the dataset, so a merge that changes the number of rims is
+        # refused however tidy the triangles look afterwards.
+        if _boundary_loop_count(kept[alive]) != rims_before:
+            continue
+        remap = trial
+        pts[rep] = points[comp].mean(axis=0)
+        merged += 1
+
+    if not merged:
+        return None
+    kept = remap[faces]
+    alive = (
+        (kept[:, 0] != kept[:, 1])
+        & (kept[:, 1] != kept[:, 2])
+        & (kept[:, 2] != kept[:, 0])
+    )
+    kept = kept[alive]
+    if not len(kept):
+        return None
+    used, compact = np.unique(kept, return_inverse=True)
+    return pts[used], compact.reshape(kept.shape)
+
+
 def collapse_tiny_edges(surface, floor=WELD_TOLERANCE_MM, max_sweeps=WELD_MAX_SWEEPS):
     """Collapse edges shorter than ``floor`` without ever fusing two sheets.
 
@@ -1832,7 +2162,14 @@ def collapse_tiny_edges(surface, floor=WELD_TOLERANCE_MM, max_sweeps=WELD_MAX_SW
             blocked.update({u, v})
             blocked |= nbr[u] | nbr[v]
         if not chosen:
-            return poly
+            # Every short edge left is pinched. Break the pinch and retry.
+            split = _unpinch_split(points, faces, cand, nbr, apex, floor)
+            if split is None:
+                split = _collapse_micro_clusters(points, faces, floor)
+            if split is None:
+                return poly
+            poly = _polydata_from_triangles(split[0], split[1])
+            continue
 
         remap = np.arange(len(points))
         for u, v in chosen:
@@ -3931,6 +4268,104 @@ def _orient_along_radial(points, vectors, cl_points):
     return np.ascontiguousarray(oriented, dtype=np.float64), True
 
 
+# A ray that finds nothing writes the same 0.0 as a template already sitting on
+# the GT, and 0.0 travels downstream as "no stretch here, do not refine" --
+# build_target_edge_array turns it into k = 1, the coarsest edge the local
+# radius allows. So the one place the template deviates most from the GT is the
+# one place guaranteed to get the fewest triangles. It is not a rare corner:
+# measured over 35 cases, every single one carried points like this, a median of
+# 18 per case more than 0.3 mm off the GT, and on p131 one sits 6.5 mm off and
+# is recorded as zero.
+#
+# What makes an outward ray find nothing is the tube poking OUTSIDE the GT --
+# the ray then travels away from the surface it is looking for and runs to the
+# 25 mm cap. The other silent zeroes are the hit landing past 3.5 R or the GT
+# normal disagreeing.
+#
+# A zero that is honest is always backed by a hit within 0.10 mm outward or
+# 0.40 mm inward, so a true distance past 0.40 mm can only mean the cast gave
+# up, and the true distance is the answer it should have had. Points are pruned
+# against the nearest GT *vertex* first, which is never nearer than the GT
+# surface, so the exact query only runs for the handful that survive.
+STRETCH_HONEST_ZERO_MM = 0.40
+
+
+def _rescue_missed_rays(distances, locator, template_pts, r_arr,
+                        gt_cell_normals=None, gt_oriented=False, report=True):
+    """Give the points whose ray missed their true distance instead of zero.
+
+    Only points the GT encloses are recovered. StretchDistance is signed in
+    everything downstream -- train_pipeline builds r* = r_local +
+    StretchDistance -- so writing the unsigned gap for a template point that
+    sits OUTSIDE the GT puts r* wrong by twice its depth and teaches the
+    decoder to push further out exactly where the tube already bulges through.
+    Those points keep the honest 0.0: the GT is not outward of them at all.
+
+    Measured, the outside patches are a thin skin and not the blow-out they
+    could have been -- median depth 0.06-0.08 mm, deepest 0.51 mm across four
+    cases -- so most sit under the rescue threshold regardless: 11 of the 47
+    rescued points on ANSYS_UNIGE_09, none at all on p131, p414 or SNF00000267.
+
+    The side test needs normals that really do point outward, which is what
+    _orient_along_radial returns; without them the side is unknowable, so the
+    rescue stands down rather than guess.
+    """
+    sign_ok = gt_oriented and gt_cell_normals is not None
+    zero = np.flatnonzero(distances <= 0.0)
+    if zero.size == 0:
+        return distances
+    gt = locator.GetDataSet()
+    gt_pts = np.ascontiguousarray(vtk_to_numpy(gt.GetPoints().GetData()), dtype=np.float64)
+    if gt_pts.shape[0] == 0:
+        return distances
+    from scipy.spatial import cKDTree
+
+    near_vertex = cKDTree(gt_pts).query(template_pts[zero])[0]
+    suspect = zero[near_vertex > STRETCH_HONEST_ZERO_MM]
+    if suspect.size == 0:
+        return distances
+
+    closest = [0.0, 0.0, 0.0]
+    cell_id = vtk.mutable(0)
+    sub_id = vtk.mutable(0)
+    d2 = vtk.mutable(0.0)
+    true_d = np.empty(suspect.size, dtype=np.float64)
+    inside = np.ones(suspect.size, dtype=bool)
+    for k, i in enumerate(suspect):
+        p = template_pts[i]
+        locator.FindClosestPoint((float(p[0]), float(p[1]), float(p[2])),
+                                 closest, cell_id, sub_id, d2)
+        true_d[k] = float(np.sqrt(max(float(d2.get()), 0.0)))
+        if sign_ok:
+            c = int(cell_id.get())
+            if 0 <= c < gt_cell_normals.shape[0]:
+                nz = gt_cell_normals[c]
+                inside[k] = (
+                    (float(p[0]) - closest[0]) * nz[0]
+                    + (float(p[1]) - closest[1]) * nz[1]
+                    + (float(p[2]) - closest[2]) * nz[2]
+                ) <= 0.0
+    outside_left = int(np.sum((true_d > STRETCH_HONEST_ZERO_MM) & ~inside))
+    keep = (true_d > STRETCH_HONEST_ZERO_MM) & inside
+    if not np.any(keep):
+        return distances
+    idx = suspect[keep]
+    # Clamped to the same 3.5 R ceiling the ray path uses, so a stray patch of
+    # tube cannot demand a twentyfold refinement of a region that is mostly the
+    # tube's own fault.
+    ceiling = 3.5 * (np.ones(idx.size) if r_arr is None else r_arr[idx])
+    distances[idx] = np.minimum(true_d[keep], ceiling)
+    if report:
+        print(
+            f"  Raycast: {idx.size} point(s) whose ray found no GT within "
+            f"{STRETCH_HONEST_ZERO_MM:.2f} mm recovered by closest-point "
+            f"(max {float(true_d[keep].max()):.3f} mm, "
+            f"{int(np.sum(true_d[keep] > ceiling))} clamped at 3.5 R, "
+            f"{outside_left} left at zero as outside the GT)"
+        )
+    return distances
+
+
 def compute_raycast_stretch_distances(
     template_mesh,
     ground_truth_mesh,
@@ -4015,9 +4450,10 @@ def compute_raycast_stretch_distances(
         and (gt_cell_normals is None or gt_radially_oriented)
         and _stretch_raycast_c is not None
     )
+    distances = None
     if use_c:
         try:
-            return np.asarray(
+            distances = np.asarray(
                 _stretch_raycast_c(
                     _vtk_c_address(locator, "vtkCellLocator"),
                     template_pts,
@@ -4031,6 +4467,11 @@ def compute_raycast_stretch_distances(
             )
         except Exception as exc:
             print(f"  WARNING: compiled raycast failed ({exc}); using Python loop")
+
+    if distances is not None:
+        return _rescue_missed_rays(
+            distances, locator, template_pts, r_arr, gt_cell_normals, gt_radially_oriented
+        )
 
     distances = np.zeros(n_pts, dtype=np.float64)
     t = vtk.mutable(0.0)
@@ -4068,7 +4509,9 @@ def compute_raycast_stretch_distances(
                         distances[i] = d
                 else:
                     distances[i] = d
-    return distances
+    return _rescue_missed_rays(
+        distances, locator, template_pts, r_arr, gt_cell_normals, gt_radially_oriented
+    )
 
 
 def build_target_edge_array(template_mesh, distances, r_template, base_edge=0.50, min_edge=0.01):
@@ -4103,11 +4546,49 @@ def remesh_surface_adaptively(
     return to_vtk_poly(remesher.Surface)
 
 
+# Angle-based edge collapse is what tears these surfaces, so it is switched off.
+#
+# vtkvmtkPolyDataSurfaceRemeshing collapses a triangle whose smallest angle
+# falls under this threshold, in radians; the VTK class defaults to 0.5 and the
+# vmtk wrapper lowers it to 0.2, which is what this pipeline has been running.
+# What it does on a vessel is open slits -- the collapse takes a sliver out and
+# leaves a hole -- which the remesher then stitches shut with a fan of enormous
+# triangles hung off one distant vertex. That fan is precisely what the hub gate
+# rejects, and it is also where essentially all of the area drift lives: on p305
+# the output came out 974.04 mm^2 against an input of 848.88, and 95.7% of that
+# 125 mm^2 excess sat in the 383 triangles above five times the median area.
+#
+# Setting it to 0 stops the angle collapse and leaves the length-driven collapse
+# and split alone. Measured against the default on the two captured failures,
+# same surfaces, same iterations:
+#
+#                        fan reach     area      edge CV   oversized   non-manifold
+#   p305       0.2          35.14     1.1474      0.935        383          10
+#              0.0           0.00     0.9961      0.155          0           0
+#   SNF208     0.2          29.53     0.9964      0.798        108          12
+#              0.0           0.87     0.9714      0.275          0           0
+#
+# Every one of the four knobs the pipeline had never set was swept across five
+# values each on p305, and nothing else came within 16 of the gate; this is the
+# only setting that produced a mesh worth shipping, and it runs faster (44 s
+# against 72 s on SNF208) because the remesher stops undoing its own work.
+#
+# It is still not free, so it is a rescue and not the default. On UPF_P0048,
+# which converges perfectly well as things stand, turning the angle collapse off
+# moves the edge-length CV from 0.129 to 0.144 -- a small loss of exactly the
+# uniformity this dataset exists to provide. So the sweep below keeps vmtk's
+# 0.2 for the first attempt, and a surface that already converges is remeshed
+# byte for byte as before.
+REMESH_COLLAPSE_ANGLE = 0.2
+REMESH_COLLAPSE_ANGLE_OFF = 0.0
+
+
 def remesh_surface_isotropically(
     open_surface,
     target_edge_length=0.5,
     n_iter=REMESH_N_ITER,
     connectivity_iter=REMESH_CONNECTIVITY_ITER,
+    collapse_angle=REMESH_COLLAPSE_ANGLE,
 ):
     remesher = vmtkscripts.vmtkSurfaceRemeshing()
     remesher.Surface = to_vtk_poly(open_surface)
@@ -4129,6 +4610,7 @@ def remesh_surface_isotropically(
     # `remesher.MinArea = 0.25 * 3.0**0.5 * REMESH_MIN_EDGE_MM**2`, and it
     # should be measured before it is trusted -- a nonzero MinArea gives the
     # remesher licence to collapse triangles, which is not free.
+    remesher.CollapseAngleThreshold = float(collapse_angle)
     remesher.Execute()
     return to_vtk_poly(remesher.Surface)
 
@@ -4321,22 +4803,53 @@ def remesh_surface_verified(
     # worth having: the sweep that rescues p097 and p379 lands them at CV 0.119
     # and 0.133, where dropping to 4 iterations gives a coarse one. Iterations
     # come off only when no tolerance in the sweep worked.
-    attempts = [(frac, n_iter, connectivity_iter) for frac in REMESH_WELD_FRACTIONS]
-    attempts += [
-        (frac, iters, conn)
-        for iters, conn in REMESH_ITER_FALLBACKS
-        if iters < n_iter
-        for frac in REMESH_WELD_FRACTIONS
-    ]
+    #
+    # Turning the angle collapse off comes second, before any welding, because
+    # welding removes geometry to buy convergence and switching off an operation
+    # that was tearing the surface does not: see REMESH_COLLAPSE_ANGLE for what
+    # it does to the two failures measured. The weld sweep then runs with the
+    # collapse off, since that is the better-behaved remesher, and only after
+    # that does it go back to vmtk's 0.2.
+    def _ladder(iters, conn):
+        """Unwelded with the angle collapse on, then off, then the weld fractions.
+
+        The rescue sits second on purpose. Putting it last instead -- running
+        every collapse-on weld fraction to exhaustion first -- was tried on the
+        56-case set and is worse: p551 keep 2 then takes a collapse-on attempt
+        that passes the gates with a far poorer surface, CV 0.469 against 0.179,
+        fan reach 8.52 against 0.75, 76 oversized triangles against none, and a
+        spurious seventh opening that fails the count. The ladder returns the
+        first attempt that clears the gates, so an attempt that merely clears
+        them preempts one that clears them comfortably.
+
+        That reordering was made to protect UPF_P0194, on the belief that the
+        rescue had cost it an opening. It had not: UPF_P0194 comes out 6 against
+        7 with the rescue early, with it late, and in the run before the rescue
+        existed. Its 7-opening surface in cleandata predates all of this and the
+        cause is elsewhere.
+        """
+        off, on = REMESH_COLLAPSE_ANGLE_OFF, REMESH_COLLAPSE_ANGLE
+        first, rest = REMESH_WELD_FRACTIONS[0], REMESH_WELD_FRACTIONS[1:]
+        return (
+            [(first, iters, conn, on), (first, iters, conn, off)]
+            + [(f, iters, conn, off) for f in rest]
+            + [(f, iters, conn, on) for f in rest]
+        )
+
+    attempts = _ladder(n_iter, connectivity_iter)
+    for iters, conn in REMESH_ITER_FALLBACKS:
+        if iters < n_iter:
+            attempts += _ladder(iters, conn)
 
     best = None
-    for fraction, iters, conn in attempts:
+    for fraction, iters, conn, collapse in attempts:
         welded = weld_to_edge_fraction(open_surface, fraction)
         out = remesh_surface_isotropically(
             welded,
             target_edge_length=target_edge_length,
             n_iter=iters,
             connectivity_iter=conn,
+            collapse_angle=collapse,
         )
         # Scored against the surface handed in, never against the welded one, so
         # a tolerance that ate geometry cannot hide the loss.
@@ -4347,15 +4860,20 @@ def remesh_surface_verified(
         # failure message means the one that came nearest to being usable.
         score = (abs(drift - 1.0), hub)
         if best is None or score < best[0]:
-            best = (score, out, drift, hub, fraction, iters, conn)
+            best = (score, out, drift, hub, fraction, iters, conn, collapse)
         if drift <= REMESH_MAX_AREA_DRIFT and hub <= REMESH_MAX_HUB_RING_EDGES:
-            if fraction > 0 or iters != n_iter:
-                how = f"welding at {fraction:.2f} of the mean edge"
+            if fraction > 0 or iters != n_iter or collapse != REMESH_COLLAPSE_ANGLE:
+                how = []
+                if collapse != REMESH_COLLAPSE_ANGLE:
+                    how.append("switching the angle collapse off")
+                if fraction > 0:
+                    how.append(f"welding at {fraction:.2f} of the mean edge")
                 if iters != n_iter:
-                    how += f" and backing off to {iters} iterations"
+                    how.append(f"backing off to {iters} iterations")
                 print(
-                    f"  NOTE: remesh diverged on the {label} as configured; {how} "
-                    f"held it ({drift:.3f}x, widest fan {hub:.1f} edges)"
+                    f"  NOTE: remesh diverged on the {label} as configured; "
+                    + " and ".join(how)
+                    + f" held it ({drift:.3f}x, widest fan {hub:.1f} edges)"
                 )
             return out
         why = []
@@ -4364,15 +4882,17 @@ def remesh_surface_verified(
         if hub > REMESH_MAX_HUB_RING_EDGES:
             why.append(f"a triangle fan reaching {hub:.1f} mean edges")
         print(
-            f"  WARNING: remesh at weld {fraction:.2f}, {iters} iterations left "
-            f"the {label} with " + " and ".join(why)
+            f"  WARNING: remesh at weld {fraction:.2f}, {iters} iterations, "
+            f"collapse angle {collapse:.2f} left the {label} with "
+            + " and ".join(why)
         )
-    _score, out, drift, hub, fraction, iters, conn = best
+    _score, out, drift, hub, fraction, iters, conn, collapse = best
     raise TemplateQualityError(
         f"isotropic remesh did not converge on the {label}: the closest attempt "
-        f"(weld {fraction:.2f} of the mean edge, {iters} iterations) still changed "
-        f"the area {drift:.2f}x and left a triangle fan reaching {hub:.1f} mean "
-        f"edges. This is a remesher failure, not a clipping one."
+        f"(weld {fraction:.2f} of the mean edge, {iters} iterations, collapse "
+        f"angle {collapse:.2f}) still changed the area {drift:.2f}x and left a "
+        f"triangle fan reaching {hub:.1f} mean edges. This is a remesher "
+        f"failure, not a clipping one."
     )
 
 
@@ -4500,7 +5020,17 @@ def finalize_surface(surface, profiles=None, max_passes=6):
     interactions can cycle instead of settling, so the loop also stops when a
     state repeats and returns the best surface it saw rather than the last one.
     """
-    cleaned = clean_triangulate(surface)
+    # Fold the sub-micron edges before anything stitches around them. The weld
+    # already ran, but at the end of every pass, which is too late: p469 arrived
+    # here with 19 edges under the floor and every one of them satisfied the
+    # link condition, yet two survived to the quality gate at 3.6e-07 mm. They
+    # survived because the manifold repair and the pinhole closer run first and
+    # hang new vertices off those edges -- the two that were left shared 93671
+    # and 93672, created during the repair -- and an edge whose endpoints share
+    # a neighbour that is not its apex is a pinch, which collapse_tiny_edges
+    # must refuse or it would fuse two sheets. Welding on the way in means the
+    # repairs never meet the degenerate edge at all.
+    cleaned = collapse_tiny_edges(clean_triangulate(surface))
     n_regions = count_connected_regions(cleaned)
     best = cleaned
     best_regions = n_regions
@@ -4847,7 +5377,15 @@ def process_variable_dataset(
         + ", ".join(f"r={op['radius']:.3f}mm n={op['n_points']}" for op in remesh_openings)
     )
 
-    final_surface, _n_regions = finalize_surface(remeshed_surface)
+    # The profiles have to go in. Without them _loop_at_a_profile answers
+    # False for every loop and finalize_surface falls back to pure geometry,
+    # which on this dataset is the wrong judge: a real ostium here can be
+    # smaller than a leftover rim, so an opening narrower than
+    # MIN_OPENING_RADIUS_MM gets sealed as if it were a pinhole. The GT path
+    # in remeshing.py has always passed them; these calls had not.
+    final_surface, _n_regions = finalize_surface(
+        remeshed_surface, profiles=anatomical_profiles
+    )
     assert_template_scale(final_surface, vessel_mesh, context=dataset_id)
     openings = assert_template_quality(final_surface, context=dataset_id)
 
@@ -4903,7 +5441,15 @@ def process_uniform_dataset(
     )
     print(f"  -> Remeshed surface points: {remeshed_surface.GetNumberOfPoints()}")
 
-    final_surface, _n_regions = finalize_surface(remeshed_surface)
+    # The profiles have to go in. Without them _loop_at_a_profile answers
+    # False for every loop and finalize_surface falls back to pure geometry,
+    # which on this dataset is the wrong judge: a real ostium here can be
+    # smaller than a leftover rim, so an opening narrower than
+    # MIN_OPENING_RADIUS_MM gets sealed as if it were a pinhole. The GT path
+    # in remeshing.py has always passed them; these calls had not.
+    final_surface, _n_regions = finalize_surface(
+        remeshed_surface, profiles=anatomical_profiles
+    )
     assert_template_scale(final_surface, vessel_mesh, context=dataset_id)
     openings = assert_template_quality(final_surface, context=dataset_id)
 

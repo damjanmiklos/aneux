@@ -17,6 +17,13 @@ os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["VTK_NUMBER_OF_THREADS"] = "1"
+# VTK_NUMBER_OF_THREADS only caps the old vtkMultiThreader. VTK 9 runs its
+# filters on vtkSMPTools, which is built here against TBB and sizes itself
+# from the machine (32 threads), so with 20 workers the partitioning varies
+# with load and the arithmetic comes out slightly differently each time. That
+# is enough to move a cutter radius and flip a verdict: 20 identical runs of
+# p398 split 3 passed / 17 failed. This is the variable that pins the pool.
+os.environ["VTK_SMP_MAX_THREADS"] = "1"
 
 import argparse
 

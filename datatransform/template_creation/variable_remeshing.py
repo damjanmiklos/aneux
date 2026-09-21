@@ -16,6 +16,13 @@ os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["VTK_NUMBER_OF_THREADS"] = "1"
+# VTK_NUMBER_OF_THREADS only caps the old vtkMultiThreader. VTK 9 runs its
+# filters on vtkSMPTools, which is built here against TBB and sizes itself
+# from the machine (32 threads), so with 20 workers the partitioning varies
+# with load and the arithmetic comes out slightly differently each time. That
+# is enough to move a cutter radius and flip a verdict: 20 identical runs of
+# p398 split 3 passed / 17 failed. This is the variable that pins the pool.
+os.environ["VTK_SMP_MAX_THREADS"] = "1"
 
 import argparse
 import inspect
@@ -181,6 +188,17 @@ def resolve_cut_frames(
     return None, None
 
 
+# How far a GT frame may sit from the template opening it is matched to before
+# the match stops being believable. The Hungarian assignment always returns a
+# pairing -- it has no notion of "no match" -- so without a distance test a
+# frame belonging to a different ostium is accepted in silence and the template
+# is clipped on the wrong plane. The two are the same opening seen on two
+# surfaces, so they should sit within a radius of each other; this allows three,
+# and says so when it has to stretch that far.
+CUT_FRAME_MATCH_RADII = 3.0
+CUT_FRAME_MATCH_FLOOR_MM = 1.0
+
+
 def align_cut_frames_to_profiles(cut_frames, profiles):
     """One frame per profile (Hungarian on origin distance). K ostia, not vertices."""
     frames = normalize_cut_frames(cut_frames)
@@ -195,13 +213,16 @@ def align_cut_frames_to_profiles(cut_frames, profiles):
     dist = np.linalg.norm(bary[:, None, :] - origins[None, :, :], axis=2)
     rows, cols = linear_sum_assignment(dist)
     assigned = {int(r): frames[int(c)] for r, c in zip(rows, cols)}
+    picked = {int(r): float(dist[int(r), int(c)]) for r, c in zip(rows, cols)}
     ordered = []
     reused = 0
     for i in range(len(profiles)):
         if i in assigned:
             ordered.append(assigned[i])
         else:
-            ordered.append(frames[int(np.argmin(dist[i]))])
+            j = int(np.argmin(dist[i]))
+            ordered.append(frames[j])
+            picked[i] = float(dist[i, j])
             reused += 1
     if reused:
         print(
@@ -211,6 +232,22 @@ def align_cut_frames_to_profiles(cut_frames, profiles):
     leftover = len(frames) - min(len(frames), len(profiles))
     if leftover > 0:
         print(f"  WARNING: {leftover} GT ostium frame(s) unmatched to template profiles")
+
+    far = []
+    for i, d in sorted(picked.items()):
+        r = float(profiles[i].get("radius", 0.0) or 0.0)
+        limit = max(CUT_FRAME_MATCH_RADII * r, CUT_FRAME_MATCH_FLOOR_MM)
+        if d > limit:
+            far.append((i, d, r, limit))
+    if far:
+        worst = max(far, key=lambda t: t[1] / t[3])
+        print(
+            f"  WARNING: {len(far)} of {len(profiles)} ostium frame(s) matched to a "
+            f"template opening further away than {CUT_FRAME_MATCH_RADII:.0f} opening "
+            f"radii; worst is opening {worst[0]} at {worst[1]:.3f} mm against a "
+            f"radius of {worst[2]:.3f} mm. The template will be clipped on those "
+            "planes, so check the ostium frames before trusting this case."
+        )
     return ordered
 
 
@@ -534,8 +571,19 @@ def process_variable_dataset(
     print("Step 8a: Computing local tube radius and raycasting stretch vs ground truth...")
     t_ray = time.perf_counter()
     r_template = compute_template_local_radii(open_base_surface, branched_centerline)
+    # The centerline has to go in. Without it the ray direction falls back to
+    # -unit_n, and vtkPolyDataNormals with AutoOrientNormalsOff cannot promise
+    # which way that points on an open surface; with it, every direction is
+    # oriented by the sign of n . (x - nearest centerline vertex), which is
+    # outward by construction. It also gates the compiled loop, which refuses
+    # to run unless both the template and the GT normals were radially
+    # oriented. vessel_pipeline's own variable path has always passed it -- this
+    # call was the one that did not.
     stretch_distances = compute_raycast_stretch_distances(
-        open_base_surface, vessel_mesh, r_template=r_template
+        open_base_surface,
+        vessel_mesh,
+        r_template=r_template,
+        centerline=branched_centerline,
     )
     print(f"  [t] radii+raycast {time.perf_counter() - t_ray:.2f}s")
     min_edge = REMESH_MIN_EDGE_MM
@@ -605,7 +653,15 @@ def process_variable_dataset(
     else:
         print("  Item 13: VMTK interpolated R_template / StretchDistance / TargetEdgeLength")
 
-    final_surface, _n_regions = finalize_surface(remeshed_surface)
+    # The profiles have to go in. Without them _loop_at_a_profile answers
+    # False for every loop and finalize_surface falls back to pure geometry,
+    # which on this dataset is the wrong judge: a real ostium here can be
+    # smaller than a leftover rim, so an opening narrower than
+    # MIN_OPENING_RADIUS_MM gets sealed as if it were a pinhole. The GT path
+    # in remeshing.py has always passed them; these calls had not.
+    final_surface, _n_regions = finalize_surface(
+        remeshed_surface, profiles=anatomical_profiles
+    )
     final_surface = restore_template_supervision(final_surface, snap_pts, snap_arrays)
     t_xfer_s = time.perf_counter() - t_xfer
     print(
