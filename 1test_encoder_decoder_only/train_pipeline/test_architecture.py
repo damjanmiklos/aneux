@@ -1426,17 +1426,32 @@ def test_persist_if_remote_skips_same_path():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_geco_beta_not_clipped_to_zero_at_epoch_one():
+    import config as cfg
+    from losses import geco_beta_max_for_epoch, update_geco_beta
+
+    hi1 = geco_beta_max_for_epoch(1, beta_max=10.0, warmup_epochs=20)
+    _assert(hi1 >= cfg.GECO_BETA_MIN, hi1)
+    _assert(abs(hi1 - cfg.GECO_BETA_INIT) < 1e-9, hi1)
+    hi20 = geco_beta_max_for_epoch(20, beta_max=10.0, warmup_epochs=20)
+    _assert(abs(hi20 - 10.0) < 1e-9, hi20)
+    # KL below R* shrinks β slightly; a zero ceiling used to force β=0.
+    b = update_geco_beta(1.0, kl_mean_raw=5.45, epoch=1, warmup_epochs=20)
+    _assert(float(b) >= cfg.GECO_BETA_MIN, b)
+    _assert(0.5 < float(b) <= hi1 + 1e-12, (b, hi1))
+
+
 def test_scale_hpc_workers_follows_gpus():
     from hpc_runtime import scale_hpc_workers
 
     full = scale_hpc_workers(n_gpu=4, n_cpu=64)
     _assert(full["num_workers"] == 15, full)
-    _assert(full["cache_build_workers"] == 48, full)
+    _assert(full["cache_build_workers"] == 63, full)
     _assert(full["cpus_per_gpu"] == 16, full)
 
     one = scale_hpc_workers(n_gpu=1, n_cpu=16)
     _assert(one["num_workers"] == 15, one)
-    _assert(one["cache_build_workers"] == 12, one)
+    _assert(one["cache_build_workers"] == 15, one)
 
     tiny = scale_hpc_workers(n_gpu=1, n_cpu=1)
     _assert(tiny["num_workers"] == 0, tiny)
@@ -2116,6 +2131,7 @@ def main():
         test_dir_has_vtp_nested_cleandata_layout,
         test_destroy_distributed_without_process_group,
         test_persist_if_remote_skips_same_path,
+        test_geco_beta_not_clipped_to_zero_at_epoch_one,
         test_scale_hpc_workers_follows_gpus,
         test_resource_monitor_snapshots_on_this_os,
         test_add_meter_accepts_fold_and_stretch,

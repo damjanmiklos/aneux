@@ -131,14 +131,14 @@ def scale_hpc_workers(n_gpu=None, n_cpu=None):
 
     Komondor GPU nodes are 64 cores / 4 A100s, so 1 GPU comes with 16 cores.
     One core per rank is left for the trainer. Cache warmup is rank-0 only and
-    may use three quarters of the allocated cores. Env overrides
+    uses all but one allocated core (GPU is idle). Env overrides
     ``ANEUX_NUM_WORKERS`` / ``ANEUX_CACHE_WORKERS`` still win at the caller.
     """
     n_gpu = max(1, int(n_gpu if n_gpu is not None else slurm_gpu_count(1)))
     n_cpu = max(1, int(n_cpu if n_cpu is not None else slurm_cpu_count()))
     per_gpu = max(1, n_cpu // n_gpu)
     num_workers = max(0, per_gpu - 1)
-    cache_build_workers = max(1, (n_cpu * 3) // 4)
+    cache_build_workers = max(1, n_cpu - 1)
     return {
         "n_gpu": n_gpu,
         "n_cpu": n_cpu,

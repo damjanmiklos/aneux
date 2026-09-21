@@ -180,8 +180,8 @@ def _face_from_batch(batch):
 def kl_anneal_weight(epoch, max_weight=LAMBDA_KL, warmup_epochs=KL_WARMUP_EPOCHS):
     """Linear KL anneal: 0 at epoch 1, `max_weight` from epoch `warmup_epochs` onward.
 
-    Used only when GECO is unavailable. With GECO, β is the KL weight and this
-    ramp is applied as β_max via ``update_geco_beta(..., epoch=)``.
+    Used only when GECO is unavailable. With GECO, β is the KL weight and the
+    ceiling β_max ramps from GECO_BETA_INIT to GECO_BETA_MAX (never 0).
     """
     if warmup_epochs <= 1:
         return float(max_weight)

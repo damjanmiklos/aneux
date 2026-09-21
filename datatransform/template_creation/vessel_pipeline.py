@@ -2217,6 +2217,18 @@ def weld_degenerate_vertices(
     edges = _triangle_edge_lengths(pts, faces)
     shortest = float(edges.min()) if edges.size else 0.0
     if shortest < float(min_edge):
+        # Retry at the floor the quality gate actually enforces. The sweep above
+        # runs at the weld tolerance, ten times coarser, and _unpinch_split only
+        # splits an escape edge comfortably longer than the floor it is given --
+        # four times it -- so at 1e-3 mm it refuses escapes of 2.2e-3 mm and the
+        # pinch survives. p551 reaches the gate on exactly one such edge,
+        # 3.98e-05 mm, pinched on one extra shared neighbour whose escapes are
+        # 2.18e-03 mm: illegal to split against a 1e-3 floor, legal against 1e-4.
+        poly = collapse_tiny_edges(poly, floor=float(min_edge))
+        _p, pts, faces = _triangle_points_faces(poly)
+        edges = _triangle_edge_lengths(pts, faces)
+        shortest = float(edges.min()) if edges.size else 0.0
+    if shortest < float(min_edge):
         print(f"  WARNING: shortest edge still {shortest:.3e} mm after welding")
     return poly, shortest
 

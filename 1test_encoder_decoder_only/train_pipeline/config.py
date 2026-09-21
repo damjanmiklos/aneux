@@ -204,7 +204,8 @@ LAMBDA_KL = 5e-4
 # Rate-controlled KL, GECO-style (Rezende & Viola 2018; §5.3.6 item 3).
 # β ← clip(β · exp(η · (KL̄_raw − R*)), β_min, β_max), once per optimiser step.
 # Constraint is on the mean over valid tokens, so healthy tokens may spend ≈ 0
-# and sac tokens more. KL_WARMUP_EPOCHS ramps β_max. R* is a starting
+# and sac tokens more. KL_WARMUP_EPOCHS ramps the β_max ceiling from
+# GECO_BETA_INIT to GECO_BETA_MAX (never below GECO_BETA_MIN). R* is a starting
 # midpoint of the 8–16 nats/token band at D = 16; set finally by the §5.3.7 sweep.
 RATE_TARGET_NATS = 12.0
 GECO_BETA_INIT = 1.0  # standard-VAE weight; the dual then adapts

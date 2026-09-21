@@ -93,18 +93,34 @@ def apply_token_kl_floor(kl_per_token, latent_valid=None, lambda_tok=None):
     return (floored * w).sum() / w.sum().clamp_min(1e-8)
 
 
-def geco_beta_max_for_epoch(epoch, beta_max=None, warmup_epochs=None):
-    """Ramp β_max from 0 at epoch 1 to ``beta_max`` at ``warmup_epochs`` (§5.3.6)."""
+def geco_beta_max_for_epoch(
+    epoch,
+    beta_max=None,
+    warmup_epochs=None,
+    beta_min=None,
+    beta_start=None,
+):
+    """Ramp the GECO ceiling from ``beta_start`` at epoch 1 to ``beta_max``.
+
+    Must never return 0: clipping β to a zero ceiling kills the KL term after
+    the first optimiser step (epoch-1 logs then show β=0 and val KL=0).
+    """
     if beta_max is None:
         beta_max = _cfg("GECO_BETA_MAX", 10.0)
     if warmup_epochs is None:
         warmup_epochs = _cfg("KL_WARMUP_EPOCHS", 20)
+    if beta_min is None:
+        beta_min = _cfg("GECO_BETA_MIN", 1e-4)
+    if beta_start is None:
+        beta_start = _cfg("GECO_BETA_INIT", 1.0)
     beta_max = float(beta_max)
+    beta_min = float(beta_min)
+    start = max(float(beta_start), beta_min)
     warmup_epochs = int(warmup_epochs)
     if warmup_epochs <= 1:
-        return beta_max
+        return max(beta_max, beta_min)
     t = min(1.0, max(0.0, (int(epoch) - 1) / float(warmup_epochs - 1)))
-    return beta_max * t
+    return max(beta_min, start + t * (beta_max - start))
 
 
 def update_geco_beta(
@@ -120,7 +136,8 @@ def update_geco_beta(
     """One optimiser-step dual update: ``β ← clip(β · exp(η · (KL̄_raw − R*)))``.
 
     Constraint is on the mean raw KL over valid tokens. Pass ``epoch`` so the
-    20-epoch warm-up ramps β_max rather than a fixed λ.
+    20-epoch warm-up ramps β_max rather than a fixed λ. The floor ``β_min``
+    always holds; the ceiling is never dropped below it.
     """
     if rate_target is None:
         rate_target = _cfg("RATE_TARGET_NATS", 12.0)
@@ -133,10 +150,13 @@ def update_geco_beta(
     kl = float(kl_mean_raw.detach().cpu()) if torch.is_tensor(kl_mean_raw) else float(kl_mean_raw)
     b = float(beta.detach().cpu()) if torch.is_tensor(beta) else float(beta)
     new_b = b * math.exp(float(eta) * (kl - float(rate_target)))
+    lo = float(beta_min)
     hi = float(beta_max)
     if epoch is not None:
-        hi = geco_beta_max_for_epoch(epoch, beta_max=hi, warmup_epochs=warmup_epochs)
-    lo = min(float(beta_min), hi)
+        hi = geco_beta_max_for_epoch(
+            epoch, beta_max=hi, warmup_epochs=warmup_epochs, beta_min=lo
+        )
+    hi = max(hi, lo)
     new_b = min(hi, max(lo, new_b))
     if torch.is_tensor(beta):
         return beta.detach().new_tensor(new_b)
