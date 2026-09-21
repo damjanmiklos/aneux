@@ -3764,40 +3764,91 @@ def find_repair_tears(surface, before_pts, tol_mm=1e-3, min_old_fraction=0.5):
     return torn
 
 
-def drop_tear_profiles(profiles, tears, label="preparation"):
-    """Profiles minus the ones sitting on a hole the repair tore open.
+def reconcile_profiles_with_loops(surface, profiles, tears=(), label="preparation"):
+    """Profiles cut down to the openings the surface actually has.
 
-    Matched tightly, because the whole point is to separate a tear from an
-    ostium that can be less than a millimetre away; a tear that has already
-    been welded or patched shut by the time the profiles are measured simply
-    matches nothing and costs nothing.
+    Two different things put a profile in the list that no hole backs.
+
+    VMTK's boundary reference systems walk each boundary polyline, and a rim
+    pinched into a figure eight is two polylines meeting at one shared vertex,
+    so a single hole is reported as two profiles. p491 keep 2 measures seven
+    profiles on a surface carrying six loops: one 10-point torn rim is read as
+    a 1.064 mm lobe and a 0.234 mm one.
+
+    And preparing the original tears holes -- see ``find_repair_tears`` -- which
+    are openings on the surface but not anatomy.
+
+    Both are settled here against the loops the surface really has. Every
+    profile is assigned to the loop it sits on, and where several claim the same
+    loop only the best fit keeps it, because one hole is one opening. A profile
+    left on a loop ``find_repair_tears`` called torn is dropped as damage.
+
+    Chasing a phantom is not free. p491's spare 0.234 mm lobe sent the
+    pipe-section uncap at a place with no hole; the fallback plane clip it then
+    took amputated the real 0.583 mm ostium 2.2 mm away, and the case finished
+    with four openings against six profiles.
     """
-    if not profiles or not tears:
-        return list(profiles), 0
-    kept, dropped = [], []
-    for profile in profiles:
+    profiles = list(profiles)
+    if not profiles:
+        return profiles, 0
+    _poly, _pts, _faces, loops = _loop_geometry(surface)
+    if not loops:
+        return profiles, 0
+    centers = np.asarray([c for _ids, c, _r, _n in loops], dtype=np.float64)
+    radii = np.asarray([r for _ids, _c, r, _n in loops], dtype=np.float64)
+
+    # The tears were measured by _loop_geometry on this same surface, so their
+    # barycentres are the loop barycentres to the bit. Matching on position
+    # rather than on an index means a reordered walk cannot mislabel an ostium.
+    torn_loop = np.zeros(len(loops), dtype=bool)
+    for tear in tears or ():
+        d = np.linalg.norm(centers - np.asarray(tear["barycenter"], np.float64), axis=1)
+        j = int(np.argmin(d))
+        if float(d[j]) <= 1e-3:
+            torn_loop[j] = True
+        else:
+            print(f"  Torn hole r={float(tear['radius']):.3f} mm no longer has a "
+                  f"loop on this surface; not dropping anything for it")
+
+    assigned, best = [], {}
+    for i, profile in enumerate(profiles):
         bary = np.asarray(profile["barycenter"], dtype=np.float64)
-        hit = None
-        for tear in tears:
-            tol = max(0.5 * float(tear["radius"]), 0.15)
-            if float(np.linalg.norm(bary - tear["barycenter"])) <= tol:
-                hit = tear
-                break
-        (dropped if hit is not None else kept).append(profile)
-    if not dropped:
-        return list(profiles), 0
+        d = np.linalg.norm(centers - bary, axis=1)
+        j = int(np.argmin(d))
+        # Nearest centre plus radius mismatch, both in mm: the lobe of a pinched
+        # rim is off on the radius even when its barycentre lands close.
+        score = float(d[j]) + abs(float(profile["radius"]) - float(radii[j]))
+        assigned.append((j, score))
+        if j not in best or score < best[j][0]:
+            best[j] = (score, i)
+
+    kept, shared, torn = [], [], []
+    for i, profile in enumerate(profiles):
+        j, _score = assigned[i]
+        if best[j][1] != i:
+            shared.append(profile)
+        elif torn_loop[j]:
+            torn.append(profile)
+        else:
+            kept.append(profile)
+    if not shared and not torn:
+        return profiles, 0
     if len(kept) < 2:
-        # A vessel needs an inlet and an outlet. If the tear test would leave
-        # fewer, it is the test that is wrong here, so keep every profile.
-        print(f"  Not dropping {len(dropped)} torn opening(s): only {len(kept)} "
-              "profile(s) would be left")
-        return list(profiles), 0
-    radii = ", ".join(f"{p['radius']:.3f}" for p in dropped)
-    print(
-        f"  Ignoring {len(dropped)} opening(s) the {label} tore (r={radii} mm); "
-        f"{len(kept)} anatomical ostia remain"
-    )
-    return kept, len(dropped)
+        # A vessel needs an inlet and an outlet. If this test would leave fewer,
+        # it is the test that is wrong here, so keep every profile.
+        print(f"  Not dropping {len(shared) + len(torn)} profile(s) without a "
+              f"loop of their own: only {len(kept)} would be left")
+        return profiles, 0
+    if shared:
+        radii_txt = ", ".join(f"{p['radius']:.3f}" for p in shared)
+        print(f"  Ignoring {len(shared)} profile(s) sharing another opening's rim "
+              f"(r={radii_txt} mm)")
+    if torn:
+        radii_txt = ", ".join(f"{p['radius']:.3f}" for p in torn)
+        print(f"  Ignoring {len(torn)} opening(s) the {label} tore "
+              f"(r={radii_txt} mm)")
+    print(f"  {len(kept)} anatomical ostia remain")
+    return kept, len(shared) + len(torn)
 
 
 def cap_unmatched_loops(surface, profiles, label="surface"):

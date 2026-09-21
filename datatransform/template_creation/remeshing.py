@@ -83,7 +83,7 @@ from vessel_pipeline import (
     extract_branches,
     extract_centerlines_for_tube,
     boundary_point_cloud,
-    drop_tear_profiles,
+    reconcile_profiles_with_loops,
     find_repair_tears,
     finalize_surface,
     inspect_openings,
@@ -405,7 +405,9 @@ def process_gt_remesh_dataset(
     print("Step 1b: Anatomical openings on the detailed original...")
     _set_step("1b_gt_openings")
     gt_profiles = measure_open_profiles(gt_surface)
-    gt_profiles, _n_torn = drop_tear_profiles(gt_profiles, repair_tears)
+    gt_profiles, _n_dropped = reconcile_profiles_with_loops(
+        gt_surface, gt_profiles, repair_tears
+    )
     log_profiles(gt_profiles, label="GT anatomical")
     seed_points_from_profiles(gt_profiles)
 
