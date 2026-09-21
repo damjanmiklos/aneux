@@ -91,6 +91,63 @@ def job_workspace(account=None, job_id=None, user=None):
     )
 
 
+def _first_positive_int(value, default=None):
+    if value is None or value == "":
+        return default
+    if isinstance(value, (int, float)):
+        n = int(value)
+        return n if n > 0 else default
+    digits = "".join(ch if ch.isdigit() else " " for ch in str(value))
+    parts = [p for p in digits.split() if p]
+    if not parts:
+        return default
+    n = int(parts[0])
+    return n if n > 0 else default
+
+
+def slurm_cpu_count():
+    for key in ("SLURM_CPUS_PER_TASK", "SLURM_CPUS_ON_NODE"):
+        n = _first_positive_int(os.environ.get(key))
+        if n:
+            return n
+    return os.cpu_count() or 1
+
+
+def slurm_gpu_count(fallback=1):
+    for key in ("SLURM_GPUS_ON_NODE", "SLURM_GPUS_PER_NODE", "SLURM_STEP_GPUS"):
+        n = _first_positive_int(os.environ.get(key))
+        if n:
+            return n
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if visible and visible not in ("-1", "NoDevFiles"):
+        n = len([p for p in visible.split(",") if p.strip() != ""])
+        if n:
+            return n
+    return fallback
+
+
+def scale_hpc_workers(n_gpu=None, n_cpu=None):
+    """DataLoader / cache process counts from the Slurm allocation.
+
+    Komondor GPU nodes are 64 cores / 4 A100s, so 1 GPU comes with 16 cores.
+    One core per rank is left for the trainer. Cache warmup is rank-0 only and
+    may use three quarters of the allocated cores. Env overrides
+    ``ANEUX_NUM_WORKERS`` / ``ANEUX_CACHE_WORKERS`` still win at the caller.
+    """
+    n_gpu = max(1, int(n_gpu if n_gpu is not None else slurm_gpu_count(1)))
+    n_cpu = max(1, int(n_cpu if n_cpu is not None else slurm_cpu_count()))
+    per_gpu = max(1, n_cpu // n_gpu)
+    num_workers = max(0, per_gpu - 1)
+    cache_build_workers = max(1, (n_cpu * 3) // 4)
+    return {
+        "n_gpu": n_gpu,
+        "n_cpu": n_cpu,
+        "cpus_per_gpu": per_gpu,
+        "num_workers": num_workers,
+        "cache_build_workers": cache_build_workers,
+    }
+
+
 def _which(name):
     return shutil.which(name)
 
@@ -129,15 +186,36 @@ def copy_tree(src, dst, description="tree"):
 
 
 def _dir_has_vtp(path):
+    """True if ``path`` or a near subdirectory contains a ``.vtp``.
+
+    ``cleandata/`` stores meshes in ``uniformly_remeshed/``, ``template_mesh/``,
+    and ``original_centerline/`` — a top-level ``listdir`` misses them.
+    """
     if not path or not os.path.isdir(path):
         return False
     try:
-        for name in os.listdir(path):
-            if name.lower().endswith(".vtp"):
-                return True
+        for root, dirnames, files in os.walk(path):
+            for name in files:
+                if name.lower().endswith(".vtp"):
+                    return True
+            rel = os.path.relpath(root, path)
+            depth = 0 if rel == os.curdir else rel.count(os.sep) + 1
+            if depth >= 2:
+                dirnames.clear()
     except OSError:
         return False
     return False
+
+
+def persist_if_remote(src, dest, description="tree"):
+    """Copy ``src`` → ``dest`` when they are different existing/creatable paths."""
+    if not src or not dest:
+        return None
+    src = os.path.abspath(src)
+    dest = os.path.abspath(dest)
+    if src == dest or not os.path.isdir(src):
+        return dest if src == dest else None
+    return copy_tree(src, dest, description)
 
 
 def stage_training_inputs(

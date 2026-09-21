@@ -98,6 +98,34 @@ def _job_pids(job_id):
     return pids or _descendant_pids(os.getpid())
 
 
+def _cpu_times_windows():
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    class FILETIME(ctypes.Structure):
+        _fields_ = [
+            ("dwLowDateTime", wintypes.DWORD),
+            ("dwHighDateTime", wintypes.DWORD),
+        ]
+
+    idle = FILETIME()
+    kernel = FILETIME()
+    user = FILETIME()
+    if not ctypes.windll.kernel32.GetSystemTimes(
+        ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)
+    ):
+        return None
+
+    def _quad(ft):
+        return (int(ft.dwHighDateTime) << 32) | int(ft.dwLowDateTime)
+
+    idle_t = _quad(idle)
+    total = _quad(kernel) + _quad(user)
+    return total, idle_t
+
+
 def _cpu_times():
     path = "/proc/stat"
     try:
@@ -108,7 +136,40 @@ def _cpu_times():
         total = sum(nums)
         return total, idle
     except (OSError, ValueError, IndexError):
-        return None
+        pass
+    return _cpu_times_windows()
+
+
+def _meminfo_windows():
+    if os.name != "nt":
+        return {}
+    import ctypes
+    from ctypes import wintypes
+
+    class MEMORYSTATUSEX(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", wintypes.DWORD),
+            ("dwMemoryLoad", wintypes.DWORD),
+            ("ullTotalPhys", ctypes.c_uint64),
+            ("ullAvailPhys", ctypes.c_uint64),
+            ("ullTotalPageFile", ctypes.c_uint64),
+            ("ullAvailPageFile", ctypes.c_uint64),
+            ("ullTotalVirtual", ctypes.c_uint64),
+            ("ullAvailVirtual", ctypes.c_uint64),
+            ("ullAvailExtendedVirtual", ctypes.c_uint64),
+        ]
+
+    status = MEMORYSTATUSEX()
+    status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        return {}
+    total = float(status.ullTotalPhys) / 1024**3
+    avail = float(status.ullAvailPhys) / 1024**3
+    return {
+        "mem_total_gib": round(total, 3),
+        "mem_available_gib": round(avail, 3),
+        "mem_used_gib": round(total - avail, 3),
+    }
 
 
 def _meminfo_gib():
@@ -129,19 +190,24 @@ def _meminfo_gib():
                     continue
                 info[key] = kib / (1024.0 * 1024.0)
     except OSError:
-        return {}
-    return {
-        "mem_total_gib": round(info.get("MemTotal", 0.0), 3),
-        "mem_available_gib": round(info.get("MemAvailable", 0.0), 3),
-        "mem_used_gib": round(
-            info.get("MemTotal", 0.0) - info.get("MemAvailable", 0.0), 3
-        ),
-    }
+        info = {}
+    if info:
+        return {
+            "mem_total_gib": round(info.get("MemTotal", 0.0), 3),
+            "mem_available_gib": round(info.get("MemAvailable", 0.0), 3),
+            "mem_used_gib": round(
+                info.get("MemTotal", 0.0) - info.get("MemAvailable", 0.0), 3
+            ),
+        }
+    return _meminfo_windows()
 
 
 def _loadavg():
+    getter = getattr(os, "getloadavg", None)
+    if getter is None:
+        return {}
     try:
-        a, b, c = os.getloadavg()
+        a, b, c = getter()
         return {"load1": round(a, 3), "load5": round(b, 3), "load15": round(c, 3)}
     except OSError:
         return {}

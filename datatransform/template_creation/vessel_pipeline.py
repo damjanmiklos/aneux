@@ -3267,10 +3267,21 @@ def clip_one_profile(surface, profile, body_point, search_mm):
         key=lambda op: float(np.linalg.norm(np.asarray(op["center"]) - bary)),
     )
     r_open = float(matched.get("radius", 0.0))
-    if r_open < min_r or r_open > max_r or matched.get("n_points", 0) < MIN_OPENING_LOOP_POINTS:
+    n_rim = int(matched.get("n_points", 0))
+    d_match = float(np.linalg.norm(np.asarray(matched["center"]) - bary))
+    # Three clauses reject a seam clip, and reporting only the radius range sent
+    # SNF00000228 profile 6 to the wrong place: it was rejected at r=0.393 mm
+    # inside a 0.124-2.853 mm band, for the rim point count. Say which one.
+    why = []
+    if r_open < min_r or r_open > max_r:
+        why.append(f"r={r_open:.3f} mm outside {min_r:.3f}-{max_r:.3f} mm")
+    if n_rim < MIN_OPENING_LOOP_POINTS:
+        why.append(f"{n_rim} rim points, under the {MIN_OPENING_LOOP_POINTS} needed")
+    if why:
         print(
-            f"  [Uncap] Profile {profile['index']} seam clip loop r={r_open:.3f} mm "
-            f"outside {min_r:.3f}–{max_r:.3f} mm. Skipping this end."
+            f"  [Uncap] Profile {profile['index']} seam clip rejected: "
+            f"{'; '.join(why)} (nearest loop sits {d_match:.3f} mm from the ostium). "
+            "Skipping this end."
         )
         return surface, False
     print(
@@ -3672,6 +3683,103 @@ def _loop_geometry(surface):
         ids = [int(locator.FindClosestPoint(xyz)) for xyz in coords]
         out.append((ids, center, radius, int(n)))
     return poly, pts, faces, out
+
+
+def boundary_point_keys(surface, ndigits=6):
+    """Rounded coordinates of every boundary point, for provenance tests."""
+    poly = to_vtk_poly(surface)
+    loops = extract_boundary_loops(poly)
+    keys = set()
+    for i in range(loops.GetNumberOfCells()):
+        cell = loops.GetCell(i)
+        pts = cell.GetPoints()
+        for j in range(cell.GetNumberOfPoints()):
+            x, y, z = pts.GetPoint(j)
+            keys.add((round(x, ndigits), round(y, ndigits), round(z, ndigits)))
+    return keys
+
+
+def find_repair_tears(surface, boundary_before, min_old_fraction=0.5):
+    """The openings the manifold repair tore, told apart from the real ostia.
+
+    force_manifold_triangles removes triangles, and removing a triangle opens a
+    hole wherever it cuts. The anatomical profiles are measured after that, so
+    the hole is promoted to an ostium and the rest of the run is spent trying to
+    preserve damage. SNF00000228 tore a 0.427 mm hole 0.57 mm from a real 0.410
+    mm ostium, counted seven profiles against the six loops its input actually
+    has, and failed 6 against 7 -- while the mesh it produced was right, with
+    all six openings round and in place. The remesher zips such a tear shut on
+    its own, so nothing here needs repairing; the count simply must not include
+    it.
+
+    Position cannot separate the two at that distance: the protect tolerance
+    around that ostium is 0.615 mm and the tear falls inside it. Provenance can.
+    A cut only deletes triangles, so a real ostium's rim points were boundary
+    points beforehand, while a torn rim is made of points that were interior.
+    ``boundary_before`` is the key set from :func:`boundary_point_keys` taken
+    before the cut.
+    """
+    poly, pts, _faces, loops = _loop_geometry(surface)
+    if not loops or not boundary_before:
+        return []
+    torn = []
+    kept = 0
+    for ids, center, radius, n in loops:
+        if n <= 0:
+            continue
+        coords = pts[np.asarray(ids, dtype=np.int64)]
+        old = 0
+        for xyz in coords:
+            key = (round(float(xyz[0]), 6), round(float(xyz[1]), 6),
+                   round(float(xyz[2]), 6))
+            if key in boundary_before:
+                old += 1
+        if float(old) / float(n) < float(min_old_fraction):
+            torn.append({"barycenter": np.asarray(center, dtype=np.float64),
+                         "radius": float(radius), "n_points": int(n)})
+        else:
+            kept += 1
+    if kept == 0:
+        # Every loop looks new, so the provenance set is wrong rather than the
+        # surface being all tears. Claiming them all would drop every ostium.
+        return []
+    return torn
+
+
+def drop_tear_profiles(profiles, tears, label="manifold repair"):
+    """Profiles minus the ones sitting on a hole the repair tore open.
+
+    Matched tightly, because the whole point is to separate a tear from an
+    ostium that can be less than a millimetre away; a tear that has already
+    been welded or patched shut by the time the profiles are measured simply
+    matches nothing and costs nothing.
+    """
+    if not profiles or not tears:
+        return list(profiles), 0
+    kept, dropped = [], []
+    for profile in profiles:
+        bary = np.asarray(profile["barycenter"], dtype=np.float64)
+        hit = None
+        for tear in tears:
+            tol = max(0.5 * float(tear["radius"]), 0.15)
+            if float(np.linalg.norm(bary - tear["barycenter"])) <= tol:
+                hit = tear
+                break
+        (dropped if hit is not None else kept).append(profile)
+    if not dropped:
+        return list(profiles), 0
+    if len(kept) < 2:
+        # A vessel needs an inlet and an outlet. If the tear test would leave
+        # fewer, it is the test that is wrong here, so keep every profile.
+        print(f"  Not dropping {len(dropped)} torn opening(s): only {len(kept)} "
+              "profile(s) would be left")
+        return list(profiles), 0
+    radii = ", ".join(f"{p['radius']:.3f}" for p in dropped)
+    print(
+        f"  Ignoring {len(dropped)} opening(s) the {label} tore (r={radii} mm); "
+        f"{len(kept)} anatomical ostia remain"
+    )
+    return kept, len(dropped)
 
 
 def cap_unmatched_loops(surface, profiles, label="surface"):

@@ -15,12 +15,32 @@ Stage-2 precision (see configure_stage2_precision):
 """
 
 import math
+import os
 
 import torch
 
 
+def configure_cuda_allocator():
+    """Linux CUDA caching allocator can grow in-place; Windows cannot."""
+    key = "PYTORCH_CUDA_ALLOC_CONF"
+    if os.name == "nt":
+        conf = os.environ.get(key, "")
+        parts = [
+            p.strip()
+            for p in conf.split(",")
+            if p.strip() and "expandable_segments" not in p
+        ]
+        if parts:
+            os.environ[key] = ",".join(parts)
+        else:
+            os.environ.pop(key, None)
+        return
+    os.environ.setdefault(key, "expandable_segments:True")
+
+
 def configure_stage2_precision():
     """FP32 tensor storage, TF32 Ampere matmuls, no autocast or reduced dtypes."""
+    configure_cuda_allocator()
     torch.set_float32_matmul_precision("high")
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True

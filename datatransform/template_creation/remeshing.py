@@ -82,6 +82,9 @@ from vessel_pipeline import (
     extract_boundary_loops,
     extract_branches,
     extract_centerlines_for_tube,
+    boundary_point_keys,
+    drop_tear_profiles,
+    find_repair_tears,
     finalize_surface,
     inspect_openings,
     load_ostium_frames,
@@ -186,7 +189,7 @@ def persist_gt_ostium_frames(output_dir, dataset_id, frames):
     return path, contract
 
 
-def prepare_gt_surface(vessel_mesh):
+def prepare_gt_surface(vessel_mesh, tears_out=None):
     """Keep original tessellation density; only repair what breaks VMTK.
 
     Nothing here resamples the surface, so the aneurysm texture is untouched.
@@ -201,6 +204,11 @@ def prepare_gt_surface(vessel_mesh):
     poly = drop_boundary_ear_triangles(poly)
     poly, n_nm = repair_nonmanifold_triangles(poly)
     if n_nm > 0:
+        # Remember which points were already on a rim. The cut below opens a
+        # hole wherever it removes a triangle, and the openings are measured
+        # after this function returns, so without this the repair's own damage
+        # becomes an anatomical ostium the rest of the run must preserve.
+        rim_before = boundary_point_keys(poly)
         poly, n_forced = force_manifold_triangles(poly)
         poly, n_nm = repair_nonmanifold_triangles(poly)
         if n_forced:
@@ -208,6 +216,18 @@ def prepare_gt_surface(vessel_mesh):
                 f"cut {n_forced} triangle(s) to make the original manifold "
                 f"({n_nm} non-manifold edges left)"
             )
+            # The surface is left exactly as it is: the remesher closes such a
+            # tear by itself and the mesh comes out right. What must not happen
+            # is the tear being counted as an ostium, so it is reported instead.
+            torn = find_repair_tears(poly, rim_before)
+            if torn and tears_out is not None:
+                tears_out.extend(torn)
+            if torn:
+                _warn(
+                    f"the manifold repair tore {len(torn)} hole(s) "
+                    "(r=" + ", ".join(f"{t['radius']:.3f}" for t in torn)
+                    + " mm); they are not ostia and will not be counted"
+                )
     if n_nm > 0:
         _warn(f"{n_nm} non-manifold edges remain on the original after repair")
     poly, min_edge = weld_degenerate_vertices(poly)
@@ -378,11 +398,13 @@ def process_gt_remesh_dataset(
 
     print("Step 1: Preparing original surface (keep detail, drop degenerates)...")
     _set_step("1_prepare_original")
-    gt_surface = prepare_gt_surface(original)
+    repair_tears = []
+    gt_surface = prepare_gt_surface(original, tears_out=repair_tears)
     print(f"  GT working surface: {gt_surface.GetNumberOfPoints()} points")
     print("Step 1b: Anatomical openings on the detailed original...")
     _set_step("1b_gt_openings")
     gt_profiles = measure_open_profiles(gt_surface)
+    gt_profiles, _n_torn = drop_tear_profiles(gt_profiles, repair_tears)
     log_profiles(gt_profiles, label="GT anatomical")
     seed_points_from_profiles(gt_profiles)
 

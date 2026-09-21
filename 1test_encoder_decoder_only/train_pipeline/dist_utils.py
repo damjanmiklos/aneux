@@ -71,10 +71,28 @@ def barrier():
         dist.barrier()
 
 
+def broadcast_object(obj, src=0):
+    """Broadcast a pickleable object from ``src``. No-op when not distributed."""
+    if not distributed_active():
+        return obj
+    packed = [obj]
+    dist.broadcast_object_list(packed, src=int(src))
+    return packed[0]
+
+
 def destroy_distributed():
-    if distributed_active():
-        dist.barrier()
+    """Tear down the process group without a barrier.
+
+    A barrier here is harmful: if one rank already failed, the others are
+    waiting on an earlier collective and this rendezvous unblocks them into
+    a dead NCCL group (SIGABRT in the watchdog).
+    """
+    if not distributed_active():
+        return
+    try:
         dist.destroy_process_group()
+    except Exception:
+        pass
 
 
 def unwrap_model(model):

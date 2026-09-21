@@ -8,8 +8,18 @@
 # Workflow (login node):
 #   cd /project/<account>/aneux
 #   git pull
-#   # cleandata/ is copied once by scp/rsync, not by git
+#   # If a previous job already built tube_cache on scratch, copy it first:
+#   # rsync -a /scratch/<account>/$USER/aneux/<oldjob>/tube_cache/ \
+#   #   $PWD/1test_encoder_decoder_only/tube_cache/
 #   sbatch --account=<account> --mail-user=YOU@email hpc/train_stage2.sbatch
+#
+# Interactive 1-GPU smoke test (1 hour, 16 cores — do not use this sbatch):
+#   srun -p gpu -A nr_hemo_ai1 --gres=gpu:1 -c 16 --mem-per-cpu=4000 \
+#     --time=01:00:00 --pty bash
+#   source ~/aneuxai_env/bin/activate
+#   export ANEUX_EPOCHS=1
+#   python 1test_encoder_decoder_only/train_pipeline/aneuxai_HPC.py
+# Faster queue, 1h cap: srun -p test -A nr_hemo_ai1 --gres=gpu:1 -c 16 --time=01:00:00 --pty bash
 #
 # Optional env (sbatch --export=ALL,ANEUX_EPOCHS=2 ...):
 #   ANEUX_BATCH_SIZE  ANEUX_NUM_WORKERS  ANEUX_EPOCHS  ANEUX_SKIP_STAGE=1
@@ -25,7 +35,7 @@
 #SBATCH --cpus-per-task=64
 #SBATCH --gres=gpu:4
 #SBATCH --exclusive
-#SBATCH --time=3-00:00:00
+#SBATCH --time=2-00:00:00
 #SBATCH --mem=0
 #SBATCH --no-requeue
 #SBATCH --signal=TERM@180
@@ -122,14 +132,21 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 export RDZV_HOST
 RDZV_HOST="$(hostname)"
 export RDZV_PORT="${RDZV_PORT:-29400}"
+NPROC="$(python -c 'import torch; print(max(1, int(torch.cuda.device_count())))')"
+echo "nproc_per_node=${NPROC} cpus_per_task=${SLURM_CPUS_PER_TASK:-unset}"
 
-srun --cpu-bind=none --kill-on-bad-exit=1 torchrun \
-  --nnodes="${SLURM_JOB_NUM_NODES}" \
-  --nproc_per_node=4 \
-  --rdzv_id="${SLURM_JOB_ID}" \
-  --rdzv_backend=c10d \
-  --rdzv_endpoint="${RDZV_HOST}:${RDZV_PORT}" \
-  "${REPO}/1test_encoder_decoder_only/train_pipeline/aneuxai_HPC.py"
+if [[ "${NPROC}" -eq 1 ]]; then
+  srun --cpu-bind=none --kill-on-bad-exit=1 \
+    python "${REPO}/1test_encoder_decoder_only/train_pipeline/aneuxai_HPC.py"
+else
+  srun --cpu-bind=none --kill-on-bad-exit=1 torchrun \
+    --nnodes="${SLURM_JOB_NUM_NODES}" \
+    --nproc_per_node="${NPROC}" \
+    --rdzv_id="${SLURM_JOB_ID}" \
+    --rdzv_backend=c10d \
+    --rdzv_endpoint="${RDZV_HOST}:${RDZV_PORT}" \
+    "${REPO}/1test_encoder_decoder_only/train_pipeline/aneuxai_HPC.py"
+fi
 
 echo "=== finished $(date -Is) ==="
 

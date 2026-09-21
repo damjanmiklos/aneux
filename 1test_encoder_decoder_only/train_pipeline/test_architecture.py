@@ -1312,6 +1312,168 @@ def test_train_val_split_covers_all():
         _assert(n_te >= 1, f"{prefix} missing from test")
 
 
+def test_filter_split_payload_skips_failed_cache_ids():
+    from aneuxai import filter_split_payload, subsets_from_ids
+
+    payload = {
+        "train": ["a", "b", "c"],
+        "val": ["d"],
+        "test": ["e"],
+        "seed": 31,
+    }
+    out = filter_split_payload(payload, ["b", "e"])
+    _assert(out["train"] == ["a", "c"], out["train"])
+    _assert(out["val"] == ["d"], out["val"])
+    _assert(out["test"] == [], out["test"])
+    _assert(out["skipped_cache"] == ["b", "e"], out["skipped_cache"])
+    _assert(payload["train"] == ["a", "b", "c"], "durable lists must stay")
+
+    class Dummy:
+        samples = [{"dataset_id": x} for x in "abcde"]
+
+        def __len__(self):
+            return len(self.samples)
+
+    tr, va, te = subsets_from_ids(Dummy(), out["train"], out["val"], out["test"])
+    _assert(tr.indices == [0, 2], tr.indices)
+    _assert(va.indices == [3], va.indices)
+    _assert(te.indices == [], te.indices)
+
+
+def test_skipped_samples_report_is_loud():
+    from aneuxai import skipped_sample_records
+    from run_report import write_run_readme, write_skipped_samples_report
+
+    payload = {"train": ["p347_x"], "val": ["p391_y"], "test": []}
+    errors = [
+        ("p347_x", "ValueError: template coarse: 2 non-manifold edges"),
+        ("p391_y", "ValueError: template mid: 3 non-manifold edges"),
+    ]
+    records = skipped_sample_records(payload, errors)
+    _assert(records[0]["split"] == "train", records[0])
+    _assert(records[1]["split"] == "val", records[1])
+    root = tempfile.mkdtemp(prefix="aneux_skip_")
+    try:
+        path = write_skipped_samples_report(root, records)
+        _assert(os.path.basename(path) == "SKIPPED_SAMPLES.txt", path)
+        text = open(path, encoding="utf-8").read()
+        _assert("TRAINING SKIPPED 2 SAMPLE" in text, text[:200])
+        _assert("p347_x" in text and "non-manifold" in text, text)
+        _assert(os.path.isfile(os.path.join(root, "data", "skipped_cache.json")), "json")
+        write_run_readme(root)
+        readme = open(os.path.join(root, "README.txt"), encoding="utf-8").read()
+        _assert("SAMPLES WERE SKIPPED" in readme, readme[:250])
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_warmup_result_skips_unless_strict():
+    from dataset import AneurysmDataset
+
+    errors = [
+        ("p347_FAQEBBwJCx8WEwMDExgKAAMd", "ValueError: template coarse: 2 non-manifold edges"),
+        ("p391_GgAcPhQdLQIbAAgKDAAAOhEN", "ValueError: template mid: 3 non-manifold edges"),
+    ]
+    out = AneurysmDataset._warmup_result(None, 695, list(range(695)), errors, strict=False)
+    _assert(len(out) == 2, out)
+    raised = False
+    try:
+        AneurysmDataset._warmup_result(None, 695, list(range(695)), errors, strict=True)
+    except RuntimeError as exc:
+        raised = True
+        _assert("2/695" in str(exc), str(exc))
+    _assert(raised, "strict=True must raise")
+    raised = False
+    try:
+        AneurysmDataset._warmup_result(None, 2, [0, 1], errors, strict=False)
+    except RuntimeError as exc:
+        raised = True
+        _assert("no usable" in str(exc), str(exc))
+    _assert(raised, "zero usable caches must raise")
+
+
+def test_dir_has_vtp_nested_cleandata_layout():
+    from hpc_runtime import _dir_has_vtp
+
+    root = tempfile.mkdtemp(prefix="aneux_vtp_")
+    try:
+        _assert(not _dir_has_vtp(root), "empty dir")
+        nested = os.path.join(root, "uniformly_remeshed")
+        os.makedirs(nested)
+        _assert(not _dir_has_vtp(root), "subdir without vtp")
+        with open(os.path.join(nested, "case.vtp"), "w", encoding="utf-8") as handle:
+            handle.write("not a real mesh")
+        _assert(_dir_has_vtp(root), "nested vtp must count")
+        _assert(_dir_has_vtp(nested), "direct vtp must count")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_destroy_distributed_without_process_group():
+    from dist_utils import destroy_distributed
+
+    destroy_distributed()
+
+
+def test_persist_if_remote_skips_same_path():
+    from hpc_runtime import persist_if_remote
+
+    root = tempfile.mkdtemp(prefix="aneux_persist_")
+    try:
+        _assert(persist_if_remote(root, root) == os.path.abspath(root), "same path")
+        _assert(persist_if_remote(root, None) is None, "missing dest")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_scale_hpc_workers_follows_gpus():
+    from hpc_runtime import scale_hpc_workers
+
+    full = scale_hpc_workers(n_gpu=4, n_cpu=64)
+    _assert(full["num_workers"] == 15, full)
+    _assert(full["cache_build_workers"] == 48, full)
+    _assert(full["cpus_per_gpu"] == 16, full)
+
+    one = scale_hpc_workers(n_gpu=1, n_cpu=16)
+    _assert(one["num_workers"] == 15, one)
+    _assert(one["cache_build_workers"] == 12, one)
+
+    tiny = scale_hpc_workers(n_gpu=1, n_cpu=1)
+    _assert(tiny["num_workers"] == 0, tiny)
+    _assert(tiny["cache_build_workers"] == 1, tiny)
+
+
+def test_resource_monitor_snapshots_on_this_os():
+    from resource_monitor import ResourceMonitor, _cpu_times, _loadavg, _meminfo_gib
+
+    _assert(isinstance(_loadavg(), dict), "loadavg must not raise")
+    mem = _meminfo_gib()
+    _assert("mem_total_gib" in mem, mem)
+    _assert(float(mem["mem_total_gib"]) > 0, mem)
+    cpu = _cpu_times()
+    _assert(cpu is not None and cpu[0] > 0, cpu)
+    root = tempfile.mkdtemp(prefix="aneux_mon_")
+    try:
+        mon = ResourceMonitor(root, interval=5.0, disk_path=root)
+        row = mon.take(write=True)
+        _assert("elapsed_s" in row, row)
+        _assert(os.path.isfile(mon.jsonl_path), mon.jsonl_path)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_add_meter_accepts_fold_and_stretch():
+    from train import _add_meter, _flush_meters, _zero_tensor_meters
+
+    acc = _zero_tensor_meters()
+    _add_meter(acc, "loss", torch.tensor(1.0), 2.0)
+    _add_meter(acc, "fold", torch.tensor(0.5), 2.0)
+    _add_meter(acc, "stretch", torch.tensor(1.5), 2.0)
+    out = _flush_meters(acc, 2.0)
+    _assert(abs(out["fold"] - 0.5) < 1e-6, out)
+    _assert(abs(out["stretch"] - 1.5) < 1e-6, out)
+
+
 def test_chamfer_weight_cap():
     w = chamfer_distance_weights(torch.tensor([0.0, 2.0, 20.0]), radius=2.0, cap=4.0)
     _assert(torch.allclose(w[0], torch.tensor(1.0)), f"zero dist {w[0]}")
@@ -1948,6 +2110,15 @@ def main():
         test_batch_inc,
         test_scaffold_decode_without_vessel,
         test_train_val_split_covers_all,
+        test_filter_split_payload_skips_failed_cache_ids,
+        test_skipped_samples_report_is_loud,
+        test_warmup_result_skips_unless_strict,
+        test_dir_has_vtp_nested_cleandata_layout,
+        test_destroy_distributed_without_process_group,
+        test_persist_if_remote_skips_same_path,
+        test_scale_hpc_workers_follows_gpus,
+        test_resource_monitor_snapshots_on_this_os,
+        test_add_meter_accepts_fold_and_stretch,
         test_chamfer_weight_cap,
         test_huber_and_radial_loss,
         test_smoothness_edge_weights,

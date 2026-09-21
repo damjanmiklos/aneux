@@ -150,6 +150,8 @@ def hardware_snapshot():
         (["uname", "-a"], "uname"),
         (["df", "-h", "/scratch", "/project", "/home"], "df"),
     ):
+        if os.name == "nt":
+            continue
         try:
             info[key] = subprocess.check_output(cmd, text=True, timeout=15)
         except Exception:
@@ -448,10 +450,50 @@ def write_run_summary(run_dir, history, extra=None):
     return dump_json(os.path.join(run_dir, "data", "run_summary.json"), payload)
 
 
-def write_run_readme(run_dir, extra_lines=None):
+def write_skipped_samples_report(run_dir, records):
+    """Write a loud run-root note plus JSON when cases are dropped from training.
+
+    ``records`` is a list of dicts with ``dataset_id``, ``error``, and optional ``split``.
+    """
+    records = list(records or [])
+    os.makedirs(os.path.join(run_dir, "data"), exist_ok=True)
+    dump_json(os.path.join(run_dir, "data", "skipped_cache.json"), records)
+    if not records:
+        return None
     lines = [
+        f"*** TRAINING SKIPPED {len(records)} SAMPLE(S) ***",
+        "",
+        "These cases were NOT used. Training continued with the remaining data.",
+        "Typical causes: non-manifold template mid/coarse meshes, missing GroupIds,",
+        "or other tube-cache build failures. Fix the meshes to include them later.",
+        "",
+    ]
+    for rec in records:
+        did = rec.get("dataset_id", "?")
+        split = rec.get("split") or "unknown"
+        err = rec.get("error") or ""
+        lines.append(f"{did}  [{split}]")
+        lines.append(f"  {err}")
+        lines.append("")
+    path = os.path.join(run_dir, "SKIPPED_SAMPLES.txt")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines).rstrip() + "\n")
+    return path
+
+
+def write_run_readme(run_dir, extra_lines=None):
+    skip_path = os.path.join(run_dir, "SKIPPED_SAMPLES.txt")
+    banner = []
+    if os.path.isfile(skip_path):
+        banner = [
+            "!!! SAMPLES WERE SKIPPED — see SKIPPED_SAMPLES.txt in this folder !!!",
+            "",
+        ]
+    lines = banner + [
         f"Stage-2 run directory created {utc_stamp()} UTC",
         "",
+        "SKIPPED_SAMPLES.txt        present only if cases were dropped (read this first)",
+        "data/skipped_cache.json    same skip list as JSON",
         "data/epoch_metrics.csv     per-epoch scalars (train + val + latent + throughput)",
         "data/epoch_metrics.jsonl   same rows, one JSON object per epoch",
         "data/history.json          full history list",

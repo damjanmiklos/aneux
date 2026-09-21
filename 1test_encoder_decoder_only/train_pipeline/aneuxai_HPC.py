@@ -1,14 +1,25 @@
 #!/usr/bin/env python3
 """Komondor GPU-partition entry point for Stage-2 training.
 
-Hardware: one exclusive `gpu` node — 64-core EPYC 7763, 256 GB RAM, 4× A100 40 GB.
-Launch with the sbatch in ``hpc/train_stage2.sbatch`` (torchrun, 4 processes).
+Hardware: `gpu` node — 64-core EPYC 7763, 256 GB, 4× A100 40 GB (16 cores/GPU).
+Workers and DDP ranks follow the GPUs/CPUs Slurm actually gave this job.
 
-Storage (https://docs.hpc.dkf.hu/storage/overview.html):
-the git checkout and the scp'd ``cleandata/`` live on ``/project/<account>``
-(HDD Lustre). At job start this script copies cleandata + tube_cache onto
-``/scratch/<account>/...`` (NVMe Lustre, fastest tier) and copies the timestamped
-run folder back to project when training finishes (or on SIGTERM).
+Production (4 GPU, 2 days)::
+
+    sbatch --account=<account> --mail-user=YOU@email hpc/train_stage2.sbatch
+
+Interactive smoke test (1 GPU, 16 cores, 1 hour)::
+
+    srun -p gpu -A nr_hemo_ai1 --gres=gpu:1 -c 16 --mem-per-cpu=4000 \\
+      --time=01:00:00 --pty bash
+    # on the compute node:
+    source ~/aneuxai_env/bin/activate   # or: conda activate aneurysmgnn
+    cd "$SLURM_SUBMIT_DIR"              # or the git checkout
+    export ANEUX_EPOCHS=1
+    python 1test_encoder_decoder_only/train_pipeline/aneuxai_HPC.py
+
+The ``test`` partition is the same GPU hardware with a 1-hour cap and often
+a shorter queue: ``srun -p test -A nr_hemo_ai1 --gres=gpu:1 -c 16 --time=01:00:00 --pty bash``.
 
 Do not run this file on the 3080 Ti. Use ``aneuxai.py`` at home.
 """
@@ -36,22 +47,23 @@ from dist_utils import (
     env_local_rank,
     init_distributed,
     is_main_process,
+    world_size,
 )
 from hpc_runtime import (
     detect_project_account,
     job_workspace,
+    persist_if_remote,
     project_root,
+    scale_hpc_workers,
+    slurm_cpu_count,
     stage_training_inputs,
     sync_run_back,
 )
 from run_report import make_run_dir
 
-# Real aneuxai.py batch on the 3080 Ti (~14k-node templates): peak 2.45 GiB
-# at bs=2. A100 40 GB therefore has room for 10/GPU. Global batch 10×4 = 40
-# (PC is 2×16 = 32). LR stays 2e-4; cosine is stretched over 500 epochs.
-# 4 DDP ranks × 16 DataLoader workers = 64 processes. Cache warmup is 48
-# short-lived processes, then they exit.
-# Override at submit time: ANEUX_BATCH_SIZE, ANEUX_NUM_WORKERS, ANEUX_EPOCHS.
+# Per-GPU batch 10. Global batch = 10 × n_gpu (40 on a full node). LR stays 2e-4.
+# DataLoader / cache workers are chosen from SLURM_CPUS_PER_TASK and GPU count
+# (16 cores/GPU on Komondor). Override with ANEUX_NUM_WORKERS / ANEUX_CACHE_WORKERS.
 BATCH_SIZE = int(os.environ.get("ANEUX_BATCH_SIZE", "10"))
 ACCUM_STEPS = int(os.environ.get("ANEUX_ACCUM_STEPS", "1"))
 EPOCHS = int(os.environ.get("ANEUX_EPOCHS", "500"))
@@ -60,14 +72,25 @@ LEARNING_RATE = float(os.environ.get("ANEUX_LR", "2e-4"))
 WEIGHT_DECAY = 1e-4
 EMA_DECAY = 0.993
 LR_WARMUP_STEPS = 300
-NUM_WORKERS = int(os.environ.get("ANEUX_NUM_WORKERS", "16"))
-CACHE_BUILD_WORKERS = int(os.environ.get("ANEUX_CACHE_WORKERS", "48"))
 TORCH_THREADS = 1
 PIN_MEMORY = True
 PREFETCH_FACTOR = 1
 PRELOAD_RAM = False
 USE_GRADIENT_CHECKPOINTING = False  # A100 40 GB; do not checkpoint
-GECO_ETA = 1e-3  # global 40 vs PC 32; leave η, do not retune from one factor
+GECO_ETA = 1e-3
+
+
+def _resolve_worker_counts(n_gpu):
+    scaled = scale_hpc_workers(n_gpu=n_gpu, n_cpu=slurm_cpu_count())
+    num_workers = scaled["num_workers"]
+    cache_workers = scaled["cache_build_workers"]
+    if os.environ.get("ANEUX_NUM_WORKERS"):
+        num_workers = int(os.environ["ANEUX_NUM_WORKERS"])
+    if os.environ.get("ANEUX_CACHE_WORKERS"):
+        cache_workers = int(os.environ["ANEUX_CACHE_WORKERS"])
+    scaled["num_workers"] = max(0, num_workers)
+    scaled["cache_build_workers"] = max(1, cache_workers)
+    return scaled
 
 
 def _activate_python_env_hints():
@@ -85,6 +108,35 @@ def _install_geco_eta(eta):
     _config.GECO_ETA = float(eta)
 
 
+def _maybe_reexec_torchrun():
+    """Start DDP: one rank per GPU in a single NCCL process group.
+
+    This is not four independent jobs. Each rank runs batch_size graphs on its
+    GPU; DistributedSampler shards the dataset; DDP all-reduces gradients so
+    the optimizer step is one global batch (batch_size × n_gpu). Skip if
+    torchrun / WORLD_SIZE already launched us.
+    """
+    if os.environ.get("LOCAL_RANK") is not None:
+        return
+    if int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        return
+    nvis = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if nvis <= 1:
+        return
+    script = os.path.abspath(__file__)
+    cmd = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        f"--nproc_per_node={nvis}",
+        "--standalone",
+        script,
+        *sys.argv[1:],
+    ]
+    print(f"[hpc] {nvis} GPUs visible; re-launching: {' '.join(cmd)}", flush=True)
+    os.execvp(cmd[0], cmd)
+
+
 def main():
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -94,8 +146,10 @@ def main():
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     os.environ.setdefault("ANEUX_MONITOR_SEC", "15")
 
+    _maybe_reexec_torchrun()
     init_distributed()
     local = env_local_rank()
+    nproc = max(1, world_size())
     if torch.cuda.is_available():
         nvis = torch.cuda.device_count()
         idx = 0 if nvis <= 1 else max(0, min(local, nvis - 1))
@@ -107,9 +161,24 @@ def main():
     else:
         device = "cpu"
 
+    scaled = _resolve_worker_counts(n_gpu=nproc)
+    num_workers = scaled["num_workers"]
+    cache_build_workers = scaled["cache_build_workers"]
+
     main_rank = is_main_process()
     if main_rank:
         _activate_python_env_hints()
+        print(
+            f"[hpc] DDP ranks={nproc}  per-GPU batch={BATCH_SIZE}  "
+            f"global batch={BATCH_SIZE * nproc * ACCUM_STEPS}  "
+            f"(NCCL gradient sync, one optimizer step)",
+            flush=True,
+        )
+        print(
+            f"[hpc] scale: ngpu={scaled['n_gpu']} ncpu={scaled['n_cpu']} "
+            f"dataloader_workers={num_workers} cache_workers={cache_build_workers}",
+            flush=True,
+        )
 
     account = detect_project_account()
     proj = project_root(account)
@@ -171,6 +240,11 @@ def main():
         if copy_back_done["yes"] or not main_rank:
             return
         copy_back_done["yes"] = True
+        if cache_dir and os.path.isdir(cache_dir):
+            try:
+                persist_if_remote(cache_dir, cache_src, "tube_cache -> project")
+            except Exception as exc:
+                print(f"[hpc] tube_cache persist failed: {exc}", flush=True)
         if run_dir and os.path.isdir(run_dir):
             dest_root = os.path.join(os.path.abspath(output_persist), "runs")
             try:
@@ -186,11 +260,14 @@ def main():
         "account": account,
         "workspace": workspace,
         "project_root": proj,
-        "nproc_per_node": 4,
-        "partition": "gpu",
+        "nproc_per_node": nproc,
+        "partition": os.environ.get("SLURM_JOB_PARTITION", "gpu"),
         "docs": "https://docs.hpc.dkf.hu/AI/pytorch.html",
         "BATCH_SIZE_PER_GPU": BATCH_SIZE,
-        "GLOBAL_BATCH": BATCH_SIZE * 4 * ACCUM_STEPS,
+        "GLOBAL_BATCH": BATCH_SIZE * nproc * ACCUM_STEPS,
+        "NUM_WORKERS": num_workers,
+        "CACHE_BUILD_WORKERS": cache_build_workers,
+        "n_cpu": scaled["n_cpu"],
         "GECO_ETA": GECO_ETA,
     }
 
@@ -202,8 +279,8 @@ def main():
             batch_size=BATCH_SIZE,
             accum_steps=ACCUM_STEPS,
             epochs=EPOCHS,
-            num_workers=NUM_WORKERS,
-            cache_build_workers=CACHE_BUILD_WORKERS,
+            num_workers=num_workers,
+            cache_build_workers=cache_build_workers,
             torch_threads=TORCH_THREADS,
             pin_memory=PIN_MEMORY,
             prefetch_factor=PREFETCH_FACTOR,

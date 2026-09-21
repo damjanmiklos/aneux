@@ -38,9 +38,9 @@ from config import (
     normalize_gradient_checkpointing,
 )
 from dataset import AneurysmDataset
-from dist_utils import barrier, is_main_process
+from dist_utils import barrier, broadcast_object, is_main_process
 from model import GraphVAE
-from run_report import dump_json, hardware_snapshot, make_run_dir
+from run_report import dump_json, hardware_snapshot, make_run_dir, write_skipped_samples_report
 from train import train_model
 
 # %% [markdown]
@@ -66,8 +66,8 @@ N_RADIAL = HIERARCHY_LEVELS[-1][1]
 #   batch 2 is the largest that still leaves WDDM headroom on 12 GiB.
 # Accumulate to a global batch of 32 (same as the old 4×8) so GECO / LR
 # stay on the measured schedule.
-BATCH_SIZE = 2
-ACCUM_STEPS = 16
+BATCH_SIZE = 4
+ACCUM_STEPS = 8
 EPOCHS = 200
 VAL_SPLIT = 0.15
 TEST_SPLIT = 0.15
@@ -96,10 +96,13 @@ WD_EXCLUDE_KEYWORDS = (
     "alpha_raw",
 )
 
-# 5950X = 16 cores / 32 threads, 32 GB RAM. 20 DataLoader workers as requested;
-# main process keeps 1 torch thread so the workers actually get CPU time.
+# 5950X = 16 cores / 32 threads, 32 GB RAM. 20 DataLoader workers as requested
+# on Linux (fork + copy-on-write). Windows spawn starts a full interpreter per
+# worker and will fill RAM before the first batch; cap unless overridden.
 NUM_WORKERS = 20
-CACHE_BUILD_WORKERS = 6
+if os.name == "nt" and not os.environ.get("ANEUX_NUM_WORKERS"):
+    NUM_WORKERS = 6
+CACHE_BUILD_WORKERS = 15
 TORCH_THREADS = 1
 PIN_MEMORY = False  # Windows WDDM: pinned host RAM fights the 3080 Ti
 PREFETCH_FACTOR = 1
@@ -400,6 +403,48 @@ def subsets_from_ids(dataset, train_ids, val_ids, test_ids):
     )
 
 
+def filter_split_payload(payload, skip_ids):
+    """Drop cache-failed IDs from in-memory splits. Durable split file is unchanged."""
+    skip = {str(x) for x in skip_ids}
+    out = dict(payload)
+    for key in ("train", "val", "test"):
+        out[key] = [i for i in list(payload.get(key) or []) if str(i) not in skip]
+    out["skipped_cache"] = sorted(skip)
+    return out
+
+
+def skipped_sample_records(payload, errors):
+    loc = {}
+    for key in ("train", "val", "test"):
+        for item in payload.get(key) or []:
+            loc[str(item)] = key
+    return [
+        {
+            "dataset_id": did,
+            "error": err,
+            "split": loc.get(str(did), "unknown"),
+        }
+        for did, err in errors
+    ]
+
+
+def persist_tube_cache(cache_dir):
+    """Copy scratch tube_cache back to ``ANEUX_CACHE`` / ``ANEUX_CACHE_PERSIST``."""
+    dest = os.environ.get("ANEUX_CACHE_PERSIST") or os.environ.get("ANEUX_CACHE")
+    if not dest:
+        return None
+    from hpc_runtime import persist_if_remote
+
+    return persist_if_remote(cache_dir, dest, "tube_cache persist")
+
+
+def _first_cache_ready_index(dataset):
+    for i in range(len(dataset)):
+        if dataset._cache_file_ready(i):
+            return i
+    return None
+
+
 def train_val_test_split(dataset, val_fraction, test_fraction, seed):
     """Fixed seeded train/val/test Subsets. Same IDs + seed => same partitions."""
     ids = [dataset.samples[i]["dataset_id"] for i in range(len(dataset))]
@@ -564,7 +609,6 @@ def run_stage2_training(
 
     seed_everything(SEED)
     configure_stage2_precision()
-    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     torch.set_num_threads(max(1, torch_threads))
     os.environ.setdefault("OMP_NUM_THREADS", str(max(1, torch_threads)))
     os.environ.setdefault("MKL_NUM_THREADS", str(max(1, torch_threads)))
@@ -614,6 +658,7 @@ def run_stage2_training(
         print(f"Dataset loaded. Total samples: {len(dataset)}")
 
     split_path = os.path.join(output_dir, SPLIT_JSON_NAME)
+    cache_errors = []
     if probe_only:
         n_need = max(int(batch_size) * 2, 4)
         if main:
@@ -678,16 +723,45 @@ def run_stage2_training(
             )
         if main:
             print("Warming tube cache (parallel raycast; not used as DataLoader workers)...")
-            n_cached = dataset.warmup_cache(num_workers=cache_build_workers)
-            print(f"Tube cache ready for {n_cached} samples")
+            cache_errors = dataset.warmup_cache(num_workers=cache_build_workers)
+            n_ready = sum(1 for i in range(len(dataset)) if dataset._cache_file_ready(i))
+            print(f"Tube cache ready for {n_ready} samples")
+            try:
+                persist_tube_cache(cache_dir)
+            except Exception as exc:
+                print(f"tube_cache persist failed: {exc}")
         barrier()
+        cache_errors = broadcast_object(cache_errors)
+        if cache_errors:
+            skip_ids = [did for did, _err in cache_errors]
+            if main:
+                records = skipped_sample_records(split_payload, cache_errors)
+                skip_path = write_skipped_samples_report(run_dir, records)
+                print(
+                    f"Skipping {len(skip_ids)} samples with failed tube cache "
+                    f"(see {skip_path}): "
+                    + "; ".join(f"{did}: {err}" for did, err in cache_errors[:8])
+                )
+            split_payload = filter_split_payload(split_payload, skip_ids)
+            train_dataset, val_dataset, test_dataset = subsets_from_ids(
+                dataset, split_payload["train"], split_payload["val"], split_payload["test"]
+            )
+            if main:
+                dump_json(os.path.join(run_dir, "data", "train_val_split.json"), split_payload)
+                print(
+                    f"After skips — Train: {len(train_dataset)} | Val: {len(val_dataset)} | "
+                    f"Test: {len(test_dataset)}"
+                )
+            if len(train_dataset) == 0:
+                raise RuntimeError("No train samples left after skipping failed tube caches")
     if preload_ram:
         n_ram = dataset.preload_ram()
         if main:
             print(f"RAM preload: {n_ram} graphs")
 
-    if len(dataset) > 0:
-        sample_data = dataset[0]
+    sample_idx = _first_cache_ready_index(dataset)
+    if sample_idx is not None:
+        sample_data = dataset[sample_idx]
         print(f"Sample X_true shape: {sample_data.x_true.shape}")
         print(f"Sample X_tube (fine) shape: {sample_data.x.shape}")
         print(f"Sample mid shape: {sample_data.pos_mid.shape}")
@@ -740,6 +814,9 @@ def run_stage2_training(
     )
     if extra_meta:
         meta.update(extra_meta)
+    if cache_errors:
+        meta["n_skipped_cache"] = len(cache_errors)
+        meta["skipped_cache_ids"] = [did for did, _err in cache_errors]
     if main:
         dump_json(os.path.join(run_dir, "data", "run_config.json"), meta)
         dump_json(os.path.join(run_dir, "data", "hardware.json"), hardware_snapshot())

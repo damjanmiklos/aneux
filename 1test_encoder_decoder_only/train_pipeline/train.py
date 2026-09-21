@@ -646,13 +646,17 @@ def _zero_meters():
         "rad": 0.0,
         "kl_mean_raw": 0.0,
         "rate_gap": 0.0,
+        "fold": 0.0,
+        "stretch": 0.0,
     }
 
 
 def _add_meter(acc, key, value, scale):
-    v = value.detach() * scale
-    prev = acc[key]
-    acc[key] = v if prev is None else prev + v
+    if torch.is_tensor(value):
+        num = float((value.detach() * scale).reshape(-1).mean().item())
+    else:
+        num = float(value) * float(scale)
+    acc[key] = float(acc.get(key) or 0.0) + num
 
 
 def _flush_meters(acc, total_samples):

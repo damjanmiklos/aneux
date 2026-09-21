@@ -2526,12 +2526,15 @@ class AneurysmDataset(Dataset):
             del data
             gc.collect()
 
-    def warmup_cache(self, indices=None, num_workers=1):
+    def warmup_cache(self, indices=None, num_workers=1, strict=False):
         """Write missing `.pt` caches. Existing versioned files are left untouched.
 
         Raycast is one core per sample, so `num_workers>1` runs samples in
         parallel processes. Each process exits after one sample so VTK/PyTorch
         heaps cannot accumulate. Training DataLoader workers are separate.
+
+        Returns a list of ``(dataset_id, error)`` for samples that failed.
+        ``strict=True`` raises if any failed; training should skip them instead.
         """
         from tqdm import tqdm
 
@@ -2540,19 +2543,24 @@ class AneurysmDataset(Dataset):
         n_hit = len(idxs) - len(missing)
         if not missing:
             print(f"Tube cache already complete ({n_hit} files)")
-            return len(idxs)
+            return []
 
         workers = max(1, int(num_workers))
         workers = min(workers, len(missing))
         print(f"Tube cache: {n_hit} ready, {len(missing)} to build, {workers} process(es)")
+        errors = []
         if workers == 1 or not getattr(self, "_init_kwargs", None):
             for i in tqdm(missing, desc="Tube cache"):
-                self._write_cache(i)
-            return len(idxs)
+                try:
+                    self._write_cache(i)
+                except Exception as exc:
+                    errors.append(
+                        (self.samples[i]["dataset_id"], f"{type(exc).__name__}: {exc}")
+                    )
+            return self._warmup_result(len(idxs), missing, errors, strict=strict)
 
         import multiprocessing
 
-        errors = []
         ctx = multiprocessing.get_context("spawn")
         prev_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
         os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
@@ -2575,12 +2583,7 @@ class AneurysmDataset(Dataset):
                 os.environ.pop("CUDA_VISIBLE_DEVICES", None)
             else:
                 os.environ["CUDA_VISIBLE_DEVICES"] = prev_cvd
-        if errors:
-            detail = "; ".join(f"{did}: {err}" for did, err in errors[:8])
-            raise RuntimeError(
-                f"Tube cache failed for {len(errors)}/{len(missing)} samples ({detail})"
-            )
-        return len(idxs)
+        return self._warmup_result(len(idxs), missing, errors, strict=strict)
 
     def preload_ram(self, indices=None, max_items=None):
         """Hold finalized cache graphs in the parent process.
@@ -2609,6 +2612,23 @@ class AneurysmDataset(Dataset):
                 continue
             self._ram_cache[i] = data
         return len(self._ram_cache)
+
+    def _warmup_result(self, n_requested, missing, errors, strict=False):
+        if errors:
+            detail = "; ".join(f"{did}: {err}" for did, err in errors[:8])
+            msg = (
+                f"Tube cache failed for {len(errors)}/{len(missing)} samples ({detail})"
+            )
+            print(msg)
+            if strict:
+                raise RuntimeError(msg)
+        n_ok = int(n_requested) - len(errors)
+        if n_ok <= 0:
+            raise RuntimeError(
+                f"Tube cache produced no usable samples "
+                f"({len(errors)} failed of {len(missing)} missing)"
+            )
+        return list(errors)
 
     def _cache_file_ready(self, idx):
         sample = self.samples[idx]
