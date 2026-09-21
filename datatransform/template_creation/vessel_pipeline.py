@@ -1225,6 +1225,71 @@ def _rescue_trace(centerline, ref_bounds, label):
     return repaired
 
 
+def _complete_missing_outlets(chosen, label, closed_anat, source_anat,
+                              profiles, arrived, ref_bounds):
+    """Ask again for the outlets this trace never reached, and add them to it.
+
+    vmtkCenterlines writes one polyline per inlet-outlet path and, when it
+    cannot descend to one of them, it does not say so: it returns fewer tracts.
+    p463 keep 1 has seven clean rims on a 44k-point original with no
+    non-manifold edges and nothing wrong with its profiles, and both traces came
+    back with four tracts for six outlets, missing the 0.905 mm and 0.850 mm
+    ostia of a tight trifurcation. The case was refused for branches the vessel
+    plainly has.
+
+    Asking for those outlets on their own is a different problem for the same
+    solver -- descend from the inlet to two targets rather than pick a steepest
+    path per target across the whole Voronoi diagram -- and it is asked on the
+    capped anatomical surface, where the seed for an ostium is that ostium's own
+    barycentre and the mapping cannot be mistaken. The raw trace is already one
+    polyline per outlet, each re-walking the shared trunk, so appending another
+    such polyline gives back exactly that kind of object; everything downstream
+    resamples and re-branches it anyway.
+
+    The retry is kept only if it is a valid trace on its own and reaches
+    openings the original did not.
+    """
+    if closed_anat is None:
+        return chosen, label
+    missing = [int(i) for i in np.flatnonzero(~arrived)]
+    if not missing:
+        return chosen, label
+    seeds = [np.asarray(profiles[i]["barycenter"], dtype=np.float64) for i in missing]
+    names = ", ".join(
+        f"profile {profiles[i]['index']} (r={float(profiles[i]['radius']):.3f} mm)"
+        for i in missing
+    )
+    print(f"  Re-tracing for the {len(missing)} opening(s) the {label} trace missed: {names}")
+    extra = _centerlines_in_child(
+        closed_anat, source_anat, seeds, CENTERLINE_TIMEOUT_S,
+        label="missing outlets",
+    )
+    if extra is None or not centerline_looks_valid(extra, ref_bounds):
+        print("  The re-trace did not produce a usable centerline; keeping the original.")
+        return chosen, label
+    extra_arrived, _gaps = centerline_arrivals(extra, profiles)
+    gained = [i for i in missing if bool(extra_arrived[i])]
+    if not gained:
+        print("  The re-trace reached none of them either; keeping the original.")
+        return chosen, label
+    append = vtk.vtkAppendPolyData()
+    append.AddInputData(to_vtk_poly(chosen))
+    append.AddInputData(to_vtk_poly(extra))
+    append.Update()
+    merged = to_vtk_poly(append.GetOutput())
+    if merged.GetPointData().GetArray("MaximumInscribedSphereRadius") is None:
+        print("  The merged trace lost its MISR array; keeping the original.")
+        return chosen, label
+    if not centerline_looks_valid(merged, ref_bounds):
+        print("  The merged trace failed the lumen check; keeping the original.")
+        return chosen, label
+    print(
+        f"  Added {extra.GetNumberOfCells()} tract(s) from the re-trace; it reaches "
+        f"{len(gained)} of the {len(missing)} missed opening(s)"
+    )
+    return merged, f"{label} plus a re-trace"
+
+
 def _centerline_reaches_targets(centerline, n_targets):
     """vmtkCenterlines writes one polyline per inlet→outlet path."""
     n_cells = int(to_vtk_poly(centerline).GetNumberOfCells())
@@ -1251,11 +1316,46 @@ CENTERLINE_ARRIVAL_RADII = 2.0
 CENTERLINE_ARRIVAL_FLOOR_MM = 0.3
 
 
+def _traced_points(centerline, max_edge_mm=10.0, min_length_mm=1.0):
+    """Every point on a tract that is actually a path, and none that is not.
+
+    vmtkCenterlines writes a polyline for an outlet it could not descend to as
+    readily as for one it reached, and that stub sits on the seed. So the stub
+    lies within a rounding error of the ostium it failed to reach, and any
+    question asked of the trace's raw points answers that the trace is right
+    there. On p463 keep 1 two 2- and 3-point stubs of 0.01 and 0.03 mm put the
+    arrival gaps for two ostia at 0.67 and 0.64 mm -- well inside their own
+    radii -- while the nearest real tract was 6.69 and 5.09 mm away, and that
+    is the difference between an opening this trace visits and one it does not.
+    The same rule that drop_degenerate_tracts uses decides which is which.
+    """
+    poly = to_vtk_poly(centerline)
+    poly.BuildCells()
+    kept = []
+    for ci in range(int(poly.GetNumberOfCells())):
+        cell = poly.GetCell(ci)
+        n = cell.GetNumberOfPoints()
+        if n < 2:
+            continue
+        pts = np.array(
+            [poly.GetPoint(int(cell.GetPointId(j))) for j in range(n)], dtype=np.float64
+        )
+        segs = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+        if segs.size == 0 or float(segs.max()) > float(max_edge_mm):
+            continue
+        if float(segs.sum()) < float(min_length_mm):
+            continue
+        kept.append(pts)
+    if kept:
+        return np.vstack(kept)
+    return np.asarray(pv.wrap(poly).points, dtype=np.float64)
+
+
 def centerline_arrival_gaps(centerline, profiles):
     """Distance from each ostium barycentre to the nearest point on the trace."""
     from scipy.spatial import cKDTree
 
-    points = np.asarray(pv.wrap(to_vtk_poly(centerline)).points, dtype=float)
+    points = _traced_points(centerline)
     if points.size == 0:
         return np.full(len(profiles), np.inf)
     tree = cKDTree(points)
@@ -1365,6 +1465,80 @@ def centerline_anatomical_coverage(centerline, anatomical_profiles,
         return 0
     voxels = np.unique(np.round(points / float(voxel_mm)).astype(np.int64), axis=0)
     return int(len(voxels))
+
+
+# Voxel size for the lumen-compartment test. It only has to be fine enough to
+# keep a vessel open, and the smallest ostium in the corpus is r=0.205 mm.
+LUMEN_VOXEL_MM = 0.3
+
+
+def ostium_lumen_compartments(surface, profiles, voxel_mm=LUMEN_VOXEL_MM):
+    """Which enclosed volume each ostium opens into. ``None`` when undecidable.
+
+    A surface can be one connected sheet and still hold two separate lumens: a
+    branch welded onto the trunk from the outside shares a wall with it and
+    opens nowhere into it. No centerline can cross that wall, because there is
+    nothing to cross into, and vmtkCenterlines says so only as "Cannot find a
+    steepest descent edge" on the outlets in the far compartment. Asking the
+    volume directly says it plainly.
+    """
+    from scipy import ndimage
+
+    if not profiles:
+        return None
+    try:
+        capped = to_vtk_poly(cap_surface(surface))
+    except Exception:
+        return None
+    b = np.asarray(capped.GetBounds(), dtype=np.float64)
+    lo = b[[0, 2, 4]] - 2.0 * voxel_mm
+    dims = np.ceil((b[[1, 3, 5]] - b[[0, 2, 4]] + 4.0 * voxel_mm) / voxel_mm).astype(int)
+    if np.any(dims < 4) or np.any(dims > 600):
+        return None
+    img = vtk.vtkImageData()
+    img.SetSpacing(voxel_mm, voxel_mm, voxel_mm)
+    img.SetOrigin(*[float(v) for v in lo])
+    img.SetDimensions(*[int(v) for v in dims])
+    img.AllocateScalars(vtk.VTK_UNSIGNED_CHAR, 1)
+    img.GetPointData().GetScalars().Fill(1)
+    stencil = vtk.vtkPolyDataToImageStencil()
+    stencil.SetInputData(capped)
+    stencil.SetOutputOrigin(*[float(v) for v in lo])
+    stencil.SetOutputSpacing(voxel_mm, voxel_mm, voxel_mm)
+    stencil.SetOutputWholeExtent(img.GetExtent())
+    stencil.Update()
+    cut = vtk.vtkImageStencil()
+    cut.SetInputData(img)
+    cut.SetStencilConnection(stencil.GetOutputPort())
+    cut.ReverseStencilOff()
+    cut.SetBackgroundValue(0)
+    cut.Update()
+    inside = vtk_to_numpy(cut.GetOutput().GetPointData().GetScalars()).reshape(dims[::-1])
+    labels, n_lumens = ndimage.label(inside > 0)
+    if n_lumens <= 1:
+        return [1] * len(profiles)
+    out = []
+    reach = int(np.ceil(1.5 / voxel_mm))
+    for prof in profiles:
+        bary = np.asarray(prof["barycenter"], dtype=np.float64)
+        normal = _unit(prof["normal"])
+        seed = bary - normal * max(float(prof["radius"]), 0.5)
+        idx = np.round((seed - lo) / voxel_mm).astype(int)
+        best = None
+        for dk in range(-reach, reach + 1):
+            for dj in range(-reach, reach + 1):
+                for di in range(-reach, reach + 1):
+                    k, j, i = idx[2] + dk, idx[1] + dj, idx[0] + di
+                    if not (0 <= k < dims[2] and 0 <= j < dims[1] and 0 <= i < dims[0]):
+                        continue
+                    lab = int(labels[k, j, i])
+                    if lab == 0:
+                        continue
+                    d2 = dk * dk + dj * dj + di * di
+                    if best is None or d2 < best[0]:
+                        best = (d2, lab)
+        out.append(best[1] if best is not None else 0)
+    return out
 
 
 def extract_centerlines_for_tube(extended_vessel, smoothed_vessel, anatomical_profiles, extended_profiles):
@@ -1478,6 +1652,17 @@ def extract_centerlines_for_tube(extended_vessel, smoothed_vessel, anatomical_pr
                     f"  NOTE: centerline taken from the {name}: it covers {coverage} "
                     f"voxels against {other_cov} for the {other[2]} ({drift:+.1%})"
                 )
+    # A rescue, not a repair: a trace that is short of a tract is about to
+    # cost the case entirely, while one that merely passes an ostium at a
+    # distance has always been allowed to, and re-tracing those would change
+    # cases that work today.
+    if not _centerline_reaches_targets(chosen, want):
+        chosen, name = _complete_missing_outlets(
+            chosen, name, closed_anat, source_anat, anatomical_profiles,
+            arrived, ref_bounds,
+        )
+        arrived, gaps = centerline_arrivals(chosen, anatomical_profiles)
+
     if not bool(arrived.all()):
         missed = ", ".join(
             f"profile {anatomical_profiles[i]['index']} "
@@ -1490,6 +1675,24 @@ def extract_centerlines_for_tube(extended_vessel, smoothed_vessel, anatomical_pr
         )
 
     if not _centerline_reaches_targets(chosen, want):
+        # Before blaming the trace, ask whether there was anywhere for it to go.
+        lumens = ostium_lumen_compartments(smoothed_vessel, anatomical_profiles)
+        if lumens and len(set(lumens)) > 1:
+            groups = {}
+            for prof, lumen in zip(anatomical_profiles, lumens):
+                groups.setdefault(lumen, []).append(
+                    f"profile {prof['index']} (r={float(prof['radius']):.3f} mm)"
+                )
+            described = "; ".join(
+                f"lumen {k}: " + ", ".join(v) for k, v in sorted(groups.items())
+            )
+            raise TemplateQualityError(
+                f"this vessel encloses {len(set(lumens))} separate lumens and its "
+                f"openings are split between them -- {described}. The wall between "
+                "them is a double wall with no way through, so no centerline can "
+                "reach the far openings and no single parent tube can carry them. "
+                "The input mesh is what has to be fixed."
+            )
         raise TemplateQualityError(
             f"the best centerline ({name}) has {chosen.GetNumberOfCells()} tracts for "
             f"{want} outlets, so at least one branch was never reached. A centerline "
@@ -4184,6 +4387,40 @@ def _clip_patch_at_plane(patch, origin, outward):
     return weld_clip_slivers(clean_triangulate(clipper.GetOutput()))
 
 
+# How far past its own rim a flow-extension collar may reach. The collar only
+# has to bridge the original rim to the ostium plane, so its reach is set by
+# that rim and not by a constant; the half again is slack for an oblique cut.
+EXTENSION_COLLAR_REACH_FACTOR = 1.5
+
+
+def _ostium_rim_reach(original_surface, origins):
+    """How far each ostium's own rim gets from its frame origin."""
+    poly, _pts, _faces, loops = _loop_geometry(original_surface)
+    reach = np.zeros(len(origins), dtype=np.float64)
+    if not loops:
+        return reach
+    centers = np.asarray([c for _ids, c, _r, _n in loops], dtype=np.float64)
+    for j, origin in enumerate(origins):
+        k = int(np.argmin(np.linalg.norm(centers - origin, axis=1)))
+        ids = loops[k][0]
+        coords = np.asarray([poly.GetPoint(int(i)) for i in ids], dtype=np.float64)
+        reach[j] = float(np.max(np.linalg.norm(coords - origin, axis=1)))
+    return reach
+
+
+def _keep_cells_within(patch, origin, radius):
+    """Drop the cells of ``patch`` whose centre is further than ``radius`` out."""
+    poly, pts, faces = _triangle_points_faces(patch)
+    if faces.size == 0:
+        return poly, 0
+    centres = pts[faces].mean(axis=1)
+    keep = np.linalg.norm(centres - np.asarray(origin, dtype=np.float64), axis=1) <= radius
+    n_cut = int(np.count_nonzero(~keep))
+    if n_cut == 0:
+        return poly, 0
+    return _polydata_from_triangles(pts, faces[keep]), n_cut
+
+
 def trim_extension_patches(extended_surface, original_surface, frames):
     """Cut every flow-extension tube back to its own ostium plane.
 
@@ -4218,9 +4455,18 @@ def trim_extension_patches(extended_surface, original_surface, frames):
 
     origins = np.asarray([np.asarray(f[0], dtype=np.float64) for f in frames], dtype=np.float64)
     outwards = np.asarray([_unit(f[1]) for f in frames], dtype=np.float64)
+    radii = np.asarray([float(f[2]) for f in frames], dtype=np.float64)
+    # A tube starts at the rim it grew from, so the frame it belongs to is the
+    # one it touches -- not the one its centroid happens to be nearest. The
+    # centroid sits halfway up a 5 mm tube and on p447 that put a tube from a
+    # torn hole onto an ostium 8.7 mm away, to be clipped on a plane that has
+    # nothing to do with it.
+    reach = _ostium_rim_reach(original_surface, origins)
 
     pieces = [body]
     n_trimmed = 0
+    n_dropped = 0
+    n_collared = 0
     for rid in range(n_regions):
         sel = vtk.vtkThreshold()
         sel.SetInputData(labelled)
@@ -4235,11 +4481,37 @@ def trim_extension_patches(extended_surface, original_surface, frames):
         if patch.GetNumberOfCells() == 0:
             continue
         _pp, ppts = _poly_points(patch)
-        centroid = ppts.mean(axis=0)
-        j = int(np.argmin(np.linalg.norm(origins - centroid, axis=1)))
+        touch = np.asarray(
+            [float(np.min(np.linalg.norm(ppts - o, axis=1))) for o in origins],
+            dtype=np.float64,
+        )
+        j = int(np.argmin(touch))
+        if touch[j] > max(2.0 * radii[j], 1.0):
+            # This tube grew out of a hole that is not an ostium -- a tear the
+            # preparation left, which vmtkFlowExtensions extrudes just the same.
+            # It has no plane of its own to be cut back to, and clipping it on
+            # somebody else's leaves whatever happens to fall inboard attached
+            # to the vessel.
+            n_dropped += 1
+            continue
         kept = _clip_patch_at_plane(patch, origins[j], outwards[j])
         before = patch.GetNumberOfCells()
         after = kept.GetNumberOfCells()
+        if after > 0 and reach[j] > 0.0:
+            # A plane can only cut a tube across if it is square to it. Where
+            # the centerline tangent and the boundary normal disagree it slices
+            # the tube lengthwise instead and half of it survives: on p447
+            # 2123 of 4494 cells, leaving a 1.83 mm rim two and a half
+            # millimetres out, which the uncap then cut a second hole beside.
+            # The collar only exists to bridge this ostium's own rim to its
+            # plane, so it cannot legitimately reach further out than that rim
+            # does.
+            kept, n_cut = _keep_cells_within(
+                kept, origins[j], EXTENSION_COLLAR_REACH_FACTOR * reach[j]
+            )
+            if n_cut:
+                n_collared += 1
+            after = kept.GetNumberOfCells()
         if after < before:
             n_trimmed += 1
         if after > 0:
@@ -4254,6 +4526,16 @@ def trim_extension_patches(extended_surface, original_surface, frames):
     if n_trimmed:
         print(
             f"  Trimmed {n_trimmed}/{n_regions} flow-extension patch(es) back to the ostium plane"
+        )
+    if n_collared:
+        print(
+            f"  {n_collared} extension patch(es) were cut lengthwise by their own ostium "
+            "plane; kept only the collar inside the rim"
+        )
+    if n_dropped:
+        print(
+            f"  Dropped {n_dropped} flow extension(s) grown out of a hole that is not an "
+            "ostium; they have no plane to be cut back to"
         )
     return merged, n_trimmed
 
@@ -5366,7 +5648,28 @@ def _mesh_components(faces, n_points):
     return roots
 
 
-def rejoin_ostium_islands(surface, profiles, tol_mm=WELD_TOLERANCE_MM):
+# A crack the remesher leaves is measured against the mesh it left it in. On
+# p398 vmtkSurfaceRemeshing retriangulated a branch without sharing the seam
+# vertices and left a split whose two sides stand 0.0006-0.05 mm apart in a
+# surface of 0.15 mm edges: a third of one triangle at its widest. Half an edge
+# separates that from any gap that is really there, and the ceiling keeps the
+# same rule from reaching across a coarse input.
+REJOIN_SEAM_EDGE_FRACTION = 0.5
+REJOIN_SEAM_MAX_MM = 0.1
+
+
+def _seam_weld_tolerance(pts, faces):
+    """How wide a crack may be and still be one the remesher opened."""
+    if faces.size == 0:
+        return WELD_TOLERANCE_MM
+    mean_edge = float(_triangle_edge_lengths(pts, faces).mean())
+    if not np.isfinite(mean_edge) or mean_edge <= 0.0:
+        return WELD_TOLERANCE_MM
+    return float(min(REJOIN_SEAM_MAX_MM,
+                     max(WELD_TOLERANCE_MM, REJOIN_SEAM_EDGE_FRACTION * mean_edge)))
+
+
+def rejoin_ostium_islands(surface, profiles, tol_mm=None):
     """Weld a severed shell that carries a real ostium back onto the body.
 
     The manifold repairs remove triangles, and where they remove the last
@@ -5390,6 +5693,8 @@ def rejoin_ostium_islands(surface, profiles, tol_mm=WELD_TOLERANCE_MM):
     uniq = np.unique(labels)
     if uniq.size < 2:
         return poly, 0
+    if tol_mm is None:
+        tol_mm = _seam_weld_tolerance(pts, faces)
     sizes = {int(u): int(np.count_nonzero(labels == u)) for u in uniq}
     body = max(sizes, key=lambda u: sizes[u])
     body_pt_ids = np.unique(faces[labels == body].reshape(-1))
@@ -5416,9 +5721,14 @@ def rejoin_ostium_islands(surface, profiles, tol_mm=WELD_TOLERANCE_MM):
             print(
                 f"  An ostium-carrying shell of {int(np.count_nonzero(mask))} "
                 f"triangles sits {float(np.min(d)):.6f} mm off the body, too far "
-                "to weld back"
+                f"to weld back (seam tolerance {float(tol_mm):.4f} mm)"
             )
             continue
+        print(
+            f"  An ostium-carrying shell of {int(np.count_nonzero(mask))} triangles "
+            f"meets the body along {int(np.count_nonzero(seam))} point(s) within "
+            f"{float(tol_mm):.4f} mm; welding it back"
+        )
         remap[shell_pt_ids[seam]] = body_pt_ids[np.asarray(idx)[seam]]
         rejoined += 1
     if not rejoined:
