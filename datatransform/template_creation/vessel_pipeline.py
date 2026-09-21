@@ -528,7 +528,12 @@ def _profile_from_loop_points(pts_xyz, body, index):
 
 
 def _profiles_from_boundary_loops(surface):
-    loops = _feature_edge_boundary_loops(surface)
+    """Profiles built from the arbitrated loop walk rather than the stripper alone.
+
+    extract_boundary_loops runs both extractors and keeps the one that agrees
+    with count_boundary_regions, so it is right where either one alone is not.
+    """
+    loops = extract_boundary_loops(surface)
     body = mesh_body_point(surface)
     profiles = []
     for i in range(loops.GetNumberOfCells()):
@@ -591,11 +596,41 @@ def _keep_seed_profiles(profiles):
 
 
 def measure_open_profiles(surface):
-    """Open-boundary loops with radius, barycenter, and (when available) outward normals."""
-    vmtk_profiles = _vmtk_boundary_profiles(surface)
-    profiles = _keep_seed_profiles(vmtk_profiles)
-    if len(profiles) < 2:
-        loop_profiles = _keep_seed_profiles(_profiles_from_boundary_loops(surface))
+    """Open-boundary loops with radius, barycenter, and (when available) outward normals.
+
+    vtkvmtkBoundaryReferenceSystems is preferred when it works, because it
+    gives a real boundary normal per rim instead of one guessed from three
+    loop points. It walks the rim with the extractor that bails on a vertex
+    carrying more than two boundary neighbours -- and when it bails it does not
+    fail, it returns the rims it managed. p376 keep 1 has six clean openings on
+    its 234k-point original, r=2.32 down to 0.83 mm with 117 to 330 rim points
+    each, and this reported two of them. Four ostia were gone before a single
+    centerline seed was placed and the case died in the Voronoi trace with
+    "the centerline left the lumen", which named the wrong step entirely.
+
+    count_boundary_regions is the referee. It is connectivity on the boundary
+    edges and nothing else, so a walk that breaks part way cannot fool it. When
+    the reference systems report fewer rims than the surface has, the profiles
+    are rebuilt from extract_boundary_loops -- which arbitrates both extractors
+    against that same count -- and kept only if they come closer to it.
+    """
+    vtk_poly = to_vtk_poly(surface)
+    expected = count_boundary_regions(vtk_poly)
+    # Compared before the seed filter: that filter drops pinholes on purpose,
+    # so the count it leaves is legitimately below the number of rims.
+    vmtk_profiles = _vmtk_boundary_profiles(vtk_poly)
+    chosen = vmtk_profiles
+    if expected > 0 and len(vmtk_profiles) < expected:
+        loop_profiles = _profiles_from_boundary_loops(vtk_poly)
+        if abs(len(loop_profiles) - expected) < abs(len(vmtk_profiles) - expected):
+            print(
+                f"  Boundary reference systems walked {len(vmtk_profiles)} of "
+                f"{expected} rim(s); using {len(loop_profiles)} extracted loops instead"
+            )
+            chosen = loop_profiles
+    profiles = _keep_seed_profiles(chosen)
+    if len(profiles) < 2 and chosen is vmtk_profiles:
+        loop_profiles = _keep_seed_profiles(_profiles_from_boundary_loops(vtk_poly))
         if len(loop_profiles) > len(profiles):
             print(
                 f"  Boundary extractor found {len(profiles)} opening(s); "
@@ -3178,6 +3213,13 @@ def _cut_loops_near_profile(surface, origin, normal, bary):
     return best
 
 
+# The seam clip opens the loop the cutter scored, on the cutter's own plane, so
+# the rim it leaves behind is that loop. Measured over 16 fallback clips, 14
+# come out within 2% of it. The two that do not are the ones that merged a
+# neighbouring ostium into the hole, and they are far outside: 1.63x and 3.38x.
+CLIP_OPENING_OVER_CUTTER = 1.30
+
+
 def clip_one_profile(surface, profile, body_point, search_mm):
     """Local seam clip at one opening. Score planes with vtkCutter, then seam-clip once.
 
@@ -3289,6 +3331,18 @@ def clip_one_profile(surface, profile, body_point, search_mm):
         why.append(f"r={r_open:.3f} mm outside {min_r:.3f}-{max_r:.3f} mm")
     if n_rim < MIN_OPENING_LOOP_POINTS:
         why.append(f"{n_rim} rim points, under the {MIN_OPENING_LOOP_POINTS} needed")
+    # The band around r_gt cannot see a clip that merged two ostia: it allows
+    # r_gt + 2.5 mm, which for UPF_P0258's 0.658 mm profile 1 is a 3.16 mm
+    # crater. That clip opened 2.734 mm against a cutter loop of 0.810 mm,
+    # swallowed the 1.412 mm ostium beside it, and the case shipped six
+    # openings against seven profiles. The cutter loop is the prediction this
+    # clip is meant to fulfil, so measure the outcome against that.
+    r_cut = float(loop["radius"])
+    if r_cut > 0.0 and r_open > CLIP_OPENING_OVER_CUTTER * r_cut:
+        why.append(
+            f"r={r_open:.3f} mm is {r_open / r_cut:.2f}x the cutter loop's "
+            f"{r_cut:.3f} mm, so the clip took in more than that loop"
+        )
     if why:
         print(
             f"  [Uncap] Profile {profile['index']} seam clip rejected: "
@@ -4680,12 +4734,17 @@ def compute_raycast_stretch_distances(
             d = float(np.sqrt((x[0] - p[0]) ** 2 + (x[1] - p[1]) ** 2 + (x[2] - p[2]) ** 2))
             if 0.10 < d <= (3.5 * r_local):
                 cid = int(cell_id.get())
-                if gt_cell_normals is not None and 0 <= cid < len(gt_cell_normals):
+                if gt_cell_normals is None:
+                    distances[i] = d
+                elif 0 <= cid < len(gt_cell_normals):
                     agree = float(np.dot(n, gt_cell_normals[cid]))
                     if (agree > 0.2) if gt_radially_oriented else (abs(agree) > 0.2):
                         distances[i] = d
-                else:
-                    distances[i] = d
+                # A hit whose cell the normals array does not cover cannot be
+                # checked for orientation, so it is refused rather than trusted.
+                # This used to fall into the branch that accepts any distance,
+                # which is the one place the two raycast implementations gave
+                # different answers; stretch_raycast.cpp has always refused it.
     return _rescue_missed_rays(
         distances, locator, template_pts, r_arr, gt_cell_normals, gt_radially_oriented
     )
@@ -5424,8 +5483,17 @@ def save_polydata(surface, out_file):
         raise TemplateQualityError(f"Failed to write {out_file}")
 
 
-def _try_reuse_centerline(reuse_centerline, reference_bounds):
-    """Load a precomputed original_centerline. None means extract Voronoi as today."""
+def _try_reuse_centerline(reuse_centerline, reference_bounds, profiles=None):
+    """Load a precomputed original_centerline. None means extract Voronoi as today.
+
+    ``profiles`` are the anatomical openings the tube has to end at. A stored
+    trace that does not reach one of them is worse than no reuse at all: the
+    polyball tube grows no stub there, the pipe-section uncap finds no end to
+    cut, and the template ships without an opening the GT has. The arrival test
+    is the same one that picks between the two live traces, and it separates the
+    two populations cleanly -- measured over 391 openings, arrivals reach p90
+    0.79 radii and misses start at 9.34, with nothing in between.
+    """
     if reuse_centerline is None:
         return None
     if isinstance(reuse_centerline, str):
@@ -5442,6 +5510,18 @@ def _try_reuse_centerline(reuse_centerline, reference_bounds):
     if not centerline_looks_valid(cl, reference_bounds):
         print(f"  WARNING: reused centerline failed the lumen check ({source}); extracting Voronoi")
         return None
+    if profiles:
+        arrived, gaps = centerline_arrivals(cl, profiles)
+        if not bool(arrived.all()):
+            missed = ", ".join(
+                f"r={float(profiles[i]['radius']):.3f} mm, {float(gaps[i]):.2f} mm away"
+                for i in np.flatnonzero(~arrived)
+            )
+            print(
+                f"  WARNING: reused centerline reaches {int(arrived.sum())}/"
+                f"{len(profiles)} openings ({missed}); extracting Voronoi"
+            )
+            return None
     print(f"  Reusing original centerline ({cl.GetNumberOfPoints()} points, skip dual Voronoi)")
     return cl
 
@@ -5476,10 +5556,18 @@ def build_parent_tube(
 
     print("Step 1b: Detecting anatomical inlet/outlet boundaries...")
     anatomical_profiles = measure_open_profiles(smoothed_vessel)
+    # One opening per hole. VMTK reports a rim pinched into a figure eight as
+    # two profiles, and each one then demands its own polyball stub and its own
+    # pipe-section cut at a place where there is only one hole.
+    anatomical_profiles, _n_phantom = reconcile_profiles_with_loops(
+        smoothed_vessel, anatomical_profiles, label="smoothing"
+    )
     log_profiles(anatomical_profiles, label="Anatomical")
     _inlet, _outlets = seed_points_from_profiles(anatomical_profiles)
 
-    branched_centerline = _try_reuse_centerline(reuse_centerline, smoothed_vessel.GetBounds())
+    branched_centerline = _try_reuse_centerline(
+        reuse_centerline, smoothed_vessel.GetBounds(), profiles=anatomical_profiles
+    )
     if branched_centerline is None:
         print("Step 2: Adding flow extensions on the open surface...")
         extended_vessel = add_flow_extensions(smoothed_vessel, extension_length=extension_length)

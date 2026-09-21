@@ -393,18 +393,34 @@ def _set_named_point_array(surface, name, values):
     return poly
 
 
-def nearest_neighbour_scalars(src_pts, src_vals, dst_pts):
-    """Vectorised NN transfer (cKDTree). Not a Python vertex loop."""
+def nearest_neighbour_index(src_pts, dst_pts):
+    """Nearest source vertex for every destination vertex, or None if either is empty.
+
+    The three supervision arrays are carried between the same two point sets, so
+    the tree and the query are shared: doing it per array built the same tree
+    three times over meshes of a few hundred thousand vertices.
+    """
     src_pts = np.ascontiguousarray(src_pts, dtype=np.float64)
     dst_pts = np.ascontiguousarray(dst_pts, dtype=np.float64)
-    src_vals = np.ascontiguousarray(src_vals, dtype=np.float64).reshape(-1)
-    n_dst = int(dst_pts.shape[0])
-    if n_dst == 0:
-        return np.zeros(0, dtype=np.float64)
-    if src_pts.shape[0] == 0:
-        return np.zeros(n_dst, dtype=np.float64)
+    if int(dst_pts.shape[0]) == 0 or int(src_pts.shape[0]) == 0:
+        return None
     _, idx = cKDTree(src_pts).query(dst_pts, k=1, workers=1)
-    return src_vals[np.asarray(idx, dtype=np.int64)]
+    return np.asarray(idx, dtype=np.int64)
+
+
+def nearest_neighbour_scalars(src_pts, src_vals, dst_pts, idx=None):
+    """Vectorised NN transfer (cKDTree). Not a Python vertex loop.
+
+    ``idx`` is the pairing from ``nearest_neighbour_index`` when the caller has
+    already built it for these same two point sets.
+    """
+    src_vals = np.ascontiguousarray(src_vals, dtype=np.float64).reshape(-1)
+    n_dst = int(np.asarray(dst_pts).shape[0])
+    if idx is None:
+        idx = nearest_neighbour_index(src_pts, dst_pts)
+    if idx is None:
+        return np.zeros(n_dst, dtype=np.float64)
+    return src_vals[idx]
 
 
 def attach_template_supervision_arrays(surface, r_template, stretch_distances, target_edge=None):
@@ -438,6 +454,7 @@ def snapshot_template_supervision(surface, fallback_pts=None, fallback_arrays=No
     _, pts = _poly_points(poly)
     arrays = {}
     n_nn = 0
+    nn_idx = None
     for name in TEMPLATE_POINT_ARRAYS:
         vals = _named_point_array(poly, name)
         need_nn = vals is None or not np.all(np.isfinite(vals))
@@ -446,7 +463,11 @@ def snapshot_template_supervision(surface, fallback_pts=None, fallback_arrays=No
                 raise TemplateQualityError(
                     f"{name} missing after remesh and no pre-remesh fallback was supplied"
                 )
-            filled = nearest_neighbour_scalars(fallback_pts, fallback_arrays[name], pts)
+            if nn_idx is None:
+                nn_idx = nearest_neighbour_index(fallback_pts, pts)
+            filled = nearest_neighbour_scalars(
+                fallback_pts, fallback_arrays[name], pts, idx=nn_idx
+            )
             if vals is None:
                 vals = filled
                 n_nn += int(pts.shape[0])
@@ -464,15 +485,23 @@ def restore_template_supervision(dst_surface, src_pts, src_arrays):
     """NN from a snapshot onto ``dst`` (covers ``finalize_surface`` stripping)."""
     poly = _mutable_poly(dst_surface)
     _, dst_pts = _poly_points(poly)
+    nn_idx = None
     for name in TEMPLATE_POINT_ARRAYS:
         existing = _named_point_array(poly, name)
-        filled = nearest_neighbour_scalars(src_pts, src_arrays[name], dst_pts)
-        if existing is not None:
-            good = np.isfinite(existing)
-            if np.all(good) and existing.size == filled.size:
-                filled = existing
-            elif np.any(good):
-                filled = np.where(good, existing, filled)
+        # _named_point_array already refuses an array whose length is not the
+        # point count, so an array that is here and finite everywhere needs no
+        # transfer at all -- and the nearest-neighbour search it used to run
+        # anyway was over every vertex of the final mesh, three times a case.
+        if existing is not None and np.all(np.isfinite(existing)):
+            _set_named_point_array(poly, name, existing)
+            continue
+        if nn_idx is None:
+            nn_idx = nearest_neighbour_index(src_pts, dst_pts)
+        filled = nearest_neighbour_scalars(
+            src_pts, src_arrays[name], dst_pts, idx=nn_idx
+        )
+        if existing is not None and np.any(np.isfinite(existing)):
+            filled = np.where(np.isfinite(existing), existing, filled)
         _set_named_point_array(poly, name, filled)
     return poly
 
@@ -671,6 +700,19 @@ def process_variable_dataset(
 
     assert_template_scale(final_surface, vessel_mesh, context=dataset_id)
     openings = assert_template_quality(final_surface, context=dataset_id)
+    # build_parent_tube checks the uncap opened every end, but finalize_surface
+    # runs afterwards and it closes holes: close_wall_pinholes and
+    # remove_spurious_openings can each take an ostium the remesh has narrowed.
+    # Nothing between there and disk looked again, so a template could ship with
+    # fewer ostia than the GT it is supposed to be the parent of, and the
+    # decoder would be trained to reproduce a vessel with a branch missing.
+    n_want = len(frames) if frames else len(anatomical_profiles)
+    if len(openings) != n_want:
+        raise TemplateQualityError(
+            f"{dataset_id}: template finished with {len(openings)} openings against "
+            f"{n_want} " + ("GT ostium frames" if frames else "anatomical profiles")
+            + "; a template whose ostia do not match the ground truth cannot supervise."
+        )
     stats = assert_template_supervision_arrays(final_surface, context=dataset_id)
     print(
         "  Item 13 final arrays: "
