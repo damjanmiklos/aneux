@@ -2,7 +2,9 @@
  * Tight C++ loop around vtkCellLocator::IntersectWithLine.
  *
  * Semantics match vessel_pipeline.compute_raycast_stretch_distances:
- * inward 1.5 mm / 0.4 mm veto, outward max_ray, 0.10 < d <= 3.5 R, dot > 0.2.
+ * inward probe max(1.5, 3.5 R) with the GT-normal side test (the 0.4 mm
+ * veto only when no GT normals), outward max_ray, 0.10 < d <= 3.5 R,
+ * dot > 0.2.
  *
  * Built against the hemomesh conda VTK. Do not import this from remeshing.py.
  */
@@ -14,6 +16,7 @@
 
 #include "vtkCellLocator.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 
@@ -161,16 +164,31 @@ static PyObject *compute(PyObject * /*self*/, PyObject *args) {
     const double *n = outward + 3 * i;
     const double r_local = radii == nullptr ? 1.0 : radii[i];
 
-    p_in[0] = p[0] - n[0] * 1.5;
-    p_in[1] = p[1] - n[1] * 1.5;
-    p_in[2] = p[2] - n[2] * 1.5;
+    // Reaches as far inward as an outward hit is allowed to be accepted.
+    const double probe = std::max(1.5, 3.5 * r_local);
+    p_in[0] = p[0] - n[0] * probe;
+    p_in[1] = p[1] - n[1] * probe;
+    p_in[2] = p[2] - n[2] * probe;
     const int hit_inward = loc->IntersectWithLine(p, p_in, tol, t, x, pcoords, subId, cellId);
     if (hit_inward) {
       const double dx = x[0] - p[0];
       const double dy = x[1] - p[1];
       const double dz = x[2] - p[2];
       const double d_inward = std::sqrt(dx * dx + dy * dy + dz * dz);
-      if (d_inward < 0.4) {
+      bool decided = false;
+      if (gtn != nullptr && cellId >= 0 && cellId < n_gt) {
+        // A wall facing back at us is this point's own near wall, so the tube
+        // is outside the GT here and there is no outward stretch to find. A
+        // wall facing away is the far side of the lumen, so the point is
+        // inside however close that far side happens to be.
+        const double *g = gtn + 3 * cellId;
+        decided = true;
+        if (n[0] * g[0] + n[1] * g[1] + n[2] * g[2] > 0.2) {
+          dist[i] = 0.0;
+          continue;
+        }
+      }
+      if (!decided && d_inward < 0.4) {
         dist[i] = 0.0;
         continue;
       }

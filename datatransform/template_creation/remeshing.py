@@ -495,6 +495,32 @@ def process_gt_remesh_dataset(
     openings = assert_template_quality(final_surface, context=dataset_id)
     log_opening_planarity(final_surface, ostium_frames)
 
+    print(
+        f"  -> Open Boundaries Count: {len(openings)} "
+        f"(anatomical profiles {n_in}, pipe-section clipped {n_clipped})"
+    )
+    if len(openings) != n_in:
+        # This used to print and ship anyway, which is how p489 went out with 9
+        # openings against 5 profiles and p129 with 6 against 4. Neither number
+        # was real: extract_boundary_loops was splitting rims, and the split
+        # also misled patch_wall_pinholes into re-opening a hole it had just
+        # patched, which is what put the one genuine tear in p129. With the
+        # count refereed by connectivity both cases now agree with their
+        # profiles, so what reaches this branch is a rim this pipeline actually
+        # tore -- the opposite of the well-made openings the dataset exists to
+        # provide, and not something to ship quietly.
+        #
+        # Asked before the write, not after it: the check used to run below the
+        # save, so every case it refused still left its surface and its ostium
+        # frames on disk under the name a good one would have had. Five of the
+        # six failures in the last 56-case run were sitting in the output
+        # directory looking exactly like the fifty that passed.
+        raise TemplateQualityError(
+            f"{dataset_id} finished with {len(openings)} openings against "
+            f"{n_in} anatomical profiles ({n_clipped} pipe-section clipped); "
+            f"the difference is torn rims, not ostia."
+        )
+
     os.makedirs(output_dir, exist_ok=True)
     out_file = os.path.join(output_dir, f"{dataset_id}.vtp")
     save_polydata(final_surface, out_file)
@@ -512,21 +538,6 @@ def process_gt_remesh_dataset(
         f"  -> Verified Open Boundaries Count: {len(openings)} "
         f"(anatomical profiles {n_in}, pipe-section clipped {n_clipped})"
     )
-    if len(openings) != n_in:
-        # This used to print and ship anyway, which is how p489 went out with 9
-        # openings against 5 profiles and p129 with 6 against 4. Neither number
-        # was real: extract_boundary_loops was splitting rims, and the split
-        # also misled patch_wall_pinholes into re-opening a hole it had just
-        # patched, which is what put the one genuine tear in p129. With the
-        # count refereed by connectivity both cases now agree with their
-        # profiles, so what reaches this branch is a rim this pipeline actually
-        # tore -- the opposite of the well-made openings the dataset exists to
-        # provide, and not something to ship quietly.
-        raise TemplateQualityError(
-            f"{dataset_id} finished with {len(openings)} openings against "
-            f"{n_in} anatomical profiles ({n_clipped} pipe-section clipped); "
-            f"the difference is torn rims, not ostia."
-        )
     record(n_openings=len(openings), n_profiles=n_in, n_clipped=n_clipped)
     return out_file, ostium_frames
 

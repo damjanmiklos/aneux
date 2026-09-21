@@ -27,6 +27,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections import Counter
 from queue import Empty, Queue
 
 import numpy as np
@@ -1163,12 +1164,18 @@ def drop_degenerate_tracts(centerline, max_edge_mm=10.0, min_length_mm=1.0):
     return out, n_cells - len(keep)
 
 
-def centerline_looks_valid(centerline, reference_bounds, max_edge_mm=10.0, pad_mm=15.0):
-    """Reject Voronoi spikes that leave the vessel (common on looping siphons)."""
+def centerline_invalid_reason(centerline, reference_bounds, max_edge_mm=10.0, pad_mm=15.0):
+    """Why this trace is not usable, or ``None`` when it is.
+
+    Same test as ``centerline_looks_valid``, which is now a thin wrapper. A
+    bare False tells whoever asked nothing at all, and that is how six
+    variable-remesh cases came to report only "the re-trace did not produce a
+    usable centerline" for six different underlying faults.
+    """
     vtk_cl = to_vtk_poly(centerline)
     n_pts = vtk_cl.GetNumberOfPoints()
     if n_pts < 20:
-        return False
+        return f"only {n_pts} points"
     b = np.asarray(reference_bounds, dtype=np.float64).reshape(-1)
     lo = np.array([b[0] - pad_mm, b[2] - pad_mm, b[4] - pad_mm])
     hi = np.array([b[1] + pad_mm, b[3] + pad_mm, b[5] + pad_mm])
@@ -1178,7 +1185,8 @@ def centerline_looks_valid(centerline, reference_bounds, max_edge_mm=10.0, pad_m
         if np.any(p < lo) or np.any(p > hi):
             n_out += 1
     if n_out > 0.2 * n_pts:
-        return False
+        return (f"{n_out} of {n_pts} points sit more than {pad_mm:.0f} mm "
+                "outside the vessel bounds")
     vtk_cl.BuildCells()
     max_edge = 0.0
     max_path = 0.0
@@ -1197,9 +1205,19 @@ def centerline_looks_valid(centerline, reference_bounds, max_edge_mm=10.0, pad_m
         max_path = max(max_path, plen)
         if plen >= 5.0:
             n_ok += 1
-    if max_edge > max_edge_mm or n_ok < 1 or max_path < 5.0:
-        return False
-    return True
+    if max_edge > max_edge_mm:
+        return f"a {max_edge:.2f} mm jump between consecutive points"
+    if n_ok < 1 or max_path < 5.0:
+        return (f"its longest tract is {max_path:.2f} mm, under the 5 mm a real "
+                "vessel path has")
+    return None
+
+
+def centerline_looks_valid(centerline, reference_bounds, max_edge_mm=10.0, pad_mm=15.0):
+    """Reject Voronoi spikes that leave the vessel (common on looping siphons)."""
+    return centerline_invalid_reason(
+        centerline, reference_bounds, max_edge_mm=max_edge_mm, pad_mm=pad_mm
+    ) is None
 
 
 def _rescue_trace(centerline, ref_bounds, label):
@@ -1223,6 +1241,84 @@ def _rescue_trace(centerline, ref_bounds, label):
         "which is otherwise discarded entirely"
     )
     return repaired
+
+
+# Each subdivision quadruples the points and the Delaunay pass that follows
+# costs roughly five times as much: on SNF00000426_03, 20k points trace in 4 s,
+# 81k in 24 s and 323k in 240 s. That is affordable for a case that is
+# otherwise lost and not affordable as a habit, which is why nothing reaches
+# here until the ordinary re-trace has already failed. Two levels are worth
+# trying because one is not always enough -- SNF00000143_01_2's 0.431 mm ostium
+# is found at 81k, and SNF00000426_03's 0.349 mm ostium dead-ends at 81k and is
+# found at 323k -- and the ceiling stops a large surface turning this into a
+# Delaunay that outlives the case timeout.
+DENSE_RETRACE_MAX_POINTS = 400_000
+DENSE_RETRACE_LEVELS = (1, 2)
+
+
+def _densify_for_tracing(surface, n_subdivisions=1):
+    """Linear subdivision, or ``None`` when that will not help.
+
+    vtkvmtkSteepestDescentLineTracer walks the Voronoi diagram of the surface
+    points, and in a branch a third of a millimetre wide there are too few of
+    them for a descending path to exist -- the tracer says "Cannot find a
+    steepest descent edge" and vmtkCenterlines returns a three-point stub
+    sitting on the seed. Nothing about the vessel is wrong; the tessellation is
+    too coarse, and every other handle makes no difference at all. On
+    SNF00000426_03 profile 10 the source, the seed depth and the direction of
+    travel were all varied at the original density and all twelve attempts
+    dead-ended within a third of a millimetre of the seed; the only thing that
+    changed the answer was points.
+
+    The subdivider refuses a non-manifold input outright, and capping makes
+    those: SNF00000426_03's cap leaves seven bad edges, which is the whole
+    reason its first densified attempt came back with zero points.
+    """
+    base = clean_triangulate(surface)
+    base, _n_nm = repair_nonmanifold_triangles(base)
+    base, _n_forced = force_manifold_triangles(base)
+    base, n_left = repair_nonmanifold_triangles(base)
+    poly = to_vtk_poly(base)
+    n_pts = poly.GetNumberOfPoints()
+    grown = n_pts * (4 ** int(n_subdivisions))
+    if n_pts == 0 or grown > DENSE_RETRACE_MAX_POINTS:
+        print(
+            f"  Not subdividing {n_subdivisions}x for the re-trace: {n_pts} points "
+            f"would become {grown}, past the {DENSE_RETRACE_MAX_POINTS} the "
+            "Delaunay is worth here."
+        )
+        return None
+    subdivider = vtk.vtkLinearSubdivisionFilter()
+    subdivider.SetInputData(poly)
+    subdivider.SetNumberOfSubdivisions(int(n_subdivisions))
+    subdivider.Update()
+    dense = clean_triangulate(subdivider.GetOutput())
+    if to_vtk_poly(dense).GetNumberOfPoints() <= n_pts:
+        print(
+            "  The surface could not be subdivided for the re-trace "
+            f"({n_left} non-manifold edge(s) left); keeping the original."
+        )
+        return None
+    return dense
+
+
+def _retrace_outlets(surface, source_anat, seeds, profiles, missing, ref_bounds, what):
+    """One re-trace attempt. Returns ``(centerline, gained)``; gained may be empty."""
+    extra = _centerlines_in_child(
+        surface, source_anat, seeds, CENTERLINE_TIMEOUT_S, label="missing outlets",
+    )
+    if extra is None:
+        print(f"  The {what} re-trace returned nothing at all.")
+        return None, []
+    bad = centerline_invalid_reason(extra, ref_bounds)
+    if bad is not None:
+        print(f"  The {what} re-trace is not a usable centerline ({bad}).")
+        return None, []
+    extra_arrived, _gaps = centerline_arrivals(extra, profiles)
+    gained = [i for i in missing if bool(extra_arrived[i])]
+    if not gained:
+        print(f"  The {what} re-trace reached none of them either.")
+    return extra, gained
 
 
 def _complete_missing_outlets(chosen, label, closed_anat, source_anat,
@@ -1254,27 +1350,48 @@ def _complete_missing_outlets(chosen, label, closed_anat, source_anat,
     missing = [int(i) for i in np.flatnonzero(~arrived)]
     if not missing:
         return chosen, label
-    seeds = [np.asarray(profiles[i]["barycenter"], dtype=np.float64) for i in missing]
     names = ", ".join(
         f"profile {profiles[i]['index']} (r={float(profiles[i]['radius']):.3f} mm)"
         for i in missing
     )
     print(f"  Re-tracing for the {len(missing)} opening(s) the {label} trace missed: {names}")
-    extra = _centerlines_in_child(
-        closed_anat, source_anat, seeds, CENTERLINE_TIMEOUT_S,
-        label="missing outlets",
-    )
-    if extra is None or not centerline_looks_valid(extra, ref_bounds):
-        print("  The re-trace did not produce a usable centerline; keeping the original.")
-        return chosen, label
-    extra_arrived, _gaps = centerline_arrivals(extra, profiles)
-    gained = [i for i in missing if bool(extra_arrived[i])]
-    if not gained:
-        print("  The re-trace reached none of them either; keeping the original.")
+    found = []
+    outstanding = list(missing)
+    attempts = [(closed_anat, "plain")]
+    # Each denser attempt asks only for what is still outstanding, because one
+    # level is enough for some ostia and not for others: on SNF00000426_03 the
+    # 0.374 mm ostium is reached at 81k points and the 0.349 mm one only at
+    # 323k, and stopping at the first success left the second shut.
+    for n_sub in DENSE_RETRACE_LEVELS:
+        attempts.append((None, n_sub))
+    for surface, how in attempts:
+        if not outstanding:
+            break
+        if surface is None:
+            surface = _densify_for_tracing(closed_anat, n_subdivisions=how)
+            if surface is None:
+                break
+            how = f"{how}x subdivided"
+            print(
+                f"  Re-tracing on a {how} surface "
+                f"({to_vtk_poly(surface).GetNumberOfPoints()} points) for "
+                f"{len(outstanding)} opening(s) still missing."
+            )
+        seeds = [np.asarray(profiles[i]["barycenter"], dtype=np.float64)
+                 for i in outstanding]
+        extra, gained = _retrace_outlets(
+            surface, source_anat, seeds, profiles, outstanding, ref_bounds, how
+        )
+        if gained:
+            found.append(extra)
+            outstanding = [i for i in outstanding if i not in set(gained)]
+    if not found:
+        print("  Keeping the original trace.")
         return chosen, label
     append = vtk.vtkAppendPolyData()
     append.AddInputData(to_vtk_poly(chosen))
-    append.AddInputData(to_vtk_poly(extra))
+    for extra in found:
+        append.AddInputData(to_vtk_poly(extra))
     append.Update()
     merged = to_vtk_poly(append.GetOutput())
     if merged.GetPointData().GetArray("MaximumInscribedSphereRadius") is None:
@@ -1283,9 +1400,10 @@ def _complete_missing_outlets(chosen, label, closed_anat, source_anat,
     if not centerline_looks_valid(merged, ref_bounds):
         print("  The merged trace failed the lumen check; keeping the original.")
         return chosen, label
+    n_tracts = sum(int(to_vtk_poly(e).GetNumberOfCells()) for e in found)
     print(
-        f"  Added {extra.GetNumberOfCells()} tract(s) from the re-trace; it reaches "
-        f"{len(gained)} of the {len(missing)} missed opening(s)"
+        f"  Added {n_tracts} tract(s) from {len(found)} re-trace(s); together they "
+        f"reach {len(missing) - len(outstanding)} of the {len(missing)} missed opening(s)"
     )
     return merged, f"{label} plus a re-trace"
 
@@ -1652,11 +1770,17 @@ def extract_centerlines_for_tube(extended_vessel, smoothed_vessel, anatomical_pr
                     f"  NOTE: centerline taken from the {name}: it covers {coverage} "
                     f"voxels against {other_cov} for the {other[2]} ({drift:+.1%})"
                 )
-    # A rescue, not a repair: a trace that is short of a tract is about to
-    # cost the case entirely, while one that merely passes an ostium at a
-    # distance has always been allowed to, and re-tracing those would change
-    # cases that work today.
-    if not _centerline_reaches_targets(chosen, want):
+    # A rescue, not a repair: it runs only where the chosen trace has already
+    # come up short. Two things can be short, and the tract count is the weaker
+    # of them -- vmtkCenterlines writes a polyline for an outlet it could not
+    # descend to, so the count can be right while the trace stops eight or
+    # twelve millimetres from the opening. The parent tube is built from this
+    # trace, so an ostium the trace never visits gets no polyball and no wall,
+    # and the uncap then reports "no nearby tube wall (closest 8.96 mm)" and
+    # the case dies for a branch the vessel plainly has: SNF00000364_01_2 lost
+    # three openings that way, SNF00000426_03 two, and five more cases one
+    # each. Arrival is the test that sees it, so arrival gates the rescue too.
+    if not _centerline_reaches_targets(chosen, want) or not bool(arrived.all()):
         chosen, name = _complete_missing_outlets(
             chosen, name, closed_anat, source_anat, anatomical_profiles,
             arrived, ref_bounds,
@@ -3574,6 +3698,10 @@ def clip_one_profile(surface, profile, body_point, search_mm):
         return surface, False
     openings = inspect_openings(candidate)
     if not openings:
+        print(
+            f"  [Uncap] Profile {profile['index']} seam clip left the surface with no "
+            "opening at all. Skipping this end."
+        )
         return surface, False
     matched = min(
         openings,
@@ -3601,6 +3729,19 @@ def clip_one_profile(surface, profile, body_point, search_mm):
         why.append(
             f"r={r_open:.3f} mm is {r_open / r_cut:.2f}x the cutter loop's "
             f"{r_cut:.3f} mm, so the clip took in more than that loop"
+        )
+    # Where the tube has no branch at this ostium -- because the trace never
+    # got there -- the clip plane slices straight across the trunk instead, and
+    # every test above passes: the loop it finds is a real loop and the clip
+    # fulfils it exactly. What it does not do is open THIS end. SNF00000426_03
+    # profile 10 was reported opened at r=2.157 mm against a 0.349 mm ostium,
+    # the hole was the inlet's, and the case shipped ten openings for eleven
+    # profiles. The distance was measured all along and only printed.
+    reach = max(1.0, 2.0 * r_gt)
+    if d_match > reach:
+        why.append(
+            f"the opening it made sits {d_match:.3f} mm away, past the "
+            f"{reach:.3f} mm that still counts as this ostium"
         )
     if why:
         print(
@@ -3711,8 +3852,49 @@ def extra_opening_spheres(centerline, profiles):
     return np.asarray(extra_pts, dtype=np.float64), np.asarray(extra_r, dtype=np.float64)
 
 
-def _opening_clip_radius(radius):
-    return max(float(radius) * OPENING_CLIP_RADIUS_FACTOR, float(radius) + 0.2)
+def _opening_clip_radius(radius, limit_mm=None):
+    """Cutter radius, narrowed so it cannot reach the ostium next door.
+
+    The default is 1.5 R, which on p153 keep LICA is 2.126 mm around a 1.417 mm
+    ostium -- and the 0.317 mm ostium beside it sits 2.14 mm off that axis, so
+    the cutter swallowed it and the neighbour guard threw the cut away. The cut
+    was not wrong, only wider than it had any need to be: an ostium is opened
+    by taking the stub off its own end, and a cylinder that reaches the next
+    branch along is doing something else.
+    """
+    default = max(float(radius) * OPENING_CLIP_RADIUS_FACTOR, float(radius) + 0.2)
+    if limit_mm is None:
+        return default
+    # Still wide enough to cut a hole this ostium's own size; below that there
+    # is nothing to be gained by narrowing further and the guard can judge it.
+    return max(min(default, float(limit_mm)), float(radius) + 0.05)
+
+
+def clip_radius_limit_for(origin, outward, radius, ostia, mine,
+                          extension_length=None, trimmed=False):
+    """How wide the cutter at ``mine`` may be before it reaches another ostium.
+
+    Only ostia that actually fall inside the cut region constrain it: one
+    behind the plane, or past the far end of the cylinder, is never touched
+    however wide the cylinder is. ``None`` means nothing is in the way.
+    """
+    origin = np.asarray(origin, dtype=np.float64)
+    outward = _unit(outward)
+    height = _opening_clip_height(radius, extension_length=extension_length, trimmed=trimmed)
+    limit = None
+    for j, (other, reach) in enumerate(ostia):
+        if j == mine:
+            continue
+        rel = np.asarray(other, dtype=np.float64) - origin
+        along = float(rel @ outward)
+        if along <= -OPENING_CLIP_INWARD_OVERLAP_MM or along >= height:
+            continue
+        lateral = float(np.linalg.norm(rel - along * outward))
+        # ``reach`` is that ostium's own neighbourhood radius, so keeping the
+        # cutter outside it keeps the branch it belongs to.
+        clear = lateral - 0.5 * float(reach)
+        limit = clear if limit is None else min(limit, clear)
+    return limit
 
 
 def _opening_clip_height(radius, extension_length=None, trimmed=False):
@@ -3736,10 +3918,11 @@ def _opening_clip_height(radius, extension_length=None, trimmed=False):
     return max(by_radius, float(extension_length) + 2.0 * r)
 
 
-def _outboard_cap_implicit(origin, outward, radius, extension_length=None, trimmed=False):
+def _outboard_cap_implicit(origin, outward, radius, extension_length=None, trimmed=False,
+                           clip_radius_limit=None):
     origin = np.asarray(origin, dtype=np.float64)
     outward = _unit(outward)
-    clip_radius = _opening_clip_radius(radius)
+    clip_radius = _opening_clip_radius(radius, limit_mm=clip_radius_limit)
     height = _opening_clip_height(radius, extension_length=extension_length, trimmed=trimmed)
     p_in = origin - OPENING_CLIP_INWARD_OVERLAP_MM * outward
     p_far = origin + height * outward
@@ -3850,7 +4033,8 @@ def _keep_region_with_point(surface, point):
     return clean_triangulate(conn.GetOutput())
 
 
-def _delete_outboard_leftover(surface, origin, outward, radius, outboard_mm=0.0, clean=True):
+def _delete_outboard_leftover(surface, origin, outward, radius, outboard_mm=0.0, clean=True,
+                              clip_radius_limit=None):
     poly, pts, faces = _triangle_points_faces(surface, clean=clean)
     if faces.size == 0:
         return poly
@@ -3860,18 +4044,20 @@ def _delete_outboard_leftover(surface, origin, outward, radius, outboard_mm=0.0,
     rel = centroids - origin
     proj = rel @ outward
     radial = np.linalg.norm(rel - np.outer(proj, outward), axis=1)
-    bad = (proj > outboard_mm) & (radial < _opening_clip_radius(radius))
+    bad = (proj > outboard_mm) & (radial < _opening_clip_radius(radius, limit_mm=clip_radius_limit))
     if not np.any(bad):
         return poly
     return _polydata_from_triangles(pts, faces[~bad])
 
 
 def _clip_opening_cap_locally(
-    surface, origin, outward, radius, extension_length=None, trimmed=False, fast=False
+    surface, origin, outward, radius, extension_length=None, trimmed=False, fast=False,
+    clip_radius_limit=None,
 ):
     """Delete the outboard stub of one opening with a bounded cylinder."""
     region = _outboard_cap_implicit(
-        origin, outward, radius, extension_length=extension_length, trimmed=trimmed
+        origin, outward, radius, extension_length=extension_length, trimmed=trimmed,
+        clip_radius_limit=clip_radius_limit,
     )
     clipper = vtk.vtkClipPolyData()
     clipper.SetInputData(_as_poly(surface) if fast else to_vtk_poly(surface))
@@ -3882,11 +4068,15 @@ def _clip_opening_cap_locally(
     clipped = weld_clip_slivers(clean_triangulate(clipper.GetOutput()))
     if clipped.GetNumberOfPoints() == 0:
         return _as_poly(surface) if fast else to_vtk_poly(surface)
-    return _delete_outboard_leftover(clipped, origin, outward, radius, clean=not fast)
+    return _delete_outboard_leftover(
+        clipped, origin, outward, radius, clean=not fast,
+        clip_radius_limit=clip_radius_limit,
+    )
 
 
 def clip_one_opening_pipe_section(
-    surface, origin, outward, radius, body_point, extension_length=None, trimmed=False, fast=True
+    surface, origin, outward, radius, body_point, extension_length=None, trimmed=False, fast=True,
+    clip_radius_limit=None,
 ):
     """Open one ostium with a pipe-section cut; inset slightly if the cutter misses.
 
@@ -3913,14 +4103,26 @@ def clip_one_opening_pipe_section(
         area_prev = float(pv.wrap(to_vtk_poly(surface)).area)
         n_local_before = 0
     inset = 0.0
+    # Every inset that fails does so for one of a handful of reasons, and the
+    # last one is the honest account of why this ostium was left shut. Without
+    # it the loop returns False in silence and the case dies several steps
+    # later saying only that some end was not opened -- which is what four of
+    # the fourteen variable-remesh failures looked like.
+    why = "the cutter never reached the surface"
     while inset <= OPENING_CLIP_INSET_MAX_MM + 1e-12:
         origin_i = origin0 - inset * outward
         clipped = _clip_opening_cap_locally(
-            surface, origin_i, outward, radius, extension_length=extension_length, trimmed=trimmed, fast=fast
+            surface, origin_i, outward, radius, extension_length=extension_length,
+            trimmed=trimmed, fast=fast, clip_radius_limit=clip_radius_limit,
         )
         if fast:
             n_cand = clipped.GetNumberOfPoints()
             if n_cand < 50 or n_cand < 0.45 * n_prev or n_cand >= n_prev:
+                why = (
+                    f"the cut left {n_cand}/{n_prev} points"
+                    if n_cand < n_prev
+                    else "the cutter removed nothing"
+                )
                 inset += OPENING_CLIP_INSET_STEP_MM
                 continue
         clipped = (
@@ -3930,12 +4132,14 @@ def clip_one_opening_pipe_section(
         )
         n_cand = clipped.GetNumberOfPoints()
         if n_cand < 50 or n_cand < 0.45 * n_prev:
+            why = f"keeping one region left {n_cand}/{n_prev} points"
             inset += OPENING_CLIP_INSET_STEP_MM
             continue
         if trimmed and area_prev > 1e-9:
             cand_area = _mesh_area_fast(clipped) if fast else float(pv.wrap(to_vtk_poly(clipped)).area)
             lost = 1.0 - cand_area / area_prev
             if lost > CLIP_MAX_AREA_LOSS_FRACTION:
+                why = f"it would take {100.0 * lost:.0f}% of the surface area"
                 inset += OPENING_CLIP_INSET_STEP_MM
                 continue
         if fast:
@@ -3955,7 +4159,12 @@ def clip_one_opening_pipe_section(
             if inset > 0:
                 print(f"  [Uncap] Pipe-section clip inset {inset:.1f} mm to create a hole")
             return clipped, True
+        why = "the cut went through but left no rim at the ostium"
         inset += OPENING_CLIP_INSET_STEP_MM
+    print(
+        f"  [Uncap] Pipe-section cut at {np.round(origin0, 2)} (r={radius:.3f} mm) "
+        f"gave up after {OPENING_CLIP_INSET_MAX_MM:.1f} mm of inset: {why}"
+    )
     return surface, False
 
 
@@ -4584,6 +4793,69 @@ def _clip_took_another_ostium(before, after, mine, ostia):
     return None, 0.0
 
 
+def unopened_profiles(surface, profiles, reach_factor=2.0, min_reach_mm=1.0):
+    """Which ostia the finished surface still has no opening near.
+
+    The uncap's own counter says how many clips succeeded; it cannot say which
+    end is missing, and "opened 14/15" is not something anyone can act on. This
+    reads the answer off the result instead: an ostium is open if some boundary
+    loop's centre sits within ``max(min_reach_mm, reach_factor * r)`` of it.
+    """
+    loops = inspect_openings(surface)
+    centres = np.asarray([np.asarray(op["center"], dtype=np.float64) for op in loops])         if loops else np.zeros((0, 3))
+    missing = []
+    for profile in profiles:
+        bary = np.asarray(profile["barycenter"], dtype=np.float64)
+        reach = max(float(min_reach_mm), reach_factor * float(profile["radius"]))
+        if centres.shape[0] and float(np.min(np.linalg.norm(centres - bary, axis=1))) <= reach:
+            continue
+        missing.append(profile)
+    return missing
+
+
+def describe_unopened(profiles):
+    return "; ".join(
+        f"profile {p['index']} r={float(p['radius']):.3f} mm at "
+        f"{np.round(np.asarray(p['barycenter'], dtype=np.float64), 2).tolist()}"
+        for p in profiles
+    )
+
+
+def _split_lumen_note(surface, profiles, suspect):
+    """Say so when the openings that stayed shut are in a lumen of their own.
+
+    ``suspect`` are the profiles with no rim near them. If the volume test puts
+    them in a different compartment from the rest, the input encloses more than
+    one lumen and the wall between them is a double wall with nothing through
+    it -- the same defect as p463 keep 1. Nothing downstream can repair that,
+    so the message has to point upstream.
+    """
+    if not suspect or not profiles:
+        return ""
+    try:
+        lumens = ostium_lumen_compartments(surface, profiles)
+    except Exception:
+        return ""
+    if not lumens or len(set(lumens)) <= 1:
+        return ""
+    by_index = {int(p["index"]): lumen for p, lumen in zip(profiles, lumens)}
+    shut = {int(p["index"]) for p in suspect}
+    main = Counter(l for i, l in by_index.items() if i not in shut).most_common(1)
+    if not main:
+        return ""
+    main_lumen = main[0][0]
+    stranded = [i for i in sorted(shut) if by_index.get(i) != main_lumen]
+    if not stranded:
+        return ""
+    return (
+        f" This vessel encloses {len(set(lumens))} separate lumens and "
+        f"profile(s) {', '.join(str(i) for i in stranded)} open into a compartment "
+        "of their own, walled off from the one the rest share. No centerline can "
+        "cross a double wall, so the tube has no branch there to cut. The input "
+        "mesh is what has to be fixed."
+    )
+
+
 def clip_flow_extensions_and_uncap(
     base_surface,
     profiles,
@@ -4648,6 +4920,12 @@ def clip_flow_extensions_and_uncap(
         ok = False
         if frames is not None:
             origin, outward, radius = frames[i]
+            # Narrow the cutter rather than let it reach the branch next door
+            # and be thrown away for it.
+            limit = clip_radius_limit_for(
+                origin, outward, radius, ostia, i,
+                extension_length=extension_length, trimmed=trimmed,
+            )
             candidate, ok = clip_one_opening_pipe_section(
                 current,
                 origin,
@@ -4657,6 +4935,7 @@ def clip_flow_extensions_and_uncap(
                 extension_length=extension_length,
                 trimmed=trimmed,
                 fast=fast_uncap,
+                clip_radius_limit=limit,
             )
             if ok:
                 ok = _accept(candidate, i, "pipe-section cut")
@@ -4679,6 +4958,10 @@ def clip_flow_extensions_and_uncap(
             n_clipped += 1
             body_pt = mesh_body_point(current)
     print(f"  Uncap: clipped {n_clipped}/{len(work_profiles)} openings")
+    if n_clipped < len(work_profiles):
+        still_shut = unopened_profiles(current, work_profiles)
+        if still_shut:
+            print(f"  Uncap: still shut -> {describe_unopened(still_shut)}")
     current = clean_triangulate(current)
     current, n_nm = repair_nonmanifold_triangles(current)
     if n_nm > 0:
@@ -4897,8 +5180,29 @@ def _cell_centroids(poly):
     return np.ascontiguousarray(vtk_to_numpy(out.GetPoints().GetData()), dtype=np.float64)
 
 
+# How much of a surface has to agree with the radial test before its sign is
+# taken from it. vtkPolyDataNormals ran with ConsistencyOn, so the array is
+# already coherent and only its global sign is unknown; the vote only has to
+# read that one bit. On C0033 the GT votes 97.7% and the parent tube 99.5%.
+RADIAL_ORIENTATION_MAJORITY = 0.80
+
+
 def _orient_along_radial(points, vectors, cl_points):
-    """Flip ``vectors`` so each agrees with (x − nearest centerline vertex)."""
+    """Give ``vectors`` the global sign that points away from the centerline.
+
+    The sign is decided once for the whole array, not once per item. That is
+    the only thing the radial test can be trusted with: vtkPolyDataNormals ran
+    with ConsistencyOn, so neighbouring normals already agree with each other
+    and only the global sense is in doubt, while (x - nearest centerline
+    vertex) is a weak proxy that goes the wrong way wherever a sac overhangs
+    the vessel it grew from or a rim faces along the trace. Flipping item by
+    item took the coherent GT normals on C0033 and turned 7914 of 348557 cells
+    against their own neighbours, some of them on a dot product of 8e-05 -- and
+    such a cell then passes or fails the hit-agreement test on a coin toss.
+
+    Returns ``(vectors, False)`` when the vote is not decisive, which leaves
+    every caller on its orientation-free path rather than acting on a guess.
+    """
     from scipy.spatial import cKDTree
 
     n = int(points.shape[0])
@@ -4909,9 +5213,13 @@ def _orient_along_radial(points, vectors, cl_points):
     nn = np.asarray(nn, dtype=np.int64).reshape(-1)
     radial = points - cl_points[nn]
     dots = np.einsum("ij,ij->i", vectors, radial)
-    oriented = np.array(vectors, dtype=np.float64, copy=True)
-    oriented[dots < 0.0] *= -1.0
-    return np.ascontiguousarray(oriented, dtype=np.float64), True
+    n_out = int(np.count_nonzero(dots > 0.0))
+    if max(n_out, n - n_out) < RADIAL_ORIENTATION_MAJORITY * n:
+        return vectors, False
+    oriented = np.ascontiguousarray(vectors, dtype=np.float64)
+    if n_out * 2 < n:
+        oriented = np.ascontiguousarray(-oriented, dtype=np.float64)
+    return oriented, True
 
 
 # A ray that finds nothing writes the same 0.0 as a template already sitting on
@@ -5009,6 +5317,107 @@ def _rescue_missed_rays(distances, locator, template_pts, r_arr,
             f"{int(np.sum(true_d[keep] > ceiling))} clamped at 3.5 R, "
             f"{outside_left} left at zero as outside the GT)"
         )
+    return distances
+
+
+# How far from an open rim of the ground truth a positive stretch is suspect.
+#
+# Beyond the rim the ground truth has simply stopped, and a template point out
+# there has no GT wall outward of it to measure -- but its ray can still graze
+# the outside of the wall near the rim and come back with a distance, and the
+# side test cannot catch it because there is no sheet behind the point to
+# probe. StretchDistance is signed downstream (r* = r_local + StretchDistance),
+# so every one of those is an instruction to push the decoder further out
+# exactly where the template already sits outside the vessel.
+#
+# Measured on C0033 with vtkSelectEnclosedPoints against the capped GT as the
+# truth: 108 of 125458 points, 0.086%, carried a positive distance while
+# outside, worst 3.394 mm; 107 of them sat within 2 mm of an open rim and the
+# furthest was 3.394 mm out. Five millimetres is a comfortable margin over
+# that and still leaves the test on a small subset -- about 1500 points on
+# these meshes, 0.1 s -- where testing every point costs 2.3-4.5 s.
+#
+# Nothing is guessed here: the points inside the net are settled by enclosure,
+# which is the question the signed distance actually asks. Points outside the
+# net keep whatever the ray found, because away from a rim a template point
+# that is outside the GT is a real tube blow-out, and the inward side test
+# already recognises those -- it has a wall to probe.
+STRETCH_RIM_GUARD_REACH_MM = 5.0
+
+
+def _open_boundary_points(surface):
+    """The points on this surface's open rims, if it has any."""
+    fe = vtk.vtkFeatureEdges()
+    fe.SetInputData(to_vtk_poly(surface))
+    fe.BoundaryEdgesOn()
+    fe.FeatureEdgesOff()
+    fe.NonManifoldEdgesOff()
+    fe.ManifoldEdgesOff()
+    fe.Update()
+    _poly, pts = _poly_points(fe.GetOutput())
+    return pts
+
+
+def _enclosed_by(closed_surface, points):
+    """Which of ``points`` the closed surface contains."""
+    probe = vtk.vtkPolyData()
+    vtk_pts = vtk.vtkPoints()
+    vtk_pts.SetData(numpy_to_vtk(np.ascontiguousarray(points, dtype=np.float64), deep=True))
+    probe.SetPoints(vtk_pts)
+    sel = vtk.vtkSelectEnclosedPoints()
+    sel.SetInputData(probe)
+    sel.SetSurfaceData(to_vtk_poly(closed_surface))
+    sel.SetTolerance(0.0)
+    sel.CheckSurfaceOff()
+    sel.Update()
+    return np.asarray([bool(sel.IsInside(i)) for i in range(points.shape[0])], dtype=bool)
+
+
+def _zero_rays_that_left_the_gt(distances, ground_truth, template_pts, report=True):
+    """Zero the positive distances at template points the GT does not enclose.
+
+    See STRETCH_RIM_GUARD_REACH_MM for what this catches and why the net is
+    drawn around the rims rather than the whole surface.
+
+    It is a rescue in the same sense as the others: it only ever takes a
+    distance away, it only looks at points that already have one, and it stands
+    down rather than guess. If the ground truth is closed there is no rim and
+    nothing to do; if the cap does not close it -- this pipeline's capper is
+    known to leave rims on some inputs -- the enclosure answer is meaningless
+    and the distances are left exactly as the ray found them, with a line in
+    the log saying so.
+    """
+    pos = np.flatnonzero(np.asarray(distances) > 0.0)
+    if pos.size == 0:
+        return distances
+    rim_pts = _open_boundary_points(ground_truth)
+    if rim_pts.shape[0] == 0:
+        return distances
+    from scipy.spatial import cKDTree
+
+    rim_d = cKDTree(rim_pts).query(template_pts[pos])[0]
+    near = pos[rim_d <= STRETCH_RIM_GUARD_REACH_MM]
+    if near.size == 0:
+        return distances
+    try:
+        capped = to_vtk_poly(cap_surface(ground_truth))
+    except Exception as exc:
+        print(f"  WARNING: could not cap the ground truth to check which rays left it "
+              f"({type(exc).__name__}); {near.size} near-rim distances left as measured")
+        return distances
+    if _open_boundary_points(capped).shape[0] > 0:
+        print(f"  WARNING: the capped ground truth is still open, so enclosure cannot "
+              f"be trusted; {near.size} near-rim distances left as measured")
+        return distances
+    outside = near[~_enclosed_by(capped, template_pts[near])]
+    if outside.size == 0:
+        return distances
+    worst = float(np.max(distances[outside]))
+    distances[outside] = 0.0
+    if report:
+        print(f"  Raycast: {outside.size} point(s) within "
+              f"{STRETCH_RIM_GUARD_REACH_MM:.1f} mm of an open rim measured a stretch "
+              f"while sitting outside the GT (worst {worst:.3f} mm); zeroed")
     return distances
 
 
@@ -5115,9 +5524,10 @@ def compute_raycast_stretch_distances(
             print(f"  WARNING: compiled raycast failed ({exc}); using Python loop")
 
     if distances is not None:
-        return _rescue_missed_rays(
+        distances = _rescue_missed_rays(
             distances, locator, template_pts, r_arr, gt_cell_normals, gt_radially_oriented
         )
+        return _zero_rays_that_left_the_gt(distances, gt_mesh_with_normals, template_pts)
 
     distances = np.zeros(n_pts, dtype=np.float64)
     t = vtk.mutable(0.0)
@@ -5126,16 +5536,39 @@ def compute_raycast_stretch_distances(
     sub_id = vtk.mutable(0)
     cell_id = vtk.mutable(0)
 
+    use_side_test = gt_cell_normals is not None and gt_radially_oriented
     for i in range(n_pts):
         p = template_pts[i]
         n = outward[i]
         r_local = 1.0 if r_arr is None else float(r_arr[i])
         p0 = (float(p[0]), float(p[1]), float(p[2]))
-        p_inward = (float(p[0] - n[0] * 1.5), float(p[1] - n[1] * 1.5), float(p[2] - n[2] * 1.5))
+        # Reaches as far inward as an outward hit is allowed to be accepted, so
+        # a tube poking through the GT is recognised at any depth at which the
+        # outward ray could still find something.
+        probe = max(1.5, 3.5 * r_local)
+        p_inward = (
+            float(p[0] - n[0] * probe),
+            float(p[1] - n[1] * probe),
+            float(p[2] - n[2] * probe),
+        )
         hit_inward = locator.IntersectWithLine(p0, p_inward, tol, t, x, pcoords, sub_id, cell_id)
         if hit_inward:
             d_inward = float(np.sqrt((x[0] - p[0]) ** 2 + (x[1] - p[1]) ** 2 + (x[2] - p[2]) ** 2))
-            if d_inward < 0.4:
+            cid_in = int(cell_id.get())
+            if use_side_test and 0 <= cid_in < len(gt_cell_normals):
+                # Which sheet the inward ray met settles the side; distance
+                # cannot. A wall facing back at us is this point's own near
+                # wall, so the tube is outside the GT here and there is no
+                # outward stretch to find -- writing one would be wrong by
+                # twice the depth, since r* = r_local + StretchDistance
+                # downstream. A wall facing away is the far side of the lumen,
+                # so the point is inside however close that far side happens to
+                # be; the old test read 0.4 mm there and zeroed a real stretch
+                # in any vessel narrower than that.
+                if float(np.dot(n, gt_cell_normals[cid_in])) > 0.2:
+                    distances[i] = 0.0
+                    continue
+            elif d_inward < 0.4:
                 distances[i] = 0.0
                 continue
 
@@ -5160,9 +5593,10 @@ def compute_raycast_stretch_distances(
                 # This used to fall into the branch that accepts any distance,
                 # which is the one place the two raycast implementations gave
                 # different answers; stretch_raycast.cpp has always refused it.
-    return _rescue_missed_rays(
+    distances = _rescue_missed_rays(
         distances, locator, template_pts, r_arr, gt_cell_normals, gt_radially_oriented
     )
+    return _zero_rays_that_left_the_gt(distances, gt_mesh_with_normals, template_pts)
 
 
 def build_target_edge_array(template_mesh, distances, r_template, base_edge=0.50, min_edge=0.01):
@@ -5177,24 +5611,6 @@ def build_target_edge_array(template_mesh, distances, r_template, base_edge=0.50
     vtk_target_array.SetName("TargetEdgeLength")
     vtk_poly.GetPointData().AddArray(vtk_target_array)
     return vtk_poly, target_edge_lengths, stretch_factors
-
-
-def remesh_surface_adaptively(
-    open_surface_with_array,
-    edge_array_name="TargetEdgeLength",
-    n_iter=REMESH_N_ITER,
-    connectivity_iter=REMESH_CONNECTIVITY_ITER,
-):
-    remesher = vmtkscripts.vmtkSurfaceRemeshing()
-    remesher.Surface = to_vtk_poly(open_surface_with_array)
-    remesher.ElementSizeMode = "edgelengtharray"
-    remesher.TargetEdgeLengthArrayName = edge_array_name
-    remesher.PreserveBoundaryEdges = 1
-    remesher.NumberOfIterations = int(n_iter)
-    remesher.NumberOfConnectivityOptimizationIterations = int(connectivity_iter)
-    remesher.MinEdgeLength = float(REMESH_MIN_EDGE_MM)
-    remesher.Execute()
-    return to_vtk_poly(remesher.Surface)
 
 
 # Angle-based edge collapse is what tears these surfaces, so it is switched off.
@@ -5232,6 +5648,28 @@ def remesh_surface_adaptively(
 # byte for byte as before.
 REMESH_COLLAPSE_ANGLE = 0.2
 REMESH_COLLAPSE_ANGLE_OFF = 0.0
+
+
+def remesh_surface_adaptively(
+    open_surface_with_array,
+    edge_array_name="TargetEdgeLength",
+    n_iter=REMESH_N_ITER,
+    connectivity_iter=REMESH_CONNECTIVITY_ITER,
+    collapse_angle=REMESH_COLLAPSE_ANGLE,
+):
+    remesher = vmtkscripts.vmtkSurfaceRemeshing()
+    remesher.Surface = to_vtk_poly(open_surface_with_array)
+    remesher.ElementSizeMode = "edgelengtharray"
+    remesher.TargetEdgeLengthArrayName = edge_array_name
+    remesher.PreserveBoundaryEdges = 1
+    remesher.NumberOfIterations = int(n_iter)
+    remesher.NumberOfConnectivityOptimizationIterations = int(connectivity_iter)
+    remesher.MinEdgeLength = float(REMESH_MIN_EDGE_MM)
+    # The default is vmtk's own 0.2, so a template that already converges is
+    # remeshed exactly as before; the variable path lowers it only as a rescue.
+    remesher.CollapseAngleThreshold = float(collapse_angle)
+    remesher.Execute()
+    return to_vtk_poly(remesher.Surface)
 
 
 def remesh_surface_isotropically(
@@ -5859,9 +6297,18 @@ def assert_template_scale(surface, reference_mesh, context="template", max_area_
     ratio = tpl_area / ref_area
     print(f"  Template area={tpl_area:.1f} mm^2 vs vessel {ref_area:.1f} mm^2 (ratio {ratio:.2f})")
     if ratio > max_area_ratio:
+        # This gate sees the finished template, which is several steps past the
+        # polyball, so it cannot name the step that grew. It used to say "MISR
+        # blob or modeller overflow" anyway, and on C0088b that was wrong twice
+        # over: the parent tube came out at 1454.6 mm^2 against a 1465 mm^2
+        # vessel, and the adaptive remesh then inflated it 8.9x. Where the
+        # remesh is the culprit the ladder above this call reports it by name,
+        # so the honest thing here is to say what was measured and stop.
         raise TemplateQualityError(
-            f"{context} parent tube area is {ratio:.2f}x the vessel "
-            f"({tpl_area:.1f} vs {ref_area:.1f} mm^2); MISR blob or modeller overflow."
+            f"{context} template area is {ratio:.2f}x the vessel "
+            f"({tpl_area:.1f} vs {ref_area:.1f} mm^2). Check the parent-tube "
+            f"area printed above: if it is close to the vessel the overflow is "
+            f"downstream of the polyball, otherwise the modeller overflowed."
         )
     return tpl_area, ref_area
 
@@ -6075,9 +6522,26 @@ def build_parent_tube(
     print(f"  -> Open base surface points: {open_base_surface.GetNumberOfPoints()}")
     n_in = len(uncap_cut_frames) if uncap_cut_frames else len(anatomical_profiles)
     if n_clipped != n_in:
+        check_against = (
+            _profiles_from_ostium_frames(uncap_cut_frames)
+            if uncap_cut_frames
+            else anatomical_profiles
+        )
+        still_shut = unopened_profiles(open_base_surface, check_against)
+        detail = (
+            f" Still shut: {describe_unopened(still_shut)}."
+            if still_shut
+            else " Every ostium has a rim near it, so the shortfall is in the count, not the mesh."
+        )
+        # An ostium in its own lumen is not a bug in the uncap and no amount of
+        # cutting will open it: the trace cannot get there, so the tube has no
+        # wall there to cut. Measured over the fourteen template-less cases,
+        # seven died this way -- and the message they gave was "opened 4/7",
+        # which sends the reader to the cutter. Name the real fault instead.
+        detail += _split_lumen_note(smoothed_vessel, check_against, still_shut)
         raise TemplateQualityError(
             f"Parent-tube uncap opened {n_clipped}/{n_in} anatomical ends; "
-            "a template missing an opening the GT has is unusable.",
+            f"a template missing an opening the GT has is unusable.{detail}",
             dataset_id=dataset_id,
         )
     return {
