@@ -5091,8 +5091,107 @@ def inspect_surface_topology(surface):
     }
 
 
-def drop_tiny_islands(surface):
-    main = keep_largest_region(surface)
+def _mesh_components(faces, n_points):
+    """Component label per face, from a union-find over shared triangle edges."""
+    parent = np.arange(int(n_points), dtype=np.int64)
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for tri in faces:
+        a, b, c = int(tri[0]), int(tri[1]), int(tri[2])
+        for u, v in ((a, b), (b, c), (c, a)):
+            ru, rv = find(u), find(v)
+            if ru != rv:
+                parent[ru] = rv
+    roots = np.array([find(int(t[0])) for t in faces], dtype=np.int64)
+    return roots
+
+
+def rejoin_ostium_islands(surface, profiles, tol_mm=WELD_TOLERANCE_MM):
+    """Weld a severed shell that carries a real ostium back onto the body.
+
+    The manifold repairs remove triangles, and where they remove the last
+    triangles joining a neck they cut a whole shell loose. On p469 that shell
+    was 55.35 mm^2 against the body's 1149 -- 5119 points -- and it carried a
+    real, round 0.328 mm ostium, so `keep_largest_region` threw the opening
+    away and the case finished 5 against 6 with every remaining rim correct.
+
+    The shell is not floating: its nearest point to the body is 113 nanometres
+    away, because cutting duplicates the seam vertices rather than moving them.
+    So the repair is to merge those duplicates and nothing else. A global
+    `vtkCleanPolyData` merge would do it and must not be used -- it welds every
+    pair anywhere inside the radius, which is what once took SNF00000228 from 8
+    non-manifold edges to 742 -- so only island points that coincide with a body
+    point are remapped.
+    """
+    poly, pts, faces = _triangle_points_faces(surface)
+    if faces.size == 0 or not profiles:
+        return poly, 0
+    labels = _mesh_components(faces, len(pts))
+    uniq = np.unique(labels)
+    if uniq.size < 2:
+        return poly, 0
+    sizes = {int(u): int(np.count_nonzero(labels == u)) for u in uniq}
+    body = max(sizes, key=lambda u: sizes[u])
+    body_pt_ids = np.unique(faces[labels == body].reshape(-1))
+    from scipy.spatial import cKDTree
+
+    tree = cKDTree(pts[body_pt_ids])
+    remap = np.arange(len(pts), dtype=np.int64)
+    rejoined = 0
+    for u in uniq:
+        if int(u) == body:
+            continue
+        mask = labels == u
+        shell = _polydata_from_triangles(pts, faces[mask])
+        carries = any(
+            _loop_at_a_profile(center, profiles, radius=radius, n_points=n)
+            for _ids, center, radius, n in _loop_geometry(shell)[3]
+        )
+        if not carries:
+            continue
+        shell_pt_ids = np.unique(faces[mask].reshape(-1))
+        d, idx = tree.query(pts[shell_pt_ids], k=1)
+        seam = np.asarray(d, dtype=np.float64) <= float(tol_mm)
+        if int(np.count_nonzero(seam)) < 3:
+            print(
+                f"  An ostium-carrying shell of {int(np.count_nonzero(mask))} "
+                f"triangles sits {float(np.min(d)):.6f} mm off the body, too far "
+                "to weld back"
+            )
+            continue
+        remap[shell_pt_ids[seam]] = body_pt_ids[np.asarray(idx)[seam]]
+        rejoined += 1
+    if not rejoined:
+        return poly, 0
+    kept = remap[faces]
+    alive = (kept[:, 0] != kept[:, 1]) & (kept[:, 1] != kept[:, 2]) & (kept[:, 2] != kept[:, 0])
+    merged = _polydata_from_triangles(pts, kept[alive])
+    n_after = count_connected_regions(merged)
+    if n_after >= count_connected_regions(poly):
+        # The weld did not actually rejoin anything; leave the surface alone.
+        return poly, 0
+    print(
+        f"  Welded {rejoined} shell(s) carrying an ostium back onto the body "
+        f"({count_connected_regions(poly)} shells -> {n_after})"
+    )
+    return merged, rejoined
+
+
+def drop_tiny_islands(surface, profiles=None):
+    """Keep the vessel body -- but never throw away a real opening with a shell.
+
+    ``profiles``, when given, let an ostium-carrying shell be welded back on
+    first; without them this is the old keep-the-largest behaviour.
+    """
+    poly = to_vtk_poly(surface)
+    if profiles and count_connected_regions(poly) > 1:
+        poly, _n = rejoin_ostium_islands(poly, profiles)
+    main = keep_largest_region(poly)
     return main, count_connected_regions(main)
 
 
@@ -5175,7 +5274,7 @@ def finalize_surface(surface, profiles=None, max_passes=6):
             cleaned, _n_left = remove_spurious_openings(cleaned, profiles)
         cleaned, _min_edge = weld_degenerate_vertices(cleaned)
         cleaned = strip_all_arrays(cleaned)
-        cleaned, n_regions = drop_tiny_islands(cleaned)
+        cleaned, n_regions = drop_tiny_islands(cleaned, profiles=profiles)
 
         defects = _finalize_defects(cleaned, profiles, n_regions)
         if defects < best_defects:
