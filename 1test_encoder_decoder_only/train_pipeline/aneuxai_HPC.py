@@ -4,7 +4,7 @@
 Hardware: `gpu` node — 64-core EPYC 7763, 256 GB, 4× A100 40 GB (16 cores/GPU).
 Workers and DDP ranks follow the GPUs/CPUs Slurm actually gave this job.
 
-Production (4 GPU, 2 days)::
+Production (4 GPU, 1.5 days)::
 
     sbatch --account=<account> --mail-user=YOU@email hpc/train_stage2.sbatch
 
@@ -62,8 +62,8 @@ from hpc_runtime import (
 from run_report import make_run_dir
 
 # Per-GPU batch 20. Global batch = 20 × n_gpu (80 on a full node). LR stays 2e-4.
-# DataLoader / cache workers are chosen from SLURM_CPUS_PER_TASK and GPU count
-# (16 cores/GPU on Komondor). Override with ANEUX_NUM_WORKERS / ANEUX_CACHE_WORKERS.
+# DataLoader / cache workers follow SLURM_CPUS_PER_TASK (2× oversubscribe on
+# 16 cores/GPU). Override with ANEUX_NUM_WORKERS / ANEUX_CACHE_WORKERS.
 BATCH_SIZE = int(os.environ.get("ANEUX_BATCH_SIZE", "25"))
 ACCUM_STEPS = int(os.environ.get("ANEUX_ACCUM_STEPS", "1"))
 EPOCHS = int(os.environ.get("ANEUX_EPOCHS", "500"))

@@ -130,15 +130,26 @@ def scale_hpc_workers(n_gpu=None, n_cpu=None):
     """DataLoader / cache process counts from the Slurm allocation.
 
     Komondor GPU nodes are 64 cores / 4 A100s, so 1 GPU comes with 16 cores.
-    One core per rank is left for the trainer. Cache warmup is rank-0 only and
-    uses all but one allocated core (GPU is idle). Env overrides
+    Counts are per rank for the DataLoader and rank-0-only for cache warmup.
+    Each worker is a 1-thread spawn process (OMP/Torch threads = 1), not
+    Python threads inside a sample.
+
+    On a 16-core-per-GPU allocation both pools oversubscribe ~2× (30 workers)
+    so spawn + NVMe wait can use SMT siblings. Cache on a full 64-core node
+    stays at n_cpu-1: extra VTK processes would only grow RSS. Env overrides
     ``ANEUX_NUM_WORKERS`` / ``ANEUX_CACHE_WORKERS`` still win at the caller.
     """
     n_gpu = max(1, int(n_gpu if n_gpu is not None else slurm_gpu_count(1)))
     n_cpu = max(1, int(n_cpu if n_cpu is not None else slurm_cpu_count()))
     per_gpu = max(1, n_cpu // n_gpu)
-    num_workers = max(0, per_gpu - 1)
-    cache_build_workers = max(1, n_cpu - 1)
+    if per_gpu <= 16:
+        num_workers = max(0, per_gpu * 2 - 2)
+    else:
+        num_workers = max(0, per_gpu - 1)
+    if n_cpu <= 16:
+        cache_build_workers = max(1, n_cpu * 2 - 2)
+    else:
+        cache_build_workers = max(1, n_cpu - 1)
     return {
         "n_gpu": n_gpu,
         "n_cpu": n_cpu,

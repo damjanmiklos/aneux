@@ -1445,13 +1445,13 @@ def test_scale_hpc_workers_follows_gpus():
     from hpc_runtime import scale_hpc_workers
 
     full = scale_hpc_workers(n_gpu=4, n_cpu=64)
-    _assert(full["num_workers"] == 15, full)
+    _assert(full["num_workers"] == 30, full)
     _assert(full["cache_build_workers"] == 63, full)
     _assert(full["cpus_per_gpu"] == 16, full)
 
     one = scale_hpc_workers(n_gpu=1, n_cpu=16)
-    _assert(one["num_workers"] == 15, one)
-    _assert(one["cache_build_workers"] == 15, one)
+    _assert(one["num_workers"] == 30, one)
+    _assert(one["cache_build_workers"] == 30, one)
 
     tiny = scale_hpc_workers(n_gpu=1, n_cpu=1)
     _assert(tiny["num_workers"] == 0, tiny)

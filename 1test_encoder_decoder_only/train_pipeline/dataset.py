@@ -2529,9 +2529,10 @@ class AneurysmDataset(Dataset):
     def warmup_cache(self, indices=None, num_workers=1, strict=False):
         """Write missing `.pt` caches. Existing versioned files are left untouched.
 
-        Raycast is one core per sample, so `num_workers>1` runs samples in
-        parallel processes. Each process exits after one sample so VTK/PyTorch
-        heaps cannot accumulate. Training DataLoader workers are separate.
+        Raycast is one *process* per sample (``OMP_NUM_THREADS=1`` inside the
+        pool), not extra Python threads. ``num_workers>1`` runs samples in
+        parallel. Each process exits after one sample so VTK/PyTorch heaps
+        cannot accumulate. Training DataLoader workers are separate.
 
         Returns a list of ``(dataset_id, error)`` for samples that failed.
         ``strict=True`` raises if any failed; training should skip them instead.

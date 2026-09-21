@@ -35,7 +35,7 @@
 #SBATCH --cpus-per-task=64
 #SBATCH --gres=gpu:4
 #SBATCH --exclusive
-#SBATCH --time=2-00:00:00
+#SBATCH --time=1-14:00:00
 #SBATCH --mem=0
 #SBATCH --no-requeue
 #SBATCH --signal=TERM@180

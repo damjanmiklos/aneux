@@ -201,7 +201,16 @@ def capture_slurm_job_stats(job_id=None):
     )
     for cmd, key in queries:
         try:
-            out[key] = subprocess.check_output(cmd, text=True, timeout=60)
+            out[key] = subprocess.check_output(
+                cmd,
+                text=True,
+                timeout=60,
+                stderr=subprocess.STDOUT,
+            )
+        except subprocess.CalledProcessError as exc:
+            # Compute nodes often cannot reach the Slurm DB (sacct → localhost:6819).
+            # Keep the text in the JSON dump; do not print it as a training failure.
+            out[f"{key}_error"] = (exc.output or str(exc)).strip() or str(exc)
         except Exception as exc:
             out[f"{key}_error"] = str(exc)
     return out
