@@ -82,7 +82,7 @@ from vessel_pipeline import (
     extract_boundary_loops,
     extract_branches,
     extract_centerlines_for_tube,
-    boundary_point_keys,
+    boundary_point_cloud,
     drop_tear_profiles,
     find_repair_tears,
     finalize_surface,
@@ -200,15 +200,15 @@ def prepare_gt_surface(vessel_mesh, tears_out=None):
     grow a spurious 5 mm tube out of them.
     """
     poly = clean_triangulate(vessel_mesh)
+    # Every rim the input actually has, before a single triangle is removed.
+    # Everything below can open a hole where it cuts, and the openings are
+    # measured after this function returns, so without this the preparation's
+    # own damage becomes an anatomical ostium the rest of the run must preserve.
+    rim_before = boundary_point_cloud(poly)
     poly = drop_degenerate_triangles(poly)
     poly = drop_boundary_ear_triangles(poly)
     poly, n_nm = repair_nonmanifold_triangles(poly)
     if n_nm > 0:
-        # Remember which points were already on a rim. The cut below opens a
-        # hole wherever it removes a triangle, and the openings are measured
-        # after this function returns, so without this the repair's own damage
-        # becomes an anatomical ostium the rest of the run must preserve.
-        rim_before = boundary_point_keys(poly)
         poly, n_forced = force_manifold_triangles(poly)
         poly, n_nm = repair_nonmanifold_triangles(poly)
         if n_forced:
@@ -216,18 +216,7 @@ def prepare_gt_surface(vessel_mesh, tears_out=None):
                 f"cut {n_forced} triangle(s) to make the original manifold "
                 f"({n_nm} non-manifold edges left)"
             )
-            # The surface is left exactly as it is: the remesher closes such a
-            # tear by itself and the mesh comes out right. What must not happen
-            # is the tear being counted as an ostium, so it is reported instead.
-            torn = find_repair_tears(poly, rim_before)
-            if torn and tears_out is not None:
-                tears_out.extend(torn)
-            if torn:
-                _warn(
-                    f"the manifold repair tore {len(torn)} hole(s) "
-                    "(r=" + ", ".join(f"{t['radius']:.3f}" for t in torn)
-                    + " mm); they are not ostia and will not be counted"
-                )
+
     if n_nm > 0:
         _warn(f"{n_nm} non-manifold edges remain on the original after repair")
     poly, min_edge = weld_degenerate_vertices(poly)
@@ -236,6 +225,18 @@ def prepare_gt_surface(vessel_mesh, tears_out=None):
     if n_pin:
         _warn(f"patched {n_pin} wall pinhole(s) on the original before flow extensions")
     poly = uncap_closed_surface(poly)
+    # The surface is left exactly as it is: the remesher zips such a tear shut
+    # by itself and the mesh comes out right. What must not happen is the tear
+    # being counted as an ostium, so it is reported rather than repaired.
+    torn = find_repair_tears(poly, rim_before)
+    if torn:
+        if tears_out is not None:
+            tears_out.extend(torn)
+        _warn(
+            f"preparing the original tore {len(torn)} hole(s) (r="
+            + ", ".join(f"{t['radius']:.3f}" for t in torn)
+            + " mm); they are not ostia and will not be counted"
+        )
     print(f"  Original min edge after welding: {min_edge:.6f} mm")
     return poly
 

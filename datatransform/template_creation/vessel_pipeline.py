@@ -3685,68 +3685,74 @@ def _loop_geometry(surface):
     return poly, pts, faces, out
 
 
-def boundary_point_keys(surface, ndigits=6):
-    """Rounded coordinates of every boundary point, for provenance tests."""
+def boundary_point_cloud(surface):
+    """Every boundary point as an (N, 3) array, for provenance tests."""
     poly = to_vtk_poly(surface)
     loops = extract_boundary_loops(poly)
-    keys = set()
+    out = []
     for i in range(loops.GetNumberOfCells()):
         cell = loops.GetCell(i)
         pts = cell.GetPoints()
         for j in range(cell.GetNumberOfPoints()):
-            x, y, z = pts.GetPoint(j)
-            keys.add((round(x, ndigits), round(y, ndigits), round(z, ndigits)))
-    return keys
+            out.append(pts.GetPoint(j))
+    if not out:
+        return np.zeros((0, 3), dtype=np.float64)
+    return np.asarray(out, dtype=np.float64)
 
 
-def find_repair_tears(surface, boundary_before, min_old_fraction=0.5):
-    """The openings the manifold repair tore, told apart from the real ostia.
+def find_repair_tears(surface, before_pts, tol_mm=1e-3, min_old_fraction=0.5):
+    """The openings the preparation tore, told apart from the real ostia.
 
-    force_manifold_triangles removes triangles, and removing a triangle opens a
-    hole wherever it cuts. The anatomical profiles are measured after that, so
-    the hole is promoted to an ostium and the rest of the run is spent trying to
-    preserve damage. SNF00000228 tore a 0.427 mm hole 0.57 mm from a real 0.410
-    mm ostium, counted seven profiles against the six loops its input actually
-    has, and failed 6 against 7 -- while the mesh it produced was right, with
-    all six openings round and in place. The remesher zips such a tear shut on
-    its own, so nothing here needs repairing; the count simply must not include
-    it.
+    Preparing the original removes triangles -- the manifold cut, the degenerate
+    and ear drops -- and removing a triangle opens a hole wherever it cuts. The
+    anatomical profiles are measured afterwards, so such a hole is promoted to
+    an ostium and the rest of the run is spent trying to preserve damage.
+    SNF00000228 tore a 0.427 mm hole 0.57 mm from a real 0.410 mm ostium,
+    counted seven profiles against the six loops its input actually has, and
+    failed 6 against 7 -- while the mesh it produced was right, with all six
+    openings round and in place. The remesher zips such a tear shut by itself,
+    so nothing here needs repairing; the count simply must not include it.
 
     Position cannot separate the two at that distance: the protect tolerance
     around that ostium is 0.615 mm and the tear falls inside it. Provenance can.
-    A cut only deletes triangles, so a real ostium's rim points were boundary
-    points beforehand, while a torn rim is made of points that were interior.
-    ``boundary_before`` is the key set from :func:`boundary_point_keys` taken
-    before the cut.
+    Removing triangles never invents a point, so a real ostium's rim points were
+    already on a rim beforehand, while a torn rim is made of points that were
+    interior. ``before_pts`` is the boundary cloud from before the preparation;
+    the match runs at ``tol_mm`` rather than on exact coordinates because the
+    weld nudges surviving points by well under a micron.
     """
-    poly, pts, _faces, loops = _loop_geometry(surface)
-    if not loops or not boundary_before:
+    before = np.asarray(before_pts, dtype=np.float64)
+    if before.size == 0:
+        # Nothing was open to begin with, so every loop here was opened on
+        # purpose -- uncap_closed_surface does that -- and none is damage.
         return []
+    poly, pts, _faces, loops = _loop_geometry(surface)
+    if not loops:
+        return []
+    from scipy.spatial import cKDTree
+
+    tree = cKDTree(before)
     torn = []
     kept = 0
     for ids, center, radius, n in loops:
         if n <= 0:
             continue
         coords = pts[np.asarray(ids, dtype=np.int64)]
-        old = 0
-        for xyz in coords:
-            key = (round(float(xyz[0]), 6), round(float(xyz[1]), 6),
-                   round(float(xyz[2]), 6))
-            if key in boundary_before:
-                old += 1
+        d, _idx = tree.query(coords, k=1)
+        old = int(np.count_nonzero(np.asarray(d, dtype=np.float64) <= float(tol_mm)))
         if float(old) / float(n) < float(min_old_fraction):
             torn.append({"barycenter": np.asarray(center, dtype=np.float64),
                          "radius": float(radius), "n_points": int(n)})
         else:
             kept += 1
     if kept == 0:
-        # Every loop looks new, so the provenance set is wrong rather than the
+        # Every loop looks new, so the provenance cloud is wrong rather than the
         # surface being all tears. Claiming them all would drop every ostium.
         return []
     return torn
 
 
-def drop_tear_profiles(profiles, tears, label="manifold repair"):
+def drop_tear_profiles(profiles, tears, label="preparation"):
     """Profiles minus the ones sitting on a hole the repair tore open.
 
     Matched tightly, because the whole point is to separate a tear from an

@@ -64,7 +64,7 @@ from run_report import make_run_dir
 # Per-GPU batch 10. Global batch = 10 × n_gpu (40 on a full node). LR stays 2e-4.
 # DataLoader / cache workers are chosen from SLURM_CPUS_PER_TASK and GPU count
 # (16 cores/GPU on Komondor). Override with ANEUX_NUM_WORKERS / ANEUX_CACHE_WORKERS.
-BATCH_SIZE = int(os.environ.get("ANEUX_BATCH_SIZE", "10"))
+BATCH_SIZE = int(os.environ.get("ANEUX_BATCH_SIZE", "20"))
 ACCUM_STEPS = int(os.environ.get("ANEUX_ACCUM_STEPS", "1"))
 EPOCHS = int(os.environ.get("ANEUX_EPOCHS", "500"))
 VAL_EVERY = int(os.environ.get("ANEUX_VAL_EVERY", "1"))
