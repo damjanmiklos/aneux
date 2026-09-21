@@ -60,6 +60,10 @@ scratch/
 # Nested personal copy of supervisor repo (own git remotes)
 datatransform/hemoMesh/
 
+# Komondor slurm logs (sbatch from repo root)
+aneux_s2_*.out
+aneux_s2_*.err
+
 # Compiled variable-remesh raycast helper (built in hemomesh against local VTK)
 datatransform/template_creation/stretch_raycast*.pyd
 datatransform/template_creation/stretch_raycast*.so

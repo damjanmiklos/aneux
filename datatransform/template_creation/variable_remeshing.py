@@ -55,11 +55,9 @@ from vessel_pipeline import (
     decimate_variable_parent_tube,
     finalize_surface,
     inspect_openings,
-    load_ostium_frames,
     measure_open_profiles,
     remesh_surface_adaptively,
     run_batch,
-    save_ostium_frames,
     save_polydata,
     to_vtk_poly,
     with_dataset_id,
@@ -173,7 +171,13 @@ def resolve_cut_frames(
             continue
         seen.add(path)
         if os.path.isfile(path):
-            return load_ostium_frames(path), path
+            with np.load(path) as data:
+                loaded = {
+                    "origin": np.ascontiguousarray(data["origin"], dtype=np.float64),
+                    "normal": np.ascontiguousarray(data["normal"], dtype=np.float64),
+                    "radius": np.ascontiguousarray(data["radius"], dtype=np.float64),
+                }
+            return normalize_cut_frames(loaded), path
     return None, None
 
 

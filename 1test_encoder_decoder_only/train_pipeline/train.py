@@ -1,16 +1,43 @@
+import contextlib
 import csv
 import inspect
 import math
 import os
 import random
+import signal
+import time
 
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.utils.data.distributed import DistributedSampler
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
+
+from dist_utils import (
+    all_reduce_sum_pair,
+    barrier,
+    distributed_active,
+    is_main_process,
+    reduce_mean_dict,
+    unwrap_model,
+    world_size,
+    wrap_ddp,
+)
+from run_report import (
+    TopKCheckpoints,
+    capture_slurm_job_stats,
+    dump_json,
+    hardware_snapshot,
+    plot_training_history,
+    selection_score,
+    write_history_tables,
+    write_run_readme,
+    write_run_summary,
+)
+from resource_monitor import ResourceMonitor
 
 from config import (
     DEFAULT_LOSS_WEIGHTS,
@@ -230,6 +257,9 @@ def weighted_total(terms, weights):
     )
     if "rad" in terms:
         total = total + float(weights.get("rad", 0.0)) * terms["rad"]
+    for extra in ("fold", "stretch"):
+        if extra in terms and extra in weights:
+            total = total + float(weights[extra]) * terms[extra]
     return total
 
 
@@ -410,7 +440,7 @@ def save_training_checkpoint(
     payload = {
         "epoch": int(epoch),
         "global_step": int(global_step),
-        "model": model.state_dict(),
+        "model": unwrap_model(model).state_dict(),
         "ema": ema.state_dict() if ema is not None else None,
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict() if scheduler is not None else None,
@@ -461,9 +491,12 @@ def resolve_resume_path(resume, ckpt_dir):
     if isinstance(resume, str) and resume.strip().lower() not in ("", "auto", "true", "1", "yes"):
         return resume
     if ckpt_dir:
-        candidate = os.path.join(ckpt_dir, "last.pt")
-        if os.path.isfile(candidate):
-            return candidate
+        for candidate in (
+            os.path.join(ckpt_dir, "checkpoints", "last.pt"),
+            os.path.join(ckpt_dir, "last.pt"),
+        ):
+            if os.path.isfile(candidate):
+                return candidate
     return None
 
 
@@ -985,10 +1018,17 @@ def apply_pose_jitter(batch, max_deg=POSE_JITTER_DEG, generator=None):
     pose_R = getattr(batch, "pose_R", None)
     if torch.is_tensor(pose_R) and pose_R.numel() >= 9:
         R_cpu = R.detach().to(device=pose_R.device, dtype=pose_R.dtype)
-        if pose_R.dim() == 2:
-            batch.pose_R = R_cpu @ pose_R
-        elif pose_R.dim() == 3:
+        if pose_R.dim() == 3 and pose_R.size(-2) == 3 and pose_R.size(-1) == 3:
             batch.pose_R = R_cpu.unsqueeze(0) @ pose_R
+        elif pose_R.dim() == 2 and tuple(pose_R.shape[-2:]) == (3, 3):
+            if pose_R.shape == (3, 3):
+                batch.pose_R = R_cpu @ pose_R
+            elif pose_R.size(0) % 3 == 0:
+                bsz = pose_R.size(0) // 3
+                batch.pose_R = R_cpu.unsqueeze(0) @ pose_R.view(bsz, 3, 3)
+        elif pose_R.dim() == 2 and pose_R.size(-1) == 3 and pose_R.size(0) % 3 == 0:
+            bsz = pose_R.size(0) // 3
+            batch.pose_R = R_cpu.unsqueeze(0) @ pose_R.view(bsz, 3, 3)
     return batch, R
 
 
@@ -1044,9 +1084,16 @@ def train_epoch(
         terms = losses_from_output(out, batch, kl_beta=geco_beta if use_geco else None)
         loss = _weighted_total(terms, weights) / window_len
 
-        loss.backward()
+        is_update = (step + 1) % accum_steps == 0 or (step + 1) == n_batches
+        sync_ctx = (
+            model.no_sync()
+            if (hasattr(model, "no_sync") and not is_update)
+            else contextlib.nullcontext()
+        )
+        with sync_ctx:
+            loss.backward()
         if vram_probe and use_cuda and not logged_first_batch:
-            _print_vram("after first batch (forward+backward, no optimizer.step yet)", device, model)
+            _print_vram("after first batch (forward+backward, no optimizer.step yet)", device, unwrap_model(model))
             logged_first_batch = True
 
         kl_raw = _tensor_scalar(terms.get("kl_mean_raw"))
@@ -1054,15 +1101,19 @@ def train_epoch(
             window_kl_sum += float(kl_raw.item()) * batch_size
             window_kl_n += batch_size
 
-        if (step + 1) % accum_steps == 0 or (step + 1) == n_batches:
+        if is_update:
             if grad_clip is not None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             if ema is not None:
-                ema.update(model)
+                ema.update(unwrap_model(model))
             if scheduler is not None:
                 scheduler.step()
+            if use_geco:
+                window_kl_sum, window_kl_n = all_reduce_sum_pair(
+                    window_kl_sum, window_kl_n, device=device if use_cuda else None
+                )
             if use_geco and window_kl_n > 0:
                 geco_beta = step_geco_beta(
                     geco_beta,
@@ -1074,12 +1125,34 @@ def train_epoch(
             window_kl_n = 0
             global_step += 1
             if vram_probe and use_cuda and not logged_first_step:
-                _print_vram("after first optimizer.step (AdamW moments allocated)", device, model)
+                _print_vram("after first optimizer.step (AdamW moments allocated)", device, unwrap_model(model))
                 logged_first_step = True
+
+        if vram_probe and os.environ.get("ANEUX_VRAM_PROBE_ONLY", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        ):
+            if not is_update:
+                if grad_clip is not None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                if ema is not None:
+                    ema.update(unwrap_model(model))
+                if use_cuda and not logged_first_step:
+                    _print_vram(
+                        "after first optimizer.step (AdamW moments allocated)",
+                        device,
+                        unwrap_model(model),
+                    )
+                    logged_first_step = True
+            tqdm.write("ANEUX_VRAM_PROBE_ONLY: stopping after the first batch")
+            break
 
         scale = float(window_len * batch_size)
         _add_meter(totals, "loss", loss, scale)
-        for key in ("recon", "kl", "disp", "lap", "norm", "rad", "kl_mean_raw", "rate_gap"):
+        for key in ("recon", "kl", "disp", "lap", "norm", "rad", "kl_mean_raw", "rate_gap", "fold", "stretch"):
             if key in terms:
                 val = terms[key]
                 if not torch.is_tensor(val):
@@ -1089,7 +1162,7 @@ def train_epoch(
         del out, terms, loss, batch
 
     if vram_probe and use_cuda:
-        _print_vram("end of epoch 1 (peak over all train batches)", device, model)
+        _print_vram("end of epoch 1 (peak over all train batches)", device, unwrap_model(model))
 
     metrics = _flush_meters(totals, total_samples)
     if geco_beta is not None:
@@ -1113,7 +1186,7 @@ def evaluate_epoch(model, dataloader, weights, device, sample=False, kl_beta=Non
             terms = losses_from_output(out, batch, kl_beta=kl_beta)
             loss = _weighted_total(terms, weights)
             _add_meter(totals, "loss", loss, float(batch_size))
-            for key in ("recon", "kl", "disp", "lap", "norm", "rad", "kl_mean_raw", "rate_gap"):
+            for key in ("recon", "kl", "disp", "lap", "norm", "rad", "kl_mean_raw", "rate_gap", "fold", "stretch"):
                 if key in terms:
                     val = terms[key]
                     if not torch.is_tensor(val):
@@ -1291,6 +1364,27 @@ def run_post_training_standardisation(model, dataloader, device, ckpt_path=None,
     return stats
 
 
+def _checkpoint_root(ckpt_dir):
+    if not ckpt_dir:
+        return None
+    nested = os.path.join(ckpt_dir, "checkpoints")
+    if os.path.isdir(nested) or os.path.isdir(os.path.join(ckpt_dir, "plots")):
+        os.makedirs(nested, exist_ok=True)
+        return nested
+    os.makedirs(ckpt_dir, exist_ok=True)
+    return ckpt_dir
+
+
+def _loader_mp_context(explicit):
+    if explicit is not None:
+        return explicit
+    if os.name == "nt":
+        return "spawn"
+    if torch.cuda.is_available():
+        return "spawn"
+    return None
+
+
 def train_model(
     model,
     train_dataset,
@@ -1312,12 +1406,24 @@ def train_model(
     resume="auto",
     lr_warmup_steps=LR_WARMUP_STEPS,
     augment=True,
+    pin_memory=False,
+    prefetch_factor=2,
+    persistent_workers=None,
+    multiprocessing_context=None,
+    topk_train=3,
+    topk_val=3,
+    write_plots=True,
+    run_meta=None,
+    find_unused_parameters=False,
 ):
     """Train loop.
 
-    Resume: pass ``resume=True`` / ``"auto"`` (default) to load ``{ckpt_dir}/last.pt``
+    Resume: pass ``resume=True`` / ``"auto"`` (default) to load ``last.pt``
     when it exists, ``resume=False`` to start fresh, or ``resume=path/to/last.pt``.
     Restores model, EMA, optimiser, scheduler, epoch, and RNG.
+
+    When torchrun has initialized a process group, each rank trains a shard
+    (DistributedSampler) and gradients sync with NCCL DDP.
     """
     if weights is None:
         weights = dict(DEFAULT_LOSS_WEIGHTS)
@@ -1325,46 +1431,80 @@ def train_model(
     configure_stage2_precision()
     device = resolve_train_device(device)
     ema_decay = _ema_decay_default(ema_decay)
-    print(
+    main = is_main_process()
+    n_gpu = world_size() if distributed_active() else 1
+    global_batch = int(batch_size) * int(max(1, accum_steps)) * int(n_gpu)
+
+    def _log(*args, **kwargs):
+        if main:
+            print(*args, **kwargs)
+
+    _log(
         f"Stage-2 precision: matmul={torch.get_float32_matmul_precision()} "
         f"tf32_matmul={torch.backends.cuda.matmul.allow_tf32} "
         f"tf32_cudnn={torch.backends.cudnn.allow_tf32}"
     )
     env_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
-    print(
+    _log(
         f"Train device: {device}  CUDA_VISIBLE_DEVICES={env_cvd!r}  "
-        f"ema_decay={ema_decay}  lr_warmup_steps={int(lr_warmup_steps)}"
+        f"world_size={n_gpu}  ema_decay={ema_decay}  "
+        f"lr_warmup_steps={int(lr_warmup_steps)}"
     )
 
     use_cuda = _device_type(device) == "cuda"
+    mp_ctx = _loader_mp_context(multiprocessing_context) if num_workers else None
+    persist = persistent_workers if persistent_workers is not None else (num_workers > 0)
     loader_kwargs = dict(
         follow_batch=FOLLOW_BATCH,
-        pin_memory=False,
+        pin_memory=bool(pin_memory) and use_cuda,
     )
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = int(max(1, prefetch_factor))
+        loader_kwargs["persistent_workers"] = bool(persist)
+        loader_kwargs["worker_init_fn"] = _worker_init
+        if mp_ctx:
+            loader_kwargs["multiprocessing_context"] = mp_ctx
+
+    train_sampler = None
+    val_sampler = None
+    if distributed_active() and n_gpu > 1:
+        train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=False)
+        val_sampler = DistributedSampler(val_dataset, shuffle=False, drop_last=False)
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=num_workers,
-        persistent_workers=(num_workers > 0),
-        prefetch_factor=2 if num_workers > 0 else None,
-        worker_init_fn=_worker_init if num_workers > 0 else None,
         **loader_kwargs,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
+        sampler=val_sampler,
         num_workers=0,
-        **loader_kwargs,
+        follow_batch=FOLLOW_BATCH,
+        pin_memory=bool(pin_memory) and use_cuda,
     )
+    latent_loader = val_loader
+    if main and val_sampler is not None:
+        latent_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=0,
+            follow_batch=FOLLOW_BATCH,
+        )
 
     model = model.to(device)
     if use_cuda:
         torch.cuda.synchronize()
-        from ops import fps_indices
+        from ops import assert_optimized_cuda_kernels, fps_indices
 
         fps_indices(torch.randn(64, 3, device=device), 8)
+        assert_optimized_cuda_kernels(device)
         torch.cuda.synchronize()
     optimizer = AdamW(adamw_param_groups(model, weight_decay), lr=lr)
     n_batches = max(1, len(train_loader))
@@ -1376,25 +1516,37 @@ def train_model(
     )
     ema = ModelEMA(model, decay=ema_decay) if ema_decay and ema_decay > 0.0 else None
 
+    ckpt_root = _checkpoint_root(ckpt_dir)
     if ckpt_dir:
         os.makedirs(ckpt_dir, exist_ok=True)
+        os.makedirs(os.path.join(ckpt_dir, "data"), exist_ok=True)
+        if main and write_plots:
+            write_run_readme(ckpt_dir)
+            dump_json(os.path.join(ckpt_dir, "data", "hardware.json"), hardware_snapshot())
+            if run_meta is not None:
+                dump_json(os.path.join(ckpt_dir, "data", "run_config.json"), run_meta)
 
     start_epoch = 1
     global_step = 0
     use_geco = geco_is_available()
     geco_beta = init_geco_beta() if use_geco else None
     if use_geco:
-        print(
+        _log(
             f"GECO dual: β_init={geco_beta:.6g}  "
             f"(KL weight=1; {kl_warmup_epochs}-epoch ramp of β_max)"
         )
     else:
-        # losses.update_geco_beta / compute_losses(kl_beta=) missing — fall back
-        # to annealed LAMBDA_KL (item 19 inert).
-        print("GECO unavailable; using annealed LAMBDA_KL")
+        _log("GECO unavailable; using annealed LAMBDA_KL")
     resume_path = resolve_resume_path(resume, ckpt_dir)
+    if resume_path and os.environ.get("ANEUX_VRAM_PROBE_ONLY", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        _log("ANEUX_VRAM_PROBE_ONLY: ignoring resume checkpoint")
+        resume_path = None
     if resume_path:
-        print(f"Resuming from {resume_path}")
+        _log(f"Resuming from {resume_path}")
         ckpt = load_training_checkpoint(
             resume_path,
             model=model,
@@ -1407,36 +1559,86 @@ def train_model(
         global_step = int(ckpt.get("global_step", 0))
         if use_geco and ckpt.get("geco_beta") is not None:
             geco_beta = float(ckpt["geco_beta"])
-        print(
+        _log(
             f"  restored epoch {ckpt.get('epoch')}  next={start_epoch}  "
             f"step={global_step}"
             + (f"  geco_beta={geco_beta:.6g}" if geco_beta is not None else "")
         )
 
-    print(f"Effective batch size: {batch_size} x {accum_steps} = {batch_size * accum_steps}")
-    print(f"Train dataset size: {len(train_dataset)}")
-    print(f"Val dataset size: {len(val_dataset)}")
-    print(
+    model = wrap_ddp(model, device, find_unused_parameters=find_unused_parameters)
+    raw_model = unwrap_model(model)
+
+    _log(
+        f"Per-GPU batch {batch_size} x accum {accum_steps} x {n_gpu} GPU(s) "
+        f"= global {global_batch}"
+    )
+    _log(f"Train dataset size: {len(train_dataset)}")
+    _log(f"Val dataset size: {len(val_dataset)}")
+    _log(
         f"Schedule: {steps_per_epoch} opt steps/epoch, {total_opt_steps} total, "
         f"warmup {int(lr_warmup_steps)} then cosine"
     )
 
-    csv_path = os.path.join(ckpt_dir, "epoch_metrics.csv") if ckpt_dir else None
+    csv_path = None
+    if ckpt_dir and main:
+        csv_path = os.path.join(ckpt_dir, "data", "epoch_metrics.csv")
     logger = CsvEpochLogger(csv_path)
-    tb = _try_tb_writer(os.path.join(ckpt_dir, "tb") if ckpt_dir else None)
+    tb = _try_tb_writer(os.path.join(ckpt_dir, "tb") if ckpt_dir and main else None)
+
+    monitor = None
+    probe_only = os.environ.get("ANEUX_VRAM_PROBE_ONLY", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if main and ckpt_dir and not probe_only:
+        interval = float(os.environ.get("ANEUX_MONITOR_SEC", "15"))
+        monitor = ResourceMonitor(
+            os.path.join(ckpt_dir, "data"),
+            interval=interval,
+            disk_path=ckpt_dir,
+        )
+        monitor.start()
+
+    top_train = (
+        TopKCheckpoints(ckpt_root, "best_train", k=int(topk_train))
+        if ckpt_root and main and topk_train
+        else None
+    )
+    top_val = (
+        TopKCheckpoints(ckpt_root, "best_val", k=int(topk_val))
+        if ckpt_root and main and topk_val
+        else None
+    )
 
     history = []
-    best_val = float("inf")
+    stop = {"flag": False}
+
+    def _on_signal(signum, _frame):
+        stop["flag"] = True
+        tqdm.write(f"signal {signum}: finishing this epoch then saving last.pt")
+
+    for sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGINT", None)):
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _on_signal)
+        except (ValueError, OSError):
+            pass
 
     for epoch in range(start_epoch, epochs + 1):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+        if val_sampler is not None:
+            val_sampler.set_epoch(epoch)
         epoch_weights = dict(weights)
         if use_geco:
-            # β already scales KL inside vae_kl_loss; do not also multiply by λ.
             epoch_weights["kl"] = 1.0
         else:
             epoch_weights["kl"] = kl_anneal_weight(
                 epoch, max_weight=kl_max, warmup_epochs=kl_warmup_epochs
             )
+        t0 = time.perf_counter()
         metrics, global_step, geco_beta = train_epoch(
             model,
             train_loader,
@@ -1445,7 +1647,7 @@ def train_model(
             device,
             accum_steps,
             grad_clip=grad_clip,
-            vram_probe=(use_cuda and epoch == start_epoch),
+            vram_probe=(use_cuda and epoch == start_epoch and main),
             ema=ema,
             scheduler=scheduler,
             global_step=global_step,
@@ -1454,6 +1656,15 @@ def train_model(
             epoch=epoch,
             kl_warmup_epochs=kl_warmup_epochs,
         )
+        epoch_s = time.perf_counter() - t0
+        metrics = reduce_mean_dict(metrics, device=device if use_cuda else None)
+        n_seen = max(1, len(train_dataset))
+        metrics["epoch"] = int(epoch)
+        metrics["epoch_seconds"] = float(epoch_s)
+        metrics["samples_per_sec"] = float(n_seen) / max(epoch_s, 1e-6)
+        if use_cuda:
+            idx = _cuda_index(device)
+            metrics["peak_vram_gib"] = float(torch.cuda.max_memory_allocated(idx) / 1024**3)
         last_lr = scheduler.get_last_lr()[0] if scheduler is not None else lr
         ema_d = ema_warmup_decay(ema.decay, max(0, ema.n_updates - 1)) if ema is not None else 0.0
         extra = f" | kl_lambda: {epoch_weights['kl']:.6f} | lr: {last_lr:.2e} | ema_d: {ema_d:.4f}"
@@ -1461,7 +1672,12 @@ def train_model(
             extra += f" | β: {float(geco_beta):.6g}"
             if metrics.get("rate_gap") is not None:
                 extra += f" | rate_gap: {metrics['rate_gap']:.4f}"
-        print(_format_metrics(metrics, epoch_weights, "TRAIN", epoch, epochs) + extra)
+        extra += f" | {metrics['samples_per_sec']:.2f} samples/s"
+        _log(_format_metrics(metrics, epoch_weights, "TRAIN", epoch, epochs) + extra)
+        if os.environ.get("ANEUX_VRAM_PROBE_ONLY", "").strip().lower() in ("1", "true", "yes"):
+            history.append(metrics)
+            _log("ANEUX_VRAM_PROBE_ONLY: skipping val, plots, and remaining epochs")
+            break
         metrics["lr"] = float(last_lr)
         metrics["kl_lambda"] = float(epoch_weights["kl"])
         metrics["global_step"] = int(global_step)
@@ -1473,94 +1689,132 @@ def train_model(
             if bmax is not None:
                 metrics["geco_beta_max"] = bmax
 
-        latent_row = _call_maybe(
-            _compute_latent_epoch_metrics,
-            model=model,
-            dataloader=val_loader if len(val_dataset) else train_loader,
-            device=device,
-            epoch=epoch,
-            beta=geco_beta if geco_beta is not None else epoch_weights["kl"],
-            r_star=None,
-            weights=epoch_weights,
-            kl_lambda=epoch_weights["kl"],
-            kl_mean_raw=metrics.get("kl_mean_raw"),
-            rate_gap=metrics.get("rate_gap"),
-        )
-        if isinstance(latent_row, dict):
-            metrics.update(_flatten_metrics(latent_row, prefix="latent"))
+        if main:
+            latent_row = _call_maybe(
+                _compute_latent_epoch_metrics,
+                model=raw_model,
+                dataloader=latent_loader if len(val_dataset) else train_loader,
+                device=device,
+                epoch=epoch,
+                beta=geco_beta if geco_beta is not None else epoch_weights["kl"],
+                r_star=None,
+                weights=epoch_weights,
+                kl_lambda=epoch_weights["kl"],
+                kl_mean_raw=metrics.get("kl_mean_raw"),
+                rate_gap=metrics.get("rate_gap"),
+            )
+            if isinstance(latent_row, dict):
+                metrics.update(_flatten_metrics(latent_row, prefix="latent"))
 
-        if epoch % val_every == 0 or epoch == epochs:
+        do_val = epoch % val_every == 0 or epoch == epochs or stop["flag"]
+        if do_val:
             if ema is not None:
                 live_mu = evaluate_epoch(
                     model, val_loader, epoch_weights, device, sample=False, kl_beta=geco_beta
                 )
-                print(_format_metrics(live_mu, epoch_weights, "VAL live μ", epoch, epochs))
+                live_mu = reduce_mean_dict(live_mu, device=device if use_cuda else None)
+                _log(_format_metrics(live_mu, epoch_weights, "VAL live μ", epoch, epochs))
                 for key, value in live_mu.items():
                     metrics[f"val_live_{key}"] = value
-                ema.store(model)
-                ema.copy_to(model)
+                ema.store(raw_model)
+                ema.copy_to(raw_model)
             val_metrics = evaluate_epoch(
                 model, val_loader, epoch_weights, device, sample=False, kl_beta=geco_beta
             )
             val_sampled = evaluate_epoch(
                 model, val_loader, epoch_weights, device, sample=True, kl_beta=geco_beta
             )
+            val_metrics = reduce_mean_dict(val_metrics, device=device if use_cuda else None)
+            val_sampled = reduce_mean_dict(val_sampled, device=device if use_cuda else None)
             if ema is not None:
-                ema.restore(model)
-            print(_format_metrics(val_metrics, epoch_weights, "VAL μ  ", epoch, epochs))
-            print(_format_metrics(val_sampled, epoch_weights, "VAL σ  ", epoch, epochs))
+                ema.restore(raw_model)
+            _log(_format_metrics(val_metrics, epoch_weights, "VAL μ  ", epoch, epochs))
+            _log(_format_metrics(val_sampled, epoch_weights, "VAL σ  ", epoch, epochs))
             gap = float(val_sampled["recon"] - val_metrics["recon"])
-            print(f"  recon(σ) − recon(μ) = {gap:.4f}")
+            _log(f"  recon(σ) − recon(μ) = {gap:.4f}")
             for key, value in val_metrics.items():
                 metrics[f"val_{key}"] = value
             for key, value in val_sampled.items():
                 metrics[f"val_sample_{key}"] = value
             metrics["val_recon_sample_gap"] = gap
 
-            val_score = val_metrics["recon"] + float(epoch_weights.get("rad", 0.0)) * val_metrics.get("rad", 0.0)
-            if ckpt_dir and val_score < best_val:
-                best_val = val_score
-                to_save = ema.shadow if ema is not None else model.state_dict()
-                torch.save(to_save, os.path.join(ckpt_dir, "best.pt"))
-                print(f"  saved best checkpoint (val_recon+rad {best_val:.4f}) [μ path]")
+            if top_val is not None:
+                payload = {
+                    "epoch": int(epoch),
+                    "model": (ema.shadow if ema is not None else raw_model.state_dict()),
+                    "metrics": {k: metrics[k] for k in metrics if k.startswith("val_")},
+                    "score": selection_score(val_metrics, epoch_weights),
+                }
+                if top_val.consider(payload["score"], payload, epoch, extra={"split": "val"}):
+                    _log(
+                        f"  saved val top-{topk_val} (score {payload['score']:.4f}) [EMA μ path]"
+                    )
 
-        logger.log(metrics, epoch=epoch, tag="epoch")
-        if tb is not None:
-            for key, value in metrics.items():
-                if isinstance(value, (int, float)) and math.isfinite(float(value)):
-                    tb.add_scalar(key, float(value), epoch)
+        if top_train is not None:
+            payload = {
+                "epoch": int(epoch),
+                "model": raw_model.state_dict(),
+                "metrics": {k: metrics[k] for k in ("loss", "recon", "rad", "kl") if k in metrics},
+                "score": selection_score(metrics, epoch_weights),
+            }
+            if top_train.consider(payload["score"], payload, epoch, extra={"split": "train"}):
+                _log(f"  saved train top-{topk_train} (score {payload['score']:.4f})")
 
-        if ckpt_dir:
-            save_training_checkpoint(
-                os.path.join(ckpt_dir, "last.pt"),
-                model=model,
-                ema=ema,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                epoch=epoch,
-                metrics=metrics,
-                global_step=global_step,
-                geco_beta=geco_beta,
-            )
+        if main:
+            logger.log(metrics, epoch=epoch, tag="epoch")
+            if tb is not None:
+                for key, value in metrics.items():
+                    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                        tb.add_scalar(key, float(value), epoch)
+            if ckpt_root:
+                save_training_checkpoint(
+                    os.path.join(ckpt_root, "last.pt"),
+                    model=model,
+                    ema=ema,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    epoch=epoch,
+                    metrics=metrics,
+                    global_step=global_step,
+                    geco_beta=geco_beta,
+                )
+            if ckpt_dir:
+                write_history_tables(history + [metrics], ckpt_dir)
+                if write_plots:
+                    plot_training_history(history + [metrics], ckpt_dir)
+                if monitor is not None:
+                    monitor.write_csv()
+                    if write_plots:
+                        monitor.plot()
 
         history.append(metrics)
+        barrier()
+        if stop["flag"]:
+            _log("stop flag set; leaving the training loop")
+            break
 
-    if ckpt_dir:
-        best_path = os.path.join(ckpt_dir, "best.pt")
-        if os.path.isfile(best_path):
+    if ckpt_dir and main and os.environ.get("ANEUX_VRAM_PROBE_ONLY", "").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+    ):
+        best_path = os.path.join(ckpt_root or ckpt_dir, "best_val_1.pt")
+        legacy_best = os.path.join(ckpt_dir, "best.pt")
+        load_path = best_path if os.path.isfile(best_path) else legacy_best
+        if os.path.isfile(load_path):
             try:
-                best_sd = torch.load(best_path, map_location=device, weights_only=False)
+                best_sd = torch.load(load_path, map_location=device, weights_only=False)
             except TypeError:
-                best_sd = torch.load(best_path, map_location=device)
+                best_sd = torch.load(load_path, map_location=device)
             if isinstance(best_sd, dict) and "model" in best_sd:
-                model.load_state_dict(best_sd["model"], strict=True)
-            else:
-                model.load_state_dict(best_sd)
-            print(f"Restored best validation weights from {best_path}")
+                raw_model.load_state_dict(best_sd["model"], strict=True)
+            elif isinstance(best_sd, dict) and all(torch.is_tensor(v) for v in best_sd.values()):
+                raw_model.load_state_dict(best_sd)
+            print(f"Restored best validation weights from {load_path}")
         try:
-            last_path = os.path.join(ckpt_dir, "last.pt")
+            last_path = os.path.join(ckpt_root or ckpt_dir, "last.pt")
             stats = run_post_training_standardisation(
-                model,
+                raw_model,
                 train_loader,
                 device,
                 ckpt_path=last_path,
@@ -1580,8 +1834,18 @@ def train_model(
                 print(f"Stored latent standardisation stats on {best_path}")
         except RuntimeError as exc:
             print(f"Post-training latent standardisation skipped: {exc}")
+        slurm = capture_slurm_job_stats()
+        if slurm:
+            dump_json(os.path.join(ckpt_dir, "data", "slurm_jobstats.json"), slurm)
+        write_history_tables(history, ckpt_dir)
+        if write_plots:
+            plot_training_history(history, ckpt_dir)
+        write_run_summary(ckpt_dir, history)
 
+    if monitor is not None:
+        monitor.stop()
     if tb is not None:
         tb.close()
 
-    return model, history
+    return raw_model, history
+

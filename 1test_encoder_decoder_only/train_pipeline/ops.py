@@ -111,6 +111,41 @@ def make_spline_conv(in_channels: int, out_channels: int, **kwargs) -> SplineCon
     return SplineConv(in_channels, out_channels, **kwargs)
 
 
+def assert_optimized_cuda_kernels(device):
+    """Fail if FPS / radius / SplineConv are not the CUDA pyg-lib + pytorch3d path."""
+    dev = torch.device(device)
+    if dev.type != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError(
+            "Optimized kernels need a CUDA device (pytorch3d FPS, pyg-lib radius/SplineConv)."
+        )
+    if not WITH_SPLINE:
+        raise RuntimeError("SplineConv is not using pyg-lib CUDA spline ops.")
+    if not WITH_RADIUS:
+        raise RuntimeError("radius / ball_query are not using pyg-lib CUDA radius ops.")
+    torch.cuda.set_device(dev)
+    pts = torch.randn(128, 3, device=dev)
+    fps = fps_indices(pts, 16)
+    if fps.device.type != "cuda":
+        raise RuntimeError("pytorch3d FPS did not return CUDA indices.")
+    batch = torch.zeros(pts.size(0), dtype=torch.long, device=dev)
+    edges = radius_graph_packed(pts, radius=0.75, batch=batch, max_num_neighbors=16)
+    if edges.device.type != "cuda":
+        raise RuntimeError("pyg-lib radius_graph did not run on CUDA.")
+    conv = make_spline_conv(8, 8, dim=3, kernel_size=5, degree=2, root_weight=False).to(dev)
+    x = torch.randn(32, 8, device=dev)
+    ei = torch.tensor([[0, 1, 2, 3], [1, 2, 3, 0]], device=dev)
+    attr = torch.rand(ei.size(1), 3, device=dev)
+    y = conv(x, ei, attr)
+    if y.device.type != "cuda" or not torch.isfinite(y).all():
+        raise RuntimeError("SplineConv CUDA forward failed.")
+    print(
+        f"Kernels OK on {torch.cuda.get_device_name(dev)}: "
+        f"pytorch3d FPS, pyg-lib radius, pyg-lib SplineConv "
+        f"(WITH_SPLINE={WITH_SPLINE}, WITH_RADIUS={WITH_RADIUS})"
+    )
+    return True
+
+
 def composed_radius(
     x: Tensor,
     x_tube: Tensor,

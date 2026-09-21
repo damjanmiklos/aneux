@@ -630,6 +630,21 @@ def fold_penalty(x_pred, x_template, face, batch=None, num_graphs=1):
     return _mean_over_faces(pen, face, batch, num_graphs, x_pred)
 
 
+def _symmetric_eigvals_2x2(mat):
+    """Eigenvalues of symmetric ``[..., 2, 2]`` without ``eigvalsh``.
+
+    For ``[[p, q], [q, r]]`` the roots are
+    ``((p+r) ± sqrt((p-r)**2 + 4q**2)) / 2``. CUDA ``eigvalsh`` on ~1e5
+    tiny matrices tries to allocate a 30+ GiB MAGMA workspace.
+    """
+    p = mat[..., 0, 0]
+    q = mat[..., 0, 1]
+    r = mat[..., 1, 1]
+    tr = p + r
+    disc = ((p - r).square() + 4.0 * q.square()).clamp_min(0.0).sqrt()
+    return torch.stack((0.5 * (tr + disc), 0.5 * (tr - disc)), dim=-1)
+
+
 def triangle_stretch_loss(
     x_pred,
     x_template,
@@ -673,7 +688,7 @@ def triangle_stretch_loss(
     c0 = c0 + 1e-8 * eye
     a = torch.linalg.solve(c0, c1)
     a = 0.5 * (a + a.transpose(-1, -2))
-    ev = torch.linalg.eigvalsh(a).clamp_min(0.0)
+    ev = _symmetric_eigvals_2x2(a).clamp_min(0.0)
     sigma = ev.sqrt().clamp_min(1e-8)
     per = (sigma + sigma.reciprocal() - 2.0).mean(dim=-1)
     area = _face_areas(tpl, face)

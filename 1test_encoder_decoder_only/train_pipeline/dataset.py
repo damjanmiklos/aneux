@@ -213,6 +213,8 @@ class AneurysmData(Data):
             "gt_faces_mirror",
         ):
             return -1
+        if key in ("pose_R", "origin_shift"):
+            return None
         return super().__cat_dim__(key, value, *args, **kwargs)
 
     def to(self, device=None, *args, **kwargs):
@@ -234,7 +236,19 @@ class AneurysmData(Data):
         if flag is None:
             flag = getattr(out, "has_true_normal", None)
         if flag is not None:
-            out.has_true_normal = bool(flag)
+            if torch.is_tensor(flag):
+                flag = flag.detach().cpu()
+                if flag.numel() <= 1:
+                    out.has_true_normal = torch.tensor(
+                        1 if bool((flag != 0).reshape(-1).any().item()) else 0,
+                        dtype=torch.uint8,
+                    )
+                else:
+                    out.has_true_normal = flag.to(dtype=torch.uint8).reshape(-1)
+            else:
+                out.has_true_normal = torch.tensor(
+                    1 if bool(flag) else 0, dtype=torch.uint8
+                )
         return out
 
 
@@ -2568,6 +2582,34 @@ class AneurysmDataset(Dataset):
             )
         return len(idxs)
 
+    def preload_ram(self, indices=None, max_items=None):
+        """Hold finalized cache graphs in the parent process.
+
+        On Linux, DataLoader workers started with ``fork`` share this via
+        copy-on-write. After CUDA is initialized Komondor must use ``spawn``,
+        so HPC training still reads ``.pt`` files from scratch NVMe; this
+        preload then only helps the rank-0 sanity print and single-process
+        debug runs. Clone on ``__getitem__`` so augmentations cannot mutate
+        the stored graph.
+        """
+        from tqdm import tqdm
+
+        idxs = list(range(len(self)) if indices is None else indices)
+        if max_items is not None:
+            idxs = idxs[: int(max_items)]
+        self._ram_cache = {}
+        for i in tqdm(idxs, desc="RAM preload"):
+            if not self._cache_file_ready(i):
+                continue
+            sample = self.samples[i]
+            path = self._cache_path(sample["dataset_id"])
+            try:
+                data = _finalize_item(_load_cached_graph(path))
+            except Exception:
+                continue
+            self._ram_cache[i] = data
+        return len(self._ram_cache)
+
     def _cache_file_ready(self, idx):
         sample = self.samples[idx]
         path = self._cache_path(sample["dataset_id"])
@@ -2576,6 +2618,10 @@ class AneurysmDataset(Dataset):
     def __getitem__(self, idx):
         sample = self.samples[idx]
         cache_path = self._cache_path(sample["dataset_id"])
+
+        ram = getattr(self, "_ram_cache", None)
+        if ram is not None and idx in ram:
+            return ram[idx].clone()
 
         if cache_path and os.path.exists(cache_path):
             try:

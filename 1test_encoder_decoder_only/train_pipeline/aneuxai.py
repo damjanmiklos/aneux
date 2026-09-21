@@ -23,6 +23,8 @@ from aneux_paths import (
 from config import (
     DEFAULT_LOSS_WEIGHTS,
     DECODER_HIDDEN_DIM,
+    GECO_BETA_INIT,
+    GECO_ETA,
     GRAD_CLIP,
     HIERARCHY_LEVELS,
     KL_WARMUP_EPOCHS,
@@ -30,12 +32,15 @@ from config import (
     LATENT_DIM,
     LATENT_LEN,
     N_TRUE,
+    RATE_TARGET_NATS,
     TUBE_RADIUS_MM,
     configure_stage2_precision,
     normalize_gradient_checkpointing,
 )
 from dataset import AneurysmDataset
+from dist_utils import barrier, is_main_process
 from model import GraphVAE
+from run_report import dump_json, hardware_snapshot, make_run_dir
 from train import train_model
 
 # %% [markdown]
@@ -56,9 +61,13 @@ TUBE_RADIUS = TUBE_RADIUS_MM
 N_LENGTH = HIERARCHY_LEVELS[-1][0]
 N_RADIAL = HIERARCHY_LEVELS[-1][1]
 
-# Real batch 4–8 fits (0.74 GiB/sample). Keep gradient accumulation as 1×8.
-BATCH_SIZE = 4
-ACCUM_STEPS = 8
+# 3080 Ti dummy epoch (scratch/vram_probe_batch.py, 20 Sep 2026):
+#   batch 1 = 3.53 GiB allocated / 5.07 GiB reserved, ~3.45 GiB/sample.
+#   batch 2 is the largest that still leaves WDDM headroom on 12 GiB.
+# Accumulate to a global batch of 32 (same as the old 4×8) so GECO / LR
+# stay on the measured schedule.
+BATCH_SIZE = 2
+ACCUM_STEPS = 16
 EPOCHS = 200
 VAL_SPLIT = 0.15
 TEST_SPLIT = 0.15
@@ -72,6 +81,7 @@ WEIGHT_DECAY = 1e-4
 WD = WEIGHT_DECAY
 EMA_DECAY = 0.993
 EMA_WARMUP = True
+# ~11 opt steps/epoch at 326 train / global-32. 300 steps ≈ 27 epochs of warmup.
 LR_WARMUP_STEPS = 300
 WD_EXCLUDE_BIAS = True
 WD_EXCLUDE_NORMS = True
@@ -86,9 +96,14 @@ WD_EXCLUDE_KEYWORDS = (
     "alpha_raw",
 )
 
-NUM_WORKERS = 3
-CACHE_BUILD_WORKERS = 8
-TORCH_THREADS = 6
+# 5950X = 16 cores / 32 threads, 32 GB RAM. 20 DataLoader workers as requested;
+# main process keeps 1 torch thread so the workers actually get CPU time.
+NUM_WORKERS = 20
+CACHE_BUILD_WORKERS = 6
+TORCH_THREADS = 1
+PIN_MEMORY = False  # Windows WDDM: pinned host RAM fights the 3080 Ti
+PREFETCH_FACTOR = 1
+PRELOAD_RAM = False
 
 # False = fully off (faster, more VRAM). True = checkpoint encoder + all decoder
 # blocks. "fine" = only the 64k-node SplineConvs if a fat graph OOMs with False.
@@ -393,12 +408,14 @@ def train_val_test_split(dataset, val_fraction, test_fraction, seed):
 
 
 def load_or_create_fixed_split(
-    dataset, split_path, val_fraction, test_fraction, seed
+    dataset, split_path, val_fraction, test_fraction, seed, write=True
 ):
     """Load a stored hospital-stratified split, or create one and write it.
 
     An existing file is reused only if it already has ``stratify: hospital``.
     Older random two-way/three-way files are rebuilt.
+    Rank-0 should pass ``write=True``; other DDP ranks wait on the barrier
+    and load with ``write=False``.
     """
     parent = os.path.dirname(split_path)
     if parent:
@@ -412,6 +429,10 @@ def load_or_create_fixed_split(
                 stored, val_fraction, test_fraction, seed
             )
     if payload is None:
+        if not write:
+            raise FileNotFoundError(
+                f"Split file missing at {split_path}; rank 0 must write it first"
+            )
         ids = [dataset.samples[i]["dataset_id"] for i in range(len(dataset))]
         train_ids, val_ids, test_ids = split_ids(
             ids, val_fraction, test_fraction, seed
@@ -419,50 +440,251 @@ def load_or_create_fixed_split(
         payload = make_split_payload(
             train_ids, val_ids, test_ids, seed, val_fraction, test_fraction
         )
-    with open(split_path, "w") as f:
-        json.dump(payload, f, indent=4)
+    if write:
+        with open(split_path, "w") as f:
+            json.dump(payload, f, indent=4)
     train_ds, val_ds, test_ds = subsets_from_ids(
         dataset, payload["train"], payload["val"], payload["test"]
     )
     return train_ds, val_ds, test_ds, payload
 
 
-if __name__ == "__main__":
+def collect_hparams(**overrides):
+    payload = {
+        "host": "pc",
+        "BATCH_SIZE": BATCH_SIZE,
+        "ACCUM_STEPS": ACCUM_STEPS,
+        "EPOCHS": EPOCHS,
+        "VAL_SPLIT": VAL_SPLIT,
+        "TEST_SPLIT": TEST_SPLIT,
+        "VAL_EVERY": VAL_EVERY,
+        "SEED": SEED,
+        "LEARNING_RATE": LEARNING_RATE,
+        "WEIGHT_DECAY": WEIGHT_DECAY,
+        "EMA_DECAY": EMA_DECAY,
+        "LR_WARMUP_STEPS": LR_WARMUP_STEPS,
+        "NUM_WORKERS": NUM_WORKERS,
+        "CACHE_BUILD_WORKERS": CACHE_BUILD_WORKERS,
+        "TORCH_THREADS": TORCH_THREADS,
+        "PIN_MEMORY": PIN_MEMORY,
+        "PREFETCH_FACTOR": PREFETCH_FACTOR,
+        "PRELOAD_RAM": PRELOAD_RAM,
+        "USE_GRADIENT_CHECKPOINTING": USE_GRADIENT_CHECKPOINTING,
+        "LATENT_DIM": LATENT_DIM,
+        "LATENT_LEN": LATENT_LEN,
+        "N_TRUE": N_TRUE,
+        "GRAD_CLIP": GRAD_CLIP,
+        "GECO_ETA": GECO_ETA,
+        "GECO_BETA_INIT": GECO_BETA_INIT,
+        "RATE_TARGET_NATS": RATE_TARGET_NATS,
+        "GLOBAL_BATCH": int(BATCH_SIZE) * int(ACCUM_STEPS),
+        "LOSS_WEIGHTS": dict(LOSS_WEIGHTS),
+        "OUTPUT_DIR": OUTPUT_DIR,
+        "CACHE_DIR": CACHE_DIR,
+        "CLEANDATA_ROOT": CLEANDATA_ROOT,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def run_stage2_training(
+    *,
+    output_dir=None,
+    cache_dir=None,
+    cleandata_root=None,
+    batch_size=None,
+    accum_steps=None,
+    epochs=None,
+    num_workers=None,
+    cache_build_workers=None,
+    torch_threads=None,
+    pin_memory=None,
+    prefetch_factor=None,
+    preload_ram=None,
+    gradient_checkpointing=None,
+    learning_rate=None,
+    weight_decay=None,
+    ema_decay=None,
+    lr_warmup_steps=None,
+    val_every=None,
+    device=None,
+    resume="auto",
+    run_name_host="pc",
+    extra_meta=None,
+    topk_train=3,
+    topk_val=3,
+    run_dir=None,
+):
+    """Shared Stage-2 launch used by aneuxai.py (PC) and aneuxai_HPC.py."""
+    output_dir = os.path.abspath(output_dir or OUTPUT_DIR)
+    cache_dir = os.path.abspath(cache_dir or CACHE_DIR)
+    cleandata_root = os.path.abspath(cleandata_root or CLEANDATA_ROOT)
+    batch_size = BATCH_SIZE if batch_size is None else int(batch_size)
+    accum_steps = ACCUM_STEPS if accum_steps is None else int(accum_steps)
+    epochs = EPOCHS if epochs is None else int(epochs)
+    num_workers = NUM_WORKERS if num_workers is None else int(num_workers)
+    cache_build_workers = (
+        CACHE_BUILD_WORKERS if cache_build_workers is None else int(cache_build_workers)
+    )
+    torch_threads = TORCH_THREADS if torch_threads is None else int(torch_threads)
+    pin_memory = PIN_MEMORY if pin_memory is None else bool(pin_memory)
+    prefetch_factor = PREFETCH_FACTOR if prefetch_factor is None else int(prefetch_factor)
+    preload_ram = PRELOAD_RAM if preload_ram is None else bool(preload_ram)
+    ckpt_mode = normalize_gradient_checkpointing(
+        USE_GRADIENT_CHECKPOINTING if gradient_checkpointing is None else gradient_checkpointing
+    )
+    learning_rate = LEARNING_RATE if learning_rate is None else float(learning_rate)
+    weight_decay = WEIGHT_DECAY if weight_decay is None else float(weight_decay)
+    ema_decay = EMA_DECAY if ema_decay is None else float(ema_decay)
+    lr_warmup_steps = LR_WARMUP_STEPS if lr_warmup_steps is None else int(lr_warmup_steps)
+    val_every = VAL_EVERY if val_every is None else int(val_every)
+
+    probe_only = os.environ.get("ANEUX_VRAM_PROBE_ONLY", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if probe_only:
+        epochs = 1
+        num_workers = 0
+        pin_memory = False
+        prefetch_factor = 1
+        preload_ram = False
+        resume = False
+        write_plots_flag = False
+        output_dir = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "scratch", "vram_aneuxai_probe")
+        )
+        if extra_meta is None:
+            extra_meta = {}
+        extra_meta = dict(extra_meta)
+        extra_meta["vram_probe_only"] = True
+    else:
+        write_plots_flag = True
+
     seed_everything(SEED)
     configure_stage2_precision()
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    torch.set_num_threads(max(1, torch_threads))
+    os.environ.setdefault("OMP_NUM_THREADS", str(max(1, torch_threads)))
+    os.environ.setdefault("MKL_NUM_THREADS", str(max(1, torch_threads)))
 
-    torch.set_num_threads(TORCH_THREADS)
+    resolved_device = apply_device(device if device is not None else parse_device_args())
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(cache_dir, exist_ok=True)
 
-    DEVICE = apply_device(parse_device_args())
+    job_id = os.environ.get("SLURM_JOB_ID")
+    main = is_main_process()
+    if run_dir:
+        run_dir = os.path.abspath(run_dir)
+        os.makedirs(os.path.join(run_dir, "data"), exist_ok=True)
+        os.makedirs(os.path.join(run_dir, "checkpoints"), exist_ok=True)
+        os.makedirs(os.path.join(run_dir, "plots"), exist_ok=True)
+    elif main:
+        run_dir = make_run_dir(output_dir, job_id=job_id)
+    else:
+        run_dir = None
+    try:
+        import torch.distributed as dist
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+        if dist.is_available() and dist.is_initialized():
+            packed = [run_dir]
+            dist.broadcast_object_list(packed, src=0)
+            run_dir = packed[0]
+    except Exception:
+        pass
+    if not run_dir:
+        run_dir = make_run_dir(output_dir, job_id=job_id)
+    if main:
+        print(f"Run directory: {run_dir}")
 
-    print("Initializing dataset...")
+    if main:
+        print("Initializing dataset...")
     dataset = AneurysmDataset(
         tube_radius=TUBE_RADIUS,
         n_length=N_LENGTH,
         n_radial=N_RADIAL,
-        cache_dir=CACHE_DIR,
+        cache_dir=cache_dir,
         n_true=N_TRUE,
-        cleandata_root=CLEANDATA_ROOT,
+        cleandata_root=cleandata_root,
         require_templates=True,
         ensure_derived=ENSURE_DERIVED,
     )
+    if main:
+        print(f"Dataset loaded. Total samples: {len(dataset)}")
 
-    print(f"Dataset loaded. Total samples: {len(dataset)}")
-
-    split_path = os.path.join(OUTPUT_DIR, SPLIT_JSON_NAME)
-    train_dataset, val_dataset, test_dataset, split_payload = load_or_create_fixed_split(
-        dataset, split_path, VAL_SPLIT, TEST_SPLIT, SEED
-    )
-    print(
-        f"Train: {len(train_dataset)} | Val: {len(val_dataset)} | "
-        f"Test: {len(test_dataset)} (held-out, seed={split_payload['seed']})"
-    )
-    print(f"Saved train/val/test split to {split_path}")
-    print("Warming tube cache (parallel raycast; not used as DataLoader workers)...")
-    n_cached = dataset.warmup_cache(num_workers=CACHE_BUILD_WORKERS)
-    print(f"Tube cache ready for {n_cached} samples")
+    split_path = os.path.join(output_dir, SPLIT_JSON_NAME)
+    if probe_only:
+        n_need = max(int(batch_size) * 2, 4)
+        if main:
+            print(
+                f"ANEUX_VRAM_PROBE_ONLY: building at most {n_need} tube caches "
+                f"(skipping samples that fail), then one batch"
+            )
+        ready = []
+        for i in range(len(dataset)):
+            if dataset._cache_file_ready(i):
+                ready.append(i)
+            else:
+                sample_id = dataset.samples[i]["dataset_id"]
+                try:
+                    dataset._write_cache(i)
+                    ready.append(i)
+                    if main:
+                        print(f"  cache built {sample_id}")
+                except Exception as exc:
+                    if main:
+                        print(f"  skip {sample_id}: {exc}")
+            if len(ready) >= n_need:
+                break
+        if len(ready) < int(batch_size):
+            raise RuntimeError(
+                f"VRAM probe needs {batch_size} cache-ready samples; got {len(ready)}. "
+                "Need complete template_mesh + original_centerline with GroupIds."
+            )
+        dataset.samples = [dataset.samples[i] for i in ready]
+        train_dataset = Subset(dataset, list(range(len(dataset))))
+        val_dataset = Subset(dataset, [])
+        test_dataset = Subset(dataset, [])
+        split_payload = {
+            "seed": int(SEED),
+            "probe_only": True,
+            "train": [s["dataset_id"] for s in dataset.samples],
+            "val": [],
+            "test": [],
+        }
+        if main:
+            dump_json(os.path.join(run_dir, "data", "train_val_split.json"), split_payload)
+            print(
+                f"Probe subset: {len(train_dataset)} train graphs "
+                f"(batch_size={batch_size})"
+            )
+        barrier()
+    else:
+        if main:
+            train_dataset, val_dataset, test_dataset, split_payload = load_or_create_fixed_split(
+                dataset, split_path, VAL_SPLIT, TEST_SPLIT, SEED, write=True
+            )
+            dump_json(os.path.join(run_dir, "data", "train_val_split.json"), split_payload)
+            print(
+                f"Train: {len(train_dataset)} | Val: {len(val_dataset)} | "
+                f"Test: {len(test_dataset)} (held-out, seed={split_payload['seed']})"
+            )
+            print(f"Saved train/val/test split to {split_path}")
+        barrier()
+        if not main:
+            train_dataset, val_dataset, test_dataset, split_payload = load_or_create_fixed_split(
+                dataset, split_path, VAL_SPLIT, TEST_SPLIT, SEED, write=False
+            )
+        if main:
+            print("Warming tube cache (parallel raycast; not used as DataLoader workers)...")
+            n_cached = dataset.warmup_cache(num_workers=cache_build_workers)
+            print(f"Tube cache ready for {n_cached} samples")
+        barrier()
+    if preload_ram:
+        n_ram = dataset.preload_ram()
+        if main:
+            print(f"RAM preload: {n_ram} graphs")
 
     if len(dataset) > 0:
         sample_data = dataset[0]
@@ -472,26 +694,12 @@ if __name__ == "__main__":
         print(f"Sample coarse shape: {sample_data.pos_coarse.shape}")
         print(f"Sample Edge Index shape: {sample_data.edge_index.shape}")
         print(f"Sample face shape: {sample_data.face.shape}")
-        print(f"Latent tokens: {sample_data.latent_pos.shape}  n_tracts={int(sample_data.n_tracts)}")
-        print(f"pose_R: {tuple(sample_data.pose_R.shape)}  origin: {tuple(sample_data.origin_shift.shape)}")
-        n_r = int(sample_data.r_star.numel())
-        n_ok = int(sample_data.r_star_valid.sum().item()) if n_r else 0
-        n_amb = int(getattr(sample_data, "r_star_ambiguous", torch.zeros(0, dtype=torch.bool)).sum().item()) if n_r else 0
-        print(f"r_star valid: {n_ok}/{n_r} ({(n_ok / max(n_r, 1)):.3f})  ambiguous: {n_amb}")
         print(
-            f"dtypes: x={sample_data.x.dtype} x_true={sample_data.x_true.dtype} "
-            f"latent_pos={sample_data.latent_pos.dtype} "
-            f"matmul={torch.get_float32_matmul_precision()} "
-            f"tf32={torch.backends.cuda.matmul.allow_tf32}"
+            f"Latent tokens: {sample_data.latent_pos.shape}  "
+            f"n_tracts={int(sample_data.n_tracts)}"
         )
 
-    # %% [markdown]
-    # ## 3. Model Initialization
-    # PointNeXt encoder → tree latent Z ∈ R^{96×128}; progressive SplineConv decoder (Stage 2).
-
-    # %%
     print("Initializing Graph VAE model...")
-    ckpt_mode = normalize_gradient_checkpointing(USE_GRADIENT_CHECKPOINTING)
     model = GraphVAE(
         latent_dim=LATENT_DIM,
         latent_len=LATENT_LEN,
@@ -503,116 +711,82 @@ if __name__ == "__main__":
     print(f"Trainable parameters: {n_params:,}")
     print(f"Gradient checkpointing: {ckpt_mode}")
 
-    # %% [markdown]
-    # ## 4. Training Loop
-    # Multi-scale Chamfer, sequence KL (annealed), displacement Dirichlet,
-    # Laplacian smoothing, normal consistency. AdamW + cosine decay.
+    meta = collect_hparams(
+        host=run_name_host,
+        BATCH_SIZE=batch_size,
+        ACCUM_STEPS=accum_steps,
+        EPOCHS=epochs,
+        NUM_WORKERS=num_workers,
+        CACHE_BUILD_WORKERS=cache_build_workers,
+        TORCH_THREADS=torch_threads,
+        PIN_MEMORY=pin_memory,
+        PREFETCH_FACTOR=prefetch_factor,
+        PRELOAD_RAM=preload_ram,
+        USE_GRADIENT_CHECKPOINTING=ckpt_mode,
+        LEARNING_RATE=learning_rate,
+        WEIGHT_DECAY=weight_decay,
+        EMA_DECAY=ema_decay,
+        LR_WARMUP_STEPS=lr_warmup_steps,
+        VAL_EVERY=val_every,
+        OUTPUT_DIR=output_dir,
+        CACHE_DIR=cache_dir,
+        CLEANDATA_ROOT=cleandata_root,
+        RUN_DIR=run_dir,
+        n_params=n_params,
+        n_train=len(train_dataset),
+        n_val=len(val_dataset),
+        n_test=len(test_dataset),
+        device=resolved_device,
+    )
+    if extra_meta:
+        meta.update(extra_meta)
+    if main:
+        dump_json(os.path.join(run_dir, "data", "run_config.json"), meta)
+        dump_json(os.path.join(run_dir, "data", "hardware.json"), hardware_snapshot())
 
-    # %%
-    print(f"Starting training on {DEVICE}...")
+    print(f"Starting training on {resolved_device}...")
+    trained_model, history = None, []
     if len(dataset) > 0:
         trained_model, history = train_model(
             model=model,
             train_dataset=train_dataset,
             val_dataset=val_dataset,
-            epochs=EPOCHS,
-            batch_size=BATCH_SIZE,
-            lr=LEARNING_RATE,
+            epochs=epochs,
+            batch_size=batch_size,
+            lr=learning_rate,
             weights=LOSS_WEIGHTS,
-            device=DEVICE,
-            accum_steps=ACCUM_STEPS,
-            val_every=VAL_EVERY,
-            num_workers=NUM_WORKERS,
-            ckpt_dir=OUTPUT_DIR,
+            device=resolved_device,
+            accum_steps=accum_steps,
+            val_every=val_every,
+            num_workers=num_workers,
+            ckpt_dir=run_dir,
             grad_clip=GRAD_CLIP,
-            weight_decay=WEIGHT_DECAY,
+            weight_decay=weight_decay,
             kl_max=LAMBDA_KL,
             kl_warmup_epochs=KL_WARMUP_EPOCHS,
-            ema_decay=EMA_DECAY,
+            ema_decay=ema_decay,
+            resume=resume,
+            lr_warmup_steps=lr_warmup_steps,
+            pin_memory=pin_memory,
+            prefetch_factor=prefetch_factor,
+            topk_train=topk_train,
+            topk_val=topk_val,
+            write_plots=write_plots_flag,
+            run_meta=meta,
         )
         print("Training complete.")
+        print(f"Artifacts: {run_dir}")
     else:
-        print("No samples found in cleandata/. Fill the five .vtp folders first.")
-        trained_model, history = None, []
+        print("No samples found in cleandata/. Fill uniformly_remeshed, original_centerline, and template_mesh first.")
+    return trained_model, history, run_dir
 
-    # %% [markdown]
-    # ## 5. Save the Model 
-    # %%
-    if trained_model is not None:
-        model_path = os.path.join(OUTPUT_DIR, "graph_vae_aneurysm.pth")
-        torch.save(trained_model.state_dict(), model_path)
-        print(f"Model saved to {model_path}")
 
-        history_path = os.path.join(OUTPUT_DIR, "history.json")
-        with open(history_path, "w") as f:
-            json.dump(history, f, indent=2)
-        print(f"History saved to {history_path}")
+if __name__ == "__main__":
+    import multiprocessing as mp
 
-        # %% [markdown]
-        # ## 6. Plot Training History
-
-        # %%
-        import matplotlib.pyplot as plt
-
-        epochs_range = range(1, len(history) + 1)
-        train_loss = [h["loss"] for h in history]
-        val_epochs = [i + 1 for i, h in enumerate(history) if "val_loss" in h]
-        val_loss = [h["val_loss"] for h in history if "val_loss" in h]
-
-        plt.figure(figsize=(14, 14))
-
-        plt.subplot(3, 3, 1)
-        plt.plot(epochs_range, train_loss, label="Train Total")
-        if val_loss:
-            plt.plot(val_epochs, val_loss, "ro-", label="Val Total")
-        plt.title("Total Loss")
-        plt.xlabel("Epoch")
-        plt.legend()
-
-        plt.subplot(3, 3, 2)
-        plt.plot(epochs_range, [h["recon"] for h in history], label="Train Recon")
-        plt.plot(val_epochs, [h["val_recon"] for h in history if "val_recon" in h], "ro-", label="Val Recon")
-        plt.title("Reconstruction (Chamfer)")
-        plt.xlabel("Epoch")
-        plt.legend()
-
-        plt.subplot(3, 3, 3)
-        plt.plot(epochs_range, [h.get("rad", 0.0) for h in history], label="Train Rad")
-        plt.plot(val_epochs, [h["val_rad"] for h in history if "val_rad" in h], "ro-", label="Val Rad")
-        plt.title("Radial Huber")
-        plt.xlabel("Epoch")
-        plt.legend()
-
-        plt.subplot(3, 3, 4)
-        plt.plot(epochs_range, [h["kl"] for h in history], label="Train KL")
-        plt.plot(val_epochs, [h["val_kl"] for h in history if "val_kl" in h], "ro-", label="Val KL")
-        plt.title("KL Divergence")
-        plt.xlabel("Epoch")
-        plt.legend()
-
-        plt.subplot(3, 3, 5)
-        plt.plot(epochs_range, [h["disp"] for h in history], label="Train Disp")
-        plt.plot(val_epochs, [h["val_disp"] for h in history if "val_disp" in h], "ro-", label="Val Disp")
-        plt.title("Displacement Dirichlet")
-        plt.xlabel("Epoch")
-        plt.legend()
-
-        plt.subplot(3, 3, 6)
-        plt.plot(epochs_range, [h["lap"] for h in history], label="Train Lap")
-        plt.plot(val_epochs, [h["val_lap"] for h in history if "val_lap" in h], "ro-", label="Val Lap")
-        plt.title("Laplacian")
-        plt.xlabel("Epoch")
-        plt.legend()
-
-        plt.subplot(3, 3, 7)
-        plt.plot(epochs_range, [h["norm"] for h in history], label="Train Norm")
-        plt.plot(val_epochs, [h["val_norm"] for h in history if "val_norm" in h], "ro-", label="Val Norm")
-        plt.title("Normal Consistency")
-        plt.xlabel("Epoch")
-        plt.legend()
-
-        plt.tight_layout()
-        plot_path = os.path.join(OUTPUT_DIR, "training_history.png")
-        plt.savefig(plot_path)
-        print(f"Training history plot saved as {plot_path}")
-        plt.show()
+    mp.freeze_support()
+    try:
+        mp.set_start_method("spawn", force=False)
+    except RuntimeError:
+        pass
+    run_stage2_training()
