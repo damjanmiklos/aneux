@@ -1,0 +1,458 @@
+[nr_hemd@vn01 aneux]$ srun -p gpu -A nr_hemo_ai1 --gres=gpu:2 -c 32 --mem-per-cpu=4000 --time=01:00:00 --pty bash
+srun: job 14414082 queued and waiting for resources
+srun: job 14414082 has been allocated resources
+[nr_hemd@x1001c2s0b0n1 aneux]$ nvidia-smi
+Tue Sep 22 08:45:51 2026
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 610.43.02              KMD Version: 610.43.02     CUDA UMD Version: 13.3     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA A100-SXM4-40GB          On  |   00000000:41:00.0 Off |                    0 |
+| N/A   35C    P0             52W /  400W |       0MiB /  40960MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA A100-SXM4-40GB          On  |   00000000:81:00.0 Off |                    0 |
+| N/A   37C    P0             51W /  400W |       0MiB /  40960MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+[nr_hemd@x1001c2s0b0n1 aneux]$ source ~/aneuxai_env/bin/activate
+HS
+python 1test_(aneuxai_env) [nr_hemd@x1001c2s0b0n1 aneux]$ cd /project/nr_hemo_ai1/nr_hemd/aneuxai/aneux
+(aneuxai_env) [nr_hemd@x1001c2s0b0n1 aneux]$ unset ANEUX_EPOCHS
+(aneuxai_env) [nr_hemd@x1001c2s0b0n1 aneux]$ python 1test_encoder_decoder_only/train_pipeline/aneuxai_HPC.py
+[hpc] 2 GPUs visible; re-launching: /home/nr_hemd/aneuxai_env/bin/python -m torch.distributed.run --nproc_per_node=2 --standalone /project/nr_hemo_ai1/nr_hemd/aneuxai/aneux/1test_encoder_decoder_only/train_pipeline/aneuxai_HPC.py
+[hpc] python=/home/nr_hemd/aneuxai_env/bin/python  version=3.11.7
+[hpc] torch=2.11.0+cu130  cuda=True
+[hpc] gpu0=NVIDIA A100-SXM4-40GB  count=2
+[hpc] DDP ranks=2  per-GPU batch=25  global batch=50  (NCCL gradient sync, one optimizer step)
+[hpc] scale: ngpu=2 ncpu=32 dataloader_workers=30 cache_workers=31
+[hpc] account='nr_hemo_ai1'  project_root='/project/nr_hemo_ai1'
+[hpc] repo=/project/nr_hemo_ai1/nr_hemd/aneuxai/aneux
+[hpc] cleandata_src=/project/nr_hemo_ai1/nr_hemd/aneuxai/aneux/cleandata
+[hpc] rsync cleandata: /project/nr_hemo_ai1/nr_hemd/aneuxai/aneux/cleandata -> /scratch/nr_hemo_ai1/nr_hemd/aneux/14414082/cleandata
+
+Number of files: 2,130 (reg: 2,126, dir: 4)
+Number of created files: 2,129 (reg: 2,126, dir: 3)
+Number of deleted files: 0
+Number of regular files transferred: 2,126
+Total file size: 4.70G bytes
+Total transferred file size: 4.70G bytes
+Literal data: 4.70G bytes
+Matched data: 0 bytes
+File list size: 0
+File list generation time: 0.001 seconds
+File list transfer time: 0.000 seconds
+Total bytes sent: 4.70G
+Total bytes received: 40.45K
+
+sent 4.70G bytes  received 40.45K bytes  93.09M bytes/sec
+total size is 4.70G  speedup is 1.00
+[hpc] cleandata copy finished in 49.4s
+[hpc] rsync tube_cache: /project/nr_hemo_ai1/nr_hemd/aneuxai/aneux/1test_encoder_decoder_only/tube_cache -> /scratch/nr_hemo_ai1/nr_hemd/aneux/14414082/tube_cache
+
+Number of files: 694 (reg: 693, dir: 1)
+Number of created files: 693 (reg: 693)
+Number of deleted files: 0
+Number of regular files transferred: 693
+Total file size: 23.22G bytes
+Total transferred file size: 23.22G bytes
+Literal data: 23.22G bytes
+Matched data: 0 bytes
+File list size: 0
+File list generation time: 0.020 seconds
+File list transfer time: 0.000 seconds
+Total bytes sent: 23.23G
+Total bytes received: 13.19K
+
+sent 23.23G bytes  received 13.19K bytes  107.80M bytes/sec
+total size is 23.22G  speedup is 1.00
+[hpc] tube_cache copy finished in 214.9s
+[hpc] run_dir=/scratch/nr_hemo_ai1/nr_hemd/aneux/14414082/output/runs/20260922_065113_job14414082
+NCCL version 2.28.9+cuda13.0
+/home/nr_hemd/aneuxai_env/lib/python3.11/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+Using cuda:0 (NVIDIA A100-SXM4-40GB); 2 GPU(s) visible (CUDA_VISIBLE_DEVICES=0,1)
+Using cuda:1 (NVIDIA A100-SXM4-40GB); 2 GPU(s) visible (CUDA_VISIBLE_DEVICES=0,1)
+Run directory: /scratch/nr_hemo_ai1/nr_hemd/aneux/14414082/output/runs/20260922_065113_job14414082
+Initializing dataset...
+AneurysmDataset: cleandata (uniformly_remeshed=709, template_mesh=695, original_centerline=718); 695 samples, 23 incomplete file sets (pass ensure_derived=True under vmtk_env to fill them)
+AneurysmDataset: cleandata (uniformly_remeshed=709, template_mesh=695, original_centerline=718); 695 samples, 23 incomplete file sets (pass ensure_derived=True under vmtk_env to fill them)
+Dataset loaded. Total samples: 695
+Train: 493 | Val: 101 | Test: 101 (held-out, seed=31)
+Saved train/val/test split to /scratch/nr_hemo_ai1/nr_hemd/aneux/14414082/output/train_val_split.json
+Warming tube cache (parallel raycast; not used as DataLoader workers)...
+Tube cache: 693 ready, 2 to build, 2 process(es)
+Tube cache: 100%|████████████████████████████████████████████████████████████████████████| 2/2 [00:06<00:00,  3.13s/it]
+Tube cache failed for 2/2 samples (p347_FAQEBBwJCx8WEwMDExgKAAMd: ValueError: template coarse: 2 non-manifold edges; p391_GgAcPhQdLQIbAAgKDAAAOhEN: ValueError: template mid: 3 non-manifold edges)
+Tube cache ready for 693 samples
+Skipping 2 samples with failed tube cache (see /scratch/nr_hemo_ai1/nr_hemd/aneux/14414082/output/runs/20260922_065113_job14414082/SKIPPED_SAMPLES.txt): p347_FAQEBBwJCx8WEwMDExgKAAMd: ValueError: template coarse: 2 non-manifold edges; p391_GgAcPhQdLQIbAAgKDAAAOhEN: ValueError: template mid: 3 non-manifold edges
+After skips — Train: 491 | Val: 101 | Test: 101
+Sample X_true shape: torch.Size([16384, 3])Sample X_true shape: torch.Size([16384, 3])
+
+Sample X_tube (fine) shape: torch.Size([13700, 3])Sample X_tube (fine) shape: torch.Size([13700, 3])
+
+Sample mid shape: torch.Size([3426, 3])Sample mid shape: torch.Size([3426, 3])
+
+Sample coarse shape: torch.Size([1102, 3])Sample coarse shape: torch.Size([1102, 3])
+
+Sample Edge Index shape: torch.Size([2, 81780])Sample Edge Index shape: torch.Size([2, 81780])
+
+Sample face shape: torch.Size([3, 27184])Sample face shape: torch.Size([3, 27184])
+
+Latent tokens: torch.Size([128, 3])  n_tracts=13Latent tokens: torch.Size([128, 3])  n_tracts=13
+
+Initializing Graph VAE model...Initializing Graph VAE model...
+
+Trainable parameters: 22,925,749
+Gradient checkpointing: off
+Trainable parameters: 22,925,749
+Gradient checkpointing: off
+Starting training on cuda:1...
+Starting training on cuda:0...
+Stage-2 precision: matmul=high tf32_matmul=True tf32_cudnn=True
+Train device: cuda:0  CUDA_VISIBLE_DEVICES='0,1'  world_size=2  ema_decay=0.993  lr_warmup_steps=300
+Kernels OK on NVIDIA A100-SXM4-40GB: pytorch3d FPS, pyg-lib radius, pyg-lib SplineConv (WITH_SPLINE=True, WITH_RADIUS=True)
+Kernels OK on NVIDIA A100-SXM4-40GB: pytorch3d FPS, pyg-lib radius, pyg-lib SplineConv (WITH_SPLINE=True, WITH_RADIUS=True)
+GECO dual: β_init=1  (KL weight=1; 20-epoch ramp of β_max)
+Per-GPU batch 25 x accum 1 x 2 GPU(s) = global 50
+Train dataset size: 491
+Val dataset size: 101
+Schedule: 10 opt steps/epoch, 5000 total, warmup 300 then cosine
+Training:   0%|                                                                                 | 0/10 [00:00<?, ?it/s]Resource monitor every 15s -> /scratch/nr_hemo_ai1/nr_hemd/aneux/14414082/output/runs/20260922_065113_job14414082/data/resource_snapshots.jsonl
+VRAM after first batch (forward+backward, no optimizer.step yet):
+  GPU: NVIDIA A100-SXM4-40GB (cuda:0)  39.52 GiB total
+  Parameters (fp32): 0.085 GiB  (22,925,749 params)
+  Current allocated: 1.180 GiB
+  Current reserved:  28.369 GiB
+  Peak allocated:    27.570 GiB
+  Peak reserved:     28.369 GiB
+  Free (driver):     10.34 / 39.52 GiB
+VRAM after first optimizer.step (AdamW moments allocated):
+  GPU: NVIDIA A100-SXM4-40GB (cuda:0)  39.52 GiB total
+  Parameters (fp32): 0.085 GiB  (22,925,749 params)
+  Current allocated: 1.350 GiB
+  Current reserved:  28.369 GiB
+  Peak allocated:    27.570 GiB
+  Peak reserved:     28.369 GiB
+  Free (driver):     10.34 / 39.52 GiB
+Training: 100%|████████████████████████████████████████████████████████████████████████| 10/10 [08:48<00:00, 52.83s/it]
+Training: 100%|████████████████████████████████████████████████████████████████████████| 10/10 [08:48<00:00, 52.83s/it]
+VRAM end of epoch 1 (peak over all train batches):
+  GPU: NVIDIA A100-SXM4-40GB (cuda:0)  39.52 GiB total
+  Parameters (fp32): 0.085 GiB  (22,925,749 params)
+  Current allocated: 0.457 GiB
+  Current reserved:  29.391 GiB
+  Peak allocated:    28.437 GiB
+  Peak reserved:     29.391 GiB
+  Free (driver):     9.32 / 39.52 GiB
+Epoch 001/500 [TRAIN] | Total: 20.6975 | Recon: 11.4821 | Rad: 0.8799 | KL: 8.3255 | Disp: 0.0000 | Lap: 0.1950 | Norm: 0.0134 | w_recon: 11.4821 | w_rad: 0.8799 | w_kl: 8.3255 | w_disp: 0.0000 | w_lap: 0.0098 | w_norm: 0.0003 | kl_lambda: 1.000000 | lr: 7.31e-06 | ema_d: 0.5263 | β: 0.964909 | rate_gap: -3.5576 | 0.93 samples/s
+Validation μ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:13<00:00,  4.51s/it]
+Validation μ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:14<00:00,  4.97s/it]
+Epoch 001/500 [VAL live μ] | Total: 8.7922 | Recon: 0.9702 | Rad: 0.8696 | KL: 6.9419 | Disp: 0.0000 | Lap: 0.2047 | Norm: 0.0121 | w_recon: 0.9702 | w_rad: 0.8696 | w_kl: 6.9419 | w_disp: 0.0000 | w_lap: 0.0102 | w_norm: 0.0002
+Validation μ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:12<00:00,  4.22s/it]
+Validation μ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:14<00:00,  4.68s/it]
+Validation σ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:12<00:00,  4.17s/it]
+Validation σ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:13<00:00,  4.63s/it]
+Epoch 001/500 [VAL μ  ] | Total: 9.0536 | Recon: 0.9709 | Rad: 0.8697 | KL: 7.2026 | Disp: 0.0000 | Lap: 0.2047 | Norm: 0.0120 | w_recon: 0.9709 | w_rad: 0.8697 | w_kl: 7.2026 | w_disp: 0.0000 | w_lap: 0.0102 | w_norm: 0.0002
+Epoch 001/500 [VAL σ  ] | Total: 9.0537 | Recon: 0.9710 | Rad: 0.8697 | KL: 7.2026 | Disp: 0.0000 | Lap: 0.2047 | Norm: 0.0120 | w_recon: 0.9710 | w_rad: 0.8697 | w_kl: 7.2026 | w_disp: 0.0000 | w_lap: 0.0102 | w_norm: 0.0002
+  recon(σ) − recon(μ) = 0.0000
+  saved val top-3 (score 1.8406) [EMA μ path]
+  saved train top-3 (score 12.3620)
+[metrics epoch] loss=20.6975 recon=11.4821 kl=8.3255 disp=7.04759e-06 lap=0.195018 norm=0.0134295 rad=0.879925 kl_mean_raw=8.44236 rate_gap=-3.55764 fold=0.00072384 stretch=66040.8 geco_beta=0.964909 beta=0.964909 epoch=1 epoch_seconds=528.283 samples_per_sec=0.929426 peak_vram_gib=28.4375 lr=7.31111e-06 kl_lambda=1 global_step=10 ema_decay_used=0.526316 geco_beta_max=1 val_live_loss=8.79219 val_live_recon=0.970183
+/home/nr_hemd/aneuxai_env/lib/python3.11/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+Training: 100%|██████████████████████████████████████████████████████████████████████████████████████████| 10/10 [06:24<00:00, 38.46s/it]
+Training: 100%|██████████████████████████████████████████████████████████████████████████████████████████| 10/10 [06:24<00:00, 38.47s/it]
+Epoch 002/500 [TRAIN] | Total: 19.8817 | Recon: 13.4393 | Rad: 0.8791 | KL: 5.5533 | Disp: 0.0000 | Lap: 0.1953 | Norm: 0.0137 | w_recon: 13.4393 | w_rad: 0.8791 | w_kl: 5.5533 | w_disp: 0.0000 | w_lap: 0.0098 | w_norm: 0.0003 | kl_lambda: 1.000000 | lr: 1.40e-05 | ema_d: 0.6897 | β: 0.907431 | rate_gap: -6.1180 | 1.28 samples/s
+Validation μ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:12<00:00,  4.27s/it]
+Validation μ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:14<00:00,  4.81s/it]
+Epoch 002/500 [VAL live μ] | Total: 5.2582 | Recon: 0.9598 | Rad: 0.8687 | KL: 3.4191 | Disp: 0.0000 | Lap: 0.2058 | Norm: 0.0131 | w_recon: 0.9598 | w_rad: 0.8687 | w_kl: 3.4191 | w_disp: 0.0000 | w_lap: 0.0103 | w_norm: 0.0003
+Validation μ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:12<00:00,  4.20s/it]
+Validation μ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:14<00:00,  4.74s/it]
+Validation σ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:12<00:00,  4.19s/it]
+Validation σ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:13<00:00,  4.63s/it]
+Epoch 002/500 [VAL μ  ] | Total: 5.8289 | Recon: 0.9626 | Rad: 0.8689 | KL: 3.9869 | Disp: 0.0000 | Lap: 0.2054 | Norm: 0.0127 | w_recon: 0.9626 | w_rad: 0.8689 | w_kl: 3.9869 | w_disp: 0.0000 | w_lap: 0.0103 | w_norm: 0.0003
+Epoch 002/500 [VAL σ  ] | Total: 5.8290 | Recon: 0.9627 | Rad: 0.8689 | KL: 3.9869 | Disp: 0.0000 | Lap: 0.2054 | Norm: 0.0127 | w_recon: 0.9627 | w_rad: 0.8689 | w_kl: 3.9869 | w_disp: 0.0000 | w_lap: 0.0103 | w_norm: 0.0003
+  recon(σ) − recon(μ) = 0.0001
+  saved val top-3 (score 1.8315) [EMA μ path]
+  saved train top-3 (score 14.3183)
+[metrics epoch] loss=19.8817 recon=13.4393 kl=5.55334 disp=1.29862e-05 lap=0.195323 norm=0.0136624 rad=0.879075 kl_mean_raw=5.88202 rate_gap=-6.11798 fold=0.000768468 stretch=84801.4 geco_beta=0.907431 beta=0.907431 epoch=2 epoch_seconds=384.653 samples_per_sec=1.27647 peak_vram_gib=28.9342 lr=1.39556e-05 kl_lambda=1 global_step=20 ema_decay_used=0.689655 geco_beta_max=1.47368 val_live_loss=5.25815 val_live_recon=0.9598
+/home/nr_hemd/aneuxai_env/lib/python3.11/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+Training: 100%|██████████████████████████████████████████████████████████████████████████████████████████| 10/10 [06:26<00:00, 38.60s/it]
+Training: 100%|██████████████████████████████████████████████████████████████████████████████████████████| 10/10 [06:26<00:00, 38.60s/it]
+Epoch 003/500 [TRAIN] | Total: 12.5655 | Recon: 9.3825 | Rad: 0.8767 | KL: 2.2961 | Disp: 0.0001 | Lap: 0.1975 | Norm: 0.0167 | w_recon: 9.3825 | w_rad: 0.8767 | w_kl: 2.2961 | w_disp: 0.0000 | w_lap: 0.0099 | w_norm: 0.0003 | kl_lambda: 1.000000 | lr: 2.06e-05 | ema_d: 0.7692 | β: 0.825959 | rate_gap: -9.3887 | 1.27 samples/s
+Validation μ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:13<00:00,  4.38s/it]
+Validation μ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:14<00:00,  4.89s/it]
+Epoch 003/500 [VAL live μ] | Total: 2.7676 | Recon: 0.9293 | Rad: 0.8686 | KL: 0.9586 | Disp: 0.0003 | Lap: 0.2108 | Norm: 0.0203 | w_recon: 0.9293 | w_rad: 0.8686 | w_kl: 0.9586 | w_disp: 0.0000 | w_lap: 0.0105 | w_norm: 0.0004
+Validation μ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:12<00:00,  4.22s/it]
+Validation μ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:14<00:00,  4.68s/it]
+Validation σ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:12<00:00,  4.19s/it]
+Validation σ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:13<00:00,  4.64s/it]
+Epoch 003/500 [VAL μ  ] | Total: 3.1791 | Recon: 0.9407 | Rad: 0.8684 | KL: 1.3593 | Disp: 0.0002 | Lap: 0.2087 | Norm: 0.0172 | w_recon: 0.9407 | w_rad: 0.8684 | w_kl: 1.3593 | w_disp: 0.0000 | w_lap: 0.0104 | w_norm: 0.0003
+Epoch 003/500 [VAL σ  ] | Total: 3.1792 | Recon: 0.9408 | Rad: 0.8683 | KL: 1.3593 | Disp: 0.0002 | Lap: 0.2086 | Norm: 0.0171 | w_recon: 0.9408 | w_rad: 0.8683 | w_kl: 1.3593 | w_disp: 0.0000 | w_lap: 0.0104 | w_norm: 0.0003
+  recon(σ) − recon(μ) = 0.0001
+  saved val top-3 (score 1.8090) [EMA μ path]
+  saved train top-3 (score 10.2592)
+[metrics epoch] loss=12.5655 recon=9.38254 kl=2.29606 disp=0.000117124 lap=0.197478 norm=0.0166868 rad=0.876695 kl_mean_raw=2.61129 rate_gap=-9.38871 fold=0.0013708 stretch=166027 geco_beta=0.825959 beta=0.825959 epoch=3 epoch_seconds=386.021 samples_per_sec=1.27195 peak_vram_gib=29.9499 lr=2.06e-05 kl_lambda=1 global_step=30 ema_decay_used=0.769231 geco_beta_max=1.94737 val_live_loss=2.76762 val_live_recon=0.929343
+/home/nr_hemd/aneuxai_env/lib/python3.11/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+Training:  20%|██████████████████▏                                                                        | 2/10 [01:23<05:31, 41.40s/it]^Training: 100%|██████████████████████████████████████████████████████████████████████████████████████████| 10/10 [06:30<00:00, 39.04s/it]
+Training: 100%|██████████████████████████████████████████████████████████████████████████████████████████| 10/10 [06:30<00:00, 39.04s/it]
+Epoch 004/500 [TRAIN] | Total: 16.1947 | Recon: 14.5721 | Rad: 0.8884 | KL: 0.7232 | Disp: 0.0005 | Lap: 0.2071 | Norm: 0.0306 | w_recon: 14.5721 | w_rad: 0.8884 | w_kl: 0.7232 | w_disp: 0.0001 | w_lap: 0.0104 | w_norm: 0.0006 | kl_lambda: 1.000000 | lr: 2.72e-05 | ema_d: 0.8163 | β: 0.739224 | rate_gap: -11.0890 | 1.26 samples/s
+Validation μ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:12<00:00,  4.28s/it]
+Validation μ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:14<00:00,  4.72s/it]
+Epoch 004/500 [VAL live μ] | Total: 2.1660 | Recon: 0.8765 | Rad: 0.8771 | KL: 0.3998 | Disp: 0.0011 | Lap: 0.2288 | Norm: 0.0455 | w_recon: 0.8765 | w_rad: 0.8771 | w_kl: 0.3998 | w_disp: 0.0002 | w_lap: 0.0114 | w_norm: 0.0009
+Validation μ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:12<00:00,  4.21s/it]
+Validation μ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:14<00:00,  4.77s/it]
+Validation σ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:12<00:00,  4.29s/it]
+Validation σ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:13<00:00,  4.65s/it]
+Epoch 004/500 [VAL μ  ] | Total: 2.2481 | Recon: 0.8941 | Rad: 0.8719 | KL: 0.4704 | Disp: 0.0007 | Lap: 0.2198 | Norm: 0.0332 | w_recon: 0.8941 | w_rad: 0.8719 | w_kl: 0.4704 | w_disp: 0.0001 | w_lap: 0.0110 | w_norm: 0.0007
+Epoch 004/500 [VAL σ  ] | Total: 2.2484 | Recon: 0.8945 | Rad: 0.8718 | KL: 0.4704 | Disp: 0.0007 | Lap: 0.2197 | Norm: 0.0331 | w_recon: 0.8945 | w_rad: 0.8718 | w_kl: 0.4704 | w_disp: 0.0001 | w_lap: 0.0110 | w_norm: 0.0007
+  recon(σ) − recon(μ) = 0.0004
+  saved val top-3 (score 1.7659) [EMA μ path]
+[metrics epoch] loss=16.1947 recon=14.5721 kl=0.723223 disp=0.000518754 lap=0.207079 norm=0.0306006 rad=0.888359 kl_mean_raw=0.910995 rate_gap=-11.089 fold=0.00415374 stretch=541313 geco_beta=0.739224 beta=0.739224 epoch=4 epoch_seconds=390.385 samples_per_sec=1.25773 peak_vram_gib=29.9499 lr=2.72444e-05 kl_lambda=1 global_step=40 ema_decay_used=0.816327 geco_beta_max=2.42105 val_live_loss=2.16595 val_live_recon=0.876491
+/home/nr_hemd/aneuxai_env/lib/python3.11/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+Training:  20%|██████████████████▏                                                                        | 2/10 [01:24<05:30, 41.27s/it]^_^\W0922 09:24:24.697000 2938083 /project/nr_hemo_ai1/nr_hemd/aneuxai_env/lib/python3.11/site-packages/torch/distributed/elastic/agent/server/api.py:739] Received 3 death signal, shutting down workers
+W0922 09:24:24.989000 2938083 /project/nr_hemo_ai1/nr_hemd/aneuxai_env/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/api.py:1012] Sending process 2938165 closing signal SIGQUIT
+W0922 09:24:24.990000 2938083 /project/nr_hemo_ai1/nr_hemd/aneuxai_env/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/api.py:1012] Sending process 2938166 closing signal SIGQUIT
+^\W0922 09:24:26.190000 2938083 /project/nr_hemo_ai1/nr_hemd/aneuxai_env/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/api.py:1012] Sending process 2938165 closing signal SIGTERM
+W0922 09:24:26.191000 2938083 /project/nr_hemo_ai1/nr_hemd/aneuxai_env/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/api.py:1012] Sending process 2938166 closing signal SIGTERM
+Traceback (most recent call last):
+  File "/home/nr_hemd/aneuxai_env/lib/python3.11/site-packages/torch/distributed/elastic/agent/server/api.py", line 731, in run
+    result = self._invoke_run(role)
+             ^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/nr_hemd/aneuxai_env/lib/python3.11/site-packages/torch/distributed/elastic/agent/server/api.py", line 908, in _invoke_run
+    time.sleep(monitor_interval)
+  File "/home/nr_hemd/aneuxai_env/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/api.py", line 86, in _terminate_process_handler
+    raise SignalException(f"Process {os.getpid()} got signal: {sigval}", sigval=sigval)
+torch.distributed.elastic.multiprocessing.api.SignalException: Process 2938083 got signal: 3
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/nr_hemd/aneuxai_env/lib/python3.11/site-packages/torch/distributed/run.py", line 994, in <module>
+    main()
+  File "/home/nr_hemd/aneuxai_env/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 362, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/home/nr_hemd/aneuxai_env/lib/python3.11/site-packages/torch/distributed/run.py", line 990, in main
+    run(args)
+  File "/home/nr_hemd/aneuxai_env/lib/python3.11/site-packages/torch/distributed/run.py", line 981, in run
+    elastic_launch(
+  File "/home/nr_hemd/aneuxai_env/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 170, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/nr_hemd/aneuxai_env/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 308, in launch_agent
+    result = agent.run()
+             ^^^^^^^^^^^
+  File "/home/nr_hemd/aneuxai_env/lib/python3.11/site-packages/torch/distributed/elastic/metrics/api.py", line 134, in wrapper
+    result = f(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^
+  File "/home/nr_hemd/aneuxai_env/lib/python3.11/site-packages/torch/distributed/elastic/agent/server/api.py", line 740, in run
+    self._shutdown(e.sigval)
+  File "/home/nr_hemd/aneuxai_env/lib/python3.11/site-packages/torch/distributed/elastic/agent/server/local_elastic_agent.py", line 416, in _shutdown
+    self._pcontext.close(death_sig)
+  File "/home/nr_hemd/aneuxai_env/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/api.py", line 661, in close
+    self._close(death_sig=death_sig, timeout=timeout)
+  File "/home/nr_hemd/aneuxai_env/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/api.py", line 1024, in _close
+    handler.proc.wait(time_to_wait)
+  File "/opt/cray/pe/python/3.11.7/lib/python3.11/subprocess.py", line 1264, in wait
+    return self._wait(timeout=timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/cray/pe/python/3.11.7/lib/python3.11/subprocess.py", line 2040, in _wait
+    time.sleep(delay)
+  File "/home/nr_hemd/aneuxai_env/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/api.py", line 86, in _terminate_process_handler
+    raise SignalException(f"Process {os.getpid()} got signal: {sigval}", sigval=sigval)
+torch.distributed.elastic.multiprocessing.api.SignalException: Process 2938083 got signal: 3
+^\
+^CQuit (core dumped)
+(aneuxai_env) [nr_hemd@x1001c2s0b0n1 aneux]$ git pull
+Already up to date.
+(aneuxai_env) [nr_hemd@x1001c2s0b0n1 aneux]$ git pull
+Already up to date.
+(aneuxai_env) [nr_hemd@x1001c2s0b0n1 aneux]$ git pull
+remote: Enumerating objects: 13, done.
+remote: Counting objects: 100% (13/13), done.
+remote: Compressing objects: 100% (1/1), done.
+remote: Total 7 (delta 6), reused 7 (delta 6), pack-reused 0 (from 0)
+Unpacking objects: 100% (7/7), 1.47 KiB | 23.00 KiB/s, done.
+From github.com:damjanmiklos/aneux
+   217b9ed..280b0c6  main       -> origin/main
+Updating 217b9ed..280b0c6
+Fast-forward
+ 1test_encoder_decoder_only/train_pipeline/dist_utils.py        | 10 +++++++++-
+ 1test_encoder_decoder_only/train_pipeline/test_architecture.py | 26 ++++++++++++++++++++++++++
+ 1test_encoder_decoder_only/train_pipeline/train.py             | 21 ++++++++++++---------
+ 3 files changed, 47 insertions(+), 10 deletions(-)
+(aneuxai_env) [nr_hemd@x1001c2s0b0n1 aneux]$ python 1test_encoder_decoder_only/train_pipeline/aneuxai_HPC.py
+[hpc] 2 GPUs visible; re-launching: /home/nr_hemd/aneuxai_env/bin/python -m torch.distributed.run --nproc_per_node=2 --standalone /project/nr_hemo_ai1/nr_hemd/aneuxai/aneux/1test_encoder_decoder_only/train_pipeline/aneuxai_HPC.py
+NCCL version 2.28.9+cuda13.0
+[hpc] python=/home/nr_hemd/aneuxai_env/bin/python  version=3.11.7
+[hpc] torch=2.11.0+cu130  cuda=True
+[hpc] gpu0=NVIDIA A100-SXM4-40GB  count=2
+[hpc] DDP ranks=2  per-GPU batch=25  global batch=50  (NCCL gradient sync, one optimizer step)
+[hpc] scale: ngpu=2 ncpu=32 dataloader_workers=30 cache_workers=31
+[hpc] account='nr_hemo_ai1'  project_root='/project/nr_hemo_ai1'
+[hpc] repo=/project/nr_hemo_ai1/nr_hemd/aneuxai/aneux
+[hpc] cleandata_src=/project/nr_hemo_ai1/nr_hemd/aneuxai/aneux/cleandata
+[hpc] rsync cleandata: /project/nr_hemo_ai1/nr_hemd/aneuxai/aneux/cleandata -> /scratch/nr_hemo_ai1/nr_hemd/aneux/14414082/cleandata
+
+Number of files: 2,130 (reg: 2,126, dir: 4)
+Number of created files: 0
+Number of deleted files: 0
+Number of regular files transferred: 0
+Total file size: 4.70G bytes
+Total transferred file size: 0 bytes
+Literal data: 0 bytes
+Matched data: 0 bytes
+File list size: 0
+File list generation time: 0.001 seconds
+File list transfer time: 0.000 seconds
+Total bytes sent: 70.83K
+Total bytes received: 23
+
+sent 70.83K bytes  received 23 bytes  47.23K bytes/sec
+total size is 4.70G  speedup is 66,333.95
+[hpc] cleandata copy finished in 0.2s
+[hpc] rsync tube_cache: /project/nr_hemo_ai1/nr_hemd/aneuxai/aneux/1test_encoder_decoder_only/tube_cache -> /scratch/nr_hemo_ai1/nr_hemd/aneux/14414082/tube_cache
+
+Number of files: 694 (reg: 693, dir: 1)
+Number of created files: 0
+Number of deleted files: 0
+Number of regular files transferred: 0
+Total file size: 23.22G bytes
+Total transferred file size: 0 bytes
+Literal data: 0 bytes
+Matched data: 0 bytes
+File list size: 0
+File list generation time: 0.014 seconds
+File list transfer time: 0.000 seconds
+Total bytes sent: 54.33K
+Total bytes received: 12
+
+sent 54.33K bytes  received 12 bytes  108.68K bytes/sec
+total size is 23.22G  speedup is 427,378.57
+[hpc] tube_cache copy finished in 0.0s
+[hpc] run_dir=/scratch/nr_hemo_ai1/nr_hemd/aneux/14414082/output/runs/20260922_072611_job14414082
+Using cuda:0 (NVIDIA A100-SXM4-40GB); 2 GPU(s) visible (CUDA_VISIBLE_DEVICES=0,1)
+Using cuda:1 (NVIDIA A100-SXM4-40GB); 2 GPU(s) visible (CUDA_VISIBLE_DEVICES=0,1)
+Run directory: /scratch/nr_hemo_ai1/nr_hemd/aneux/14414082/output/runs/20260922_072611_job14414082
+Initializing dataset...
+AneurysmDataset: cleandata (uniformly_remeshed=709, template_mesh=695, original_centerline=718); 695 samples, 23 incomplete file sets (pass ensure_derived=True under vmtk_env to fill them)
+Dataset loaded. Total samples: 695
+AneurysmDataset: cleandata (uniformly_remeshed=709, template_mesh=695, original_centerline=718); 695 samples, 23 incomplete file sets (pass ensure_derived=True under vmtk_env to fill them)
+Train: 493 | Val: 101 | Test: 101 (held-out, seed=31)
+Saved train/val/test split to /scratch/nr_hemo_ai1/nr_hemd/aneux/14414082/output/train_val_split.json
+Warming tube cache (parallel raycast; not used as DataLoader workers)...
+Tube cache: 693 ready, 2 to build, 2 process(es)
+Tube cache: 100%|██████████████████████████████████████████████████████████████████████████████████████████| 2/2 [00:05<00:00,  2.99s/it]
+Tube cache failed for 2/2 samples (p347_FAQEBBwJCx8WEwMDExgKAAMd: ValueError: template coarse: 2 non-manifold edges; p391_GgAcPhQdLQIbAAgKDAAAOhEN: ValueError: template mid: 3 non-manifold edges)
+Tube cache ready for 693 samples
+Skipping 2 samples with failed tube cache (see /scratch/nr_hemo_ai1/nr_hemd/aneux/14414082/output/runs/20260922_072611_job14414082/SKIPPED_SAMPLES.txt): p347_FAQEBBwJCx8WEwMDExgKAAMd: ValueError: template coarse: 2 non-manifold edges; p391_GgAcPhQdLQIbAAgKDAAAOhEN: ValueError: template mid: 3 non-manifold edges
+After skips — Train: 491 | Val: 101 | Test: 101
+Sample X_true shape: torch.Size([16384, 3])
+Sample X_tube (fine) shape: torch.Size([13700, 3])
+Sample mid shape: torch.Size([3426, 3])
+Sample coarse shape: torch.Size([1102, 3])
+Sample Edge Index shape: torch.Size([2, 81780])
+Sample face shape: torch.Size([3, 27184])
+Latent tokens: torch.Size([128, 3])  n_tracts=13
+Initializing Graph VAE model...
+Sample X_true shape: torch.Size([16384, 3])
+Sample X_tube (fine) shape: torch.Size([13700, 3])
+Sample mid shape: torch.Size([3426, 3])
+Sample coarse shape: torch.Size([1102, 3])
+Sample Edge Index shape: torch.Size([2, 81780])
+Sample face shape: torch.Size([3, 27184])
+Latent tokens: torch.Size([128, 3])  n_tracts=13
+Initializing Graph VAE model...
+Trainable parameters: 22,925,749
+Gradient checkpointing: off
+Trainable parameters: 22,925,749
+Gradient checkpointing: off
+Starting training on cuda:1...
+Starting training on cuda:0...
+Stage-2 precision: matmul=high tf32_matmul=True tf32_cudnn=True
+Train device: cuda:0  CUDA_VISIBLE_DEVICES='0,1'  world_size=2  ema_decay=0.993  lr_warmup_steps=300
+Kernels OK on NVIDIA A100-SXM4-40GB: pytorch3d FPS, pyg-lib radius, pyg-lib SplineConv (WITH_SPLINE=True, WITH_RADIUS=True)
+Kernels OK on NVIDIA A100-SXM4-40GB: pytorch3d FPS, pyg-lib radius, pyg-lib SplineConv (WITH_SPLINE=True, WITH_RADIUS=True)
+GECO dual: β_init=1  (KL weight=1; 20-epoch ramp of β_max)
+Per-GPU batch 25 x accum 1 x 2 GPU(s) = global 50
+Train dataset size: 491
+Val dataset size: 101
+Schedule: 10 opt steps/epoch, 5000 total, warmup 300 then cosine
+Training:   0%|                                                                                                   | 0/10 [00:00<?, ?it/s]Resource monitor every 15s -> /scratch/nr_hemo_ai1/nr_hemd/aneux/14414082/output/runs/20260922_072611_job14414082/data/resource_snapshots.jsonl
+VRAM after first batch (forward+backward, no optimizer.step yet):
+  GPU: NVIDIA A100-SXM4-40GB (cuda:0)  39.52 GiB total
+  Parameters (fp32): 0.085 GiB  (22,925,749 params)
+  Current allocated: 1.190 GiB
+  Current reserved:  28.213 GiB
+  Peak allocated:    27.429 GiB
+  Peak reserved:     28.213 GiB
+  Free (driver):     10.49 / 39.52 GiB
+VRAM after first optimizer.step (AdamW moments allocated):
+  GPU: NVIDIA A100-SXM4-40GB (cuda:0)  39.52 GiB total
+  Parameters (fp32): 0.085 GiB  (22,925,749 params)
+  Current allocated: 1.361 GiB
+  Current reserved:  28.213 GiB
+  Peak allocated:    27.429 GiB
+  Peak reserved:     28.213 GiB
+  Free (driver):     10.49 / 39.52 GiB
+Training: 100%|██████████████████████████████████████████████████████████████████████████████████████████| 10/10 [08:20<00:00, 50.07s/it]
+Training: 100%|██████████████████████████████████████████████████████████████████████████████████████████| 10/10 [08:20<00:00, 50.07s/it]
+VRAM end of epoch 1 (peak over all train batches):
+  GPU: NVIDIA A100-SXM4-40GB (cuda:0)  39.52 GiB total
+  Parameters (fp32): 0.085 GiB  (22,925,749 params)
+  Current allocated: 0.457 GiB
+  Current reserved:  29.254 GiB
+  Peak allocated:    28.277 GiB
+  Peak reserved:     29.254 GiB
+  Free (driver):     9.45 / 39.52 GiB
+Epoch 001/500 [TRAIN] | Total: 10.3575 | Recon: 1.1691 | Rad: 0.8799 | KL: 8.2984 | Disp: 0.0000 | Lap: 0.1949 | Norm: 0.0131 | w_recon: 1.1691 | w_rad: 0.8799 | w_kl: 8.2984 | w_disp: 0.0000 | w_lap: 0.0097 | w_norm: 0.0003 | kl_lambda: 1.000000 | lr: 7.31e-06 | ema_d: 0.5263 | β: 0.964641 | rate_gap: -3.5853 | 0.98 samples/s
+Validation μ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:13<00:00,  4.36s/it]
+Validation μ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:14<00:00,  4.85s/it]
+Epoch 001/500 [VAL live μ] | Total: 8.7497 | Recon: 0.9701 | Rad: 0.8696 | KL: 6.8995 | Disp: 0.0000 | Lap: 0.2047 | Norm: 0.0121 | w_recon: 0.9701 | w_rad: 0.8696 | w_kl: 6.8995 | w_disp: 0.0000 | w_lap: 0.0102 | w_norm: 0.0002
+Validation μ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:12<00:00,  4.21s/it]
+Validation μ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:14<00:00,  4.67s/it]
+Validation σ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:12<00:00,  4.18s/it]
+Validation σ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:13<00:00,  4.64s/it]
+Epoch 001/500 [VAL μ  ] | Total: 9.0181 | Recon: 0.9706 | Rad: 0.8697 | KL: 7.1674 | Disp: 0.0000 | Lap: 0.2047 | Norm: 0.0121 | w_recon: 0.9706 | w_rad: 0.8697 | w_kl: 7.1674 | w_disp: 0.0000 | w_lap: 0.0102 | w_norm: 0.0002
+Epoch 001/500 [VAL σ  ] | Total: 9.0182 | Recon: 0.9707 | Rad: 0.8697 | KL: 7.1674 | Disp: 0.0000 | Lap: 0.2047 | Norm: 0.0121 | w_recon: 0.9707 | w_rad: 0.8697 | w_kl: 7.1674 | w_disp: 0.0000 | w_lap: 0.0102 | w_norm: 0.0002
+  recon(σ) − recon(μ) = 0.0001
+  saved val top-3 (score 1.8403) [EMA μ path]
+  saved train top-3 (score 2.0490)
+[metrics epoch] loss=10.3575 recon=1.16914 kl=8.29841 disp=4.9875e-06 lap=0.194909 norm=0.013089 rad=0.8799 kl_mean_raw=8.41469 rate_gap=-3.58531 fold=0.000537099 stretch=51661.4 geco_beta=0.964641 beta=0.964641 epoch=1 epoch_seconds=500.691 samples_per_sec=0.980644 peak_vram_gib=28.2771 lr=7.31111e-06 kl_lambda=1 global_step=10 ema_decay_used=0.526316 geco_beta_max=1 val_live_loss=8.7497 val_live_recon=0.970062
+Training: 100%|██████████████████████████████████████████████████████████████████████████████████████████| 10/10 [06:18<00:00, 37.81s/it]
+Training: 100%|██████████████████████████████████████████████████████████████████████████████████████████| 10/10 [06:18<00:00, 37.81s/it]
+Epoch 002/500 [TRAIN] | Total: 7.4126 | Recon: 1.1666 | Rad: 0.8791 | KL: 5.3570 | Disp: 0.0000 | Lap: 0.1955 | Norm: 0.0138 | w_recon: 1.1666 | w_rad: 0.8791 | w_kl: 5.3570 | w_disp: 0.0000 | w_lap: 0.0098 | w_norm: 0.0003 | kl_lambda: 1.000000 | lr: 1.40e-05 | ema_d: 0.6897 | β: 0.905318 | rate_gap: -6.3224 | 1.30 samples/s
+Validation μ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:14<00:00,  4.92s/it]
+Validation μ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:15<00:00,  5.21s/it]
+Epoch 002/500 [VAL live μ] | Total: 5.1206 | Recon: 0.9579 | Rad: 0.8688 | KL: 3.2833 | Disp: 0.0001 | Lap: 0.2061 | Norm: 0.0135 | w_recon: 0.9579 | w_rad: 0.8688 | w_kl: 3.2833 | w_disp: 0.0000 | w_lap: 0.0103 | w_norm: 0.0003
+Validation μ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:13<00:00,  4.36s/it]
+Validation μ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:14<00:00,  4.79s/it]
+Validation σ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:12<00:00,  4.32s/it]
+Validation σ: 100%|████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:13<00:00,  4.65s/it]
+Epoch 002/500 [VAL μ  ] | Total: 5.7103 | Recon: 0.9614 | Rad: 0.8690 | KL: 3.8694 | Disp: 0.0000 | Lap: 0.2057 | Norm: 0.0129 | w_recon: 0.9614 | w_rad: 0.8690 | w_kl: 3.8694 | w_disp: 0.0000 | w_lap: 0.0103 | w_norm: 0.0003
+Epoch 002/500 [VAL σ  ] | Total: 5.7104 | Recon: 0.9615 | Rad: 0.8690 | KL: 3.8694 | Disp: 0.0000 | Lap: 0.2056 | Norm: 0.0129 | w_recon: 0.9615 | w_rad: 0.8690 | w_kl: 3.8694 | w_disp: 0.0000 | w_lap: 0.0103 | w_norm: 0.0003
+  recon(σ) − recon(μ) = 0.0001
+  saved val top-3 (score 1.8304) [EMA μ path]
+  saved train top-3 (score 2.0456)
+[metrics epoch] loss=7.41263 recon=1.16656 kl=5.35695 disp=2.00882e-05 lap=0.195528 norm=0.0138339 rad=0.879055 kl_mean_raw=5.67759 rate_gap=-6.32241 fold=0.0007963 stretch=93560 geco_beta=0.905318 beta=0.905318 epoch=2 epoch_seconds=378.141 samples_per_sec=1.29846 peak_vram_gib=28.799 lr=1.39556e-05 kl_lambda=1 global_step=20 ema_decay_used=0.689655 geco_beta_max=1.47368 val_live_loss=5.12065 val_live_recon=0.957918
+Training:  50%|█████████████████████████████████████████████▌                                             | 5/10 [03:12<03:05, 37.16s/it]slurmstepd: error: *** STEP 14414082.0 ON x1001c2s0b0n1 CANCELLED AT 2026-09-22T09:46:04 DUE TO TIME LIMIT ***
+srun: Job step aborted: Waiting up to 32 seconds for job step to finish.
+Training:  60%|██████████████████████████████████████████████████████▌                                    | 6/10 [03:52<02:32, 38.06s/it]srun: error: Timed out waiting for job step to complete

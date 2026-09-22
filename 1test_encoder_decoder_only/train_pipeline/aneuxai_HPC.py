@@ -4,7 +4,7 @@
 Hardware: `gpu` node — 64-core EPYC 7763, 256 GB, 4× A100 40 GB (16 cores/GPU).
 Workers and DDP ranks follow the GPUs/CPUs Slurm actually gave this job.
 
-Production (4 GPU, 1.5 days)::
+Production (4 GPU, 1 day 16 hours)::
 
     sbatch --account=<account> --mail-user=YOU@email hpc/train_stage2.sbatch
 

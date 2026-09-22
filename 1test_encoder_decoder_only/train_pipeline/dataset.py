@@ -1030,7 +1030,7 @@ class AneurysmDataset(Dataset):
             samples = complete
             n_incomplete = len(incomplete)
             skipped = [rec["dataset_id"] for rec in incomplete]
-        if not quiet:
+        if not quiet and os.environ.get("RANK", "0") in ("0", ""):
             _, counts = summarize_cleandata(self.cleandata_root)
             count_txt = ", ".join(f"{k}={v}" for k, v in counts.items())
             extra = ""

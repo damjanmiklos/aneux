@@ -1086,7 +1086,8 @@ def train_epoch(
     if vram_probe and use_cuda:
         torch.cuda.reset_peak_memory_stats(_cuda_index(device))
 
-    for step, batch in enumerate(tqdm(dataloader, desc="Training")):
+    show_bar = is_main_process()
+    for step, batch in enumerate(tqdm(dataloader, desc="Training", disable=not show_bar)):
         batch = _keep_meta_on_cpu(batch.to(device))
         if augment:
             apply_train_augmentations(batch)
@@ -1192,7 +1193,11 @@ def evaluate_epoch(model, dataloader, weights, device, sample=False, kl_beta=Non
     total_samples = 0
 
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Validation σ" if sample else "Validation μ"):
+        for batch in tqdm(
+            dataloader,
+            desc="Validation σ" if sample else "Validation μ",
+            disable=not is_main_process(),
+        ):
             batch = _keep_meta_on_cpu(batch.to(device))
             batch_size = int(batch.num_graphs)
             total_samples += batch_size

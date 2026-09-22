@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 from torch import Tensor
 
@@ -138,11 +140,12 @@ def assert_optimized_cuda_kernels(device):
     y = conv(x, ei, attr)
     if y.device.type != "cuda" or not torch.isfinite(y).all():
         raise RuntimeError("SplineConv CUDA forward failed.")
-    print(
-        f"Kernels OK on {torch.cuda.get_device_name(dev)}: "
-        f"pytorch3d FPS, pyg-lib radius, pyg-lib SplineConv "
-        f"(WITH_SPLINE={WITH_SPLINE}, WITH_RADIUS={WITH_RADIUS})"
-    )
+    if os.environ.get("RANK", "0") in ("0", ""):
+        print(
+            f"Kernels OK on {torch.cuda.get_device_name(dev)}: "
+            f"pytorch3d FPS, pyg-lib radius, pyg-lib SplineConv "
+            f"(WITH_SPLINE={WITH_SPLINE}, WITH_RADIUS={WITH_RADIUS})"
+        )
     return True
 
 

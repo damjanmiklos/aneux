@@ -692,8 +692,8 @@ def triangle_stretch_loss(
                 ((v1 - v0).norm(dim=-1), (v2 - v1).norm(dim=-1), (v0 - v2).norm(dim=-1)),
                 dim=-1,
             )
-        ratio = _el(pred) / _el(tpl).clamp_min(1e-8)
-        per = (ratio + ratio.clamp_min(1e-8).reciprocal() - 2.0).mean(dim=-1)
+        ratio = (_el(pred) / _el(tpl).clamp_min(1e-8)).clamp(1e-3, 1e3)
+        per = (ratio + ratio.reciprocal() - 2.0).mean(dim=-1)
         return _mean_over_faces(per, face, batch, num_graphs, x_pred)
 
     d_tpl = torch.stack(
@@ -704,12 +704,18 @@ def triangle_stretch_loss(
     )
     c0 = d_tpl.transpose(-1, -2) @ d_tpl
     c1 = d_pred.transpose(-1, -2) @ d_pred
+    # Ridge both metrics by a fraction of their scale. An absolute 1e-8 on
+    # the template only turns a skinny identity triangle into 1/σ ~ 1e8,
+    # which is what printed stretch=5e4..5e5 while chamfer stayed ~1.
+    scale = 0.5 * (
+        c0.diagonal(dim1=-2, dim2=-1).sum(-1) + c1.diagonal(dim1=-2, dim2=-1).sum(-1)
+    )
+    eps = (1e-6 * scale).clamp_min(1e-12).unsqueeze(-1).unsqueeze(-1)
     eye = torch.eye(2, device=pred.device, dtype=pred.dtype).expand(c0.size(0), 2, 2)
-    c0 = c0 + 1e-8 * eye
-    a = torch.linalg.solve(c0, c1)
+    a = torch.linalg.solve(c0 + eps * eye, c1 + eps * eye)
     a = 0.5 * (a + a.transpose(-1, -2))
     ev = _symmetric_eigvals_2x2(a).clamp_min(0.0)
-    sigma = ev.sqrt().clamp_min(1e-8)
+    sigma = ev.sqrt().clamp(1e-3, 1e3)
     per = (sigma + sigma.reciprocal() - 2.0).mean(dim=-1)
     area = _face_areas(tpl, face)
     per = torch.where(area > 1e-12, per, torch.zeros_like(per))

@@ -35,10 +35,12 @@
 #SBATCH --cpus-per-task=64
 #SBATCH --gres=gpu:4
 #SBATCH --exclusive
-#SBATCH --time=1-14:00:00
+#SBATCH --time=1-16:00:00
 #SBATCH --mem=0
 #SBATCH --no-requeue
-#SBATCH --signal=TERM@180
+# One epoch is several minutes. 600s lets the handler finish that epoch,
+# write last.pt, and copy the run off scratch before Slurm SIGKILLs.
+#SBATCH --signal=TERM@600
 #SBATCH --output=aneux_s2_%j.out
 #SBATCH --error=aneux_s2_%j.err
 #SBATCH --mail-type=END,FAIL

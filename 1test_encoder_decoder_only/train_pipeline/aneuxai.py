@@ -760,7 +760,7 @@ def run_stage2_training(
             print(f"RAM preload: {n_ram} graphs")
 
     sample_idx = _first_cache_ready_index(dataset)
-    if sample_idx is not None:
+    if sample_idx is not None and main:
         sample_data = dataset[sample_idx]
         print(f"Sample X_true shape: {sample_data.x_true.shape}")
         print(f"Sample X_tube (fine) shape: {sample_data.x.shape}")
@@ -773,7 +773,8 @@ def run_stage2_training(
             f"n_tracts={int(sample_data.n_tracts)}"
         )
 
-    print("Initializing Graph VAE model...")
+    if main:
+        print("Initializing Graph VAE model...")
     model = GraphVAE(
         latent_dim=LATENT_DIM,
         latent_len=LATENT_LEN,
@@ -782,8 +783,9 @@ def run_stage2_training(
         gradient_checkpointing=ckpt_mode,
     )
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"Trainable parameters: {n_params:,}")
-    print(f"Gradient checkpointing: {ckpt_mode}")
+    if main:
+        print(f"Trainable parameters: {n_params:,}")
+        print(f"Gradient checkpointing: {ckpt_mode}")
 
     meta = collect_hparams(
         host=run_name_host,
@@ -821,7 +823,8 @@ def run_stage2_training(
         dump_json(os.path.join(run_dir, "data", "run_config.json"), meta)
         dump_json(os.path.join(run_dir, "data", "hardware.json"), hardware_snapshot())
 
-    print(f"Starting training on {resolved_device}...")
+    if main:
+        print(f"Starting training on {resolved_device}...")
     trained_model, history = None, []
     if len(dataset) > 0:
         trained_model, history = train_model(

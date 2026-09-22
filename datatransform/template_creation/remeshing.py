@@ -83,6 +83,8 @@ from vessel_pipeline import (
     extract_boundary_loops,
     extract_branches,
     extract_centerlines_for_tube,
+    reopen_stranded_lumen,
+    SplitLumenError,
     boundary_point_cloud,
     recompute_point_normals,
     reconcile_profiles_with_loops,
@@ -417,9 +419,28 @@ def process_gt_remesh_dataset(
     log_profiles(gt_profiles, label="GT anatomical")
     seed_points_from_profiles(gt_profiles)
 
-    _work, work_profiles, branched = _gt_centerline(
-        gt_surface, extension_length, sample_spacing, gt_profiles=gt_profiles
-    )
+    try:
+        _work, work_profiles, branched = _gt_centerline(
+            gt_surface, extension_length, sample_spacing, gt_profiles=gt_profiles
+        )
+    except SplitLumenError as exc:
+        # The GT surface itself is what ships, so the mouth is reopened on it
+        # and not on the working copy the trace is taken from.
+        print(f"  {exc}")
+        print("  Rescue: reopening the stranded mouth onto the parent wall, "
+              "then tracing again.")
+        repaired, n_mouths = reopen_stranded_lumen(
+            gt_surface, profiles=gt_profiles, label=dataset_id
+        )
+        if not n_mouths:
+            raise
+        gt_surface = repaired
+        gt_profiles = measure_open_profiles(gt_surface)
+        gt_profiles, _n_dropped = reconcile_profiles_with_loops(gt_surface, gt_profiles)
+        log_profiles(gt_profiles, label="GT anatomical (after reopening)")
+        _work, work_profiles, branched = _gt_centerline(
+            gt_surface, extension_length, sample_spacing, gt_profiles=gt_profiles
+        )
     if len(gt_profiles) != len(work_profiles):
         _warn(
             f"opening count differs on GT vs sanitised working copy "

@@ -598,6 +598,9 @@ def process_variable_dataset(
     open_base_surface = built["open_base_surface"]
     branched_centerline = built["branched_centerline"]
     anatomical_profiles = built["anatomical_profiles"]
+    # If the tube builder had to reopen a sealed-off branch, the ground truth
+    # the raycast measures against has to be the mesh that has it.
+    vessel_mesh = built.get("vessel_mesh", vessel_mesh)
     if speedups:
         n_pre = open_base_surface.GetNumberOfPoints()
         t_dec = time.perf_counter()

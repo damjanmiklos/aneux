@@ -686,6 +686,31 @@ def test_point_to_plane_chamfer():
     _assert(abs(float(plane_n) - expected_n) < 1e-3, f"normal offset {float(plane_n)} vs {expected_n}")
 
 
+def test_stretch_identity_on_skinny_triangle():
+    """Skinny template faces must not blow up σ + 1/σ when pred == template."""
+    from losses import triangle_stretch_loss
+
+    tpl = torch.tensor(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, 1e-6, 0.0]],
+        dtype=torch.float32,
+    )
+    face = torch.tensor([[0], [1], [2]], dtype=torch.long)
+    same = float(triangle_stretch_loss(tpl, tpl, face))
+    _assert(same < 1e-4, same)
+    healthy = torch.tensor(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        dtype=torch.float32,
+    )
+    pred = healthy.clone()
+    pred[:, :2] *= 2.0
+    scaled = float(triangle_stretch_loss(pred, healthy, face))
+    _assert(abs(scaled - 0.5) < 1e-3, scaled)
+    collapsed = healthy.clone()
+    collapsed[2] = collapsed[0]
+    bad = float(triangle_stretch_loss(collapsed, healthy, face))
+    _assert(math.isfinite(bad) and bad < 2000.0, bad)
+
+
 def test_mesh_losses_match_pytorch3d():
     from pytorch3d.loss import mesh_laplacian_smoothing, mesh_normal_consistency
     from pytorch3d.structures import Meshes
@@ -2153,6 +2178,7 @@ def main():
         test_cross_attention_two_graph_isolation,
         test_knn_chamfer_matches_cdist,
         test_point_to_plane_chamfer,
+        test_stretch_identity_on_skinny_triangle,
         test_mesh_losses_match_pytorch3d,
         test_spline_conv_backend,
         test_dirichlet_zero_on_rigid,
