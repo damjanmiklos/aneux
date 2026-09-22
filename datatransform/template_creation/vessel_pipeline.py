@@ -1600,13 +1600,21 @@ def centerline_anatomical_coverage(centerline, anatomical_profiles,
 LUMEN_VOXEL_MM = 0.3
 
 
-def _inside_voxels(surface, voxel_mm, max_dim=600):
-    """(mask, origin, dims) for the volume a capped surface encloses."""
-    try:
-        capped = to_vtk_poly(cap_surface(surface))
-    except Exception:
-        return None, None, None
-    b = np.asarray(capped.GetBounds(), dtype=np.float64)
+def _inside_voxels(surface, voxel_mm, max_dim=600, bounds=None, capped=None):
+    """(mask, origin, dims) for the volume a capped surface encloses.
+
+    ``bounds`` restricts the grid to a box, which is what makes a voxel
+    fine enough to resolve a double wall affordable; ``capped`` hands in a
+    surface that has already been closed, so a caller taking several boxes
+    out of one surface does not cap it again for each.
+    """
+    if capped is None:
+        try:
+            capped = to_vtk_poly(cap_surface(surface))
+        except Exception:
+            return None, None, None
+    b = np.asarray(capped.GetBounds() if bounds is None else bounds,
+                   dtype=np.float64)
     lo = b[[0, 2, 4]] - 2.0 * voxel_mm
     dims = np.ceil((b[[1, 3, 5]] - b[[0, 2, 4]] + 4.0 * voxel_mm) / voxel_mm).astype(int)
     if np.any(dims < 4) or np.any(dims > max_dim):
@@ -1678,12 +1686,14 @@ def ostium_lumen_compartments(surface, profiles, voxel_mm=LUMEN_VOXEL_MM):
 
 
 LUMEN_MOUTH_VOXEL_MM = 0.2
-MOUTH_RADIUS_LADDER = (1.0, 1.3, 0.8, 1.6, 0.6)
+MOUTH_RADIUS_LADDER = (1.0, 1.3, 0.8, 1.6, 2.0, 0.6)
 MOUTH_SITE_SPACING_MM = 2.0
 MOUTH_CONTACT_SLACK_MM = 1.0
 MAX_MOUTH_SITES = 6
 MAX_MOUTHS = 4
 MIN_MOUTH_RIM_POINTS = 6
+MOUTH_OPENING_DRIFT_MM = 0.5
+MOUTH_TANGLE_REACH_MM = 3.0
 
 
 def _lumen_label_grid(surface, voxel_mm):
@@ -1852,6 +1862,68 @@ def _profile_lumens(labels, lo, voxel, profiles, reach_mm=1.5):
         hit = _lumen_label_at(labels, lo, voxel, seed + off)
         found = np.flatnonzero(hit > 0)
         out.append(int(hit[found[0]]) if found.size else 0)
+    return out
+
+
+def _segments_cross_triangles(p0, p1, a, b, c):
+    """Moller-Trumbore over matched rows: does each segment pierce its triangle."""
+    d = p1 - p0
+    e1, e2 = b - a, c - a
+    h = np.cross(d, e2)
+    det = np.einsum("ij,ij->i", e1, h)
+    ok = np.abs(det) > 1e-14
+    inv = np.where(ok, 1.0 / np.where(ok, det, 1.0), 0.0)
+    s = p0 - a
+    u = inv * np.einsum("ij,ij->i", s, h)
+    q = np.cross(s, e1)
+    v = inv * np.einsum("ij,ij->i", d, q)
+    t = inv * np.einsum("ij,ij->i", e2, q)
+    eps = 1e-9
+    return ok & (u > eps) & (v > eps) & (u + v < 1.0 - eps) & (t > eps) & (t < 1.0 - eps)
+
+
+def _crossing_faces(pts, faces, cent, centre, reach):
+    """Triangles that pass through other triangles near a point.
+
+    This is what a stranded compartment actually is. The surface is one
+    connected manifold with no coincident points and no non-manifold edge, so
+    it cannot enclose two volumes -- and yet a voxel fill finds two, at every
+    resolution down to 0.02 mm. The reason is that the branch wall runs
+    *through* the trunk wall: the sheet crosses itself, and a fill by parity
+    hands the overlap back to the outside, which cuts the branch off from the
+    trunk it is plainly joined to.
+
+    So the mouth is not somewhere to be chosen. It is where the two sheets
+    already interpenetrate, and the repair is to take that tangle out and tube
+    the two rims it leaves. On p483 keep 1 the tangle is 122 triangles across
+    about a millimetre; on SNF00000364 keep 2 it is 1692.
+    """
+    from scipy.spatial import cKDTree
+
+    near = np.flatnonzero(np.all(np.abs(cent - centre) <= reach, axis=1))
+    if near.size < 2:
+        return np.zeros(len(faces), dtype=bool)
+    tri = pts[faces[near]]
+    span = float(np.percentile(np.linalg.norm(tri[:, 0] - tri[:, 1], axis=1), 95))
+    pairs = cKDTree(cent[near]).query_pairs(2.0 * span, output_type="ndarray")
+    if pairs.size == 0:
+        return np.zeros(len(faces), dtype=bool)
+    fi, fj = near[pairs[:, 0]], near[pairs[:, 1]]
+    # Neighbours share a vertex and touching is not crossing.
+    apart = ~(faces[fi][:, :, None] == faces[fj][:, None, :]).any(axis=(1, 2))
+    fi, fj = fi[apart], fj[apart]
+    if fi.size == 0:
+        return np.zeros(len(faces), dtype=bool)
+    ti, tj = pts[faces[fi]], pts[faces[fj]]
+    hit = np.zeros(fi.size, dtype=bool)
+    for s, e in ((0, 1), (1, 2), (2, 0)):
+        hit |= _segments_cross_triangles(ti[:, s], ti[:, e],
+                                         tj[:, 0], tj[:, 1], tj[:, 2])
+        hit |= _segments_cross_triangles(tj[:, s], tj[:, e],
+                                         ti[:, 0], ti[:, 1], ti[:, 2])
+    out = np.zeros(len(faces), dtype=bool)
+    out[fi[hit]] = True
+    out[fj[hit]] = True
     return out
 
 
@@ -2033,8 +2105,8 @@ def _stitch(pts, ring_a, ring_b):
     return None if best is None else best[1]
 
 
-def _cut_and_stitch(pts, faces, cent, tri_lab, alive, graph, site, radius,
-                    a_lab, b_lab, protected):
+def _cut_and_stitch(pts, faces, cent, tri_lab, alive, graph, site, cand,
+                    a_lab, b_lab):
     """Take a disc out of each sheet and tube the two rims together.
 
     The acceptance that matters here is combinatorial rather than measured: if
@@ -2044,29 +2116,30 @@ def _cut_and_stitch(pts, faces, cent, tri_lab, alive, graph, site, radius,
     matched by label, and a cut that does not leave exactly one rim per lumen
     is not a mouth -- it is refused rather than patched up.
 
-    Each sheet is cut about its own closest point. A single ball about the
-    midpoint would bite unequally into two walls a wall-thickness apart, and
-    where the mouth was never welded shut it could miss one of them entirely.
+    ``cand`` is the set of triangles the caller is willing to lose -- the
+    tangle where the sheets cross, or a ball about the contact when there is
+    no tangle to find. What comes out of it is everything it reaches from
+    either sheet, not one label at a time: the two sheets are fused through
+    the crossing, so the last stretch of the branch before it is
+    face-connected to the trunk and not to the rest of the branch. On p483
+    keep 1 that tongue was 67 triangles, and cutting the branch label alone
+    left a seven-point hole in it while the trunk side opened properly. A seed
+    per lumen is still taken, because where the sheets only lie against each
+    other a single seed reaches one of them and stops.
     """
     indptr, indices = graph
     mid = 0.5 * (site["a"] + site["b"])
-    da = np.linalg.norm(cent - site["a"], axis=1)
-    db = np.linalg.norm(cent - site["b"], axis=1)
     drop = np.zeros(len(faces), dtype=bool)
-    for lab, dist in ((a_lab, da), (b_lab, db)):
-        cand = alive & (tri_lab == lab) & (dist <= radius)
-        if not cand.any():
-            return None, None, f"nothing of lumen {lab} within {radius:.3f} mm"
-        seed = int(np.flatnonzero(cand)[np.argmin(dist[cand])])
+    for lab, anchor in ((a_lab, site["a"]), (b_lab, site["b"])):
+        own = cand & (tri_lab == lab)
+        if not own.any():
+            return None, None, f"nothing of lumen {lab} in the cut"
+        dist = np.linalg.norm(cent - anchor, axis=1)
+        seed = int(np.flatnonzero(own)[np.argmin(dist[own])])
         drop |= _patch_around(seed, cand, indptr, indices)
-    # A mouth can sit within a millimetre of an ostium -- on SNF00000364 keep 2
-    # the stranded branch opens 0.27 mm from the profile it carries -- and a cut
-    # that reaches a rim eats the opening instead of making one.
-    if protected is not None and protected.size and np.isin(faces[drop], protected).any():
-        return None, None, "the cut would reach an opening the vessel already has"
     live = alive & ~drop
     kept, kept_lab = faces[live], tri_lab[live]
-    reach = 3.0 * radius + site["gap"]
+    reach = 2.0 * float(np.linalg.norm(cent[drop] - mid, axis=1).max()) + 1.0
     near = []
     for cyc, owners in _directed_boundary_cycles(kept):
         if np.linalg.norm(pts[np.asarray(cyc)].mean(axis=0) - mid) >= reach:
@@ -2092,6 +2165,59 @@ def _cut_and_stitch(pts, faces, cent, tri_lab, alive, graph, site, radius,
     return drop, np.asarray(strip, dtype=np.int64), f"{len(rim_a[0])} + {len(rim_b[0])} point rims"
 
 
+def _mouth_holds_up(pts, faces, alive, drop, strips, was_open, before):
+    """Is the cut a mouth, measured on the surface it would leave behind.
+
+    Three things can go wrong and none of them shows in the cut itself. Two
+    rims a hundredth of a millimetre apart can both belong to the same sheet,
+    so tubing them together leaves a clean manifold, the same openings and the
+    same two volumes -- a repair that reports success and changes nothing. The
+    ball can bite through an ostium a fraction of a millimetre away, on
+    SNF00000364 keep 2 the stranded branch opens 0.27 mm from the profile it
+    carries. And the stitch can leave an edge with three faces on it.
+
+    Refusing every cut that comes near an existing rim was the earlier guard,
+    and it turned down the only site that worked. Building the surface and
+    looking at it costs a few seconds on a path that runs on a handful of
+    cases, and it answers the question that was actually being asked.
+
+    The compartment count is taken twice, on the working grid and on one half
+    its spacing, because a mouth narrower than a voxel merges the two volumes
+    on paper and nowhere else. On p438 keep 2 a 0.894 mm cut read as one lumen
+    at 0.2 mm and as two at 0.15, 0.1 and 0.08 -- the merge was the grid, not
+    the geometry. p463 keep 1, which the tracer really does get through, holds
+    at every one of them.
+    """
+    cand = clean_triangulate(_polydata_from_triangles(
+        pts, np.vstack([faces[alive & ~drop]] + strips)
+    ))
+    if int(inspect_surface_topology(cand)["n_nonmanifold"]):
+        return None, None, "the stitch leaves a non-manifold edge"
+    now = inspect_openings(cand)
+    if len(now) != len(was_open):
+        return None, None, (f"the cut turns {len(was_open)} opening(s) into "
+                            f"{len(now)}")
+    here = np.array([o["center"] for o in now], dtype=np.float64)
+    for was in was_open:
+        moved = np.min(np.linalg.norm(here - was["center"], axis=1))
+        if moved > MOUTH_OPENING_DRIFT_MM:
+            return None, None, ("the cut reaches an opening the vessel already "
+                                f"has, and moves it {moved:.2f} mm")
+    left = {}
+    for voxel, was in before.items():
+        left[voxel] = _lumen_label_grid(cand, voxel)[3]
+        if left[voxel] >= was:
+            return None, None, (
+                f"but the two volumes are still apart at {voxel:.2f} mm, which "
+                "is the grid the vessel was refused on"
+                if voxel == LUMEN_VOXEL_MM else
+                "but the two volumes are still apart afterwards"
+                if voxel == LUMEN_MOUTH_VOXEL_MM else
+                f"and they only meet above {voxel:.2f} mm, which "
+                "is a mouth no centreline can be traced through")
+    return cand, left, None
+
+
 def reopen_stranded_lumen(surface, profiles=None, label="vessel", report=True):
     """Open a sealed-off compartment back onto the lumen it belongs to.
 
@@ -2112,9 +2238,10 @@ def reopen_stranded_lumen(surface, profiles=None, label="vessel", report=True):
     if labels is None or n <= 1:
         return poly, 0
     _p, pts, faces = _triangle_points_faces(poly)
-    tri_lab, cent, n_filled = _triangle_lumen_side(poly, pts, faces, labels, lo, voxel)
-    _ev, _fid, _inv, _cnt = _edge_tables(faces)
-    protected = np.unique(_ev[_cnt[_inv] == 1])
+    tri_lab, cent, n_filled = _triangle_lumen_side(
+        poly, pts, faces, labels, lo, voxel
+    )
+    was_open = inspect_openings(poly)
     graph = _face_graph(faces)
     sizes = np.bincount(labels.ravel())
     order = list(np.argsort(sizes[1:])[::-1] + 1)
@@ -2137,6 +2264,20 @@ def reopen_stranded_lumen(surface, profiles=None, label="vessel", report=True):
               flush=True)
     alive = np.ones(len(faces), dtype=bool)
     strips, opened = [], 0
+    # Three grids, and LUMEN_VOXEL_MM is the one that decides the case:
+    # ostium_lumen_compartments reads the volume at 0.30 mm, so a mouth proved
+    # only at 0.20 and 0.10 is a mouth the check that refused the vessel cannot
+    # see. Measured on p463: the first site is a 0.029 mm pinch, the cut there
+    # merges the volumes at 0.20 and 0.10 and NOT at 0.30, the gate took it, and
+    # the vessel was refused again a step later for the two lumens the 0.30 mm
+    # grid still found. Sites with a real gap are on the list right behind it --
+    # 0.53, 0.87 and 0.96 mm -- and every one of them merges at all three.
+    # Asking for 0.30 as well is what lets the search walk past the pinhole.
+    fine = 0.5 * LUMEN_MOUTH_VOXEL_MM
+    counts = {LUMEN_VOXEL_MM: _lumen_label_grid(poly, LUMEN_VOXEL_MM)[3],
+              LUMEN_MOUTH_VOXEL_MM: n,
+              fine: _lumen_label_grid(poly, fine)[3]}
+    was_split = counts[fine]
     for b_lab in [int(x) for x in order[1:MAX_MOUTHS + 1]]:
         ranked = []
         for site in _mouth_sites(cent, np.where(alive, tri_lab, -1), a_lab, b_lab):
@@ -2146,23 +2287,41 @@ def reopen_stranded_lumen(surface, profiles=None, label="vessel", report=True):
         ranked.sort(key=lambda t: -t[0])
         done = False
         for base, site in ranked:
-            for scale in MOUTH_RADIUS_LADDER:
+            mid = 0.5 * (site["a"] + site["b"])
+            reaches = np.linalg.norm(cent - mid, axis=1)
+            crossings = int(_crossing_faces(
+                pts, faces, cent, mid, MOUTH_TANGLE_REACH_MM).sum())
+            if crossings and report:
+                print(f"    lumen {b_lab} at {np.round(mid, 2)}: the surface "
+                      f"passes through itself here, {crossings} triangle(s) "
+                      "cross; a mouth cut will not part them", flush=True)
+            shapes = [(f"r={scale * base:.3f} mm",
+                       alive & (reaches <= scale * base))
+                      for scale in MOUTH_RADIUS_LADDER]
+            for what, cand in shapes:
                 drop, strip, why = _cut_and_stitch(
                     pts, faces, cent, tri_lab, alive, graph,
-                    site, scale * base, a_lab, b_lab, protected,
+                    site, cand, a_lab, b_lab,
                 )
-                head = (f"    lumen {b_lab} mouth at "
-                        f"{np.round(0.5 * (site['a'] + site['b']), 2)} "
-                        f"gap {site['gap']:.3f} r={scale * base:.3f} mm")
+                head = (f"    lumen {b_lab} mouth at {np.round(mid, 2)} "
+                        f"gap {site['gap']:.3f} {what}")
                 if drop is None:
                     if report:
                         print(f"{head}: {why}", flush=True)
+                    continue
+                _cand, left_now, bad = _mouth_holds_up(
+                    pts, faces, alive, drop, strips + [strip], was_open, counts
+                )
+                if bad is not None:
+                    if report:
+                        print(f"{head}: {why}, {bad}", flush=True)
                     continue
                 if report:
                     print(f"{head}: {why}, {int(drop.sum())} triangle(s) removed",
                           flush=True)
                 alive &= ~drop
                 strips.append(strip)
+                counts = left_now
                 opened += 1
                 done = True
                 break
@@ -2180,13 +2339,16 @@ def reopen_stranded_lumen(surface, profiles=None, label="vessel", report=True):
     n_open = len(inspect_openings(out))
     regions = count_connected_regions(out)
     grew = _surface_area(out) / area_before
-    left = _lumen_label_grid(out, LUMEN_MOUTH_VOXEL_MM)[3]
+    left = _lumen_label_grid(out, fine)[3]
     ok = (int(topo["n_nonmanifold"]) == 0 and regions == 1
           and n_open == n_open_before and abs(grew - 1.0) < 0.05)
     if report:
         print(f"  {label}: reopened {opened} mouth(s) -> nm {topo['n_nonmanifold']} "
               f"regions {regions} openings {n_open}/{n_open_before} area {grew:.4f}x "
-              f"lumens {left} (was {n}) -> {'keep' if ok else 'stand down'}", flush=True)
+              f"lumens {left} (was {was_split}) at {fine:.2f} mm, "
+              f"{_lumen_label_grid(out, LUMEN_VOXEL_MM)[3]} at "
+              f"{LUMEN_VOXEL_MM:.2f} mm -> "
+              f"{'keep' if ok else 'stand down'}", flush=True)
     if not ok:
         return poly, 0
     return out, opened
@@ -4063,7 +4225,7 @@ def sanitize_vessel_for_vmtk(
     poly = drop_degenerate_triangles(poly)
     poly = drop_boundary_ear_triangles(poly)
     n_mid = poly.GetNumberOfPoints()
-    if tessellation_looks_original(poly):
+    if target_reduction and tessellation_looks_original(poly):
         poly = decimate_dense_mc(
             poly, target_reduction=target_reduction, min_points=min_points
         )
@@ -7388,9 +7550,41 @@ def build_parent_tube(
         )
         if not n_mouths:
             raise
-        built = _parent_tube_attempt(repaired, **kwargs)
+        # The trace has to see the mouth, and the decimator would not leave it.
+        built = _parent_tube_attempt(
+            repaired, keep_tessellation=True, reopened=True, **kwargs
+        )
         built["vessel_mesh"] = repaired
         return built
+
+
+def reopen_mouth_on_working_copy(smoothed, profiles, label="vessel", report=True):
+    """Reopen a mouth the smoothing shut again on a copy that is only traced.
+
+    A mouth cut through a double wall is a collar spanning a gap far thinner
+    than an edge -- 0.029 mm on p463 -- and Taubin smoothing pulls its two rims
+    back together. Measured on p463: the repair leaves one lumen at 0.20 and
+    0.10 mm, the 54% decimation keeps it at one, and the smoothing puts it back
+    to two. The centerline is then traced on a copy where the branch is sealed
+    off again, so the trace never reaches the far openings and the case dies
+    for a repair that did work.
+
+    A rescue, not a repair: it runs only for a vessel whose mouth was already
+    reopened once, and only when the copy really does come back split, so a
+    surface that survives the smoothing is traced exactly as before. The copy
+    is discarded after the trace, so nothing it does reaches what ships.
+    """
+    n = _lumen_label_grid(smoothed, LUMEN_MOUTH_VOXEL_MM)[3]
+    if n < 2:
+        return smoothed, 0
+    if report:
+        print(f"  The smoothing shut the reopened mouth again ({n} lumens on the "
+              "working copy); reopening it there too.")
+    copy, n_mouths = reopen_stranded_lumen(
+        smoothed, profiles=profiles, label=f"{label} (centerline copy)",
+        report=report,
+    )
+    return (copy, n_mouths) if n_mouths else (smoothed, 0)
 
 
 def _parent_tube_attempt(
@@ -7404,6 +7598,8 @@ def _parent_tube_attempt(
     skip_mc_decimate=False,
     fast_uncap=True,
     cut_frames=None,
+    keep_tessellation=False,
+    reopened=False,
 ):
     """Shared path: smooth -> extend -> cap -> centerline -> polyball tube -> uncap at anatomy.
 
@@ -7418,8 +7614,16 @@ def _parent_tube_attempt(
     uses ``measure_open_profiles`` on the vessel; that is not a second cut pass.
     """
     print("Step 1: Applying Taubin surface smoothing...")
-    work_vessel = sanitize_vessel_for_vmtk(vessel_mesh)
+    work_vessel = sanitize_vessel_for_vmtk(
+        vessel_mesh,
+        target_reduction=0.0 if keep_tessellation else SANITIZE_INPUT_REDUCTION,
+    )
     smoothed_vessel = apply_taubin_smoothing(work_vessel)
+    if reopened:
+        smoothed_vessel, _n_again = reopen_mouth_on_working_copy(
+            smoothed_vessel, measure_open_profiles(smoothed_vessel),
+            label=dataset_id or "vessel",
+        )
 
     print("Step 1b: Detecting anatomical inlet/outlet boundaries...")
     anatomical_profiles = measure_open_profiles(smoothed_vessel)

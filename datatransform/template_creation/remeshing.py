@@ -84,6 +84,7 @@ from vessel_pipeline import (
     extract_branches,
     extract_centerlines_for_tube,
     reopen_stranded_lumen,
+    reopen_mouth_on_working_copy,
     SplitLumenError,
     boundary_point_cloud,
     recompute_point_normals,
@@ -345,12 +346,18 @@ def log_opening_planarity(surface, frames):
         )
 
 
-def _gt_centerline(work_vessel, extension_length, sample_spacing, gt_profiles=None):
+def _gt_centerline(work_vessel, extension_length, sample_spacing, gt_profiles=None,
+                   reopened=False):
     """Sanitised + strongly smoothed copy is only used to trace the lumen."""
     print("Step 2: Working copy for centerlines (sanitise + strong Taubin, discarded later)...")
     _set_step("2_centerline_working_copy")
     work = sanitize_vessel_for_vmtk(work_vessel)
     work = apply_taubin_smoothing(work)
+    if reopened:
+        work, _n_again = reopen_mouth_on_working_copy(
+            work, gt_profiles or measure_open_profiles(work),
+            label="GT",
+        )
     # Decimating to a quarter of the points tears the wall wherever the input
     # was already punctured, and merges neighbouring punctures into holes far
     # bigger than either -- a 4-point, 1.2 mm quad on p375. Those are not
@@ -439,7 +446,8 @@ def process_gt_remesh_dataset(
         gt_profiles, _n_dropped = reconcile_profiles_with_loops(gt_surface, gt_profiles)
         log_profiles(gt_profiles, label="GT anatomical (after reopening)")
         _work, work_profiles, branched = _gt_centerline(
-            gt_surface, extension_length, sample_spacing, gt_profiles=gt_profiles
+            gt_surface, extension_length, sample_spacing, gt_profiles=gt_profiles,
+            reopened=True,
         )
     if len(gt_profiles) != len(work_profiles):
         _warn(
