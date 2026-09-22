@@ -57,9 +57,11 @@ from vessel_pipeline import (
     build_parent_tube,
     clip_flow_extensions_and_uncap,
     decimate_variable_parent_tube,
+    enforce_min_edge,
     finalize_surface,
     inspect_openings,
     measure_open_profiles,
+    recompute_point_normals,
     run_batch,
     save_polydata,
     supervise_and_remesh_verified,
@@ -658,6 +660,18 @@ def process_variable_dataset(
     final_surface, _n_regions = finalize_surface(
         remeshed_surface, profiles=anatomical_profiles
     )
+    # finalize_surface welds at WELD_TOLERANCE_MM, a hundredth of the target
+    # edge, so an edge it leaves can still be orders of magnitude under the
+    # quality floor: p402 shipped nothing because its final mesh carried a
+    # 0.000001 mm edge and p414 a 0.000034 mm one, both made after the remesh
+    # step that already ran enforce_min_edge. The GT path has folded them here
+    # since it was written; this path never did. The fold is checked before it
+    # is kept, so a surface it cannot improve comes back untouched -- and it
+    # runs before the supervision transfer so the arrays land on the vertices
+    # that actually ship.
+    folded = enforce_min_edge(final_surface, label="template")
+    if folded is not final_surface:
+        final_surface = recompute_point_normals(folded, auto_orient=False)
     final_surface = restore_template_supervision(final_surface, snap_pts, snap_arrays)
     t_xfer_s = time.perf_counter() - t_xfer
     print(
