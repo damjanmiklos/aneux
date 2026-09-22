@@ -3085,7 +3085,7 @@ def fan_fill_small_loops(surface, min_radius=WALL_PINHOLE_RADIUS_MM, profiles=No
     # A rim vertex with four boundary neighbours is not part of any simple cycle,
     # so the walk below would skip its hole entirely. Those ears are debris from
     # the clip, never anatomy.
-    surface = drop_boundary_ear_triangles(surface)
+    surface = drop_boundary_ear_triangles(surface, profiles=profiles)
     poly, pts, faces, rings = _boundary_loop_vertex_rings(surface)
     if not rings:
         return poly, 0
@@ -3437,15 +3437,50 @@ def drop_degenerate_triangles(surface, min_edge=DEGENERATE_EDGE_MM):
     return out
 
 
-def drop_boundary_ear_triangles(surface, max_passes=16):
+def _anatomical_rim_points(surface, profiles):
+    """Point ids on the boundary loops that are anatomical openings."""
+    poly, pts, faces = _triangle_points_faces(surface)
+    if faces.size == 0 or not profiles:
+        return np.empty(0, dtype=np.int64)
+    ev = np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
+    key = np.sort(ev, axis=1)
+    uniq, counts = np.unique(key, axis=0, return_counts=True)
+    rim = uniq[counts == 1]
+    if rim.size == 0:
+        return np.empty(0, dtype=np.int64)
+    comp = _rim_components(rim, len(pts))
+    keep = []
+    for c in np.unique(comp[comp >= 0]):
+        ids = np.flatnonzero(comp == c)
+        member = pts[ids]
+        bary = member.mean(axis=0)
+        radius = float(np.mean(np.linalg.norm(member - bary, axis=1)))
+        if _loop_at_a_profile(bary, profiles, radius=radius, n_points=len(ids)):
+            keep.append(ids)
+    return np.concatenate(keep) if keep else np.empty(0, dtype=np.int64)
+
+
+def drop_boundary_ear_triangles(surface, max_passes=16, profiles=None):
     """Drop triangles with 2+ boundary edges (fins glued onto an ostium rim).
 
     Those ears give rim vertices four boundary neighbours, and VMTK's
     vtkvmtkPolyDataBoundaryExtractor then reports only one opening.
+
+    Dropping one turns its third edge into a boundary edge, which can make a
+    neighbour an ear, so this runs until the surface stops changing -- and on a
+    finished surface that cascade is a tear. p398 arrived at ``finalize_surface``
+    with all eight rims round (worst circularity 0.980) and lost 41 triangles
+    here, which split it into five shells, put 40 non-manifold edges into the
+    weld that put them back together and cost 54 more triangles to the manifold
+    repair; the ostium came out at 0.181. So when the anatomy is known, no
+    triangle on one of its rims is dropped: an ear at an ostium is only in the
+    way of walking that ostium's loop, and an ostium's loop is never one this
+    fills.
     """
     poly, pts, faces = _triangle_points_faces(surface)
     if faces.size == 0:
         return poly
+    protected = _anatomical_rim_points(poly, profiles) if profiles else None
     n_dropped = 0
     for _ in range(int(max_passes)):
         edges = np.concatenate(
@@ -3465,6 +3500,8 @@ def drop_boundary_ear_triangles(surface, max_passes=16):
                 if usage.get(key, 0) == 1:
                     n_boundary[fi] += 1
         keep = n_boundary < 2
+        if protected is not None and protected.size:
+            keep |= np.isin(faces, protected).any(axis=1)
         n_drop = int((~keep).sum())
         if n_drop == 0:
             break
@@ -5083,6 +5120,45 @@ def _split_lumen_note(surface, profiles, suspect):
     )
 
 
+OSTIUM_ROUND_ENOUGH = 0.80
+
+
+def rim_circularity_at(surface, origin, reach_mm=6.0):
+    """How round the boundary nearest ``origin`` is, 1.0 for a circle.
+
+    A pipe-section cut that meets the wall at a glancing angle, or that runs
+    into a second rim a millimetre away, opens a long ragged hole instead of an
+    ostium and nothing downstream can undo it: on p531 the uncap turned a
+    0.24 mm opening into a 199-point rim 21.2 mm around at circularity 0.199,
+    and the remesh and the repairs carried it through to the shipped surface at
+    0.361. Measuring the rim the clip just made is what lets the fallback clip
+    be tried on its merits rather than only when the first one fails outright.
+    """
+    ring = extract_boundary_loops(to_vtk_poly(surface))
+    best = None
+    origin = np.asarray(origin, dtype=np.float64)
+    for k in range(ring.GetNumberOfCells()):
+        cell = ring.GetCell(k)
+        co = np.array(
+            [ring.GetPoint(cell.GetPointId(j)) for j in range(cell.GetNumberOfPoints())],
+            dtype=np.float64,
+        )
+        if len(co) < 3:
+            continue
+        d = float(np.linalg.norm(co.mean(axis=0) - origin))
+        if d > float(reach_mm):
+            continue
+        perimeter = float(np.sum(np.linalg.norm(co - np.roll(co, -1, axis=0), axis=1)))
+        if perimeter <= 0:
+            continue
+        rel = co - co.mean(axis=0)
+        area = 0.5 * float(np.linalg.norm(np.cross(rel, np.roll(rel, -1, axis=0)).sum(axis=0)))
+        circ = 4.0 * np.pi * area / (perimeter * perimeter)
+        if best is None or d < best[0]:
+            best = (d, circ)
+    return 1.0 if best is None else float(best[1])
+
+
 def clip_flow_extensions_and_uncap(
     base_surface,
     profiles,
@@ -5144,6 +5220,10 @@ def clip_flow_extensions_and_uncap(
 
     for i, profile in enumerate(work_profiles):
         search_mm = float(extension_length) + 3.0 * max(float(profile["radius"]), 0.5)
+        where = (np.asarray(frames[i][0], dtype=np.float64) if frames is not None
+                 else np.asarray(profile["barycenter"], dtype=np.float64))
+        before = current
+        near_at_entry = near_before
         ok = False
         if frames is not None:
             origin, outward, radius = frames[i]
@@ -5172,6 +5252,34 @@ def clip_flow_extensions_and_uncap(
                     f"  [Uncap] Profile {profile['index']} pipe-section cut "
                     f"r={radius:.3f} mm at {np.round(origin, 2)}"
                 )
+        if ok and rim_circularity_at(current, where) < OSTIUM_ROUND_ENOUGH:
+            # The cut was taken, but the hole it made is not an opening shape.
+            # Try the plane clip from the surface as it stood and keep whichever
+            # rim is rounder; on p531 that is the difference between a 0.199 rim
+            # 21.2 mm around and the ostium the input actually has.
+            ragged = rim_circularity_at(current, where)
+            alternative, alt_ok = clip_one_profile(before, profile, body_pt, search_mm)
+            if alt_ok:
+                rounder = rim_circularity_at(alternative, where)
+                # _accept measures against the surface as it was before this
+                # ostium was cut, and the pipe-section cut has already moved
+                # that baseline forward; the alternative starts from the same
+                # place the pipe cut did, so the baseline goes back with it.
+                near_before = near_at_entry
+                if rounder > ragged and _accept(alternative, i, "anatomical plane clip"):
+                    current = alternative
+                    print(
+                        f"  [Uncap] Profile {profile['index']} pipe-section cut left a "
+                        f"rim at circularity {ragged:.3f}; the plane clip gives "
+                        f"{rounder:.3f} and was taken instead"
+                    )
+                else:
+                    near_before = _ostium_neighbourhoods(current, ostia)
+                    print(
+                        f"  [Uncap] Profile {profile['index']} rim is ragged "
+                        f"(circularity {ragged:.3f}); the plane clip is no better "
+                        f"({rounder:.3f}), so the pipe-section cut stands"
+                    )
         if not ok:
             candidate, ok = clip_one_profile(current, profile, body_pt, search_mm)
             if ok:
@@ -6158,6 +6266,7 @@ def remesh_surface_verified(
             attempts += _ladder(iters, conn)
 
     best = None
+    usable = None
     for fraction, iters, conn, collapse in attempts:
         welded = weld_to_edge_fraction(open_surface, fraction)
         out = remesh_surface_isotropically(
@@ -6177,7 +6286,37 @@ def remesh_surface_verified(
         score = (abs(drift - 1.0), hub)
         if best is None or score < best[0]:
             best = (score, out, drift, hub, fraction, iters, conn, collapse)
-        if drift <= REMESH_MAX_AREA_DRIFT and hub <= REMESH_MAX_HUB_RING_EDGES:
+        held = drift <= REMESH_MAX_AREA_DRIFT and hub <= REMESH_MAX_HUB_RING_EDGES
+        if held:
+            # Holding the area and the fan is not the same as handing on a
+            # surface the rest of the pipeline can work with. p398 cleared both
+            # on the first attempt and still came out with 34 non-manifold edges
+            # and an edge of 1e-06 mm, from an input that had none of either --
+            # and repairing that is what tore one of its ostia from circularity
+            # 0.980 to 0.181. So a torn attempt no longer ends the ladder: it is
+            # kept as the answer if nothing better turns up, and the remaining
+            # rungs are given the chance to produce a clean one.
+            topo = inspect_surface_topology(out)
+            n_nm = int(topo["n_nonmanifold"])
+            min_edge = float(topo["min_edge"])
+            intact = n_nm == 0 and min_edge >= MIN_EDGE_LENGTH_MM
+            if usable is None:
+                usable = (out, drift, hub, fraction, iters, conn, collapse, n_nm, min_edge)
+            if not intact:
+                torn = []
+                if n_nm:
+                    torn.append(f"{n_nm} non-manifold edge(s)")
+                if min_edge < MIN_EDGE_LENGTH_MM:
+                    torn.append(f"an edge of {min_edge:.2e} mm")
+                print(
+                    f"  NOTE: remesh at weld {fraction:.2f}, {iters} iterations, "
+                    f"collapse angle {collapse:.2f} held the {label} "
+                    f"({drift:.3f}x, fan {hub:.1f}) but left "
+                    + " and ".join(torn)
+                    + "; trying the next rung for a clean one"
+                )
+                continue
+        if held:
             if fraction > 0 or iters != n_iter or collapse != REMESH_COLLAPSE_ANGLE:
                 how = []
                 if collapse != REMESH_COLLAPSE_ANGLE:
@@ -6202,6 +6341,21 @@ def remesh_surface_verified(
             f"collapse angle {collapse:.2f} left the {label} with "
             + " and ".join(why)
         )
+    if usable is not None:
+        out, drift, hub, fraction, iters, conn, collapse, n_nm, min_edge = usable
+        torn = []
+        if n_nm:
+            torn.append(f"{n_nm} non-manifold edge(s)")
+        if min_edge < MIN_EDGE_LENGTH_MM:
+            torn.append(f"an edge of {min_edge:.2e} mm")
+        print(
+            f"  WARNING: no rung of the ladder remeshed the {label} without "
+            "tearing it; keeping the first that held the area and the fan "
+            f"(weld {fraction:.2f}, {iters} iterations, collapse angle "
+            f"{collapse:.2f}, {drift:.3f}x, fan {hub:.1f}) with "
+            + " and ".join(torn)
+        )
+        return out
     _score, out, drift, hub, fraction, iters, conn, collapse = best
     raise TemplateQualityError(
         f"isotropic remesh did not converge on the {label}: the closest attempt "
