@@ -591,8 +591,15 @@ def _fn_has_param(fn, name):
 
 
 def _forward_model(model, batch, sample=None):
-    """Run GraphVAE.forward. Pass `sample` when model.py exposes it (item 9)."""
-    fwd = model.forward
+    """Run GraphVAE.forward. Pass `sample` when model.py exposes it (item 9).
+
+    DDP's wrapper ``forward`` is ``(*inputs, **kwargs)`` and has no
+    ``reparameterize``. One GPU never wraps, so this only shows up on the
+    4-GPU job, on the validation-σ pass. Inspect and patch the inner module;
+    still call the wrapper so NCCL brackets the forward.
+    """
+    core = unwrap_model(model)
+    fwd = core.forward
     if _fn_has_param(fwd, "sample"):
         if sample is None:
             return model(batch)
@@ -606,28 +613,28 @@ def _forward_model(model, batch, sample=None):
     if (not want) and (not model.training):
         return model(batch)
 
-    orig = model.reparameterize
+    orig = core.reparameterize
     if want and _fn_has_param(orig, "sample"):
         def _forced(mu, logvar, *args, **kwargs):
             kwargs["sample"] = True
             return orig(mu, logvar, *args, **kwargs)
 
-        model.reparameterize = _forced
+        core.reparameterize = _forced
     elif want:
         def _sampled(mu, logvar, *args, **kwargs):
             std = torch.exp(0.5 * logvar)
             return mu + torch.randn_like(std) * std
 
-        model.reparameterize = _sampled
+        core.reparameterize = _sampled
     else:
         def _mu(mu, logvar, *args, **kwargs):
             return mu
 
-        model.reparameterize = _mu
+        core.reparameterize = _mu
     try:
         return model(batch)
     finally:
-        model.reparameterize = orig
+        core.reparameterize = orig
 
 
 def _accum_window_len(step, n_batches, accum_steps):

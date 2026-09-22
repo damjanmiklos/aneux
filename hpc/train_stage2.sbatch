@@ -65,9 +65,6 @@ export ANEUX_CACHE="${ANEUX_CACHE:-$REPO/1test_encoder_decoder_only/tube_cache}"
 export ANEUX_OUTPUT="${ANEUX_OUTPUT:-$REPO/1test_encoder_decoder_only/output}"
 echo "repo=$REPO"
 
-# Python: aneurysmgnn (Python 3.11, already on this cluster), then ~/aneuxai_env.
-# Do not `module load cuda` — a custom torch wheel already bundles it
-# (https://docs.hpc.dkf.hu/AI/pytorch.html).
 _source_conda() {
   local cand
   for cand in \
@@ -89,27 +86,33 @@ _source_conda() {
   return 1
 }
 
-_ANEurySMGNN=""
-for _cand in \
-  "${HOME}/.conda/envs/aneurysmgnn" \
-  "${HOME}/miniconda3/envs/aneurysmgnn" \
-  "${HOME}/anaconda3/envs/aneurysmgnn"
-do
-  if [[ -x "${_cand}/bin/python" ]]; then
-    _ANEurySMGNN="${_cand}"
-    break
-  fi
-done
-
-if [[ -n "$_ANEurySMGNN" ]] && _source_conda; then
-  conda activate aneurysmgnn
-  echo "env=aneurysmgnn"
-elif [[ -f "${HOME}/aneuxai_env/bin/activate" ]]; then
+# Python: the interactive env, ~/aneuxai_env. aneurysmgnn is only a fallback.
+# Do not `module load cuda` — that wheel already bundles CUDA
+# (https://docs.hpc.dkf.hu/AI/pytorch.html).
+# torchrun below is the same aneuxai_HPC.py, one process per GPU.
+if [[ -f "${HOME}/aneuxai_env/bin/activate" ]]; then
   # shellcheck disable=SC1091
   source "${HOME}/aneuxai_env/bin/activate"
   echo "env=aneuxai_env"
-else
-  echo "ERROR: no conda env aneurysmgnn and no ~/aneuxai_env" >&2
+elif _source_conda; then
+  _ANEurySMGNN=""
+  for _cand in \
+    "${HOME}/.conda/envs/aneurysmgnn" \
+    "${HOME}/miniconda3/envs/aneurysmgnn" \
+    "${HOME}/anaconda3/envs/aneurysmgnn"
+  do
+    if [[ -x "${_cand}/bin/python" ]]; then
+      _ANEurySMGNN="${_cand}"
+      break
+    fi
+  done
+  if [[ -n "$_ANEurySMGNN" ]]; then
+    conda activate aneurysmgnn
+    echo "env=aneurysmgnn"
+  fi
+fi
+if [[ -z "${VIRTUAL_ENV:-}" && -z "${CONDA_PREFIX:-}" ]]; then
+  echo "ERROR: no ~/aneuxai_env and no conda env aneurysmgnn" >&2
   exit 1
 fi
 python - <<'PY'

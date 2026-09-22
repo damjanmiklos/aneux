@@ -2013,6 +2013,29 @@ def test_decimation_keeps_profile_loops():
     _assert(n_c == n_loops0, f"coarse loops {n_c} vs {n_loops0}")
 
 
+def test_forward_model_passes_sample_through_ddp_wrapper():
+    """DDP hides GraphVAE.reparameterize; val-σ must still reach the inner forward."""
+    import torch.nn as nn
+    from train import _forward_model
+
+    class Inner(nn.Module):
+        def forward(self, data, sample=None):
+            return sample
+
+    class Wrap(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.module = Inner()
+
+        def forward(self, *args, **kwargs):
+            return self.module(*args, **kwargs)
+
+    wrap = Wrap()
+    wrap.eval()
+    _assert(_forward_model(wrap, None, sample=True) is True, "sample=True")
+    _assert(_forward_model(wrap, None, sample=False) is False, "sample=False")
+
+
 def test_reparameterize_eval_samples_and_logvar_floor():
     model = _tiny_model()
     model.eval()
@@ -2157,6 +2180,7 @@ def main():
         test_token_spacing_independent_of_length,
         test_ring_neighbour_eth_at_cube_edge,
         test_decimation_keeps_profile_loops,
+        test_forward_model_passes_sample_through_ddp_wrapper,
         test_reparameterize_eval_samples_and_logvar_floor,
         test_mixer_before_sampling,
         test_null_code_decodes_to_template,
