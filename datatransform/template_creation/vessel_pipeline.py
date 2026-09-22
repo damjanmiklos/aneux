@@ -6553,6 +6553,236 @@ def build_parent_tube(
     }
 
 
+# ---------------------------------------------------------------------------
+# Steps 8a-8c, as one retryable attempt
+# ---------------------------------------------------------------------------
+
+def enforce_min_edge(surface, floor=REMESH_MIN_EDGE_MM, label="template", report=True):
+    """Collapse the edges the remesher was told not to make.
+
+    ``remesh_surface_adaptively`` passes MinEdgeLength to vmtk, which turns it
+    into the MinArea the remesher reads, and the target-edge array is clamped
+    at the same floor -- so nothing in the configuration asks for an edge below
+    it. The remesher makes a few anyway. On p414 the shipped template carried
+    24 edges under 0.01 mm out of 104538, the shortest 0.002066 mm, in 22
+    triangles whose median area is a hundredth of the mesh's; none of them was
+    near a rim, so they are not a clipping artefact but slivers left behind in
+    a dense stretch zone.
+
+    Collapsing exactly those is measurably free: on p414 it merges 11 points,
+    lifts the shortest edge to 0.0105 mm, leaves the area identical to two
+    decimal places, the six openings, the fan reach and the non-manifold count
+    unchanged, and takes the sliver fraction from 3.56% to 3.49%. On C0088b and
+    SNF00000426_03, which have no sub-floor edge, it is a no-op and is skipped
+    outright, so a mesh that does not need it keeps its interpolated point
+    arrays.
+    """
+    poly = to_vtk_poly(surface)
+    # Measured on the merged mesh, because the remesher hands back a surface
+    # whose points are split per triangle corner -- p414 comes out of it with
+    # 70447 points that clean to 17534 -- and counting a collapse against that
+    # number would read as a catastrophe rather than the eleven points it is.
+    merged = to_vtk_poly(clean_triangulate(poly))
+    _p, pts, faces = _triangle_points_faces(merged)
+    if faces.size == 0:
+        return poly
+    edges = _triangle_edge_lengths(pts, faces)
+    n_short = int(np.count_nonzero(edges < float(floor)))
+    if n_short == 0:
+        return poly
+    shortest = float(edges.min())
+    out = to_vtk_poly(collapse_tiny_edges(merged, floor=float(floor)))
+    if report:
+        print(f"  Collapsed {n_short} edge(s) under the {floor} mm floor on the {label} "
+              f"(shortest was {shortest:.6f} mm): "
+              f"{merged.GetNumberOfPoints()} -> {out.GetNumberOfPoints()} points")
+    return out
+
+
+def _adaptive_remesh_ladder():
+    """Weld fraction and collapse angle to try, in order, gentlest first.
+
+    Same shape as the ground-truth path's ladder in vessel_pipeline, and for
+    the same reasons: the first rung is exactly what this pipeline did before,
+    so a template that already converges is remeshed byte for byte as it was
+    and pays nothing for this machinery. Switching the angle collapse off comes
+    next because it removes no geometry, and only then does the weld sweep run.
+
+    The difference here is what a rung costs. On the isotropic path a rung is
+    one remesh; here the weld merges points and VTK drops every point array
+    when it does, so a welded rung has to raycast the ground truth again before
+    it can remesh. That is the price of a rescue on a case that would otherwise
+    ship nothing, and the cache in the caller keeps rungs that share a weld
+    fraction from paying it twice.
+    """
+    off, on = REMESH_COLLAPSE_ANGLE_OFF, REMESH_COLLAPSE_ANGLE
+    first, rest = REMESH_WELD_FRACTIONS[0], REMESH_WELD_FRACTIONS[1:]
+    return ([(first, on), (first, off)]
+            + [(f, off) for f in rest]
+            + [(f, on) for f in rest])
+
+
+def build_template_supervision(base_surface, vessel_mesh, centerline,
+                               target_edge_length, min_edge, weld_fraction,
+                               prepare=None, announce=True):
+    """Weld the tube, then measure R_template, StretchDistance and the edge array on it.
+
+    The weld has to happen before the arrays and not after: weld_to_edge_fraction
+    merges points, and at 0.10 and above the surface comes back with no point
+    arrays at all. Everything the remesh is steered by therefore belongs to the
+    welded surface, which is also the honest thing -- the raycast should measure
+    the surface that is actually going to be remeshed.
+
+    ``prepare`` is for a caller that wants more than the target-edge array on
+    the surface before it is remeshed: it is handed the surface and the three
+    measurements and returns the surface to remesh. variable_remeshing uses it
+    to attach the supervision arrays, so VMTK interpolates them onto the new
+    vertices instead of the caller filling them in afterwards by nearest
+    neighbour.
+    """
+    surface = (to_vtk_poly(base_surface) if weld_fraction <= 0
+               else to_vtk_poly(weld_to_edge_fraction(base_surface, weld_fraction)))
+    if weld_fraction > 0:
+        print(f"  Welded the tube at {weld_fraction:.2f} of the mean edge: "
+              f"{to_vtk_poly(base_surface).GetNumberOfPoints()} -> "
+              f"{surface.GetNumberOfPoints()} points")
+    t_ray = time.perf_counter()
+    r_template = compute_template_local_radii(surface, centerline)
+    # The centerline has to go in. Without it the ray direction falls back to
+    # -unit_n, and vtkPolyDataNormals with AutoOrientNormalsOff cannot promise
+    # which way that points on an open surface; with it, every direction is
+    # oriented by the sign of n . (x - nearest centerline vertex), which is
+    # outward by construction. It also gates the compiled loop, which refuses
+    # to run unless both the template and the GT normals were radially
+    # oriented. vessel_pipeline's own variable path has always passed it -- this
+    # call was the one that did not.
+    stretch_distances = compute_raycast_stretch_distances(
+        surface, vessel_mesh, r_template=r_template, centerline=centerline,
+    )
+    print(f"  [t] radii+raycast {time.perf_counter() - t_ray:.2f}s")
+    if announce:
+        print(
+            f"Step 8b: Building stretch metric k = 1 + d / R_template "
+            f"(Base={target_edge_length} mm, Min={min_edge:.2f} mm)..."
+        )
+    surface_with_array, edge_lengths, stretch_factors = build_target_edge_array(
+        surface, stretch_distances, r_template,
+        base_edge=target_edge_length, min_edge=min_edge,
+    )
+    t_attach = time.perf_counter()
+    if prepare is not None:
+        surface_with_array = prepare(
+            surface_with_array, r_template, stretch_distances, edge_lengths
+        )
+    t_attach_s = time.perf_counter() - t_attach
+    pre_pts = np.ascontiguousarray(
+        vtk_to_numpy(to_vtk_poly(surface_with_array).GetPoints().GetData()),
+        dtype=np.float64,
+    )
+    thin = np.asarray(r_template) < 0.7
+    if np.any(thin):
+        print(
+            f"  Thin-branch target edges (R<0.7 mm): "
+            f"min/median/max={edge_lengths[thin].min():.3f}/"
+            f"{np.median(edge_lengths[thin]):.3f}/{edge_lengths[thin].max():.3f} mm "
+            f"n={int(thin.sum())}"
+        )
+    healthy = stretch_factors[stretch_distances < 0.3]
+    stretched = stretch_factors[stretch_distances >= 0.3]
+    mean_k_healthy = float(np.mean(healthy)) if healthy.size else 1.0
+    mean_k_stretch = float(np.mean(stretched)) if stretched.size else 1.0
+    print(
+        f"  -> Stretch Factor k metrics: Max k={float(np.max(stretch_factors)):.2f}, "
+        f"Healthy Vessel k={mean_k_healthy:.2f}, Stretched Zone k={mean_k_stretch:.2f}"
+    )
+    return {
+        "surface": surface_with_array,
+        "pre_pts": pre_pts,
+        "r_template": np.ascontiguousarray(r_template, dtype=np.float64).reshape(-1),
+        "stretch_distances": np.ascontiguousarray(
+            stretch_distances, dtype=np.float64).reshape(-1),
+        "edge_lengths": np.ascontiguousarray(edge_lengths, dtype=np.float64).reshape(-1),
+        "t_attach_s": t_attach_s,
+    }
+
+
+def supervise_and_remesh_verified(base_surface, vessel_mesh, centerline,
+                                  target_edge_length, min_edge, prepare=None,
+                                  dataset_id="template"):
+    """Adaptively remesh the parent tube, and reject a pass that diverged.
+
+    The array-driven remesher fails the same way the isotropic one does and was
+    never guarded for it. On C0088b the parent tube is sound -- 1454.6 mm^2
+    against a 1465 mm^2 vessel, one region, five clean loops, no non-manifold
+    edges -- and the adaptive remesh returned 12980.5 mm^2, 8.92x, with
+    triangles up to 111.5 mm^2 and a fan of 46 mm spokes. Every giant triangle
+    hung off one vertex on the r=1.7 mm opening, a vertex carrying two
+    triangles and a 0.025 mm sliver edge. Nothing downstream could tell what
+    had happened: the area gate blamed the polyball, which was innocent.
+
+    Welding that sliver out before the arrays are built fixes it completely --
+    0.99x, edge-length CV 0.305, no fan, all five openings -- so the cure is
+    the one the ground-truth path already uses, and it is applied the same way:
+    as a rescue that runs only after the configured settings have failed.
+    """
+    base_area = _surface_area(base_surface)
+    supervision = {}
+    best = None
+    for rung, (fraction, collapse) in enumerate(_adaptive_remesh_ladder()):
+        if fraction not in supervision:
+            if rung:
+                print(f"  Rebuilding the supervision arrays for a weld of "
+                      f"{fraction:.2f} of the mean edge...")
+            supervision[fraction] = build_template_supervision(
+                base_surface, vessel_mesh, centerline, target_edge_length,
+                min_edge, fraction, prepare=prepare, announce=(rung == 0),
+            )
+        sup = supervision[fraction]
+        if rung == 0:
+            print("Step 8c: Adaptively remeshing surface (ElementSizeMode='edgelengtharray')...")
+        t_rm = time.perf_counter()
+        remeshed = remesh_surface_adaptively(
+            sup["surface"], edge_array_name="TargetEdgeLength", collapse_angle=collapse,
+        )
+        remeshed = enforce_min_edge(remeshed, label="remeshed template")
+        t_rm_s = time.perf_counter() - t_rm
+        # Scored against the surface handed in, never against the welded one,
+        # so a weld that ate geometry cannot pass by flattering itself.
+        after = _surface_area(remeshed)
+        drift = after / base_area if base_area > 0 else float("inf")
+        fan = worst_hub_ring_edges(remeshed)
+        score = (abs(drift - 1.0), fan)
+        if best is None or score < best[0]:
+            best = (score, remeshed, sup, t_rm_s, drift, fan, fraction, collapse)
+        if drift <= REMESH_MAX_AREA_DRIFT and fan <= REMESH_MAX_HUB_RING_EDGES:
+            if rung:
+                how = []
+                if collapse != REMESH_COLLAPSE_ANGLE:
+                    how.append("switching the angle collapse off")
+                if fraction > 0:
+                    how.append(f"welding at {fraction:.2f} of the mean edge")
+                print("  NOTE: the adaptive remesh diverged as configured; "
+                      + " and ".join(how)
+                      + f" held it ({drift:.3f}x, widest fan {fan:.1f} edges)")
+            return remeshed, sup, t_rm_s
+        why = []
+        if drift > REMESH_MAX_AREA_DRIFT:
+            why.append(f"area {drift:.2f}x ({base_area:.1f} -> {after:.1f} mm^2)")
+        if fan > REMESH_MAX_HUB_RING_EDGES:
+            why.append(f"a triangle fan reaching {fan:.1f} mean edges")
+        print(f"  WARNING: adaptive remesh at weld {fraction:.2f}, collapse angle "
+              f"{collapse:.2f} left the template with " + " and ".join(why))
+    _score, _remeshed, _sup, _t, drift, fan, fraction, collapse = best
+    raise TemplateQualityError(
+        f"adaptive remesh did not converge on the parent tube: the closest "
+        f"attempt (weld {fraction:.2f} of the mean edge, collapse angle "
+        f"{collapse:.2f}) still changed the area {drift:.2f}x and left a "
+        f"triangle fan reaching {fan:.1f} mean edges. The tube itself is not "
+        f"what failed here; the remesher is.",
+        dataset_id=dataset_id,
+    )
+
+
 @with_dataset_id
 def process_variable_dataset(
     dataset_id,
@@ -6599,48 +6829,16 @@ def process_variable_dataset(
         )
 
     print("Step 8a: Computing local tube radius and raycasting stretch vs ground truth...")
-    t_ray = time.perf_counter()
-    r_template = compute_template_local_radii(open_base_surface, branched_centerline)
-    stretch_distances = compute_raycast_stretch_distances(
+    min_edge = REMESH_MIN_EDGE_MM
+    remeshed_surface, _supervision, t_rm_s = supervise_and_remesh_verified(
         open_base_surface,
         vessel_mesh,
-        r_template=r_template,
-        centerline=branched_centerline,
+        branched_centerline,
+        target_edge_length,
+        min_edge,
+        dataset_id=dataset_id,
     )
-    print(f"  [t] radii+raycast {time.perf_counter() - t_ray:.2f}s")
-    min_edge = REMESH_MIN_EDGE_MM
-    print(
-        f"Step 8b: Building stretch metric k = 1 + d / R_template "
-        f"(Base={target_edge_length} mm, Min={min_edge:.2f} mm)..."
-    )
-    surface_with_array, edge_lengths, stretch_factors = build_target_edge_array(
-        open_base_surface,
-        stretch_distances,
-        r_template,
-        base_edge=target_edge_length,
-        min_edge=min_edge,
-    )
-    thin = np.asarray(r_template) < 0.7
-    if np.any(thin):
-        print(
-            f"  Thin-branch target edges (R<0.7 mm): "
-            f"min/median/max={edge_lengths[thin].min():.3f}/"
-            f"{np.median(edge_lengths[thin]):.3f}/{edge_lengths[thin].max():.3f} mm "
-            f"n={int(thin.sum())}"
-        )
-    healthy = stretch_factors[stretch_distances < 0.3]
-    stretched = stretch_factors[stretch_distances >= 0.3]
-    mean_k_healthy = float(np.mean(healthy)) if healthy.size else 1.0
-    mean_k_stretch = float(np.mean(stretched)) if stretched.size else 1.0
-    print(
-        f"  -> Stretch Factor k metrics: Max k={float(np.max(stretch_factors)):.2f}, "
-        f"Healthy Vessel k={mean_k_healthy:.2f}, Stretched Zone k={mean_k_stretch:.2f}"
-    )
-
-    print("Step 8c: Adaptively remeshing surface (ElementSizeMode='edgelengtharray')...")
-    t_rm = time.perf_counter()
-    remeshed_surface = remesh_surface_adaptively(surface_with_array, edge_array_name="TargetEdgeLength")
-    print(f"  [t] remesh {time.perf_counter() - t_rm:.2f}s")
+    print(f"  [t] remesh {t_rm_s:.2f}s")
     print(f"  -> Adaptive remeshed surface points: {remeshed_surface.GetNumberOfPoints()}")
     remesh_openings = inspect_openings(remeshed_surface)
     print(
