@@ -911,16 +911,19 @@ _MIRROR_PAIRS = (
 
 
 def maybe_apply_cached_mirror(batch, p=0.5, generator=None):
-    """Use a dataset-cached L/R mirror if present. Do not rebuild scaffolds."""
-    has_mirror = False
-    for _, mirrored in _MIRROR_PAIRS:
-        if _batch_tensor(batch, mirrored) is not None:
-            has_mirror = True
-            break
+    """Swap in a cached L/R mirror. No-op unless the tube scaffold is mirrored too.
+
+    Current caches store ``gt_*_mirror`` only. ``resample_x_true`` then draws
+    the Chamfer target from that flipped cloud while ``x`` / ``theta`` stay in
+    the original frame, so train recon is computed against the reflected
+    aneurysm. Require ``x_mirror``, or a packed mirror that includes ``x``.
+    """
     packed = getattr(batch, "mirrored_sample", None)
-    if packed is not None:
-        has_mirror = True
-    if not has_mirror:
+    packed_x = packed.get("x") if isinstance(packed, dict) else None
+    has_scaffold = _batch_tensor(batch, "x_mirror") is not None or (
+        torch.is_tensor(packed_x) and packed_x.numel() > 0
+    )
+    if not has_scaffold:
         return batch
     draw = torch.rand((), generator=generator)
     if float(draw.item()) >= float(p):

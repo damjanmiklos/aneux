@@ -54,11 +54,19 @@ def init_distributed(backend=None):
     if backend is None:
         backend = "nccl" if torch.cuda.is_available() else "gloo"
     local = env_local_rank()
+    idx = None
     if torch.cuda.is_available():
         nvis = torch.cuda.device_count()
         idx = 0 if nvis <= 1 else max(0, min(local, nvis - 1))
         torch.cuda.set_device(idx)
-    dist.init_process_group(backend=backend, init_method="env://")
+    init_kwargs = {}
+    if idx is not None and backend == "nccl":
+        # PyTorch 2.11 warns on barrier() unless the group knows its device.
+        init_kwargs["device_id"] = torch.device("cuda", idx)
+    try:
+        dist.init_process_group(backend=backend, init_method="env://", **init_kwargs)
+    except TypeError:
+        dist.init_process_group(backend=backend, init_method="env://")
     if torch.cuda.is_available():
         nvis = torch.cuda.device_count()
         idx = 0 if nvis <= 1 else max(0, min(env_local_rank(), nvis - 1))

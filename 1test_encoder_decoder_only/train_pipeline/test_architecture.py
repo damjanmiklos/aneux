@@ -1477,6 +1477,31 @@ def test_resource_monitor_snapshots_on_this_os():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_mirror_aug_requires_scaffold():
+    """GT-only mirrors must not flip the Chamfer target out from under the tube."""
+    from train import maybe_apply_cached_mirror
+
+    class Batch:
+        pass
+
+    gt_only = Batch()
+    gt_only.x = torch.tensor([[1.0, 0.0, 0.0]])
+    gt_only.gt_points = torch.tensor([[1.0, 2.0, 3.0]])
+    gt_only.gt_points_mirror = torch.tensor([[-1.0, 2.0, 3.0]])
+    kept = maybe_apply_cached_mirror(gt_only, p=1.0)
+    _assert(torch.equal(kept.x, torch.tensor([[1.0, 0.0, 0.0]])), kept.x)
+    _assert(torch.equal(kept.gt_points, torch.tensor([[1.0, 2.0, 3.0]])), kept.gt_points)
+
+    full = Batch()
+    full.x = torch.tensor([[1.0, 0.0, 0.0]])
+    full.x_mirror = torch.tensor([[-1.0, 0.0, 0.0]])
+    full.gt_points = torch.tensor([[1.0, 2.0, 3.0]])
+    full.gt_points_mirror = torch.tensor([[-1.0, 2.0, 3.0]])
+    swapped = maybe_apply_cached_mirror(full, p=1.0)
+    _assert(torch.equal(swapped.x, torch.tensor([[-1.0, 0.0, 0.0]])), swapped.x)
+    _assert(torch.equal(swapped.gt_points, torch.tensor([[-1.0, 2.0, 3.0]])), swapped.gt_points)
+
+
 def test_add_meter_accepts_fold_and_stretch():
     from train import _add_meter, _flush_meters, _zero_tensor_meters
 
@@ -2157,6 +2182,7 @@ def main():
         test_geco_beta_not_clipped_to_zero_at_epoch_one,
         test_scale_hpc_workers_follows_gpus,
         test_resource_monitor_snapshots_on_this_os,
+        test_mirror_aug_requires_scaffold,
         test_add_meter_accepts_fold_and_stretch,
         test_chamfer_weight_cap,
         test_huber_and_radial_loss,
