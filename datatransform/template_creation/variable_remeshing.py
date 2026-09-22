@@ -42,6 +42,12 @@ from aneux_paths import (
     CLEANDATA_UNIFORM,
 )
 
+from batch_run_log import (
+    add_run_log_args,
+    configure_batch_logging,
+    finalize_run_logs,
+)
+
 from vessel_pipeline import (
     DEFAULT_EXTENSION_LENGTH,
     DEFAULT_GRID_SPACING,
@@ -69,6 +75,11 @@ from vessel_pipeline import (
     with_dataset_id,
 )
 
+
+# Its own folder: the GT path writes "gt_remesh_logs" beside the same output
+# root, and a template run that shared it would overwrite the transcripts of
+# the run its inputs came from.
+LOG_FOLDER = "template_remesh_logs"
 
 TEMPLATE_POINT_ARRAYS = ("R_template", "StretchDistance", "TargetEdgeLength")
 OSTIUM_FRAMES_SUFFIX = ".ostium_frames.npz"
@@ -767,8 +778,15 @@ def main():
         default=None,
         help="Explicit {stem}.ostium_frames.npz for --case (overrides directory search).",
     )
+    add_run_log_args(parser, LOG_FOLDER)
     parser.set_defaults(vessel_dir=CLEANDATA_UNIFORM, from_folder=True)
     args = parser.parse_args()
+    # Keeps every worker's stdout, which is where the per-case raycast
+    # diagnostics are printed. Without it only a failing case leaves a trace
+    # and the passing 700 cannot be audited at all.
+    extra_log, on_worker_result = configure_batch_logging(
+        args, LOG_FOLDER, DEFAULT_OUTPUT_DIR
+    )
     extra = [
         "--target-edge-length", str(args.target_edge_length),
         "--extension-length", str(args.extension_length),
@@ -776,12 +794,21 @@ def main():
         "--grid-spacing", str(args.grid_spacing),
         "--max-grid-size", str(args.max_grid_size),
         "--speedups" if args.speedups else "--no-speedups",
-    ]
+    ] + extra_log
     if args.cut_frames_dir:
         extra.extend(["--cut-frames-dir", str(args.cut_frames_dir)])
     if args.cut_frames_file:
         extra.extend(["--cut-frames-file", str(args.cut_frames_file)])
-    run_batch(os.path.abspath(__file__), _process_one, args, extra)
+    try:
+        run_batch(
+            os.path.abspath(__file__),
+            _process_one,
+            args,
+            extra,
+            on_worker_result=on_worker_result,
+        )
+    finally:
+        finalize_run_logs(args)
 
 
 if __name__ == "__main__":

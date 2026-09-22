@@ -6788,6 +6788,87 @@ def worst_hub_ring_edges(surface, hub_valence=REMESH_HUB_VALENCE):
             worst = reach
     return worst
 
+# How much longer than the length asked for there the worst edge may be.
+#
+# worst_hub_ring_edges averages a fan's ring, so a fan that is mostly tight and
+# reaches far in a few directions hides inside its own mean. p391 stitches a
+# slit with a 33-triangle fan whose longest ring edge is 5.118 mm in a mesh
+# averaging 0.311; the hub metric reads 6.33 against a limit of 12 and the
+# template ships. Measured against the target edge length the remesher was
+# asked for at that edge, the same mesh reads 21.36.
+#
+# Over the 695 delivered templates the separation is wide and one-sided:
+#
+#     p391      21.36
+#     next      8.14 (SNF00000388), then 8.09, 7.73, 7.57
+#     p99       7.23
+#     median    3.89
+#
+# so 12 sits with a factor of 1.5 above every legitimate template and 1.8 below
+# the one defect. It selects p391 and nothing else, which is what a rescue
+# trigger has to do: the ladder below it is free to cost a rung only on a case
+# that would otherwise ship a blade through its lumen.
+REMESH_MAX_LOCAL_EDGE_RATIO = 12.0
+
+
+def worst_local_edge_ratio(surface, array_name="TargetEdgeLength", reference=None):
+    """The longest edge as a multiple of the edge length asked for there.
+
+    Zero when neither the surface nor ``reference`` carries a target array, so
+    a caller on the isotropic path measures nothing and is unaffected.
+
+    ``reference`` is the surface the remesh was asked to honour. It is needed
+    because vmtkSurfaceRemeshing does not carry point arrays through: its
+    output has no TargetEdgeLength at all, and the array only comes back later
+    when the supervision is restored. Measuring the raw output on its own
+    therefore always read 0.0 and the gate could never fire -- which is exactly
+    how p391 shipped a 6.5 mm edge past it. Sampling the reference field at the
+    remeshed points by nearest neighbour asks the right question instead: how
+    long is this edge against the length that was requested where it lies.
+
+    Runs on the uncleaned triangles on purpose. vmtkSurfaceRemeshing leaves
+    orphan points behind, so welding here would renumber the points out of step
+    with the target array; skipping the weld keeps them aligned. Any duplicate
+    point the weld would have merged shows up as a zero-length edge, which can
+    only pull the maximum down, never push it up.
+    """
+    poly = to_vtk_poly(surface)
+    arr = poly.GetPointData().GetArray(array_name)
+    _p, pts, faces = _triangle_points_faces(poly, clean=False)
+    if faces.size == 0:
+        return 0.0
+    if arr is not None and arr.GetNumberOfTuples() == len(pts):
+        target = np.asarray(vtk_to_numpy(arr), dtype=float).ravel()
+    elif reference is not None:
+        from scipy.spatial import cKDTree
+
+        ref = to_vtk_poly(reference)
+        ref_arr = ref.GetPointData().GetArray(array_name)
+        if ref_arr is None:
+            return 0.0
+        ref_pts = np.asarray(
+            vtk_to_numpy(ref.GetPoints().GetData()), dtype=float
+        )
+        ref_target = np.asarray(vtk_to_numpy(ref_arr), dtype=float).ravel()
+        if len(ref_pts) != len(ref_target) or not len(ref_pts):
+            return 0.0
+        _d, nearest = cKDTree(ref_pts).query(pts, k=1, workers=1)
+        target = ref_target[nearest]
+    else:
+        return 0.0
+    if len(target) != len(pts):
+        return 0.0
+    pairs = np.concatenate(
+        [faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]]
+    )
+    lengths = np.linalg.norm(pts[pairs[:, 0]] - pts[pairs[:, 1]], axis=1)
+    asked = 0.5 * (target[pairs[:, 0]] + target[pairs[:, 1]])
+    usable = asked > 1e-9
+    if not np.any(usable):
+        return 0.0
+    return float(np.max(lengths[usable] / asked[usable]))
+
+
 # What actually defeats vmtkSurfaceRemeshing on these surfaces is edges far
 # shorter than the mesh they sit in, and the tolerance that clears them has to
 # be measured in that mesh's own units. WELD_TOLERANCE_MM is a fixed 1e-3 mm,
@@ -8015,10 +8096,14 @@ def supervise_and_remesh_verified(base_surface, vessel_mesh, centerline,
         after = _surface_area(remeshed)
         drift = after / base_area if base_area > 0 else float("inf")
         fan = worst_hub_ring_edges(remeshed)
-        score = (abs(drift - 1.0), fan)
+        ratio = worst_local_edge_ratio(remeshed, reference=sup["surface"])
+        score = (abs(drift - 1.0), fan, ratio)
         if best is None or score < best[0]:
-            best = (score, remeshed, sup, t_rm_s, drift, fan, fraction, collapse)
-        if drift <= REMESH_MAX_AREA_DRIFT and fan <= REMESH_MAX_HUB_RING_EDGES:
+            best = (score, remeshed, sup, t_rm_s, drift, fan, fraction, collapse,
+                    ratio)
+        if (drift <= REMESH_MAX_AREA_DRIFT
+                and fan <= REMESH_MAX_HUB_RING_EDGES
+                and ratio <= REMESH_MAX_LOCAL_EDGE_RATIO):
             if rung:
                 how = []
                 if collapse != REMESH_COLLAPSE_ANGLE:
@@ -8034,14 +8119,20 @@ def supervise_and_remesh_verified(base_surface, vessel_mesh, centerline,
             why.append(f"area {drift:.2f}x ({base_area:.1f} -> {after:.1f} mm^2)")
         if fan > REMESH_MAX_HUB_RING_EDGES:
             why.append(f"a triangle fan reaching {fan:.1f} mean edges")
+        if ratio > REMESH_MAX_LOCAL_EDGE_RATIO:
+            why.append(
+                f"an edge {ratio:.1f}x the length asked for there"
+            )
         print(f"  WARNING: adaptive remesh at weld {fraction:.2f}, collapse angle "
               f"{collapse:.2f} left the template with " + " and ".join(why))
-    _score, _remeshed, _sup, _t, drift, fan, fraction, collapse = best
+    (_score, _remeshed, _sup, _t, drift, fan, fraction, collapse,
+     ratio) = best
     raise TemplateQualityError(
         f"adaptive remesh did not converge on the parent tube: the closest "
         f"attempt (weld {fraction:.2f} of the mean edge, collapse angle "
-        f"{collapse:.2f}) still changed the area {drift:.2f}x and left a "
-        f"triangle fan reaching {fan:.1f} mean edges. The tube itself is not "
+        f"{collapse:.2f}) still changed the area {drift:.2f}x, left a "
+        f"triangle fan reaching {fan:.1f} mean edges and an edge {ratio:.1f}x "
+        f"the length asked for there. The tube itself is not "
         f"what failed here; the remesher is.",
         dataset_id=dataset_id,
     )
