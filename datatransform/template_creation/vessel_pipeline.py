@@ -5252,12 +5252,12 @@ def clip_flow_extensions_and_uncap(
                     f"  [Uncap] Profile {profile['index']} pipe-section cut "
                     f"r={radius:.3f} mm at {np.round(origin, 2)}"
                 )
-        if ok and rim_circularity_at(current, where) < OSTIUM_ROUND_ENOUGH:
+        ragged = rim_circularity_at(current, where) if ok else 1.0
+        if ragged < OSTIUM_ROUND_ENOUGH:
             # The cut was taken, but the hole it made is not an opening shape.
             # Try the plane clip from the surface as it stood and keep whichever
             # rim is rounder; on p531 that is the difference between a 0.199 rim
             # 21.2 mm around and the ostium the input actually has.
-            ragged = rim_circularity_at(current, where)
             alternative, alt_ok = clip_one_profile(before, profile, body_pt, search_mm)
             if alt_ok:
                 rounder = rim_circularity_at(alternative, where)
