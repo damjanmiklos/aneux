@@ -84,8 +84,10 @@ from vessel_pipeline import (
     extract_branches,
     extract_centerlines_for_tube,
     boundary_point_cloud,
+    recompute_point_normals,
     reconcile_profiles_with_loops,
     find_repair_tears,
+    enforce_min_edge,
     finalize_surface,
     inspect_openings,
     load_ostium_frames,
@@ -491,6 +493,14 @@ def process_gt_remesh_dataset(
 
     _set_step("7_finalize_and_save")
     final_surface, _n_regions = finalize_surface(remeshed, profiles=gt_profiles)
+    # finalize_surface welds at WELD_TOLERANCE_MM, a hundredth of the edge the
+    # remesher was told to hold, so what it leaves behind can still be ten times
+    # under the floor: 26 of the 55 surfaces in the validation run shipped with
+    # one, the worst at 0.001002 mm. Folding them is checked before it is kept,
+    # so a surface that cannot be improved is returned exactly as it was.
+    folded = enforce_min_edge(final_surface, label="GT surface")
+    if folded is not final_surface:
+        final_surface = recompute_point_normals(folded, auto_orient=False)
     assert_gt_remesh_scale(final_surface, original, context=dataset_id)
     openings = assert_template_quality(final_surface, context=dataset_id)
     log_opening_planarity(final_surface, ostium_frames)

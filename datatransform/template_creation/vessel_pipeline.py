@@ -2467,7 +2467,9 @@ def _collapse_micro_clusters(points, faces, floor):
     return pts[used], compact.reshape(kept.shape)
 
 
-def collapse_tiny_edges(surface, floor=WELD_TOLERANCE_MM, max_sweeps=WELD_MAX_SWEEPS):
+def collapse_tiny_edges(
+    surface, floor=WELD_TOLERANCE_MM, max_sweeps=WELD_MAX_SWEEPS, allow_cuts=True
+):
     """Collapse edges shorter than ``floor`` without ever fusing two sheets.
 
     A sub-micron edge has to go. VMTK's boundary-preserving remesh keeps every
@@ -2524,7 +2526,17 @@ def collapse_tiny_edges(surface, floor=WELD_TOLERANCE_MM, max_sweeps=WELD_MAX_SW
             blocked.update({u, v})
             blocked |= nbr[u] | nbr[v]
         if not chosen:
-            # Every short edge left is pinched. Break the pinch and retry.
+            # Every short edge left is pinched. Break the pinch and retry --
+            # unless the caller forbade it. Both fallbacks below cut geometry
+            # rather than fold it, which is the right trade at the sub-micron
+            # floor this function was written for and the wrong one at a floor
+            # a hundred times larger: swept at 0.01 mm over the 26 GT surfaces
+            # that carry a sub-floor edge, the cuts tore UPF_P0171.00_ID1 open
+            # from 6 rims to 7 and p469 from 6 to 11, taking their worst
+            # circularity from 0.93 and 0.98 to 0.02. A fold can only ever
+            # shorten the mesh; a cut can open it.
+            if not allow_cuts:
+                return poly
             split = _unpinch_split(points, faces, cand, nbr, apex, floor)
             if split is None:
                 split = _collapse_micro_clusters(points, faces, floor)
@@ -2787,6 +2799,221 @@ def _loop_at_a_profile(bary, profiles, radius=None, n_points=None):
             continue
         return True
     return False
+
+
+def _rim_graph(surface):
+    """Boundary vertices, their rim edges, and the degree of each, by point id."""
+    poly = clean_triangulate(surface)
+    _p, pts, faces = _triangle_points_faces(poly)
+    if faces.size == 0:
+        return poly, pts, faces, np.empty((0, 2), dtype=np.int64)
+    ev = np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
+    key = np.sort(ev, axis=1)
+    uniq, counts = np.unique(key, axis=0, return_counts=True)
+    return poly, pts, faces, uniq[counts == 1]
+
+
+def branching_rims(surface, report=False):
+    """Rim components that are not a simple cycle, i.e. a slit joined to a rim.
+
+    A boundary vertex with three or more rim edges on it is the seam of a tear
+    that reaches an opening. Every edge on it still has exactly one face, so the
+    surface is manifold and ``assert_template_quality`` sees nothing; the rim,
+    though, is no longer a loop. On p398 four such vertices took an ostium that
+    left the remesher at circularity 0.997 down to 0.181, its perimeter from
+    6.08 mm to 14.26 mm, because ``extract_boundary_loops`` measures a rim
+    component and the component had grown five extra cycles.
+    """
+    _poly, _pts, _faces, rim = _rim_graph(surface)
+    if rim.size == 0:
+        return 0
+    deg = np.bincount(rim.ravel())
+    branch = np.flatnonzero(deg > 2)
+    if branch.size == 0:
+        return 0
+    comp = _rim_components(rim, deg.size)
+    n = len(set(comp[b] for b in branch))
+    if report:
+        print(f"  {n} rim component(s) branch at {branch.size} vertex/vertices")
+    return n
+
+
+def _rim_components(rim, n_points):
+    """Component label per point id over the rim graph (-1 off the rim)."""
+    parent = np.arange(n_points, dtype=np.int64)
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for u, v in rim:
+        ru, rv = find(int(u)), find(int(v))
+        if ru != rv:
+            parent[ru] = rv
+    label = np.full(n_points, -1, dtype=np.int64)
+    for pid in np.unique(rim):
+        label[pid] = find(int(pid))
+    return label
+
+
+def _shortest_rim_ear(rim, pts, b):
+    """The shortest cycle through rim vertex ``b``, as a list of point ids.
+
+    Straight Dijkstra on the rim graph with ``b`` removed, between each pair of
+    its neighbours: the cheapest pair plus the two edges back to ``b`` is the
+    smallest loop the branch closes, which is the tear rather than the ostium.
+    """
+    import heapq
+
+    adj = {}
+    for u, v in rim:
+        adj.setdefault(int(u), []).append(int(v))
+        adj.setdefault(int(v), []).append(int(u))
+    nbrs = adj.get(int(b), [])
+    if len(nbrs) < 2:
+        return None
+    best = None
+    for i, src in enumerate(nbrs):
+        dist = {src: 0.0}
+        prev = {}
+        heap = [(0.0, src)]
+        targets = set(nbrs[i + 1:])
+        seen = set()
+        while heap and targets - seen:
+            d, u = heapq.heappop(heap)
+            if u in seen:
+                continue
+            seen.add(u)
+            for w in adj.get(u, []):
+                if w == int(b) or w in seen:
+                    continue
+                nd = d + float(np.linalg.norm(pts[u] - pts[w]))
+                if nd < dist.get(w, np.inf):
+                    dist[w] = nd
+                    prev[w] = u
+                    heapq.heappush(heap, (nd, w))
+        for dst in nbrs[i + 1:]:
+            if dst not in dist:
+                continue
+            total = (dist[dst]
+                     + float(np.linalg.norm(pts[int(b)] - pts[src]))
+                     + float(np.linalg.norm(pts[int(b)] - pts[dst])))
+            if best is None or total < best[0]:
+                chain, node = [dst], dst
+                while node != src:
+                    node = prev[node]
+                    chain.append(node)
+                best = (total, [int(b)] + chain)
+    return None if best is None else best[1]
+
+
+def unbranch_rims(
+    surface, label="surface", profiles=None, min_radius=WALL_PINHOLE_RADIUS_MM,
+    max_ears=32,
+):
+    """Close the tears that hang off an opening's rim.
+
+    ``collapse_pinhole_loops`` reaches a puncture that shares a rim component
+    with an ostium only when the boundary extractor still splits the component
+    into loops, and it does not: loops are the components now, which is what
+    stopped rims being thrown away mid-walk. So a tear welded onto an ostium is
+    measured together with it -- the component is enormous by pinhole standards
+    -- and no pass closes it. This one finds the smallest cycle through each
+    branch vertex instead, which is the tear and not the opening.
+
+    The tear is fanned shut, not welded to a point. Welding fuses two rim
+    vertices, which is a non-manifold edge, and the manifold repair then cuts
+    triangles off and opens the next tear: on p398 that chased itself through
+    sixteen welds and left the rim branching anyway. A fan only adds triangles,
+    so nothing downstream has to cut.
+    """
+    current = clean_triangulate(surface)
+    closed = 0
+    for _ in range(int(max_ears)):
+        poly, pts, faces, rim = _rim_graph(current)
+        if rim.size == 0:
+            break
+        deg = np.bincount(rim.ravel(), minlength=len(pts))
+        branch = np.flatnonzero(deg > 2)
+        if branch.size == 0:
+            break
+        # How big a tear may be is set by the rim it hangs off, not by a
+        # constant: an ear is worth closing when it is small beside its own
+        # opening. p398's is 0.426 mm against an ostium of 0.97 mm, which no
+        # fixed pinhole radius would reach without also reaching real anatomy
+        # elsewhere in the dataset.
+        comp = _rim_components(rim, len(pts))
+        comp_limit = {}
+        for c in np.unique(comp[comp >= 0]):
+            member = pts[comp == c]
+            radius = float(np.mean(np.linalg.norm(member - member.mean(axis=0), axis=1)))
+            comp_limit[int(c)] = max(float(min_radius), 0.5 * radius)
+        ear = None
+        for b in branch:
+            cycle = _shortest_rim_ear(rim, pts, int(b))
+            if cycle is None or len(cycle) < 3:
+                continue
+            ring = []
+            for pid in cycle:
+                if pid not in ring:
+                    ring.append(int(pid))
+            if len(ring) < 3:
+                continue
+            coords = pts[np.asarray(ring, dtype=np.int64)]
+            centre = coords.mean(axis=0)
+            radius = float(np.mean(np.linalg.norm(coords - centre, axis=1)))
+            # Radius only, never the point count. ``_is_wall_pinhole`` also
+            # calls a loop of under six points a pinhole, which is right for a
+            # free-standing rim and wrong here: an ear is a cycle through one
+            # branch vertex, so three and four point cycles are the normal case
+            # whatever their size. Judged that way p469 fanned twenty-four of
+            # them and took a 0.977 rim to 0.001.
+            if radius >= comp_limit.get(int(comp[int(b)]), float(min_radius)):
+                continue
+            if _loop_at_a_profile(centre, profiles, radius=radius, n_points=len(ring)):
+                continue
+            if ear is None or radius < ear[2]:
+                ear = (ring, centre, radius)
+        if ear is None:
+            break
+        ring, centre, radius = ear
+        pts_list = pts.tolist()
+        pts_list.append(centre.tolist())
+        apex = len(pts_list) - 1
+        new_faces = faces.tolist()
+        for k in range(len(ring)):
+            new_faces.append([ring[k], ring[(k + 1) % len(ring)], apex])
+        current = clean_triangulate(_polydata_from_triangles(
+            np.asarray(pts_list, dtype=np.float64),
+            np.asarray(new_faces, dtype=np.int64).reshape(-1, 3),
+        ))
+        closed += 1
+        print(f"  Fanned a {len(ring)}-point tear (r={radius:.4f} mm) off a rim "
+              f"on the {label}")
+    if closed == 0:
+        return clean_triangulate(surface), 0
+    # Checked, not trusted: the same rule the rest of these repairs now follow.
+    # A fan that leaves fewer openings, a rounder rim somewhere else at the cost
+    # of this one, or a new non-manifold edge is not a repair.
+    before = clean_triangulate(surface)
+    before_rims, before_circ = _rim_shape(before)
+    after_rims, after_circ = _rim_shape(current)
+    harm = None
+    if after_rims != before_rims:
+        harm = f"openings {before_rims} -> {after_rims}"
+    elif after_circ < before_circ - 1e-6:
+        harm = f"worst rim circularity {before_circ:.3f} -> {after_circ:.3f}"
+    elif int(inspect_surface_topology(current)["n_nonmanifold"]) > int(
+        inspect_surface_topology(before)["n_nonmanifold"]
+    ):
+        harm = "a new non-manifold edge"
+    if harm is not None:
+        print(f"  NOTE: fanning {closed} rim tear(s) on the {label} would cost {harm}; "
+              "left the rims as they were")
+        return before, 0
+    return current, closed
 
 
 def _is_wall_pinhole(loop, min_radius, profiles=None):
@@ -6203,7 +6430,16 @@ def _finalize_defects(surface, profiles, n_regions):
 
     Ordered so that a straight tuple comparison picks the better surface:
     non-manifold edges first (the remesher amplifies them), then holes that are
-    not anatomy, then extra shells, then degenerate edges.
+    not anatomy, then rims a tear has branched, then extra shells, then
+    degenerate edges.
+
+    A branching rim ranks above an extra shell because it is an opening that has
+    stopped being one. Every edge on it still has a single face, so the
+    non-manifold count is zero and the loop count is right; it is only when the
+    rim is measured as a shape that the damage shows. On p398 an ostium left the
+    remesher at circularity 0.997 and the repairs below handed it on at 0.181,
+    and this tuple -- which reached (0, 0, 0, 0) on that surface -- called it
+    finished.
     """
     topo = inspect_surface_topology(surface)
     extra = [
@@ -6214,6 +6450,7 @@ def _finalize_defects(surface, profiles, n_regions):
     return (
         int(topo["n_nonmanifold"]),
         len(extra),
+        branching_rims(surface),
         max(int(n_regions) - 1, 0),
         0 if topo["min_edge"] >= MIN_EDGE_LENGTH_MM else 1,
     )
@@ -6253,7 +6490,7 @@ def finalize_surface(surface, profiles=None, max_passes=6):
     best_defects = _finalize_defects(cleaned, profiles, n_regions)
     seen = set()
     for _ in range(int(max_passes)):
-        if best_defects == (0, 0, 0, 0):
+        if not any(best_defects):
             break
         signature = (
             cleaned.GetNumberOfPoints(),
@@ -6273,6 +6510,9 @@ def finalize_surface(surface, profiles=None, max_passes=6):
         cleaned, _n_pin = close_wall_pinholes(
             cleaned, label="remeshed surface", profiles=profiles
         )
+        cleaned, _n_ears = unbranch_rims(
+            cleaned, label="remeshed surface", profiles=profiles
+        )
         if profiles:
             cleaned, _n_left = remove_spurious_openings(cleaned, profiles)
         cleaned, _min_edge = weld_degenerate_vertices(cleaned)
@@ -6282,7 +6522,7 @@ def finalize_surface(surface, profiles=None, max_passes=6):
         defects = _finalize_defects(cleaned, profiles, n_regions)
         if defects < best_defects:
             best, best_regions, best_defects = cleaned, n_regions, defects
-        if defects == (0, 0, 0, 0):
+        if not any(defects):
             break
     best = strip_all_arrays(best)
     best = recompute_point_normals(best, auto_orient=False)
@@ -6557,8 +6797,31 @@ def build_parent_tube(
 # Steps 8a-8c, as one retryable attempt
 # ---------------------------------------------------------------------------
 
+def _rim_shape(poly):
+    """(number of rim loops, worst circularity) -- what a bad collapse ruins."""
+    ring = extract_boundary_loops(poly)
+    worst = 1.0
+    n = ring.GetNumberOfCells()
+    for k in range(n):
+        cell = ring.GetCell(k)
+        co = np.array(
+            [ring.GetPoint(cell.GetPointId(j)) for j in range(cell.GetNumberOfPoints())],
+            dtype=float,
+        )
+        if len(co) < 3:
+            return n, 0.0
+        perimeter = float(np.sum(np.linalg.norm(co - np.roll(co, -1, axis=0), axis=1)))
+        if perimeter <= 0:
+            return n, 0.0
+        rel = co - co.mean(axis=0)
+        area = 0.5 * float(np.linalg.norm(np.cross(rel, np.roll(rel, -1, axis=0)).sum(axis=0)))
+        worst = min(worst, 4.0 * np.pi * area / (perimeter * perimeter))
+    return n, worst
+
+
 def enforce_min_edge(surface, floor=REMESH_MIN_EDGE_MM, label="template", report=True):
-    """Collapse the edges the remesher was told not to make.
+    """Fold the edges the remesher was told not to make, and keep the fold only
+    if it cost nothing.
 
     ``remesh_surface_adaptively`` passes MinEdgeLength to vmtk, which turns it
     into the MinArea the remesher reads, and the target-edge array is clamped
@@ -6567,15 +6830,26 @@ def enforce_min_edge(surface, floor=REMESH_MIN_EDGE_MM, label="template", report
     24 edges under 0.01 mm out of 104538, the shortest 0.002066 mm, in 22
     triangles whose median area is a hundredth of the mesh's; none of them was
     near a rim, so they are not a clipping artefact but slivers left behind in
-    a dense stretch zone.
+    a dense stretch zone. Across the 55 GT surfaces of the validation run, 26
+    carry one.
 
-    Collapsing exactly those is measurably free: on p414 it merges 11 points,
-    lifts the shortest edge to 0.0105 mm, leaves the area identical to two
-    decimal places, the six openings, the fan reach and the non-manifold count
-    unchanged, and takes the sliver fraction from 3.56% to 3.49%. On C0088b and
-    SNF00000426_03, which have no sub-floor edge, it is a no-op and is skipped
-    outright, so a mesh that does not need it keeps its interpolated point
-    arrays.
+    Two things make this safe to run on a surface that already passed. The fold
+    is pure -- ``allow_cuts=False`` bars the two fallbacks that cut geometry
+    when every remaining short edge is pinched, which is what tore
+    UPF_P0171.00_ID1 from 6 rims to 7 and p469 from 6 to 11 in the first sweep
+    at this floor. And the result is checked rather than trusted: a fold that
+    changes the rim count, worsens the worst rim's circularity, adds a
+    non-manifold edge or moves the area by more than a part in ten thousand is
+    dropped and the input returned untouched.
+
+    What survives the check is free. Over the 24 GT surfaces where the pure
+    fold applies it merges a median of 24 points, moves the area by at most
+    5.4e-05 relative, leaves every rim count and circularity exactly as it
+    found them, and takes the mean sliver fraction from 0.891% to 0.857%. On
+    p414 it merges 11 points and lifts the shortest edge from 0.002066 mm to
+    0.0105 mm with the six openings, the fan reach and the non-manifold count
+    unchanged. A mesh with no sub-floor edge is skipped outright and keeps its
+    interpolated point arrays.
     """
     poly = to_vtk_poly(surface)
     # Measured on the merged mesh, because the remesher hands back a surface
@@ -6591,11 +6865,59 @@ def enforce_min_edge(surface, floor=REMESH_MIN_EDGE_MM, label="template", report
     if n_short == 0:
         return poly
     shortest = float(edges.min())
-    out = to_vtk_poly(collapse_tiny_edges(merged, floor=float(floor)))
+    out = to_vtk_poly(
+        collapse_tiny_edges(merged, floor=float(floor), allow_cuts=False)
+    )
+    if out.GetNumberOfPoints() == merged.GetNumberOfPoints():
+        if report:
+            print(f"  NOTE: {n_short} edge(s) under the {floor} mm floor on the {label} "
+                  f"(shortest {shortest:.6f} mm) are all pinched; left alone")
+        return poly
+
+    # Cheapest check first and stop at the first complaint: this runs once per
+    # rung of the variable path's remesh ladder, where the time matters.
+    def _harm():
+        before_area = _surface_area(merged)
+        after_area = _surface_area(out)
+        drift = abs(after_area / before_area - 1.0) if before_area > 0 else float("inf")
+        if drift > 1e-4:
+            return f"area x{after_area / before_area:.6f}"
+        before_rims, before_circ = _rim_shape(merged)
+        after_rims, after_circ = _rim_shape(out)
+        if after_rims != before_rims:
+            return f"rims {before_rims} -> {after_rims}"
+        if after_circ < before_circ - 1e-6:
+            return f"worst rim circularity {before_circ:.3f} -> {after_circ:.3f}"
+        fan_before = worst_hub_ring_edges(merged)
+        fan_after = worst_hub_ring_edges(out)
+        if fan_after > REMESH_MAX_HUB_RING_EDGES >= fan_before:
+            # A fold moves every triangle on the collapsed vertex onto its
+            # partner, so it can in principle raise the fan reach. Measured it
+            # never does by much -- the worst of the 24 GT surfaces moved 1.14
+            # to 1.17 against a gate of 12 -- but a fold that pushed a mesh over
+            # the gate would be trading a sliver for a tent, the worse of the
+            # two.
+            return f"fan reach {fan_before:.1f} -> {fan_after:.1f}"
+        n_nm_before = int(inspect_surface_topology(merged)["n_nonmanifold"])
+        n_nm = int(inspect_surface_topology(out)["n_nonmanifold"])
+        if n_nm > n_nm_before:
+            return f"non-manifold edges {n_nm_before} -> {n_nm}"
+        return None
+
+    harm = _harm()
+    if harm:
+        if report:
+            print(f"  NOTE: folding the {n_short} sub-floor edge(s) on the {label} would "
+                  f"cost {harm}; kept the surface as it was")
+        return poly
+
+    left = int(np.count_nonzero(
+        _triangle_edge_lengths(*_triangle_points_faces(out)[1:]) < float(floor)))
     if report:
-        print(f"  Collapsed {n_short} edge(s) under the {floor} mm floor on the {label} "
-              f"(shortest was {shortest:.6f} mm): "
-              f"{merged.GetNumberOfPoints()} -> {out.GetNumberOfPoints()} points")
+        tail = "" if left == 0 else f"; {left} still pinched under it"
+        print(f"  Folded {n_short - left} edge(s) under the {floor} mm floor on the "
+              f"{label} (shortest was {shortest:.6f} mm): "
+              f"{merged.GetNumberOfPoints()} -> {out.GetNumberOfPoints()} points{tail}")
     return out
 
 
