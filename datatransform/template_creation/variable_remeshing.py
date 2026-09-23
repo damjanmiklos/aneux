@@ -634,11 +634,32 @@ def restore_template_supervision(dst_surface, src_pts, src_arrays):
     return poly
 
 
-def assert_template_supervision_arrays(surface, context="template"):
+# Slack on the supervision contract below. Every bound there holds exactly at
+# the raycast's own vertices, and linear interpolation and nearest-neighbour
+# transfer both keep it (S <= 3.5 R is linear in the pair), so this only has to
+# absorb float32 storage. Over the 40 templates of the 2026-09-23 ladder run
+# the closest any vertex came to 3.5 R was 0.0056 mm under it.
+SUPERVISION_CONTRACT_TOL = 1e-5
+
+
+def assert_template_supervision_arrays(surface, context="template",
+                                       base_edge=DEFAULT_TARGET_EDGE_LENGTH,
+                                       min_edge=REMESH_MIN_EDGE_MM):
+    """Every array present and finite, and inside the bounds the raycast promises.
+
+    Presence is not enough: a stretch the raycast could never have written is
+    a template that would teach the decoder a wall that is not there. The ray
+    only accepts a hit at most 3.5 R_template out, and a point outside the GT
+    gets 0, never a negative distance -- r* = R_template + StretchDistance
+    downstream, so a negative one would shrink the tube twice over (see
+    _zero_rays_that_left_the_gt). The target edge is clamped to
+    [min_edge, base_edge] where it is built.
+    """
     poly = to_vtk_poly(surface)
     n = int(poly.GetNumberOfPoints())
     issues = []
     stats = {}
+    vals_by_name = {}
     for name in TEMPLATE_POINT_ARRAYS:
         vals = _named_point_array(poly, name)
         if vals is None:
@@ -646,7 +667,35 @@ def assert_template_supervision_arrays(surface, context="template"):
             continue
         if not np.all(np.isfinite(vals)):
             issues.append(f"{name} has non-finite values")
+            continue
+        vals_by_name[name] = vals
         stats[name] = (float(np.min(vals)), float(np.max(vals)))
+    tol = SUPERVISION_CONTRACT_TOL
+    r = vals_by_name.get("R_template")
+    s = vals_by_name.get("StretchDistance")
+    t = vals_by_name.get("TargetEdgeLength")
+    if r is not None and np.any(r <= 0):
+        issues.append(f"R_template is not positive at {int(np.sum(r <= 0))} vertices")
+    if s is not None and np.any(s < -tol):
+        issues.append(
+            f"StretchDistance is negative at {int(np.sum(s < -tol))} vertices "
+            f"(min {s.min():.4f} mm)"
+        )
+    if r is not None and s is not None:
+        over = s > 3.5 * r + tol
+        if np.any(over):
+            k = int(np.argmax(s - 3.5 * r))
+            issues.append(
+                f"StretchDistance exceeds the raycast's 3.5 R ceiling at "
+                f"{int(over.sum())} vertices (worst {s[k]:.3f} mm at R={r[k]:.3f})"
+            )
+    if t is not None:
+        bad = (t < min_edge - tol) | (t > base_edge + tol)
+        if np.any(bad):
+            issues.append(
+                f"TargetEdgeLength outside [{min_edge}, {base_edge}] mm at "
+                f"{int(bad.sum())} vertices (range {t.min():.4f}-{t.max():.4f})"
+            )
     if issues:
         raise TemplateQualityError(f"{context} supervision arrays failed: " + "; ".join(issues))
     return stats
@@ -840,7 +889,9 @@ def process_variable_dataset(
             f"{n_want} " + ("GT ostium frames" if frames else "anatomical profiles")
             + "; a template whose ostia do not match the ground truth cannot supervise."
         )
-    stats = assert_template_supervision_arrays(final_surface, context=dataset_id)
+    stats = assert_template_supervision_arrays(
+        final_surface, context=dataset_id, base_edge=target_edge_length, min_edge=min_edge
+    )
     print(
         "  Item 13 final arrays: "
         + ", ".join(f"{n}=[{lo:.4g}, {hi:.4g}]" for n, (lo, hi) in stats.items())

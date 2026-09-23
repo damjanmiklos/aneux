@@ -6869,6 +6869,52 @@ def worst_local_edge_ratio(surface, array_name="TargetEdgeLength", reference=Non
     return float(np.max(lengths[usable] / asked[usable]))
 
 
+# How many of the template's edges must land within a factor of two of the
+# length asked for where they lie.
+#
+# The drift, fan and edge-ratio gates all look for a surface that broke; none of
+# them asks whether the remesh did its job, which is to put the variable density
+# on the tube. With the angle collapse off vmtk only splits, so the output keeps
+# every point of the marching-cubes tube it was handed and the target array can
+# only make edges shorter, never longer. p414 shipped that way: 42338 points,
+# 0.40 of its edges within x2 of the target and the median edge at 0.46 of it,
+# every quality gate passing. Across the 39 templates rung 0 delivered on the
+# same run the fraction runs 0.980 to 0.993, so 0.85 sits well clear of both.
+REMESH_MIN_DENSITY_WITHIN_X2 = 0.85
+
+
+def density_within_x2(surface, reference, array_name="TargetEdgeLength"):
+    """Fraction of edges within a factor of two of the target where they lie.
+
+    The target is sampled from ``reference`` by nearest neighbour, for the same
+    reason worst_local_edge_ratio does: the raw remesh cannot be trusted to
+    carry the array. One when there is no target to measure against, so the
+    isotropic path is unaffected.
+    """
+    from scipy.spatial import cKDTree
+
+    ref = to_vtk_poly(reference)
+    ref_arr = ref.GetPointData().GetArray(array_name)
+    if ref_arr is None or not ref.GetNumberOfPoints():
+        return 1.0
+    ref_pts = np.asarray(vtk_to_numpy(ref.GetPoints().GetData()), dtype=float)
+    ref_target = np.asarray(vtk_to_numpy(ref_arr), dtype=float).ravel()
+    _p, pts, faces = _triangle_points_faces(to_vtk_poly(surface))
+    if faces.size == 0 or len(ref_target) != len(ref_pts):
+        return 1.0
+    target = ref_target[cKDTree(ref_pts).query(pts, k=1, workers=1)[1]]
+    pairs = np.unique(np.sort(np.concatenate(
+        [faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]]
+    ), axis=1), axis=0)
+    lengths = np.linalg.norm(pts[pairs[:, 0]] - pts[pairs[:, 1]], axis=1)
+    asked = 0.5 * (target[pairs[:, 0]] + target[pairs[:, 1]])
+    usable = (asked > 1e-9) & (lengths > 0)
+    if not np.any(usable):
+        return 1.0
+    ratio = lengths[usable] / asked[usable]
+    return float(np.mean((ratio >= 0.5) & (ratio <= 2.0)))
+
+
 # What actually defeats vmtkSurfaceRemeshing on these surfaces is edges far
 # shorter than the mesh they sit in, and the tolerance that clears them has to
 # be measured in that mesh's own units. WELD_TOLERANCE_MM is a fixed 1e-3 mm,
@@ -7967,6 +8013,41 @@ def _adaptive_remesh_ladder():
             + [(f, on) for f in rest])
 
 
+# Iterations of the collapse-off pass that polishes a failed collapse-on rung.
+# Measured on p414: 2 iterations clear the blade (edge ratio 18.7 -> 5.4) in 4 s
+# at 0.964 within x2; 6 do no better on any gate (4.7, 0.957) and take 10 s.
+REMESH_POLISH_N_ITER = 2
+
+
+def _polish_input(remeshed, sup):
+    """The failed rung's surface, cleaned, carrying the supervision's arrays.
+
+    Every point array on the supervised surface is carried across by nearest
+    neighbour from that surface, never from the rung's own output: the raw
+    remesh may have dropped or smeared them, and the polish has to be steered
+    by the field the raycast measured.
+    """
+    from scipy.spatial import cKDTree
+
+    poly = clean_triangulate(remeshed)
+    src = to_vtk_poly(sup["surface"])
+    src_pts = np.asarray(vtk_to_numpy(src.GetPoints().GetData()), dtype=float)
+    dst_pts = np.asarray(vtk_to_numpy(poly.GetPoints().GetData()), dtype=float)
+    nearest = cKDTree(src_pts).query(dst_pts, k=1, workers=1)[1]
+    src_pd, dst_pd = src.GetPointData(), poly.GetPointData()
+    for i in range(src_pd.GetNumberOfArrays()):
+        arr = src_pd.GetArray(i)
+        if arr is None or arr.GetName() is None or arr.GetNumberOfTuples() != len(src_pts):
+            continue
+        vals = np.asarray(vtk_to_numpy(arr))[nearest]
+        out = numpy_to_vtk(np.ascontiguousarray(vals), deep=True)
+        out.SetName(arr.GetName())
+        if dst_pd.GetArray(arr.GetName()) is not None:
+            dst_pd.RemoveArray(arr.GetName())
+        dst_pd.AddArray(out)
+    return poly
+
+
 def build_template_supervision(base_surface, vessel_mesh, centerline,
                                target_edge_length, min_edge, weld_fraction,
                                prepare=None, announce=True):
@@ -8069,10 +8150,46 @@ def supervise_and_remesh_verified(base_surface, vessel_mesh, centerline,
     0.99x, edge-length CV 0.305, no fan, all five openings -- so the cure is
     the one the ground-truth path already uses, and it is applied the same way:
     as a rescue that runs only after the configured settings have failed.
+
+    A collapse-on rung that fails without changing the area gets one more try
+    before the ladder moves on: its own output, remeshed briefly with the
+    collapse off. The collapse-on pass has already brought the density to the
+    target, which a collapse-off pass over the marching-cubes tube never can
+    (see REMESH_MIN_DENSITY_WITHIN_X2), and what is left to clear is local --
+    on p414 a blade beside an r=0.32 mm opening, 596 edges over 3x the target
+    and all within a millimetre of it. Splitting only, the polish cuts those
+    and leaves the rest where it was: 18.7x -> 5.4x at 0.964 within x2, in 4 s.
     """
     base_area = _surface_area(base_surface)
     supervision = {}
     best = None
+
+    def judge(remeshed, sup, label):
+        # Scored against the surface handed in, never against the welded one,
+        # so a weld that ate geometry cannot pass by flattering itself.
+        nonlocal best
+        after = _surface_area(remeshed)
+        drift = after / base_area if base_area > 0 else float("inf")
+        fan = worst_hub_ring_edges(remeshed)
+        ratio = worst_local_edge_ratio(remeshed, reference=sup["surface"])
+        dens = density_within_x2(remeshed, sup["surface"])
+        score = (dens < REMESH_MIN_DENSITY_WITHIN_X2, abs(drift - 1.0), fan, ratio)
+        if best is None or score < best[0]:
+            best = (score, drift, fan, ratio, dens, label)
+        why = []
+        if drift > REMESH_MAX_AREA_DRIFT:
+            why.append(f"area {drift:.2f}x ({base_area:.1f} -> {after:.1f} mm^2)")
+        if fan > REMESH_MAX_HUB_RING_EDGES:
+            why.append(f"a triangle fan reaching {fan:.1f} mean edges")
+        if ratio > REMESH_MAX_LOCAL_EDGE_RATIO:
+            why.append(f"an edge {ratio:.1f}x the length asked for there")
+        if dens < REMESH_MIN_DENSITY_WITHIN_X2:
+            why.append(f"only {dens:.2f} of its edges within x2 of the target")
+        if why:
+            print(f"  WARNING: adaptive remesh at {label} left the template with "
+                  + " and ".join(why))
+        return not why, drift, fan, dens
+
     for rung, (fraction, collapse) in enumerate(_adaptive_remesh_ladder()):
         if fraction not in supervision:
             if rung:
@@ -8085,55 +8202,48 @@ def supervise_and_remesh_verified(base_surface, vessel_mesh, centerline,
         sup = supervision[fraction]
         if rung == 0:
             print("Step 8c: Adaptively remeshing surface (ElementSizeMode='edgelengtharray')...")
+        label = f"weld {fraction:.2f}, collapse angle {collapse:.2f}"
         t_rm = time.perf_counter()
         remeshed = remesh_surface_adaptively(
             sup["surface"], edge_array_name="TargetEdgeLength", collapse_angle=collapse,
         )
         remeshed = enforce_min_edge(remeshed, label="remeshed template")
         t_rm_s = time.perf_counter() - t_rm
-        # Scored against the surface handed in, never against the welded one,
-        # so a weld that ate geometry cannot pass by flattering itself.
-        after = _surface_area(remeshed)
-        drift = after / base_area if base_area > 0 else float("inf")
-        fan = worst_hub_ring_edges(remeshed)
-        ratio = worst_local_edge_ratio(remeshed, reference=sup["surface"])
-        score = (abs(drift - 1.0), fan, ratio)
-        if best is None or score < best[0]:
-            best = (score, remeshed, sup, t_rm_s, drift, fan, fraction, collapse,
-                    ratio)
-        if (drift <= REMESH_MAX_AREA_DRIFT
-                and fan <= REMESH_MAX_HUB_RING_EDGES
-                and ratio <= REMESH_MAX_LOCAL_EDGE_RATIO):
-            if rung:
-                how = []
-                if collapse != REMESH_COLLAPSE_ANGLE:
-                    how.append("switching the angle collapse off")
-                if fraction > 0:
-                    how.append(f"welding at {fraction:.2f} of the mean edge")
+        ok, drift, fan, dens = judge(remeshed, sup, label)
+        how = []
+        if ok and rung:
+            if collapse != REMESH_COLLAPSE_ANGLE:
+                how.append("switching the angle collapse off")
+        if (not ok and collapse != REMESH_COLLAPSE_ANGLE_OFF
+                and drift <= REMESH_MAX_AREA_DRIFT):
+            t_po = time.perf_counter()
+            polished = remesh_surface_adaptively(
+                _polish_input(remeshed, sup), edge_array_name="TargetEdgeLength",
+                n_iter=REMESH_POLISH_N_ITER, collapse_angle=REMESH_COLLAPSE_ANGLE_OFF,
+            )
+            polished = enforce_min_edge(polished, label="polished template")
+            t_rm_s += time.perf_counter() - t_po
+            ok, drift, fan, dens = judge(polished, sup,
+                                         label + " then a collapse-off polish")
+            if ok:
+                remeshed = polished
+                how.append("polishing it with the angle collapse off")
+        if ok:
+            if fraction > 0:
+                how.append(f"welding at {fraction:.2f} of the mean edge")
+            if how:
                 print("  NOTE: the adaptive remesh diverged as configured; "
                       + " and ".join(how)
-                      + f" held it ({drift:.3f}x, widest fan {fan:.1f} edges)")
+                      + f" held it ({drift:.3f}x, widest fan {fan:.1f} edges, "
+                      f"{dens:.3f} of edges within x2 of the target)")
             return remeshed, sup, t_rm_s
-        why = []
-        if drift > REMESH_MAX_AREA_DRIFT:
-            why.append(f"area {drift:.2f}x ({base_area:.1f} -> {after:.1f} mm^2)")
-        if fan > REMESH_MAX_HUB_RING_EDGES:
-            why.append(f"a triangle fan reaching {fan:.1f} mean edges")
-        if ratio > REMESH_MAX_LOCAL_EDGE_RATIO:
-            why.append(
-                f"an edge {ratio:.1f}x the length asked for there"
-            )
-        print(f"  WARNING: adaptive remesh at weld {fraction:.2f}, collapse angle "
-              f"{collapse:.2f} left the template with " + " and ".join(why))
-    (_score, _remeshed, _sup, _t, drift, fan, fraction, collapse,
-     ratio) = best
+    _score, drift, fan, ratio, dens, label = best
     raise TemplateQualityError(
         f"adaptive remesh did not converge on the parent tube: the closest "
-        f"attempt (weld {fraction:.2f} of the mean edge, collapse angle "
-        f"{collapse:.2f}) still changed the area {drift:.2f}x, left a "
-        f"triangle fan reaching {fan:.1f} mean edges and an edge {ratio:.1f}x "
-        f"the length asked for there. The tube itself is not "
-        f"what failed here; the remesher is.",
+        f"attempt ({label}) still changed the area {drift:.2f}x, left a "
+        f"triangle fan reaching {fan:.1f} mean edges, an edge {ratio:.1f}x "
+        f"the length asked for there and {dens:.2f} of its edges within x2 of "
+        f"the target. The tube itself is not what failed here; the remesher is.",
         dataset_id=dataset_id,
     )
 
