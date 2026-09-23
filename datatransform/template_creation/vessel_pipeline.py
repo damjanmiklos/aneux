@@ -2802,6 +2802,47 @@ def _drop_duplicate_triangles(faces):
     return faces[keep], n_drop
 
 
+def drop_pillow_triangles(surface, label="surface"):
+    """Remove every pair of triangles that share all three vertices.
+
+    Two triangles on one vertex set, back to back, are a closed surface of
+    zero volume: every edge they have is used by exactly those two, so no
+    non-manifold edge shows it and repair_nonmanifold_triangles never runs.
+    What does show it is the three corners. Each is a pinch point where the
+    pillow's fan meets the wall's, and vmtkSurfaceRemeshing turns those into
+    non-manifold edges it cannot remove. SNF00000360_01_1 came out of the
+    uncap with one 0.0106 mm^2 pillow among its collapsed pinholes. Every
+    collapse-off rung of the remesh ladder then left the same 3 non-manifold
+    edges, whatever the weld, until the case timed out at 5400 s. Without the
+    pillow the first collapse-off rung is clean: 0 non-manifold edges, 0.997x,
+    all 8 openings.
+
+    _drop_duplicate_triangles is the wrong tool here: it keeps one copy of a
+    pair, which leaves a single triangle hanging off the wall by its corners.
+    A pillow carries no surface, so both copies go. A surface without one
+    comes back as it was.
+    """
+    poly, pts, faces = _triangle_points_faces(surface, clean=False)
+    if faces.size == 0:
+        return poly, 0
+    keys = np.sort(faces, axis=1)
+    _, inverse, counts = np.unique(keys, axis=0, return_inverse=True, return_counts=True)
+    counts = counts[np.asarray(inverse).reshape(-1)]
+    # An odd copy is kept: three on one vertex set are a pillow plus a face.
+    doubled = counts > 1
+    if not np.any(doubled):
+        return poly, 0
+    keep = ~doubled
+    for key in np.unique(keys[doubled], axis=0):
+        same = np.flatnonzero(np.all(keys == key, axis=1))
+        if len(same) % 2:
+            keep[same[0]] = True
+    n_drop = int(len(faces) - keep.sum())
+    out = clean_triangulate(_polydata_from_triangles(pts, faces[keep]))
+    print(f"  Dropped {n_drop // 2} zero-volume triangle pillow(s) on the {label}")
+    return out, n_drop // 2
+
+
 def _drop_nonmanifold_flaps(pts, faces, area_ratio=NM_FLAP_AREA_RATIO):
     """On edges used by >2 triangles, drop extras that are much smaller than the two kept faces.
 
@@ -6010,6 +6051,7 @@ def clip_flow_extensions_and_uncap(
         current, label="uncapped surface", profiles=work_profiles
     )
     current, n_filled = remove_spurious_openings(current, work_profiles)
+    current, _n_pillows = drop_pillow_triangles(current, label="uncapped surface")
     post = inspect_openings(current)
     print(
         "  Openings after uncap/pinhole-fill: "

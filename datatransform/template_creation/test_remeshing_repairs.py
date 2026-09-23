@@ -29,6 +29,7 @@ from vessel_pipeline import (
     _triangle_points_faces,
     add_flow_extensions,
     boundary_loop_radii,
+    drop_pillow_triangles,
     fan_fill_small_loops,
     finalize_surface,
     force_manifold_triangles,
@@ -629,7 +630,7 @@ def test_remesh_keeps_the_configured_iterations_when_they_converge():
     tube = open_tube(n_sides=40, n_rings=30)
     calls = []
 
-    def fake(surface, target_edge_length, n_iter, connectivity_iter):
+    def fake(surface, target_edge_length, n_iter, connectivity_iter, collapse_angle=None):
         calls.append((n_iter, connectivity_iter))
         return vp.to_vtk_poly(surface)
 
@@ -652,7 +653,7 @@ def test_remesh_backs_off_when_the_configured_iterations_diverge():
     tube = open_tube(n_sides=40, n_rings=30)
     calls = []
 
-    def fake(surface, target_edge_length, n_iter, connectivity_iter):
+    def fake(surface, target_edge_length, n_iter, connectivity_iter, collapse_angle=None):
         calls.append((n_iter, connectivity_iter))
         # The configured count diverges the way 20/20 does on p129; backing off
         # to fewer iterations is what recovers it.
@@ -690,7 +691,7 @@ def test_remesh_failure_is_reported_as_a_remesh_failure():
 
     tube = open_tube(n_sides=40, n_rings=30)
 
-    def fake(surface, target_edge_length, n_iter, connectivity_iter):
+    def fake(surface, target_edge_length, n_iter, connectivity_iter, collapse_angle=None):
         return _scaled_copy(surface, 4.0)
 
     original = vp.remesh_surface_isotropically
@@ -836,3 +837,39 @@ def test_collapse_tiny_edges_does_not_fuse_two_sheets_touching_at_a_point():
         inspect_surface_topology(fixed)["n_nonmanifold"]
         <= inspect_surface_topology(surf)["n_nonmanifold"]
     ), "the collapse added non-manifold edges"
+
+
+def _with_pillow(copies=2):
+    """open_tube with a triangle on three wall vertices stacked ``copies`` times.
+
+    Alternate copies are flipped, so two of them are back to back: a closed
+    zero-volume surface touching the wall only at its corners, as the uncap
+    left on SNF00000360_01_1.
+    """
+    tube = open_tube()
+    _poly, pts, faces = _triangle_points_faces(tube, clean=False)
+    a, b, c = 5 * 40 + 3, 5 * 40 + 9, 9 * 40 + 6
+    extra = [(a, b, c) if k % 2 == 0 else (c, b, a) for k in range(copies)]
+    return tube, _polydata_from_triangles(pts, np.vstack([faces, extra]))
+
+
+def test_a_pillow_is_dropped_whole():
+    tube, pillowed = _with_pillow()
+    out, n = drop_pillow_triangles(pillowed)
+    assert n == 1
+    assert out.GetNumberOfCells() == tube.GetNumberOfCells()
+    assert len(boundary_loop_radii(out)) == 2
+
+
+def test_an_odd_copy_is_kept_as_a_face():
+    tube, pillowed = _with_pillow(copies=3)
+    out, n = drop_pillow_triangles(pillowed)
+    assert n == 1
+    assert out.GetNumberOfCells() == tube.GetNumberOfCells() + 1
+
+
+def test_a_surface_without_a_pillow_is_returned_as_it_was():
+    tube = open_tube()
+    out, n = drop_pillow_triangles(tube)
+    assert n == 0
+    assert out is tube
