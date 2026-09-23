@@ -1,32 +1,24 @@
 """Paper-style overview of the full two-stage model (fullscreen, 16:9).
 
-Stage 1 follows the design draft (conditioning, latent diffusion with
-classifier-free guidance, Transformer decoder to a serialized tree). Stage 2
-is the implemented geometry VAE of make_pipeline_figure.py, condensed. The
-draft's Stage 2 (a tube conditioned by FiLM on a global z) is replaced by
-what the code does now; the interface between the stages follows the Stage-1
-contract in STAGE2_REVIEW §5.2 / §10.2: per 1 mm sample [x, y, z, r, s],
-a texture token every 2 mm, codes standardised by latent_standardise.py.
+Follows the design draft. Stage 1 turns clinical conditions into a latent z
+(latent diffusion with classifier-free guidance) and z into the serialized
+centerline tree (Transformer decoder): per 1 mm row x, y, z, radius r and
+mesh density s. Stage 2 is the template SplineConv decoder of the current code.
 
-Layout plan (canvas 160 x 90 units, 1 unit = 1/8 in, figure 20 x 11.25 in):
+The stages meet three times:
+  * geometry, non-differentiable: the rows build the template T (VMTK tube,
+    uncap, remesh at edge length s). Nothing is back-propagated through T.
+  * global, differentiable: z -> MLP -> (gamma, beta) modulates every
+    SplineConv layer (FiLM or AdaIN).
+  * local, differentiable: the Transformer's last hidden state h_i of every
+    row is laid on its centerline sample and interpolated onto the vertices
+    between neighbouring samples, h(v) = (1 - lam) h_i + lam h_{i+1}.
+So the surface loss trains the Transformer and the encoder through z and h,
+while the template itself stays a fixed input.
 
-  Title row      title, subtitle with the line-style key, legend at right.
-  Stage 1 band   (y 48-84.5), vertical tab on the left.
-    inference lane: clinical vector -> embedding / frequency encoding /
-      missing token -> concat -> MLP -> c (and learned null condition) ->
-      diffusion box [x_t node, two U-Net passes (c and null), guidance,
-      denoising step, loop x1000] -> x0 -> Transformer decoder ->
-      generated sequence table -> decoded tree render.
-    training lane (dashed, step 3): S_GT -> PointNeXt (global) -> x0 ->
-      diffusion loss; z ~ N(x0, I) -> Transformer; sequence targets / loss.
-  Hand-off wire  along the gap between the bands (non-differentiable).
-  Stage 2 band   (y 1-46.3), vertical tab on the left.
-    lane I: parse sequence -> de-standardise -> Z grid, Z bus.
-    lane D: template construction -> T -> coarse / mid / fine decoder
-      levels (kNN upsampling between) -> post-processing -> surface render.
-    lane T (dashed, steps 1 and 2): S_GT -> PointNeXt blocks -> latent head
-      -> mu, log sigma^2 -> tract mixer -> reparameterise -> z joins the Z bus;
-      standardise -> Stage-1 targets; Stage-2 losses.
+Layout (canvas 160 x 90 units, 1 unit = 1/8 in). A U-shaped read: Stage 1
+left to right on top, the three connections drop straight down, Stage 2
+reads right to left from the template to the output surface.
 
     python figures/make_two_stage_figure.py
 """
@@ -34,22 +26,22 @@ from __future__ import annotations
 
 import os
 
-import numpy as np
-from matplotlib.colors import to_rgb
 from matplotlib.patches import Circle, Rectangle
 
 import make_pipeline_figure as base
-from make_pipeline_figure import GREY, INK, KIND, TRACT_COLORS, Z_COL, Canvas, fmt, load_info
+from make_pipeline_figure import GREY, INK, KIND, Z_COL, Canvas, fmt, load_info
 
-# Arial lacks circled digits, subscript digits and angle brackets; fall back per glyph
+# Arial lacks subscript digits and angle brackets; fall back per glyph
 base.plt.rcParams["font.family"] = ["Arial", "Segoe UI Symbol", "DejaVu Sans"]
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "two_stage_pipeline")
 
+H_COL = "#1f8a8a"
 KIND.update({
     "diff": ("#ece3f5", "#6a4c93"),
     "cond": ("#efefef", "#6b6b6b"),
+    "hid": ("#d8eeec", H_COL),
 })
 BAND = {
     1: ("#f8f5fb", "#d9cce8", "#6a4c93"),
@@ -57,6 +49,7 @@ BAND = {
 }
 TRAIN = (0, (4.5, 2.5))
 LOSS_EC = KIND["loss"][1]
+TF, BF, SF = 10.6, 9.7, 9.3  # block title, body, smallest
 
 
 def band(c, key, y0, y1, title, sub):
@@ -64,7 +57,7 @@ def band(c, key, y0, y1, title, sub):
     c.rbox(1, y0, 158, y1 - y0, fc, ec, lw=1.0, r=1.2, z=0)
     c.rbox(1, y0, 3.6, y1 - y0, tab, tab, lw=1.0, r=1.2, z=1)
     c.text(2.25, (y0 + y1) / 2, title, fs=13.5, weight="bold", color="white", rotation=90)
-    c.text(3.85, (y0 + y1) / 2, sub, fs=9.3, color="white", rotation=90)
+    c.text(3.85, (y0 + y1) / 2, sub, fs=SF, color="white", rotation=90)
 
 
 def badge(c, x, y, n, r=0.82, col="#555555"):
@@ -90,10 +83,9 @@ def unet(c, x, y, w, h, ec=KIND["diff"][1], fc=KIND["diff"][0]):
         bx = x + i * step
         c.ax.add_patch(Rectangle((bx, by), bw, bh, fc=fc, ec=ec, lw=0.9, zorder=4))
         if i < n // 2:
-            j = n - 1 - i
             yy = by + bh * 0.82
-            c.ax.plot([bx + bw, x + j * step], [yy, yy], color=ec, lw=0.6, ls=(0, (2, 1.5)),
-                      zorder=3)
+            c.ax.plot([bx + bw, x + (n - 1 - i) * step], [yy, yy], color=ec, lw=0.6,
+                      ls=(0, (2, 1.5)), zorder=3)
 
 
 def vec_glyph(c, x, y, w, h, n, col, ec):
@@ -101,318 +93,309 @@ def vec_glyph(c, x, y, w, h, n, col, ec):
         c.ax.add_patch(Rectangle((x, y + i * h / n), w, h / n, fc=col, ec=ec, lw=0.6, zorder=4))
 
 
-def z_grid(c, info, gx, gy, gw, gh):
-    tok = np.asarray(info["tok_tract"])
-    order = np.argsort(tok, kind="stable")
-    n = len(order)
-    cw = gw / n
-    for j, t in enumerate(tok[order]):
-        base_c = np.array(to_rgb(TRACT_COLORS[t % len(TRACT_COLORS)]))
-        c.ax.add_patch(Rectangle((gx + j * cw, gy), cw, gh, fc=1 - 0.45 * (1 - base_c),
-                                 ec="none", zorder=3))
-        c.ax.add_patch(Rectangle((gx + j * cw, gy + gh), cw, 0.5,
-                                 fc=TRACT_COLORS[t % len(TRACT_COLORS)], ec="none", zorder=3))
-    for i in range(17):
-        c.ax.plot([gx, gx + gw], [gy + i * gh / 16] * 2, color="white", lw=0.35, zorder=4)
-    c.ax.add_patch(Rectangle((gx, gy), gw, gh + 0.5, fc="none", ec=Z_COL, lw=1.3, zorder=5))
+def node(c, x, y, s, r=1.3, fs=10.1):
+    c.ax.add_patch(Circle((x, y), r, fc=KIND["lat"][0], ec=KIND["lat"][1], lw=1.2, zorder=5))
+    c.text(x, y, s, fs=fs)
+
+
+def texts(c, x, y_top, lines, fs=BF, step=None, color="#333333", ha="center", weight="normal"):
+    step = step or base.line_units(fs)
+    for j, s in enumerate(lines):
+        c.text(x, y_top - j * step, s, fs=fs, color=color, ha=ha, weight=weight)
 
 
 # ---------------------------------------------------------------------------
 def draw_header(c):
     c.text(1.5, 88.3, "Two-stage generative model: clinical conditions → vessel surface",
            fs=19, weight="bold", ha="left")
-    c.text(1.5, 85.9,
-           "Stage 1 generates the centerline tree with texture tokens; Stage 2 decodes the "
-           "tokens onto a template mesh.   Solid: inference · dashed: training only · "
-           "numbered badges: training order",
-           fs=11, color=GREY, ha="left")
+    c.text(1.5, 85.8,
+           "Stage 1 generates the centerline tree; Stage 2 deforms a template built from it, "
+           "conditioned on z and on the Transformer's hidden states.",
+           fs=10.6, color=GREY, ha="left")
     entries = [
         ("cond", "condition"), ("diff", "diffusion"), ("attn", "attention / transformer"),
-        ("enc", "encoder"), ("lat", "latent / stochastic"), ("dec", "decoder"),
-        ("op", "fixed op (non-diff.)"), ("loss", "loss"),
+        ("enc", "encoder"), ("lat", "latent / stochastic"), ("hid", "hidden states h"),
+        ("dec", "decoder"), ("loss", "loss"), ("op", "fixed op (non-diff.)"),
+        ("_solid", "inference"), ("_dash", "training only"), ("_badge", "training order"),
     ]
-    x0, y0 = 103.6, 88.7
+    x0, y0 = 99.5, 89.0
     for i, (k, lab) in enumerate(entries):
         col, row = i % 4, i // 4
-        xx, yy = x0 + col * 14.4, y0 - row * 2.2
-        fc, ec = KIND[k]
-        c.rbox(xx, yy - 0.5, 2.2, 1.0, fc, ec, lw=0.9, ls=(0, (3, 1.6)) if k == "op" else "-",
-               r=0.2, z=3)
-        c.text(xx + 2.8, yy, lab, fs=9.3, ha="left")
+        xx, yy = x0 + col * 15.0, y0 - row * 1.95
+        if k == "_solid":
+            c.arrow([(xx, yy), (xx + 2.4, yy)], lw=1.3, ms=7)
+        elif k == "_dash":
+            c.arrow([(xx, yy), (xx + 2.4, yy)], lw=1.3, ls=TRAIN, color=GREY, ms=7)
+        elif k == "_badge":
+            badge(c, xx + 1.1, yy, 1, r=0.7)
+        else:
+            fc, ec = KIND[k]
+            c.rbox(xx, yy - 0.5, 2.4, 1.0, fc, ec, lw=0.9,
+                   ls=(0, (3, 1.6)) if k == "op" else "-", r=0.2, z=3)
+        c.text(xx + 3.0, yy, lab, fs=SF, ha="left")
 
 
-def draw_stage1(c, info):
-    band(c, 1, 47.7, 84.4, "STAGE 1 · generation", "design draft")
+def draw_stage1(c):
+    band(c, 1, 47.6, 84.4, "STAGE 1 · centerline generation", "design draft")
 
-    # clinical vector
-    c.text(10.7, 82.9, "clinical vector", fs=10.8, weight="bold")
+    # clinical vector and its encoders
+    c.text(10.7, 82.9, "clinical vector", fs=TF, weight="bold")
     c.rbox(6.0, 65.0, 9.4, 16.8, KIND["cond"][0], KIND["cond"][1], lw=1.1, r=0.5, z=3)
     rows = ["sex = female", "age = 60 y", "m$_1$ = 1.3", "m$_2$ = 9.8", "m$_3$ = NULL"]
     ry = [79.4, 76.4, 73.4, 70.4, 67.4]
     for s, y in zip(rows, ry):
-        c.text(6.7, y, s, fs=9.7, ha="left")
-
-    # encoders
+        c.text(6.7, y, s, fs=BF, ha="left")
     encs = [
         (76.6, "Embedding", "categorical", [0]),
         (71.0, "Frequency enc.", "numerical, N freq.", [1, 2, 3]),
         (65.4, "Missing token", "NULL (learned)", [4]),
     ]
     for yb, title, sub, src in encs:
-        c.block(18.0, yb, 12.4, 4.6, "cond", title, [sub], tfs=9.9, fs=9.3)
+        c.block(17.6, yb, 11.8, 4.6, "cond", title, [sub], tfs=10.1, fs=SF)
         for k in src:
-            c.arrow([(15.5, ry[k]), (18.0, yb + 2.3)], lw=0.9, ms=7)
-        c.arrow([(30.4, yb + 2.3), (32.4, 73.3)], lw=0.9, ms=7)
-    c.ax.add_patch(Circle((33.2, 73.3), 0.8, fc="white", ec=INK, lw=1.0, zorder=5))
-    c.text(33.2, 73.3, "+", fs=11)
-    c.arrow([(34.0, 73.3), (35.2, 73.3)], ms=7)
-    c.block(35.2, 67.6, 3.0, 11.4, "cond", "concat → MLP", rot=90, tfs=10.1)
-    c.arrow([(38.2, 73.3), (39.7, 73.3)], ms=7)
-    vec_glyph(c, 39.7, 70.3, 1.5, 6.0, 6, "#dcd3ea", KIND["diff"][1])
-    c.text(40.45, 77.3, r"$c\in\mathbb{R}^{256}$", fs=10.1)
-    vec_glyph(c, 39.7, 64.4, 1.5, 3.3, 3, "#ffffff", KIND["diff"][1])
-    c.text(40.45, 63.4, r"$\varnothing$ learned", fs=9.3, color=GREY)
+            c.arrow([(15.4, ry[k]), (17.6, yb + 2.3)], lw=0.9, ms=7)
+        c.arrow([(29.4, yb + 2.3), (30.6, 73.3)], lw=0.9, ms=7)
+    c.ax.add_patch(Circle((31.4, 73.3), 0.8, fc="white", ec=INK, lw=1.0, zorder=5))
+    c.text(31.4, 73.3, "+", fs=10)
+    c.arrow([(32.2, 73.3), (33.0, 73.3)], ms=7)
+    c.block(33.0, 67.6, 3.0, 11.4, "cond", "concat → MLP", rot=90, tfs=10.1)
+    c.arrow([(36.0, 73.3), (37.2, 73.3)], ms=7)
+    vec_glyph(c, 37.2, 70.3, 1.5, 6.0, 6, "#dcd3ea", KIND["diff"][1])
+    c.text(38.9, 77.4, r"$c\in\mathbb{R}^{256}$", fs=BF)
+    vec_glyph(c, 37.2, 64.4, 1.5, 3.3, 3, "#ffffff", KIND["diff"][1])
+    c.text(37.95, 63.3, r"$\varnothing$ learned", fs=SF, color=GREY)
 
-    # diffusion
-    dx0, dx1, dy0, dy1 = 44.3, 101.0, 63.5, 83.2
+    # latent diffusion
+    dx0, dx1, dy0, dy1 = 41.5, 95.5, 63.5, 83.2
     c.rbox(dx0, dy0, dx1 - dx0, dy1 - dy0, "#f3eef9", KIND["diff"][1], lw=1.2, r=0.9, z=2)
     c.text((dx0 + dx1) / 2, 82.0, "Latent diffusion with classifier-free guidance",
-           fs=11.6, weight="bold")
-    # x_t node
-    c.ax.add_patch(Circle((48.6, 73.2), 1.5, fc=KIND["lat"][0], ec=KIND["lat"][1], lw=1.2,
-                          zorder=5))
-    c.text(48.6, 73.2, r"$x_t$", fs=11.6)
-    c.text(48.6, 77.7, r"$x_T\sim\mathcal{N}(0,I)$", fs=9.5)
-    c.arrow([(48.6, 76.9), (48.6, 74.7)], ms=7)
-    # U-Nets
-    unet(c, 54.2, 75.2, 12.2, 5.4)
-    unet(c, 54.2, 67.4, 12.2, 5.4)
-    c.text(60.3, 74.3, r"U-Net $\epsilon_\theta(x_t,t,c)$", fs=9.5)
-    c.text(60.3, 66.5, r"same U-Net, $\epsilon_\theta(x_t,t,\varnothing)$", fs=9.5)
-    c.arrow([(50.1, 73.2), (52.3, 73.2), (52.3, 77.4), (54.2, 77.4)], ms=7)
-    c.arrow([(52.3, 73.2), (52.3, 70.8), (54.2, 70.8)], ms=7)
-    c.arrow([(41.2, 74.8), (43.0, 74.8), (43.0, 79.9), (54.2, 79.9)], color=KIND["diff"][1],
+           fs=TF, weight="bold")
+    node(c, 45.6, 73.2, r"$x_t$", r=1.5, fs=11)
+    c.text(45.6, 77.7, r"$x_T\sim\mathcal{N}(0,I)$", fs=BF)
+    c.arrow([(45.6, 76.9), (45.6, 74.7)], ms=7)
+    unet(c, 50.6, 75.2, 11.2, 5.4)
+    unet(c, 50.6, 67.4, 11.2, 5.4)
+    c.text(56.2, 74.3, r"U-Net $\epsilon_\theta(x_t,t,c)$", fs=BF)
+    c.text(56.2, 66.5, r"same U-Net, $\epsilon_\theta(x_t,t,\varnothing)$", fs=BF)
+    c.arrow([(47.1, 73.2), (48.9, 73.2), (48.9, 77.4), (50.6, 77.4)], ms=7)
+    c.arrow([(48.9, 73.2), (48.9, 70.8), (50.6, 70.8)], ms=7)
+    c.arrow([(38.7, 74.8), (40.3, 74.8), (40.3, 79.9), (50.6, 79.9)], color=KIND["diff"][1],
             lw=1.1, ms=7)
-    c.arrow([(41.2, 66.0), (43.0, 66.0), (43.0, 68.6), (54.2, 68.6)], color=KIND["diff"][1],
+    c.arrow([(38.7, 66.0), (40.3, 66.0), (40.3, 68.6), (50.6, 68.6)], color=KIND["diff"][1],
             lw=1.1, ms=7)
-    # guidance and step
-    c.arrow([(66.4, 77.9), (68.0, 77.9), (68.0, 75.0), (69.4, 75.0)], ms=7)
-    c.arrow([(66.4, 70.1), (68.0, 70.1), (68.0, 72.6), (69.4, 72.6)], ms=7)
-    c.block(69.4, 69.3, 15.8, 9.0, "diff", "Guidance",
+    c.arrow([(61.8, 77.9), (63.2, 77.9), (63.2, 75.0), (64.6, 75.0)], ms=7)
+    c.arrow([(61.8, 70.1), (63.2, 70.1), (63.2, 72.6), (64.6, 72.6)], ms=7)
+    c.block(64.6, 69.3, 14.8, 9.0, "diff", "Guidance",
             [r"$\hat\epsilon=\epsilon_\varnothing+w\,(\epsilon_c-\epsilon_\varnothing)$",
-             "w: guidance scale"], tfs=10.6, fs=9.5)
-    c.arrow([(85.2, 73.8), (86.8, 73.8)], ms=7)
-    c.block(86.8, 69.3, 12.6, 9.0, "diff", "Denoising step",
-            [r"$x_{t-1}=\mathrm{step}(x_t,\hat\epsilon)$", "t = T … 1"], tfs=10.6, fs=9.5)
-    c.arrow([(93.1, 69.3), (93.1, 64.7), (48.6, 64.7), (48.6, 71.7)], color=KIND["diff"][1],
+             "w: guidance scale"], tfs=TF, fs=BF)
+    c.arrow([(79.4, 73.8), (81.0, 73.8)], ms=7)
+    c.block(81.0, 69.3, 13.0, 9.0, "diff", "Denoising step",
+            [r"$x_{t-1}=\mathrm{step}(x_t,\hat\epsilon)$", "t = T … 1"], tfs=TF, fs=BF)
+    c.arrow([(87.5, 69.3), (87.5, 64.7), (45.6, 64.7), (45.6, 71.7)], color=KIND["diff"][1],
             lw=1.1, ms=8)
-    c.text(71.0, 64.7, "repeat T = 1000 steps", fs=9.3, color=KIND["diff"][1],
-           bg="#f3eef9")
-    # x0 -> Transformer
-    c.arrow([(99.4, 73.8), (104.0, 73.8)])
-    c.text(102.3, 75.4, r"$z=x_0$", fs=10.3)
+    c.text(66.5, 64.7, "repeat T = 1000 steps", fs=SF, color=KIND["diff"][1], bg="#f3eef9")
 
-    c.block(104.0, 64.6, 12.4, 17.0, "attn", "Transformer",
-            ["decoder", "", "z → serialized", "tree, one row", "per step", "", "+ MLP heads"],
-            tfs=11, fs=9.4)
-    c.arrow([(116.4, 73.1), (118.6, 73.1)])
+    # z: x0 at inference, a noisy x0 in training
+    zx, zy = 97.5, 60.6
+    c.arrow([(94.0, 73.8), (zx, 73.8), (zx, zy + 1.3)], lw=1.3, ms=8)
+    c.text(96.5, 75.1, r"$x_0$", fs=BF)
+    c.text(99.1, 67.3, r"inference: $z=x_0$", fs=SF, rotation=90)
+    node(c, zx, zy, r"$z$")
+    c.arrow([(zx + 1.3, zy), (100.8, zy)], ms=7)
 
-    # generated sequence
-    tx, tw = 118.6, 21.0
-    c.text(tx + tw / 2, 82.9, "generated sequence", fs=10.8, weight="bold")
-    rows = [
-        ("hdr", "x   y   z   r   s", r"$\tau\in\mathbb{R}^{16}$"),
-        ("sp", r"$\langle$branch start$\rangle$", ""),
-        ("row", "x₁ y₁ z₁ r₁ s₁", "τ₁"),
-        ("row", "x₂ y₂ z₂ r₂ s₂", "–"),
-        ("row", "x₃ y₃ z₃ r₃ s₃", "τ₂"),
-        ("dots", "⋮", "⋮"),
-        ("sp", r"$\langle$branch end$\rangle$", ""),
-        ("sp", r"$\langle$branch start$\rangle$", ""),
-        ("dots", "⋮", "⋮"),
+    # Transformer -> hidden states -> MLP head -> rows
+    c.block(100.8, 52.0, 10.8, 30.0, "attn", "Transformer",
+            ["decoder", "", "z → rows of", "the serialized", "tree"], tfs=TF, fs=BF)
+    c.arrow([(111.6, 73.3), (113.4, 73.3)], ms=7)
+    vec_glyph(c, 113.4, 56.0, 1.8, 23.0, 12, KIND["hid"][0], H_COL)
+    c.text(114.3, 80.6, r"$h_i$", fs=11, color=H_COL, weight="bold")
+    c.arrow([(115.2, 73.3), (117.0, 73.3)], ms=7)
+    c.block(117.0, 67.6, 3.0, 11.4, "attn", "MLP head", rot=90, tfs=10.1)
+    c.arrow([(120.0, 73.3), (121.8, 73.3)], ms=7)
+
+    tx, tw = 121.8, 19.2
+    c.text(tx + tw / 2, 82.9, "generated sequence", fs=TF, weight="bold")
+    seq = [
+        ("hdr", "x    y    z    r    s"),
+        ("sp", r"$\langle$branch start$\rangle$"),
+        ("row", "x₁  y₁  z₁  r₁  s₁"),
+        ("row", "x₂  y₂  z₂  r₂  s₂"),
+        ("row", "x₃  y₃  z₃  r₃  s₃"),
+        ("row", "⋮"),
+        ("sp", r"$\langle$branch end$\rangle$"),
+        ("sp", r"$\langle$branch start$\rangle$  …"),
     ]
-    rh = 1.8
-    y = 81.5
-    split = tx + 14.2
-    for kind, left, right in rows:
+    rh, y = 1.9, 81.5
+    for kind, s in seq:
         y0 = y - rh
-        if kind == "hdr":
-            c.ax.add_patch(Rectangle((tx, y0), tw, rh, fc="#e6e6e6", ec="#9a9a9a", lw=0.6,
-                                     zorder=3))
-        elif kind == "sp":
-            c.ax.add_patch(Rectangle((tx, y0), tw, rh, fc="#f4f0e2", ec="#9a9a9a", lw=0.6,
-                                     zorder=3))
-        else:
-            c.ax.add_patch(Rectangle((tx, y0), split - tx, rh, fc="white", ec="#9a9a9a",
-                                     lw=0.6, zorder=3))
-            c.ax.add_patch(Rectangle((split, y0), tx + tw - split, rh,
-                                     fc=KIND["lat"][0] if right.startswith("τ") else "white",
-                                     ec="#9a9a9a", lw=0.6, zorder=3))
-        if kind == "sp":
-            c.text(tx + tw / 2, y0 + rh / 2, left, fs=9.3, color="#7a5d10")
-        else:
-            c.text((tx + split) / 2, y0 + rh / 2, left, fs=9.3)
-            c.text((split + tx + tw) / 2, y0 + rh / 2, right, fs=9.3)
+        fc = {"hdr": "#e6e6e6", "sp": "#f4f0e2", "row": "white"}[kind]
+        c.ax.add_patch(Rectangle((tx, y0), tw, rh, fc=fc, ec="#9a9a9a", lw=0.6, zorder=3))
+        c.text(tx + tw / 2, y0 + rh / 2, s, fs=BF, color="#7a5d10" if kind == "sp" else INK)
         y = y0
-    c.text(tx + tw / 2, y - 0.9, "1 mm samples · τ on every 2nd (2 mm)", fs=9.3, color=GREY)
-    c.text(tx + tw / 2, y - 2.1, "r = MISR · s = template stretch", fs=9.3, color=GREY)
+    c.text(tx + tw / 2, y - 1.0, "one row per 1 mm · r: radius (MISR)", fs=SF, color=GREY)
+    c.text(tx + tw / 2, y - 2.3, "s: mesh density (target edge length)", fs=SF, color=GREY)
+    c.arrow([(tx + tw, 73.3), (142.4, 73.3)], ms=7)
+    c.image("stage1_tree", 142.4, 64.6, 15.8, 16.4)
+    c.text(150.3, 82.9, "decoded tree", fs=TF, weight="bold")
 
-    c.arrow([(139.6, 73.1), (141.2, 73.1)], ms=8)
-    c.image("stage1_tree", 141.2, 64.8, 16.6, 16.0)
-    c.text(149.5, 82.9, "decoded tree", fs=10.8, weight="bold")
-
-    # training lane (step 3)
-    lane_label(c, 6.0, 62.0, 3, "Stage-1 training (Stage 2 frozen)")
+    # training lane
+    lane_label(c, 6.0, 61.6, 1, "Training (end-to-end with Stage 2)")
     c.image("gt_surface", 5.6, 49.0, 10.8, 10.0)
-    c.text(11.0, 48.7, r"$S_{GT}$", fs=9.5, color=GREY)
-    c.arrow([(16.4, 54.2), (18.2, 54.2)], ls=TRAIN, color=GREY, ms=8)
-    c.block(18.2, 50.3, 12.6, 8.0, "enc", "PointNeXt", ["encoder", "(global pooling)"],
-            tfs=10.6, fs=9.3)
-    c.arrow([(30.8, 54.2), (33.1, 54.2)], ls=TRAIN, color=GREY, ms=8)
-    c.ax.add_patch(Circle((34.4, 54.2), 1.3, fc=KIND["lat"][0], ec=KIND["lat"][1], lw=1.1,
-                          zorder=5))
-    c.text(34.4, 54.2, r"$x_0$", fs=10.6)
-    c.arrow([(35.7, 54.2), (44.3, 54.2)], ls=TRAIN, color=GREY, ms=8)
-    c.block(44.3, 49.6, 56.7, 9.1, "loss", r"$\mathcal{L}_{diff}=\|\epsilon-\epsilon_\theta(x_t,t,c)\|^2$",
-            [r"$x_t=\sqrt{\bar\alpha_t}\,x_0+\sqrt{1-\bar\alpha_t}\,\epsilon$,   $\epsilon\sim\mathcal{N}(0,I)$",
+    c.text(11.0, 48.6, r"$S_{GT}$", fs=BF, color=GREY)
+    c.arrow([(16.4, 54.2), (18.0, 54.2)], ls=TRAIN, color=GREY, ms=8)
+    c.block(18.0, 50.3, 12.4, 8.0, "enc", "PointNeXt", ["encoder", "(global pooling)"],
+            tfs=TF, fs=BF)
+    c.arrow([(30.4, 54.2), (32.3, 54.2)], ls=TRAIN, color=GREY, ms=8)
+    node(c, 33.6, 54.2, r"$x_0$")
+    c.arrow([(34.9, 54.2), (41.5, 54.2)], ls=TRAIN, color=GREY, ms=8)
+    c.block(41.5, 49.6, 54.0, 9.1, "loss",
+            r"$\mathcal{L}_{diff}=\|\epsilon-\epsilon_\theta(x_t,t,c)\|^2$",
+            [r"$x_t=\sqrt{\bar\alpha_t}\,x_0+\sqrt{1-\bar\alpha_t}\,\epsilon$  on the latents "
+             r"$x_0$ of the trained encoder",
              r"c randomly replaced by $\varnothing$, which trains the unconditional branch"],
-            tfs=10.8, fs=9.5)
-    c.arrow([(72.6, 58.7), (72.6, 63.5)], ls=TRAIN, color=LOSS_EC, lw=1.1, ms=8)
-    c.arrow([(34.4, 55.5), (34.4, 60.6), (110.2, 60.6), (110.2, 64.6)], ls=TRAIN, color=GREY,
-            ms=8)
-    c.text(104.6, 60.6, r"$z\sim\mathcal{N}(x_0,I)$", fs=9.7, color=INK, bg=BAND[1][0])
-    c.block(112.6, 48.8, 33.2, 12.0, "loss", r"$\mathcal{L}_{seq}$  sequence reconstruction",
-            ["targets per 1 mm sample:",
-             "x, y, z, r: original centerline + MISR",
-             "s: StretchDistance of the template",
-             "τ: standardised Stage-2 posterior samples (step 2)",
-             r"$\langle$branch$\rangle$ tokens: tree order"], tfs=10.6, fs=9.3)
+            tfs=TF, fs=BF)
+    badge(c, 42.5, 57.7, 2, col=LOSS_EC)
+    c.arrow([(68.5, 58.7), (68.5, 63.5)], ls=TRAIN, color=LOSS_EC, lw=1.1, ms=8)
+    c.arrow([(33.6, 55.5), (33.6, zy), (zx - 1.3, zy)], ls=TRAIN, color=GREY, ms=8)
+    c.text(84.0, zy, r"training: $z\sim\mathcal{N}(x_0,I)$", fs=BF, bg=BAND[1][0])
+    c.block(116.4, 48.6, 33.4, 12.4, "loss", r"$\mathcal{L}_{seq}$  sequence reconstruction",
+            ["targets per 1 mm row, from the GT centerline:",
+             "x, y, z and r (MISR)",
+             "s: template edge length (StretchDistance)",
+             r"$\langle$branch start / end$\rangle$: tree order"], tfs=TF, fs=BF)
+    return zx
 
 
-def draw_handoff(c):
-    y = 47.2
-    c.arrow([(149.5, 64.8), (149.5, y), (14.0, y), (14.0, 44.2)], lw=1.6)
-    c.text(82.0, y, "inference hand-off (non-differentiable): generated sequence → Stage 2",
-           fs=9.7, weight="bold", bg="white", z=8)
+def draw_links(c, zx):
+    """The three places where Stage 1 feeds Stage 2."""
+    top = 44.6
+    c.arrow([(zx, 59.3), (zx, top)], color=Z_COL, lw=1.9, ms=10, z=7)
+    c.text(zx + 0.8, 46.6, r"$z$  (global)", fs=BF, color=Z_COL, weight="bold", ha="left",
+           bg="white", z=8)
+    c.arrow([(114.3, 56.0), (114.3, top)], color=H_COL, lw=1.9, ms=10, z=7)
+    c.text(115.1, 46.6, r"$h_i$  (one per row)", fs=BF, color=H_COL, weight="bold",
+           ha="left", bg="white", z=8)
+    c.arrow([(152.0, 64.6), (152.0, top)], color=INK, lw=1.9, ms=10, z=7)
+    c.text(151.2, 46.6, "rows x, y, z, r, s", fs=BF, weight="bold", ha="right", bg="white",
+           z=8)
 
 
-def draw_stage2(c, info):
-    band(c, 2, 1, 46.4, "STAGE 2 · geometry VAE", "implemented")
+def draw_stage2(c, info, zx):
+    band(c, 2, 1, 45.8, "STAGE 2 · template decoder", "SplineConv decoder of the current code")
 
-    # lane I: parse, de-standardise, Z
-    c.block(6.0, 36.4, 16.0, 7.8, "op", "Parse sequence",
-            [r"$\mathcal{C}$: xyz, MISR r, branches", "s: stretch · τ: tokens"], tfs=10.6, fs=9.3)
-    c.arrow([(22.0, 40.3), (24.6, 40.3)], ms=8)
-    c.block(24.6, 36.4, 16.4, 7.8, "op", "De-standardise",
-            [r"$\tau\,\sigma_d+\mu_d$ per dimension", "inactive dims → 0"], tfs=10.6, fs=9.3)
-    c.arrow([(41.0, 40.3), (44.6, 40.3)], color=Z_COL, lw=1.4, ms=9)
-    z_grid(c, info, 44.6, 37.3, 30.0, 5.9)
-    c.text(76.4, 42.1, r"$Z\in\mathbb{R}^{L\times16}$", fs=11.6, ha="left")
-    c.text(76.4, 40.1, "one 16-d code per 2 mm token", fs=9.3, color=GREY, ha="left")
-    c.text(76.4, 38.6, f"(p462: {len(info['tok_tract'])} tokens, L = 128 slots)", fs=9.3,
-           color=GREY, ha="left")
+    # --- conditioning and template (top row), fed from above ---------------
+    ty0, ty1 = 34.6, 44.6
+    # global: FiLM / AdaIN
+    c.rbox(71.0, ty0, 28.5, ty1 - ty0, KIND["lat"][0], Z_COL, lw=1.3, r=0.7, z=3)
+    c.text(85.25, 43.1, "Global: z → every layer", fs=TF, weight="bold")
+    texts(c, 85.25, 41.0, [r"MLP$(z)\to(\gamma_\ell,\beta_\ell)$ per SplineConv layer $\ell$",
+                           r"FiLM:  $y\leftarrow\gamma\odot y+\beta$",
+                           r"AdaIN:  $y\leftarrow\gamma\odot(y-\mu_y)/\sigma_y+\beta$"],
+          step=1.95)
+    # local: hidden states interpolated onto the mesh
+    c.rbox(101.5, ty0, 32.0, ty1 - ty0, KIND["hid"][0], H_COL, lw=1.3, r=0.7, z=3)
+    c.text(112.4, 43.1, "Local: h on the mesh", fs=TF, weight="bold")
+    texts(c, 112.4, 41.0, [r"$h_i$ sits on centerline sample $i$",
+                           r"vertex $v$ between samples $i,\,i{+}1$:",
+                           r"$h(v)=(1-\lambda)\,h_i+\lambda\,h_{i+1}$"], step=1.95)
+    c.image("hidden_interp", 123.6, 35.2, 9.6, 8.8, z=4)
+    # template generation: the only non-differentiable step
+    c.rbox(135.6, ty0, 22.6, ty1 - ty0, "white", KIND["op"][1], lw=1.4, ls=(0, (4, 2.5)),
+           r=0.7, z=3)
+    c.text(146.9, 43.1, "Template generation", fs=TF, weight="bold")
+    texts(c, 146.9, 41.1, ["VMTK tube from x, y, z, r", "uncap · remesh at edge length s",
+                           "→ T + scaffold (u, θ, tract)"], step=1.75)
+    c.text(146.9, 35.6, "non-differentiable", fs=BF, weight="bold", color=LOSS_EC)
+    c.arrow([(135.6, 37.4), (133.5, 37.4)], ms=7)
+    c.text(134.55, 38.6, "T", fs=SF, weight="bold")
 
-    # lane D: template, levels, post-processing
-    c.arrow([(14.0, 36.4), (14.0, 34.1)], ms=8)
-    c.block(6.0, 18.6, 16.0, 15.5, "op", "Template (VMTK)",
-            [r"base surface from $\mathcal{C}$ + MISR", "uncap outlets",
-             "remesh, edge length", "set by s", "→ T (variable density)",
-             "+ scaffold (u, θ, tract)"], tfs=10.6, fs=9.3)
-    c.image("template", 22.4, 19.5, 13.0, 11.0)
-    c.text(28.9, 31.3, "T", fs=11.6, weight="bold")
+    # gradient note
+    c.rbox(48.0, ty0, 21.0, ty1 - ty0, "white", "#9a9a9a", lw=0.9, ls=(0, (1.5, 1.5)), r=0.7,
+           z=3)
+    c.text(58.5, 43.1, "Gradient paths", fs=TF, weight="bold")
+    texts(c, 58.5, 40.9, ["z and h are differentiable, so", "the surface loss also trains",
+                          "the Transformer and encoder;", "T is a fixed input"],
+          step=1.6, fs=SF)
+
+    # --- decoder row, right to left ----------------------------------------
+    c.arrow([(147.0, ty0), (147.0, 31.8)], ms=8)
+    c.image("template", 139.2, 15.2, 19.0, 16.4)
+    c.text(140.2, 30.6, "T", fs=11, weight="bold", ha="left")
+    c.text(148.7, 13.9, "levels: 8 / 25 / 100 % of T", fs=SF, color=GREY)
+    c.text(148.7, 12.5, r"geometry: $r_{local},\,\kappa,\,\tau,\,d_{ost}$", fs=SF, color=GREY)
+
+    ly0, lh, lw_ = 13.5, 18.0, 23.0
     levels = [
-        ("coarse", "Coarse", info["n_coarse"], 38.2,
-         ["cross-attn → Z", "pos. self-attn", "6 × SplineConv", "free Δx", "rim-plane proj."]),
-        ("mid", "Mid", info["n_mid"], 64.8,
-         ["cross-attn → Z", "skip  h↑, Δx↑", "6 × SplineConv", "Δr n + Δs (t, b)",
-          "rim-plane proj."]),
-        ("fine", "Fine", info["n_fine"], 91.4,
-         ["cross-attn → Z", "skip  h↑, Δx↑", "6 × SplineConv", "Δr n + Δs (t, b)",
-          "rim-plane proj."]),
+        ("coarse", "Coarse", info["n_coarse"], 114.0,
+         ["in: h(v) ‖ geometry", "pos. self-attn", "6 × SplineConv", "+ FiLM/AdaIN each",
+          "free Δx", "rim-plane proj."]),
+        ("mid", "Mid", info["n_mid"], 87.0,
+         ["in: h(v) ‖ geometry", "skip  h↑, Δx↑", "6 × SplineConv", "+ FiLM/AdaIN each",
+          "Δr n + Δs (t, b)", "rim-plane proj."]),
+        ("fine", "Fine", info["n_fine"], 60.0,
+         ["in: h(v) ‖ geometry", "skip  h↑, Δx↑", "6 × SplineConv", "+ FiLM/AdaIN each",
+          "Δr n + Δs (t, b)", "rim-plane proj."]),
     ]
-    lw_, ly0, lh = 23.6, 18.6, 15.0
-    c.arrow([(35.4, 25.0), (38.2, 25.0)], ms=8)
+    yc = 22.0
+    c.arrow([(139.2, yc), (137.0, yc)], ms=8)
     for key, name, n, x0, lines in levels:
         c.rbox(x0, ly0, lw_, lh, KIND["dec"][0], KIND["dec"][1], lw=1.2, r=0.7, z=3)
-        c.text(x0 + 0.9, ly0 + lh - 1.2, f"{name} · {fmt(n)} v.", fs=10.3, weight="bold",
+        c.text(x0 + 0.9, ly0 + lh - 1.3, f"{name} · {fmt(n)} v.", fs=TF, weight="bold",
                ha="left")
-        c.image(f"level_{key}", x0 + 0.5, ly0 + 0.7, 10.0, 10.8, anchor="bottom", z=4)
+        c.image(f"level_{key}", x0 + 0.4, ly0 + 0.6, 9.6, 11.2, anchor="bottom", z=4)
         for j, s in enumerate(lines):
-            col = "#7a5a0a" if s.startswith(("cross", "pos.")) else "#1f5c2a" if "Spline" in s else "#333333"
-            c.text(x0 + 17.3, ly0 + lh - 3.8 - 2.05 * j, s, fs=9.3, color=col)
-    for xa, xb in ((61.8, 64.8), (88.4, 91.4)):
-        c.arrow([(xa, 25.0), (xb, 25.0)], color=KIND["dec"][1], ms=8)
-        c.text((xa + xb) / 2, 26.4, "kNN↑", fs=9.3, color=KIND["dec"][1])
-    # Z bus
-    zb = 35.4
-    c.arrow([(59.6, 37.3), (59.6, zb)], color=Z_COL, lw=1.6, head=False, z=7)
-    c.arrow([(50.0, zb), (116.6, zb)], color=Z_COL, lw=1.6, head=False, z=7)
-    for x0 in (38.2, 64.8, 91.4):
-        c.arrow([(x0 + 11.8, zb), (x0 + 11.8, ly0 + lh)], color=Z_COL, lw=1.6, z=7, ms=9)
-    # post-processing and output
-    c.arrow([(115.0, 25.0), (118.2, 25.0)], ms=8)
-    c.block(118.2, 20.0, 9.2, 10.0, "op", "Post-process",
-            ["fold checks", "isotropic", "remesh"], tfs=9.9, fs=9.3)
-    c.arrow([(127.4, 25.0), (129.2, 25.0)], ms=8)
-    c.image("gt_surface", 129.0, 21.6, 28.8, 22.6)
-    c.text(143.4, 20.7, r"$\hat{S}$: watertight, open outlets → CFD", fs=10.1, weight="bold")
-    c.text(143.4, 19.2, "(shown: GT surface of case p462)", fs=9.3, color=GREY)
+            col = (H_COL if s.startswith("in:") else Z_COL if "FiLM" in s
+                   else "#1f5c2a" if "Spline" in s else "#7a5a0a" if s.startswith("pos.")
+                   else "#333333")
+            c.text(x0 + 17.0, ly0 + lh - 4.0 - 1.95 * j, s, fs=BF, color=col)
+    for xa, xb in ((114.0, 110.0), (87.0, 83.0)):
+        c.arrow([(xa, yc), (xb, yc)], color=KIND["dec"][1], ms=8)
+        c.text((xa + xb) / 2, yc + 1.5, "kNN↑", fs=SF, color=KIND["dec"][1])
 
-    # lane T: stage-2 training
-    lane_label(c, 6.0, 16.3, 1, r"Stage-2 training (VAE):  $\mathcal{C}$ = original centerline,  "
-               r"T = cleandata template,  target $S_{GT}$")
-    c.image("gt_surface", 5.6, 2.3, 10.6, 10.0)
-    c.arrow([(16.2, 7.6), (17.8, 7.6)], ls=TRAIN, color=GREY, ms=7)
-    # mini PointNeXt blocks
-    x = 17.8
-    for n, ch in ((16384, 32), (1024, 64), (256, 128), (64, 128), (64, 256)):
-        h = 0.48 * 0.95 * n ** 0.3
-        w = 0.24 * ch ** 0.5
-        c.fmap(x, 7.6 - h / 2, w, h)
-        x += w + 1.4
-    c.text(26.6, 2.6, "PointNeXt, 16384 → 64 pts", fs=9.3, color=GREY)
-    c.arrow([(x - 0.4, 7.6), (38.2, 7.6)], ls=TRAIN, color=GREY, ms=7)
-    c.block(38.2, 3.8, 11.2, 7.6, "enc", "Latent head", ["pool → tokens", "transformer × 3"],
-            tfs=10.1, fs=9.3)
-    c.arrow([(49.4, 9.4), (51.0, 9.4)], ls=TRAIN, color=GREY, ms=7)
-    c.arrow([(49.4, 5.8), (51.0, 5.8)], ls=TRAIN, color=GREY, ms=7)
-    c.block(51.0, 7.9, 6.0, 3.4, "lat", r"$\mu$", tfs=11)
-    c.block(51.0, 3.9, 6.0, 3.4, "lat", r"$\log\sigma^2$", tfs=10.3)
-    c.arrow([(57.0, 9.4), (58.8, 9.4)], ls=TRAIN, color=GREY, ms=7)
-    c.arrow([(57.0, 5.8), (58.8, 5.8)], ls=TRAIN, color=GREY, ms=7)
-    c.block(58.8, 3.8, 10.6, 7.6, "attn", "Tract mixer", ["on μ"], tfs=10.1, fs=9.3)
-    c.arrow([(69.4, 7.6), (71.2, 7.6)], ls=TRAIN, color=GREY, ms=7)
-    c.block(71.2, 3.8, 11.2, 7.6, "lat", "Reparam.", [r"$z=\tilde\mu+\sigma\odot\varepsilon$"],
-            tfs=10.1, fs=9.5)
-    c.arrow([(82.4, 7.6), (84.6, 7.6)], ls=TRAIN, color=GREY, ms=7)
-    c.block(84.6, 2.6, 17.4, 10.0, "op", "Standardise",
-            ["drop inactive dims", r"$(\mu+\sigma\varepsilon-\mu_d)\,/\,\sigma_d$",
-             "→ τ targets of Stage 1"], tfs=10.1, fs=9.3)
-    # training z joins the bus
-    c.arrow([(76.8, 11.4), (76.8, 14.3), (116.6, 14.3), (116.6, zb)], color=Z_COL, lw=1.4,
-            ls=TRAIN, head=False, bridge=True, z=6)
-    c.text(108.0, 14.3, "z (training)", fs=9.3, color=Z_COL, bg=BAND[2][0], z=8)
-    # losses
-    c.arrow([(112.0, ly0), (112.0, 16.9), (135.0, 16.9), (135.0, 14.2)], ls=TRAIN,
-            color=LOSS_EC, lw=1.1, ms=8)
-    c.block(119.6, 1.9, 38.2, 12.3, "loss", "Stage-2 losses",
-            [r"$\mathcal{L}_{CD}+\mathcal{L}_{rad}+\lambda_{KL}\,\beta\,\mathcal{L}_{KL}"
-             r"+0.15\,\mathcal{L}_{disp}+0.05\,\mathcal{L}_{lap}+0.02\,\mathcal{L}_{n}$",
-             "Chamfer at 3 levels · radial Huber vs r* · KL rate by GECO", ""],
-            tfs=10.6, fs=9.3)
-    badge(c, 85.9, 11.5, 2)
-    badge(c, 124.6, 3.6, 4, col=LOSS_EC)
-    c.text(125.8, 3.6, "planned: fine-tune the Stage-2 decoder on Stage-1 samples", fs=9.3,
-           color=LOSS_EC, ha="left", weight="bold")
+    # buses: (gamma, beta) to every level, h(v) to every level
+    gb, hb = 33.5, 32.6
+    c.arrow([(85.25, ty0), (85.25, gb)], color=Z_COL, lw=1.6, head=False, z=7)
+    c.arrow([(60.0 + 13.6, gb), (114.0 + 13.6, gb)], color=Z_COL, lw=1.6, head=False, z=7)
+    c.arrow([(117.5, ty0), (117.5, hb)], color=H_COL, lw=1.6, head=False, z=7, bridge=True)
+    c.arrow([(60.0 + 20.4, hb), (114.0 + 20.4, hb)], color=H_COL, lw=1.6, head=False, z=7)
+    for x0 in (60.0, 87.0, 114.0):
+        c.arrow([(x0 + 13.6, gb), (x0 + 13.6, ly0 + lh)], color=Z_COL, lw=1.6, z=7, ms=9,
+                bridge=True)
+        c.arrow([(x0 + 20.4, hb), (x0 + 20.4, ly0 + lh)], color=H_COL, lw=1.6, z=7, ms=9)
+    c.text(60.0 + 13.0, gb, r"$(\gamma_\ell,\beta_\ell)$", fs=BF, color=Z_COL, ha="right")
+    c.text(114.0 + 21.0, hb - 0.1, r"$h(v)$", fs=BF, color=H_COL, ha="left")
+
+    # post-processing and output
+    c.arrow([(60.0, yc), (57.4, yc)], ms=8)
+    c.block(47.2, 17.0, 10.2, 10.0, "op", "Post-process", ["fold checks", "isotropic", "remesh"],
+            tfs=TF, fs=BF)
+    c.arrow([(47.2, yc), (45.4, yc)], ms=8)
+    c.image("gt_surface", 5.6, 14.6, 40.4, 30.0)
+    c.text(25.8, 13.4, r"$\hat{S}$: watertight, open outlets → CFD", fs=10.1, weight="bold")
+    c.text(25.8, 11.9, "(shown: GT surface of case p462)", fs=SF, color=GREY)
+
+    # losses (the same end-to-end training as step 1)
+    c.arrow([(71.5, ly0), (71.5, 11.0)], ls=TRAIN, color=LOSS_EC, lw=1.1, ms=8)
+    c.rbox(48.4, 1.9, 109.8, 9.1, KIND["loss"][0], LOSS_EC, lw=1.3, r=0.7, z=3)
+    badge(c, 49.9, 9.5, 1)
+    c.text(51.3, 9.5, r"Surface losses vs $S_{GT}$", fs=TF, weight="bold", ha="left")
+    c.text(103.3, 7.0,
+           r"$\mathcal{L}_{CD}$ (fine + 0.5 mid + 0.05 coarse) $+\ \mathcal{L}_{rad}"
+           r"+0.15\,\mathcal{L}_{disp}+0.05\,\mathcal{L}_{lap}+0.02\,\mathcal{L}_{n}$",
+           fs=BF)
+    c.text(103.3, 4.9, r"trained together with $\mathcal{L}_{seq}$ · in training T is built "
+           r"from the GT centerline (cleandata template)", fs=BF)
+    c.text(103.3, 3.0, "radial Huber vs r* · Chamfer: Huber point-to-plane + 0.2 L2",
+           fs=SF, color=GREY)
 
 
 def main():
     info = load_info()
     c = Canvas()
     draw_header(c)
-    draw_stage1(c, info)
-    draw_handoff(c)
-    draw_stage2(c, info)
+    zx = draw_stage1(c)
+    draw_links(c, zx)
+    draw_stage2(c, info, zx)
     c.fig.savefig(OUT + ".png", dpi=200)
     c.fig.savefig(OUT + ".pdf")
     c.fig.savefig(OUT + ".svg")

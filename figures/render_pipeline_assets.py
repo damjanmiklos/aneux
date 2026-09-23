@@ -10,6 +10,9 @@ sees, canonical pose, mm), so the figure shows real data rather than cartoons:
     tokens          latent token positions (2 mm spacing) on the tree
     template        template mesh T (fine level)
     level_coarse/mid/fine  the three decoder scaffolds, coloured by tract
+    stage1_tree     Stage-1 output: one MISR sphere and dot per 1 mm row
+    hidden_interp   T coloured by a smooth per-row feature interpolated between
+                    neighbouring centerline samples (stand-in for the hidden states h)
 
 Run in the aneurysmgnn env:
     python figures/render_pipeline_assets.py [--case p462_EwAADxURDAABCwMWEQAcCxAB]
@@ -174,7 +177,7 @@ def main():
                     color=TRACT_COLORS[int(t) % len(TRACT_COLORS)], smooth_shading=True)
     shots.append(r.shoot(pl, "tokens"))
 
-    # Stage-1 output as a sequence: one MISR sphere per 1 mm sample + tokens
+    # Stage-1 output as a sequence: one MISR sphere and one dot per 1 mm row
     raw_cl = pv.read(os.path.join(REPO, "cleandata", "original_centerline", f"{args.case}.vtp"))
     posed = (np.asarray(raw_cl.points) - d.origin_shift.numpy()) @ d.pose_R.numpy()
     misr = np.asarray(raw_cl.point_data["MaximumInscribedSphereRadius"])
@@ -194,11 +197,39 @@ def main():
         pl.add_mesh(balls.glyph(geom=pv.Sphere(radius=1.0, theta_resolution=24, phi_resolution=24),
                                 scale="r", orient=False),
                     color=col, opacity=0.22, smooth_shading=True)
-    for t in np.unique(tok_t):
-        pl.add_mesh(pv.PolyData(tok[tok_t == t]).glyph(geom=pv.Sphere(radius=0.5), scale=False,
-                                                     orient=False),
-                    color=TRACT_COLORS[int(t) % len(TRACT_COLORS)], smooth_shading=True)
+        pl.add_mesh(pv.PolyData(samples).glyph(geom=pv.Sphere(radius=0.42), scale=False,
+                                               orient=False),
+                    color=col, smooth_shading=True)
     shots.append(r.shoot(pl, "stage1_tree"))
+
+    # Transformer hidden states laid on the 1 mm samples and interpolated onto
+    # the template: a smooth random feature per sample stands in for h_i
+    fine = poly(d.x.numpy(), d.face.numpy())
+    rng = np.random.default_rng(3)
+    v_tract = d.tract_id.numpy()
+    v_pos = d.x.numpy()
+    v_rgb = np.zeros((len(v_pos), 3))
+    pl = r.plotter()
+    for t in np.unique(cl_t):
+        pts = cl[cl_t == t]
+        if len(pts) < 2:
+            continue
+        n_s = (len(pts) - 1) // 5 + 1
+        walk = np.cumsum(rng.normal(size=(n_s + 8, 3)), axis=0)
+        walk = np.stack([np.convolve(walk[:, k], np.ones(9) / 9, mode="valid") for k in range(3)], 1)
+        walk = walk[:n_s]
+        walk = (walk - walk.min(0)) / np.maximum(np.ptp(walk, 0), 1e-9)
+        feat = 0.7 * (0.25 + 0.65 * walk) + 0.3 * 0.78
+        sel = np.nonzero(v_tract == t)[0]
+        if len(sel):
+            fi = cKDTree(pts).query(v_pos[sel])[1] / 5.0
+            i0 = np.clip(np.floor(fi).astype(int), 0, n_s - 1)
+            i1 = np.clip(i0 + 1, 0, n_s - 1)
+            lam = (fi - i0)[:, None]
+            v_rgb[sel] = (1 - lam) * feat[i0] + lam * feat[i1]
+    fine.point_data["rgb"] = (v_rgb * 255).astype(np.uint8)
+    pl.add_mesh(fine, scalars="rgb", rgb=True, smooth_shading=True, ambient=0.2)
+    shots.append(r.shoot(pl, "hidden_interp"))
 
     fine = poly(d.x.numpy(), d.face.numpy())
     pl = r.plotter()
