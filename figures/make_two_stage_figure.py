@@ -63,19 +63,19 @@ def band(c, key, y0, y1, title, sub):
     fc, ec, tab = BAND[key]
     c.rbox(1, y0, 158, y1 - y0, fc, ec, lw=1.0, r=1.2, z=0)
     c.rbox(1, y0, 3.6, y1 - y0, tab, tab, lw=1.0, r=1.2, z=1)
-    c.text(2.35, (y0 + y1) / 2, title, fs=12.5, weight="bold", color="white", rotation=90)
-    c.text(3.75, (y0 + y1) / 2, sub, fs=8.6, color="white", rotation=90)
+    c.text(2.25, (y0 + y1) / 2, title, fs=13.5, weight="bold", color="white", rotation=90)
+    c.text(3.85, (y0 + y1) / 2, sub, fs=9.3, color="white", rotation=90)
 
 
-def badge(c, x, y, n, r=0.72, col="#555555"):
+def badge(c, x, y, n, r=0.82, col="#555555"):
     """Numbered training-order badge (Arial has no circled digits)."""
     c.ax.add_patch(Circle((x, y), r, fc=col, ec="none", zorder=9))
-    c.text(x, y - 0.03, str(n), fs=7.6, weight="bold", color="white", z=10)
+    c.text(x, y - 0.03, str(n), fs=8.8, weight="bold", color="white", z=10)
 
 
 def lane_label(c, x, y, n, s):
-    badge(c, x + 0.72, y, n)
-    c.text(x + 1.9, y, s, fs=9.2, weight="bold", color="#555555", ha="left")
+    badge(c, x + 0.82, y, n)
+    c.text(x + 2.1, y, s, fs=10.1, weight="bold", color="#555555", ha="left")
 
 
 def unet(c, x, y, w, h, ec=KIND["diff"][1], fc=KIND["diff"][0]):
@@ -120,37 +120,37 @@ def z_grid(c, info, gx, gy, gw, gh):
 # ---------------------------------------------------------------------------
 def draw_header(c):
     c.text(1.5, 88.3, "Two-stage generative model: clinical conditions → vessel surface",
-           fs=18.5, weight="bold", ha="left")
+           fs=19, weight="bold", ha="left")
     c.text(1.5, 85.9,
            "Stage 1 generates the centerline tree with texture tokens; Stage 2 decodes the "
            "tokens onto a template mesh.   Solid: inference · dashed: training only · "
            "numbered badges: training order",
-           fs=10, color=GREY, ha="left")
+           fs=11, color=GREY, ha="left")
     entries = [
         ("cond", "condition"), ("diff", "diffusion"), ("attn", "attention / transformer"),
         ("enc", "encoder"), ("lat", "latent / stochastic"), ("dec", "decoder"),
         ("op", "fixed op (non-diff.)"), ("loss", "loss"),
     ]
-    x0, y0 = 106.5, 88.7
+    x0, y0 = 103.6, 88.7
     for i, (k, lab) in enumerate(entries):
         col, row = i % 4, i // 4
-        xx, yy = x0 + col * 13.4, y0 - row * 2.2
+        xx, yy = x0 + col * 14.4, y0 - row * 2.2
         fc, ec = KIND[k]
         c.rbox(xx, yy - 0.5, 2.2, 1.0, fc, ec, lw=0.9, ls=(0, (3, 1.6)) if k == "op" else "-",
                r=0.2, z=3)
-        c.text(xx + 2.8, yy, lab, fs=8.2, ha="left")
+        c.text(xx + 2.8, yy, lab, fs=9.3, ha="left")
 
 
 def draw_stage1(c, info):
     band(c, 1, 47.7, 84.4, "STAGE 1 · generation", "design draft")
 
     # clinical vector
-    c.text(10.7, 82.9, "clinical vector", fs=9.8, weight="bold")
+    c.text(10.7, 82.9, "clinical vector", fs=10.8, weight="bold")
     c.rbox(6.0, 65.0, 9.4, 16.8, KIND["cond"][0], KIND["cond"][1], lw=1.1, r=0.5, z=3)
     rows = ["sex = female", "age = 60 y", "m$_1$ = 1.3", "m$_2$ = 9.8", "m$_3$ = NULL"]
     ry = [79.4, 76.4, 73.4, 70.4, 67.4]
     for s, y in zip(rows, ry):
-        c.text(6.7, y, s, fs=8.8, ha="left")
+        c.text(6.7, y, s, fs=9.7, ha="left")
 
     # encoders
     encs = [
@@ -159,37 +159,36 @@ def draw_stage1(c, info):
         (65.4, "Missing token", "NULL (learned)", [4]),
     ]
     for yb, title, sub, src in encs:
-        c.block(18.0, yb, 12.4, 4.6, "cond", title, [sub], tfs=9.0, fs=7.9)
+        c.block(18.0, yb, 12.4, 4.6, "cond", title, [sub], tfs=9.9, fs=9.3)
         for k in src:
             c.arrow([(15.5, ry[k]), (18.0, yb + 2.3)], lw=0.9, ms=7)
         c.arrow([(30.4, yb + 2.3), (32.4, 73.3)], lw=0.9, ms=7)
     c.ax.add_patch(Circle((33.2, 73.3), 0.8, fc="white", ec=INK, lw=1.0, zorder=5))
-    c.text(33.2, 73.3, "+", fs=10)
-    c.text(33.2, 75.1, "concat", fs=7.6, color=GREY)
+    c.text(33.2, 73.3, "+", fs=11)
     c.arrow([(34.0, 73.3), (35.2, 73.3)], ms=7)
-    c.block(35.2, 67.6, 3.0, 11.4, "cond", "MLP", rot=90, tfs=9.2)
+    c.block(35.2, 67.6, 3.0, 11.4, "cond", "concat → MLP", rot=90, tfs=10.1)
     c.arrow([(38.2, 73.3), (39.7, 73.3)], ms=7)
     vec_glyph(c, 39.7, 70.3, 1.5, 6.0, 6, "#dcd3ea", KIND["diff"][1])
-    c.text(40.45, 77.3, r"$c\in\mathbb{R}^{256}$", fs=9.2)
+    c.text(40.45, 77.3, r"$c\in\mathbb{R}^{256}$", fs=10.1)
     vec_glyph(c, 39.7, 64.4, 1.5, 3.3, 3, "#ffffff", KIND["diff"][1])
-    c.text(40.45, 68.6, r"$\varnothing$ learned", fs=8.2, color=GREY)
+    c.text(40.45, 63.4, r"$\varnothing$ learned", fs=9.3, color=GREY)
 
     # diffusion
     dx0, dx1, dy0, dy1 = 44.3, 101.0, 63.5, 83.2
     c.rbox(dx0, dy0, dx1 - dx0, dy1 - dy0, "#f3eef9", KIND["diff"][1], lw=1.2, r=0.9, z=2)
     c.text((dx0 + dx1) / 2, 82.0, "Latent diffusion with classifier-free guidance",
-           fs=10.5, weight="bold")
+           fs=11.6, weight="bold")
     # x_t node
     c.ax.add_patch(Circle((48.6, 73.2), 1.5, fc=KIND["lat"][0], ec=KIND["lat"][1], lw=1.2,
                           zorder=5))
-    c.text(48.6, 73.2, r"$x_t$", fs=10.5)
-    c.text(48.6, 77.7, r"$x_T\sim\mathcal{N}(0,I)$", fs=8.6)
+    c.text(48.6, 73.2, r"$x_t$", fs=11.6)
+    c.text(48.6, 77.7, r"$x_T\sim\mathcal{N}(0,I)$", fs=9.5)
     c.arrow([(48.6, 76.9), (48.6, 74.7)], ms=7)
     # U-Nets
     unet(c, 54.2, 75.2, 12.2, 5.4)
     unet(c, 54.2, 67.4, 12.2, 5.4)
-    c.text(60.3, 74.3, r"U-Net $\epsilon_\theta(x_t,t,c)$", fs=8.6)
-    c.text(60.3, 66.5, r"same U-Net, $\epsilon_\theta(x_t,t,\varnothing)$", fs=8.6)
+    c.text(60.3, 74.3, r"U-Net $\epsilon_\theta(x_t,t,c)$", fs=9.5)
+    c.text(60.3, 66.5, r"same U-Net, $\epsilon_\theta(x_t,t,\varnothing)$", fs=9.5)
     c.arrow([(50.1, 73.2), (52.3, 73.2), (52.3, 77.4), (54.2, 77.4)], ms=7)
     c.arrow([(52.3, 73.2), (52.3, 70.8), (54.2, 70.8)], ms=7)
     c.arrow([(41.2, 74.8), (43.0, 74.8), (43.0, 79.9), (54.2, 79.9)], color=KIND["diff"][1],
@@ -201,26 +200,26 @@ def draw_stage1(c, info):
     c.arrow([(66.4, 70.1), (68.0, 70.1), (68.0, 72.6), (69.4, 72.6)], ms=7)
     c.block(69.4, 69.3, 15.8, 9.0, "diff", "Guidance",
             [r"$\hat\epsilon=\epsilon_\varnothing+w\,(\epsilon_c-\epsilon_\varnothing)$",
-             "w: guidance scale"], tfs=9.6, fs=8.6)
+             "w: guidance scale"], tfs=10.6, fs=9.5)
     c.arrow([(85.2, 73.8), (86.8, 73.8)], ms=7)
     c.block(86.8, 69.3, 12.6, 9.0, "diff", "Denoising step",
-            [r"$x_{t-1}=\mathrm{step}(x_t,\hat\epsilon)$", "t = T … 1"], tfs=9.6, fs=8.6)
+            [r"$x_{t-1}=\mathrm{step}(x_t,\hat\epsilon)$", "t = T … 1"], tfs=10.6, fs=9.5)
     c.arrow([(93.1, 69.3), (93.1, 64.7), (48.6, 64.7), (48.6, 71.7)], color=KIND["diff"][1],
             lw=1.1, ms=8)
-    c.text(71.0, 64.7, "repeat T = 1000 steps", fs=8.2, color=KIND["diff"][1],
+    c.text(71.0, 64.7, "repeat T = 1000 steps", fs=9.3, color=KIND["diff"][1],
            bg="#f3eef9")
     # x0 -> Transformer
     c.arrow([(99.4, 73.8), (104.0, 73.8)])
-    c.text(102.3, 75.4, r"$z=x_0$", fs=9.4)
+    c.text(102.3, 75.4, r"$z=x_0$", fs=10.3)
 
     c.block(104.0, 64.6, 12.4, 17.0, "attn", "Transformer",
             ["decoder", "", "z → serialized", "tree, one row", "per step", "", "+ MLP heads"],
-            tfs=10, fs=8.5)
+            tfs=11, fs=9.4)
     c.arrow([(116.4, 73.1), (118.6, 73.1)])
 
     # generated sequence
     tx, tw = 118.6, 21.0
-    c.text(tx + tw / 2, 82.9, "generated sequence", fs=9.8, weight="bold")
+    c.text(tx + tw / 2, 82.9, "generated sequence", fs=10.8, weight="bold")
     rows = [
         ("hdr", "x   y   z   r   s", r"$\tau\in\mathbb{R}^{16}$"),
         ("sp", r"$\langle$branch start$\rangle$", ""),
@@ -250,51 +249,51 @@ def draw_stage1(c, info):
                                      fc=KIND["lat"][0] if right.startswith("τ") else "white",
                                      ec="#9a9a9a", lw=0.6, zorder=3))
         if kind == "sp":
-            c.text(tx + tw / 2, y0 + rh / 2, left, fs=8.3, color="#7a5d10")
+            c.text(tx + tw / 2, y0 + rh / 2, left, fs=9.3, color="#7a5d10")
         else:
-            c.text((tx + split) / 2, y0 + rh / 2, left, fs=8.3)
-            c.text((split + tx + tw) / 2, y0 + rh / 2, right, fs=8.3)
+            c.text((tx + split) / 2, y0 + rh / 2, left, fs=9.3)
+            c.text((split + tx + tw) / 2, y0 + rh / 2, right, fs=9.3)
         y = y0
-    c.text(tx + tw / 2, y - 0.9, "1 mm samples · τ on every 2nd (2 mm)", fs=7.9, color=GREY)
-    c.text(tx + tw / 2, y - 2.1, "r = MISR · s = template stretch", fs=7.9, color=GREY)
+    c.text(tx + tw / 2, y - 0.9, "1 mm samples · τ on every 2nd (2 mm)", fs=9.3, color=GREY)
+    c.text(tx + tw / 2, y - 2.1, "r = MISR · s = template stretch", fs=9.3, color=GREY)
 
     c.arrow([(139.6, 73.1), (141.2, 73.1)], ms=8)
     c.image("stage1_tree", 141.2, 64.8, 16.6, 16.0)
-    c.text(149.5, 82.9, "decoded tree", fs=9.8, weight="bold")
+    c.text(149.5, 82.9, "decoded tree", fs=10.8, weight="bold")
 
     # training lane (step 3)
     lane_label(c, 6.0, 62.0, 3, "Stage-1 training (Stage 2 frozen)")
     c.image("gt_surface", 5.6, 49.0, 10.8, 10.0)
-    c.text(11.0, 48.7, r"$S_{GT}$", fs=8.6, color=GREY)
+    c.text(11.0, 48.7, r"$S_{GT}$", fs=9.5, color=GREY)
     c.arrow([(16.4, 54.2), (18.2, 54.2)], ls=TRAIN, color=GREY, ms=8)
     c.block(18.2, 50.3, 12.6, 8.0, "enc", "PointNeXt", ["encoder", "(global pooling)"],
-            tfs=9.6, fs=8.3)
+            tfs=10.6, fs=9.3)
     c.arrow([(30.8, 54.2), (33.1, 54.2)], ls=TRAIN, color=GREY, ms=8)
     c.ax.add_patch(Circle((34.4, 54.2), 1.3, fc=KIND["lat"][0], ec=KIND["lat"][1], lw=1.1,
                           zorder=5))
-    c.text(34.4, 54.2, r"$x_0$", fs=9.6)
+    c.text(34.4, 54.2, r"$x_0$", fs=10.6)
     c.arrow([(35.7, 54.2), (44.3, 54.2)], ls=TRAIN, color=GREY, ms=8)
     c.block(44.3, 49.6, 56.7, 9.1, "loss", r"$\mathcal{L}_{diff}=\|\epsilon-\epsilon_\theta(x_t,t,c)\|^2$",
             [r"$x_t=\sqrt{\bar\alpha_t}\,x_0+\sqrt{1-\bar\alpha_t}\,\epsilon$,   $\epsilon\sim\mathcal{N}(0,I)$",
              r"c randomly replaced by $\varnothing$, which trains the unconditional branch"],
-            tfs=9.8, fs=8.6)
+            tfs=10.8, fs=9.5)
     c.arrow([(72.6, 58.7), (72.6, 63.5)], ls=TRAIN, color=LOSS_EC, lw=1.1, ms=8)
     c.arrow([(34.4, 55.5), (34.4, 60.6), (110.2, 60.6), (110.2, 64.6)], ls=TRAIN, color=GREY,
             ms=8)
-    c.text(104.6, 60.6, r"$z\sim\mathcal{N}(x_0,I)$", fs=8.8, color=INK, bg=BAND[1][0])
+    c.text(104.6, 60.6, r"$z\sim\mathcal{N}(x_0,I)$", fs=9.7, color=INK, bg=BAND[1][0])
     c.block(112.6, 48.8, 33.2, 12.0, "loss", r"$\mathcal{L}_{seq}$  sequence reconstruction",
             ["targets per 1 mm sample:",
              "x, y, z, r: original centerline + MISR",
              "s: StretchDistance of the template",
              "τ: standardised Stage-2 posterior samples (step 2)",
-             r"$\langle$branch$\rangle$ tokens: tree order"], tfs=9.6, fs=8.1)
+             r"$\langle$branch$\rangle$ tokens: tree order"], tfs=10.6, fs=9.3)
 
 
 def draw_handoff(c):
     y = 47.2
     c.arrow([(149.5, 64.8), (149.5, y), (14.0, y), (14.0, 44.2)], lw=1.6)
     c.text(82.0, y, "inference hand-off (non-differentiable): generated sequence → Stage 2",
-           fs=8.8, weight="bold", bg="white", z=8)
+           fs=9.7, weight="bold", bg="white", z=8)
 
 
 def draw_stage2(c, info):
@@ -302,15 +301,15 @@ def draw_stage2(c, info):
 
     # lane I: parse, de-standardise, Z
     c.block(6.0, 36.4, 16.0, 7.8, "op", "Parse sequence",
-            [r"$\mathcal{C}$: xyz, MISR r, branches", "s: stretch · τ: tokens"], tfs=9.6, fs=8.1)
+            [r"$\mathcal{C}$: xyz, MISR r, branches", "s: stretch · τ: tokens"], tfs=10.6, fs=9.3)
     c.arrow([(22.0, 40.3), (24.6, 40.3)], ms=8)
     c.block(24.6, 36.4, 16.4, 7.8, "op", "De-standardise",
-            [r"$\tau\,\sigma_d+\mu_d$ per dimension", "inactive dims → 0"], tfs=9.6, fs=8.1)
+            [r"$\tau\,\sigma_d+\mu_d$ per dimension", "inactive dims → 0"], tfs=10.6, fs=9.3)
     c.arrow([(41.0, 40.3), (44.6, 40.3)], color=Z_COL, lw=1.4, ms=9)
     z_grid(c, info, 44.6, 37.3, 30.0, 5.9)
-    c.text(76.4, 42.1, r"$Z\in\mathbb{R}^{L\times16}$", fs=10.5, ha="left")
-    c.text(76.4, 40.1, "one 16-d code per 2 mm token", fs=8.3, color=GREY, ha="left")
-    c.text(76.4, 38.6, f"(p462: {len(info['tok_tract'])} tokens, L = 128 slots)", fs=8.3,
+    c.text(76.4, 42.1, r"$Z\in\mathbb{R}^{L\times16}$", fs=11.6, ha="left")
+    c.text(76.4, 40.1, "one 16-d code per 2 mm token", fs=9.3, color=GREY, ha="left")
+    c.text(76.4, 38.6, f"(p462: {len(info['tok_tract'])} tokens, L = 128 slots)", fs=9.3,
            color=GREY, ha="left")
 
     # lane D: template, levels, post-processing
@@ -318,9 +317,9 @@ def draw_stage2(c, info):
     c.block(6.0, 18.6, 16.0, 15.5, "op", "Template (VMTK)",
             [r"base surface from $\mathcal{C}$ + MISR", "uncap outlets",
              "remesh, edge length", "set by s", "→ T (variable density)",
-             "+ scaffold (u, θ, tract)"], tfs=9.6, fs=8.1)
+             "+ scaffold (u, θ, tract)"], tfs=10.6, fs=9.3)
     c.image("template", 22.4, 19.5, 13.0, 11.0)
-    c.text(28.9, 31.3, "T", fs=10.5, weight="bold")
+    c.text(28.9, 31.3, "T", fs=11.6, weight="bold")
     levels = [
         ("coarse", "Coarse", info["n_coarse"], 38.2,
          ["cross-attn → Z", "pos. self-attn", "6 × SplineConv", "free Δx", "rim-plane proj."]),
@@ -335,15 +334,15 @@ def draw_stage2(c, info):
     c.arrow([(35.4, 25.0), (38.2, 25.0)], ms=8)
     for key, name, n, x0, lines in levels:
         c.rbox(x0, ly0, lw_, lh, KIND["dec"][0], KIND["dec"][1], lw=1.2, r=0.7, z=3)
-        c.text(x0 + 0.9, ly0 + lh - 1.2, f"{name} · {fmt(n)} v.", fs=9.4, weight="bold",
+        c.text(x0 + 0.9, ly0 + lh - 1.2, f"{name} · {fmt(n)} v.", fs=10.3, weight="bold",
                ha="left")
         c.image(f"level_{key}", x0 + 0.5, ly0 + 0.7, 10.0, 10.8, anchor="bottom", z=4)
         for j, s in enumerate(lines):
             col = "#7a5a0a" if s.startswith(("cross", "pos.")) else "#1f5c2a" if "Spline" in s else "#333333"
-            c.text(x0 + 17.3, ly0 + lh - 3.8 - 2.05 * j, s, fs=8.3, color=col)
+            c.text(x0 + 17.3, ly0 + lh - 3.8 - 2.05 * j, s, fs=9.3, color=col)
     for xa, xb in ((61.8, 64.8), (88.4, 91.4)):
         c.arrow([(xa, 25.0), (xb, 25.0)], color=KIND["dec"][1], ms=8)
-        c.text((xa + xb) / 2, 26.4, "kNN↑", fs=7.6, color=KIND["dec"][1])
+        c.text((xa + xb) / 2, 26.4, "kNN↑", fs=9.3, color=KIND["dec"][1])
     # Z bus
     zb = 35.4
     c.arrow([(59.6, 37.3), (59.6, zb)], color=Z_COL, lw=1.6, head=False, z=7)
@@ -353,11 +352,11 @@ def draw_stage2(c, info):
     # post-processing and output
     c.arrow([(115.0, 25.0), (118.2, 25.0)], ms=8)
     c.block(118.2, 20.0, 9.2, 10.0, "op", "Post-process",
-            ["fold checks", "isotropic", "remesh"], tfs=9.0, fs=8.1)
+            ["fold checks", "isotropic", "remesh"], tfs=9.9, fs=9.3)
     c.arrow([(127.4, 25.0), (129.2, 25.0)], ms=8)
     c.image("gt_surface", 129.0, 21.6, 28.8, 22.6)
-    c.text(143.4, 20.7, r"$\hat{S}$: watertight, open outlets → CFD", fs=9.2, weight="bold")
-    c.text(143.4, 19.2, "(shown: GT surface of case p462)", fs=8.1, color=GREY)
+    c.text(143.4, 20.7, r"$\hat{S}$: watertight, open outlets → CFD", fs=10.1, weight="bold")
+    c.text(143.4, 19.2, "(shown: GT surface of case p462)", fs=9.3, color=GREY)
 
     # lane T: stage-2 training
     lane_label(c, 6.0, 16.3, 1, r"Stage-2 training (VAE):  $\mathcal{C}$ = original centerline,  "
@@ -368,31 +367,31 @@ def draw_stage2(c, info):
     x = 17.8
     for n, ch in ((16384, 32), (1024, 64), (256, 128), (64, 128), (64, 256)):
         h = 0.48 * 0.95 * n ** 0.3
-        w = 0.19 * ch ** 0.5
-        c.cuboid(x, 7.6 - h / 2, w, h)
-        x += w + base.CUBE_DX * 0.6 + 1.3
-    c.text(26.6, 2.6, "PointNeXt, 16384 → 64 pts", fs=7.9, color=GREY)
+        w = 0.24 * ch ** 0.5
+        c.fmap(x, 7.6 - h / 2, w, h)
+        x += w + 1.4
+    c.text(26.6, 2.6, "PointNeXt, 16384 → 64 pts", fs=9.3, color=GREY)
     c.arrow([(x - 0.4, 7.6), (38.2, 7.6)], ls=TRAIN, color=GREY, ms=7)
     c.block(38.2, 3.8, 11.2, 7.6, "enc", "Latent head", ["pool → tokens", "transformer × 3"],
-            tfs=9.2, fs=8.0)
+            tfs=10.1, fs=9.3)
     c.arrow([(49.4, 9.4), (51.0, 9.4)], ls=TRAIN, color=GREY, ms=7)
     c.arrow([(49.4, 5.8), (51.0, 5.8)], ls=TRAIN, color=GREY, ms=7)
-    c.block(51.0, 7.9, 6.0, 3.4, "lat", r"$\mu$", tfs=10)
-    c.block(51.0, 3.9, 6.0, 3.4, "lat", r"$\log\sigma^2$", tfs=9.4)
+    c.block(51.0, 7.9, 6.0, 3.4, "lat", r"$\mu$", tfs=11)
+    c.block(51.0, 3.9, 6.0, 3.4, "lat", r"$\log\sigma^2$", tfs=10.3)
     c.arrow([(57.0, 9.4), (58.8, 9.4)], ls=TRAIN, color=GREY, ms=7)
     c.arrow([(57.0, 5.8), (58.8, 5.8)], ls=TRAIN, color=GREY, ms=7)
-    c.block(58.8, 3.8, 10.6, 7.6, "attn", "Tract mixer", ["on μ"], tfs=9.2, fs=8.0)
+    c.block(58.8, 3.8, 10.6, 7.6, "attn", "Tract mixer", ["on μ"], tfs=10.1, fs=9.3)
     c.arrow([(69.4, 7.6), (71.2, 7.6)], ls=TRAIN, color=GREY, ms=7)
     c.block(71.2, 3.8, 11.2, 7.6, "lat", "Reparam.", [r"$z=\tilde\mu+\sigma\odot\varepsilon$"],
-            tfs=9.2, fs=8.6)
+            tfs=10.1, fs=9.5)
     c.arrow([(82.4, 7.6), (84.6, 7.6)], ls=TRAIN, color=GREY, ms=7)
     c.block(84.6, 2.6, 17.4, 10.0, "op", "Standardise",
             ["drop inactive dims", r"$(\mu+\sigma\varepsilon-\mu_d)\,/\,\sigma_d$",
-             "→ τ targets of Stage 1"], tfs=9.2, fs=8.1)
+             "→ τ targets of Stage 1"], tfs=10.1, fs=9.3)
     # training z joins the bus
     c.arrow([(76.8, 11.4), (76.8, 14.3), (116.6, 14.3), (116.6, zb)], color=Z_COL, lw=1.4,
             ls=TRAIN, head=False, bridge=True, z=6)
-    c.text(108.0, 14.3, "z (training)", fs=8.2, color=Z_COL, bg=BAND[2][0], z=8)
+    c.text(108.0, 14.3, "z (training)", fs=9.3, color=Z_COL, bg=BAND[2][0], z=8)
     # losses
     c.arrow([(112.0, ly0), (112.0, 16.9), (135.0, 16.9), (135.0, 14.2)], ls=TRAIN,
             color=LOSS_EC, lw=1.1, ms=8)
@@ -400,10 +399,10 @@ def draw_stage2(c, info):
             [r"$\mathcal{L}_{CD}+\mathcal{L}_{rad}+\lambda_{KL}\,\beta\,\mathcal{L}_{KL}"
              r"+0.15\,\mathcal{L}_{disp}+0.05\,\mathcal{L}_{lap}+0.02\,\mathcal{L}_{n}$",
              "Chamfer at 3 levels · radial Huber vs r* · KL rate by GECO", ""],
-            tfs=9.6, fs=8.4)
+            tfs=10.6, fs=9.3)
     badge(c, 85.9, 11.5, 2)
     badge(c, 124.6, 3.6, 4, col=LOSS_EC)
-    c.text(125.8, 3.6, "planned: fine-tune the Stage-2 decoder on Stage-1 samples", fs=8.4,
+    c.text(125.8, 3.6, "planned: fine-tune the Stage-2 decoder on Stage-1 samples", fs=9.3,
            color=LOSS_EC, ha="left", weight="bold")
 
 

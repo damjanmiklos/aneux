@@ -40,7 +40,7 @@ import matplotlib.patheffects as pe  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 from matplotlib.colors import LinearSegmentedColormap, to_rgb  # noqa: E402
-from matplotlib.patches import FancyArrowPatch, FancyBboxPatch, Polygon, Rectangle  # noqa: E402
+from matplotlib.patches import FancyArrowPatch, FancyBboxPatch, Rectangle  # noqa: E402
 from matplotlib.path import Path  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -76,7 +76,6 @@ TRACT_COLORS = ["#4E79A7", "#F28E2B", "#59A14F", "#E15759", "#B07AA1",
 INK = "#2b2b2b"
 GREY = "#6a6a6a"
 Z_COL = "#c0692a"
-CUBE_DX, CUBE_DY = 1.3, 0.9
 
 
 def line_units(fs):
@@ -124,22 +123,10 @@ class Canvas:
                       color=INK if i == 0 else "#333333")
             cy -= hh / 2
 
-    def cuboid(self, x, y, w, h, fc=None, ec=None, z=3):
-        """Pseudo-3-D feature block: front face (w x h) plus top and side faces."""
-        fc = fc or KIND["enc"][0]
-        ec = ec or KIND["enc"][1]
-        base = np.array(to_rgb(fc))
-        top = tuple(np.clip(base + 0.06, 0, 1))
-        side = tuple(base * 0.86)
-        dx, dy = CUBE_DX, CUBE_DY
-        faces = [
-            ([(x, y), (x + w, y), (x + w, y + h), (x, y + h)], fc),
-            ([(x, y + h), (x + w, y + h), (x + w + dx, y + h + dy), (x + dx, y + h + dy)], top),
-            ([(x + w, y), (x + w + dx, y + dy), (x + w + dx, y + h + dy), (x + w, y + h)], side),
-        ]
-        for verts, col in faces:
-            self.ax.add_patch(Polygon(verts, closed=True, fc=col, ec=ec, lw=1.0, zorder=z,
-                                      joinstyle="round"))
+    def fmap(self, x, y, w, h, fc=None, ec=None, z=3):
+        """Feature-map block: w ~ channels, h ~ points."""
+        self.ax.add_patch(Rectangle((x, y), w, h, fc=fc or KIND["enc"][0], ec=ec or KIND["enc"][1],
+                                    lw=1.1, zorder=z))
 
     def arrow(self, pts, color=INK, lw=1.3, ls="-", head=True, z=4, bridge=False, ms=11):
         verts = [tuple(p) for p in pts]
@@ -216,7 +203,7 @@ def draw_encoder(c, info):
         return 0.95 * n ** 0.3
 
     def block_w(ch):
-        return 0.30 * ch ** 0.5
+        return 0.36 * ch ** 0.5
 
     yc_f = 66.0
     tensors = [
@@ -234,7 +221,7 @@ def draw_encoder(c, info):
         ("SA$_4$", ["FPS → 64", "r = 12 mm"]),
     ]
     x_lo, x_hi = 37.3, 92.6
-    solid = sum(block_w(ch) + CUBE_DX for _, ch, _ in tensors)
+    solid = sum(block_w(ch) for _, ch, _ in tensors)
     gap = (x_hi - x_lo - solid) / len(tensors)
     x = x_lo
     for (n, ch, img), (name, lines) in zip(tensors, ops):
@@ -244,12 +231,12 @@ def draw_encoder(c, info):
             c.text(x + gap / 2, yc_f - 1.25 - 1.3 * j, s_, fs=7.9, color="#333333")
         x += gap
         w_, h_ = block_w(ch), block_h(n)
-        c.cuboid(x, yc_f - h_ / 2, w_, h_)
-        cx = x + (w_ + CUBE_DX) / 2
+        c.fmap(x, yc_f - h_ / 2, w_, h_)
+        cx = x + w_ / 2
         c.text(cx, yc_f - h_ / 2 - 1.25, f"{n} × {ch}", fs=8.3, color=GREY)
         if img:
             c.image(img, cx - 5.0, 71.2, 10.0, 7.4, anchor="bottom")
-        x += w_ + CUBE_DX
+        x += w_
     prev_right = x
     c.text(68.75, 81.9, "PointNeXt hierarchy  (set centres after FPS, shown on the GT)",
            fs=8.9, color=GREY)
