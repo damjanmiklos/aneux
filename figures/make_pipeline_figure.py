@@ -40,7 +40,7 @@ import matplotlib.patheffects as pe  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 from matplotlib.colors import LinearSegmentedColormap, to_rgb  # noqa: E402
-from matplotlib.patches import FancyArrowPatch, FancyBboxPatch, Rectangle  # noqa: E402
+from matplotlib.patches import FancyArrowPatch, FancyBboxPatch, Polygon, Rectangle  # noqa: E402
 from matplotlib.path import Path  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -76,6 +76,7 @@ TRACT_COLORS = ["#4E79A7", "#F28E2B", "#59A14F", "#E15759", "#B07AA1",
 INK = "#2b2b2b"
 GREY = "#6a6a6a"
 Z_COL = "#c0692a"
+CUBE_DX, CUBE_DY = 1.3, 0.9
 
 
 def line_units(fs):
@@ -122,6 +123,23 @@ class Canvas:
                       weight="bold" if i == 0 else "normal",
                       color=INK if i == 0 else "#333333")
             cy -= hh / 2
+
+    def cuboid(self, x, y, w, h, fc=None, ec=None, z=3):
+        """Pseudo-3-D feature block: front face (w x h) plus top and side faces."""
+        fc = fc or KIND["enc"][0]
+        ec = ec or KIND["enc"][1]
+        base = np.array(to_rgb(fc))
+        top = tuple(np.clip(base + 0.06, 0, 1))
+        side = tuple(base * 0.86)
+        dx, dy = CUBE_DX, CUBE_DY
+        faces = [
+            ([(x, y), (x + w, y), (x + w, y + h), (x, y + h)], fc),
+            ([(x, y + h), (x + w, y + h), (x + w + dx, y + h + dy), (x + dx, y + h + dy)], top),
+            ([(x + w, y), (x + w + dx, y + dy), (x + w + dx, y + h + dy), (x + w, y + h)], side),
+        ]
+        for verts, col in faces:
+            self.ax.add_patch(Polygon(verts, closed=True, fc=col, ec=ec, lw=1.0, zorder=z,
+                                      joinstyle="round"))
 
     def arrow(self, pts, color=INK, lw=1.3, ls="-", head=True, z=4, bridge=False, ms=11):
         verts = [tuple(p) for p in pts]
@@ -192,30 +210,52 @@ def draw_encoder(c, info):
     c.text(29.25, 58.3, "0", fs=7.5, color=GREY)
     c.text(34.0, 58.3, f"+{lim:.1f} mm", fs=7.5, color=GREY)
 
-    # stem
-    c.arrow([(37.3, 66), (39.2, 66)])
-    c.block(39.2, 60, 3.6, 12, "enc", "Stem MLP  7 → 32", rot=90, tfs=9.5)
-    c.text(41.0, 58.8, "16384×32", fs=8.3, color=GREY)
+    # feature blocks: height ~ points^0.3, width ~ sqrt(channels), so the
+    # 256x drop in points and 8x rise in channels both stay visible
+    def block_h(n):
+        return 0.95 * n ** 0.3
 
-    # set abstraction stages
-    stages = [
-        ("1", 1024, "1.5", "1024 × 64", 12.0, "fps_1024"),
-        ("2", 256, "3", "256 × 128", 10.5, "fps_256"),
-        ("3", 64, "6", "64 × 128", 9.0, "fps_64"),
-        ("4", 64, "12", "64 × 256", 9.0, "fps_64"),
+    def block_w(ch):
+        return 0.30 * ch ** 0.5
+
+    yc_f = 66.0
+    tensors = [
+        (16384, 32, None),
+        (1024, 64, "fps_1024"),
+        (256, 128, "fps_256"),
+        (64, 128, "fps_64"),
+        (64, 256, "fps_64"),
     ]
-    x = 45.0
-    prev_right = 42.8
-    for i, (k, n, r, shape, h, img) in enumerate(stages):
-        c.image(img, x - 0.3, 72.7, 10.6, 7.9, anchor="bottom")
-        c.arrow([(prev_right, 66), (x, 66)])
-        c.block(x, 66 - h / 2, 10, h, "enc", f"SA$_{k}$",
-                [f"FPS → {n}", f"ball  r = {r} mm", "+ 2× InvResMLP"])
-        c.text(x + 5, 66 - h / 2 - 1.2, shape, fs=8.3, color=GREY)
-        prev_right = x + 10
-        x += 12.5
+    ops = [
+        ("Stem", ["MLP 7 → 32"]),
+        ("SA$_1$", ["FPS → 1024", "r = 1.5 mm"]),
+        ("SA$_2$", ["FPS → 256", "r = 3 mm"]),
+        ("SA$_3$", ["FPS → 64", "r = 6 mm"]),
+        ("SA$_4$", ["FPS → 64", "r = 12 mm"]),
+    ]
+    x_lo, x_hi = 37.3, 92.6
+    solid = sum(block_w(ch) + CUBE_DX for _, ch, _ in tensors)
+    gap = (x_hi - x_lo - solid) / len(tensors)
+    x = x_lo
+    for (n, ch, img), (name, lines) in zip(tensors, ops):
+        c.arrow([(x, yc_f), (x + gap, yc_f)])
+        c.text(x + gap / 2, yc_f + 1.25, name, fs=9.4, weight="bold")
+        for j, s_ in enumerate(lines):
+            c.text(x + gap / 2, yc_f - 1.25 - 1.3 * j, s_, fs=7.9, color="#333333")
+        x += gap
+        w_, h_ = block_w(ch), block_h(n)
+        c.cuboid(x, yc_f - h_ / 2, w_, h_)
+        cx = x + (w_ + CUBE_DX) / 2
+        c.text(cx, yc_f - h_ / 2 - 1.25, f"{n} × {ch}", fs=8.3, color=GREY)
+        if img:
+            c.image(img, cx - 5.0, 71.2, 10.0, 7.4, anchor="bottom")
+        x += w_ + CUBE_DX
+    prev_right = x
     c.text(68.75, 81.9, "PointNeXt hierarchy  (set centres after FPS, shown on the GT)",
            fs=8.9, color=GREY)
+    c.text(51.5, 56.2, "every SA stage is followed by 2 InvResMLP blocks · "
+           "block height ~ points$^{0.3}$, width ~ channels$^{0.5}$",
+           fs=7.9, color=GREY, ha="left")
 
     # centerline latent head
     hx, hw = 95.0, 17.5

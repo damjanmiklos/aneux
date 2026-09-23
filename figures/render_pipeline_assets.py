@@ -174,6 +174,32 @@ def main():
                     color=TRACT_COLORS[int(t) % len(TRACT_COLORS)], smooth_shading=True)
     shots.append(r.shoot(pl, "tokens"))
 
+    # Stage-1 output as a sequence: one MISR sphere per 1 mm sample + tokens
+    raw_cl = pv.read(os.path.join(REPO, "cleandata", "original_centerline", f"{args.case}.vtp"))
+    posed = (np.asarray(raw_cl.points) - d.origin_shift.numpy()) @ d.pose_R.numpy()
+    misr = np.asarray(raw_cl.point_data["MaximumInscribedSphereRadius"])
+    from scipy.spatial import cKDTree
+    tree = cKDTree(posed)
+    pl = r.plotter()
+    for t in np.unique(cl_t):
+        pts = cl[cl_t == t]
+        if len(pts) < 2:
+            continue
+        col = TRACT_COLORS[int(t) % len(TRACT_COLORS)]
+        pl.add_mesh(pv.lines_from_points(pts).tube(radius=0.12), color="#7a7a7a")
+        samples = pts[::5]  # cl_dense is 0.2 mm, so every 5th point is 1 mm
+        rad = misr[tree.query(samples)[1]]
+        balls = pv.PolyData(samples)
+        balls.point_data["r"] = rad
+        pl.add_mesh(balls.glyph(geom=pv.Sphere(radius=1.0, theta_resolution=24, phi_resolution=24),
+                                scale="r", orient=False),
+                    color=col, opacity=0.22, smooth_shading=True)
+    for t in np.unique(tok_t):
+        pl.add_mesh(pv.PolyData(tok[tok_t == t]).glyph(geom=pv.Sphere(radius=0.5), scale=False,
+                                                     orient=False),
+                    color=TRACT_COLORS[int(t) % len(TRACT_COLORS)], smooth_shading=True)
+    shots.append(r.shoot(pl, "stage1_tree"))
+
     fine = poly(d.x.numpy(), d.face.numpy())
     pl = r.plotter()
     pl.add_mesh(fine, color=TEMPLATE_BLUE, smooth_shading=True, specular=0.25)
