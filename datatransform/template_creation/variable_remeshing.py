@@ -25,7 +25,10 @@ os.environ["VTK_NUMBER_OF_THREADS"] = "1"
 os.environ["VTK_SMP_MAX_THREADS"] = "1"
 
 import argparse
+import hashlib
 import inspect
+import pickle
+import shutil
 import time
 from contextlib import contextmanager
 
@@ -49,6 +52,7 @@ from batch_run_log import (
     run_logged_case,
 )
 
+import vessel_pipeline
 from vessel_pipeline import (
     DEFAULT_EXTENSION_LENGTH,
     DEFAULT_GRID_SPACING,
@@ -367,6 +371,119 @@ def _build_parent_tube(vessel_mesh, cut_frames=None, **kwargs):
 
 
 # ---------------------------------------------------------------------------
+# Parent-tube cache
+# ---------------------------------------------------------------------------
+# The tube (flow extensions, Voronoi trace, polyball, uncap) is a pure function
+# of the GT mesh, its frames, four grid parameters and the code, and it is most
+# of a case: the Voronoi trace alone is 17-50 s typically and 299 s on
+# SNF00000426_03, against 20-50 s for the remesh that follows. This path is
+# rerun many times on the same GT set, so the tube is kept on disk and a rerun
+# pays only for the raycast and the remesh. The key hashes the input file's
+# bytes, the frames, the parameters and the full source of both modules, so
+# any edit to the code rebuilds rather than reusing a tube it would not make.
+DEFAULT_TUBE_CACHE_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), ".variable_tube_cache"
+)
+TUBE_CACHE_FORMAT = 1
+
+
+def _file_digest(path, h):
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+
+
+def tube_cache_key(v_file, frames, params, reuse_centerline=None):
+    """Hex digest naming the tube this input, these frames and this code build."""
+    h = hashlib.sha256()
+    h.update(f"format={TUBE_CACHE_FORMAT}".encode())
+    for path in (v_file, reuse_centerline, vessel_pipeline.__file__, os.path.abspath(__file__)):
+        h.update(b"|file|")
+        if path:
+            _file_digest(path, h)
+    h.update(repr(sorted(params.items())).encode())
+    for frame in frames or []:
+        h.update(np.asarray(frame["origin"], dtype=np.float64).tobytes())
+        h.update(np.asarray(frame["normal"], dtype=np.float64).tobytes())
+        h.update(np.float64(frame["radius"]).tobytes())
+    return h.hexdigest()
+
+
+def _write_vtp(poly, path):
+    writer = vtk.vtkXMLPolyDataWriter()
+    writer.SetFileName(path)
+    writer.SetInputData(to_vtk_poly(poly))
+    writer.SetDataModeToBinary()
+    if not writer.Write():
+        raise OSError(f"could not write {path}")
+
+
+def _read_vtp(path):
+    reader = vtk.vtkXMLPolyDataReader()
+    reader.SetFileName(path)
+    reader.Update()
+    out = vtk.vtkPolyData()
+    out.DeepCopy(reader.GetOutput())
+    return out
+
+
+def load_cached_tube(cache_dir, key, vessel_mesh):
+    """The ``built`` dict stored under ``key``, or None on a miss."""
+    entry = os.path.join(cache_dir, key)
+    meta_path = os.path.join(entry, "meta.pkl")
+    if not os.path.isfile(meta_path):
+        return None
+    try:
+        with open(meta_path, "rb") as fh:
+            meta = pickle.load(fh)
+        built = {
+            "anatomical_profiles": meta["anatomical_profiles"],
+            "n_clipped": meta["n_clipped"],
+            "open_base_surface": _read_vtp(os.path.join(entry, "open_base_surface.vtp")),
+            "branched_centerline": _read_vtp(os.path.join(entry, "branched_centerline.vtp")),
+        }
+        if meta["vessel_repaired"]:
+            built["vessel_mesh"] = pv.wrap(_read_vtp(os.path.join(entry, "vessel_mesh.vtp")))
+        else:
+            built["vessel_mesh"] = vessel_mesh
+    except Exception as exc:  # a torn entry is a miss, never a wrong tube
+        print(f"  Tube cache entry {key[:12]} unreadable ({exc}); rebuilding")
+        return None
+    if built["open_base_surface"].GetNumberOfPoints() == 0:
+        return None
+    return built
+
+
+def store_cached_tube(cache_dir, key, built, vessel_mesh):
+    """Write ``built`` under ``key``; the entry appears whole or not at all."""
+    entry = os.path.join(cache_dir, key)
+    if os.path.isdir(entry):
+        return
+    tmp = f"{entry}.tmp{os.getpid()}"
+    try:
+        os.makedirs(tmp, exist_ok=True)
+        repaired = built.get("vessel_mesh", vessel_mesh) is not vessel_mesh
+        _write_vtp(built["open_base_surface"], os.path.join(tmp, "open_base_surface.vtp"))
+        _write_vtp(built["branched_centerline"], os.path.join(tmp, "branched_centerline.vtp"))
+        if repaired:
+            _write_vtp(built["vessel_mesh"], os.path.join(tmp, "vessel_mesh.vtp"))
+        with open(os.path.join(tmp, "meta.pkl"), "wb") as fh:
+            pickle.dump(
+                {
+                    "anatomical_profiles": built["anatomical_profiles"],
+                    "n_clipped": int(built["n_clipped"]),
+                    "vessel_repaired": bool(repaired),
+                },
+                fh,
+            )
+        os.replace(tmp, entry)
+    except Exception as exc:
+        print(f"  Tube cache: could not store {key[:12]} ({exc})")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
 # Item 13 — supervision arrays on FINAL vertices
 # ---------------------------------------------------------------------------
 
@@ -567,6 +684,7 @@ def process_variable_dataset(
     ostium_frames=None,
     cut_frames_dir=None,
     cut_frames_path=None,
+    tube_cache_dir=None,
 ):
     print(f"\n=========================================\nProcessing Adaptive Variable Remeshing Case: {dataset_id}")
     t_all = time.perf_counter()
@@ -598,17 +716,33 @@ def process_variable_dataset(
         else:
             print("  original_centerline missing; will extract Voronoi")
 
-    built = _build_parent_tube(
-        vessel_mesh,
-        cut_frames=frames,
+    tube_params = dict(
         extension_length=extension_length,
         sample_spacing=sample_spacing,
         grid_spacing=grid_spacing,
         max_grid_size=max_grid_size,
-        dataset_id=dataset_id,
-        reuse_centerline=reuse,
         skip_mc_decimate=bool(speedups),
     )
+    built = key = None
+    if tube_cache_dir:
+        t_key = time.perf_counter()
+        key = tube_cache_key(v_file, frames, tube_params, reuse_centerline=reuse)
+        built = load_cached_tube(tube_cache_dir, key, vessel_mesh)
+        if built is not None:
+            print(
+                f"  Parent tube from cache {key[:12]} "
+                f"({time.perf_counter() - t_key:.2f}s; steps 1-7 skipped)"
+            )
+    if built is None:
+        built = _build_parent_tube(
+            vessel_mesh,
+            cut_frames=frames,
+            dataset_id=dataset_id,
+            reuse_centerline=reuse,
+            **tube_params,
+        )
+        if key is not None:
+            store_cached_tube(tube_cache_dir, key, built, vessel_mesh)
     open_base_surface = built["open_base_surface"]
     branched_centerline = built["branched_centerline"]
     anatomical_profiles = built["anatomical_profiles"]
@@ -752,6 +886,7 @@ def _process_one(dataset_id, v_file, args):
             speedups=args.speedups,
             cut_frames_dir=getattr(args, "cut_frames_dir", None),
             cut_frames_path=getattr(args, "cut_frames_file", None),
+            tube_cache_dir=getattr(args, "tube_cache_dir", None) or None,
         )
 
     # Stage 2 records every case this way; without it only a crashed worker
@@ -792,6 +927,15 @@ def main():
         default=None,
         help="Explicit {stem}.ostium_frames.npz for --case (overrides directory search).",
     )
+    parser.add_argument(
+        "--tube-cache-dir",
+        type=str,
+        default=DEFAULT_TUBE_CACHE_DIR,
+        help=(
+            "Where built parent tubes are kept between runs (keyed on input, frames, "
+            "parameters and code). Pass an empty string to build every tube afresh."
+        ),
+    )
     add_run_log_args(parser, LOG_FOLDER)
     parser.set_defaults(vessel_dir=CLEANDATA_UNIFORM, from_folder=True)
     args = parser.parse_args()
@@ -813,6 +957,7 @@ def main():
         extra.extend(["--cut-frames-dir", str(args.cut_frames_dir)])
     if args.cut_frames_file:
         extra.extend(["--cut-frames-file", str(args.cut_frames_file)])
+    extra.extend(["--tube-cache-dir", str(args.tube_cache_dir or "")])
     try:
         run_batch(
             os.path.abspath(__file__),

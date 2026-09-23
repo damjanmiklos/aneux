@@ -68,3 +68,6 @@ aneux_s2_*.err
 datatransform/template_creation/stretch_raycast*.pyd
 datatransform/template_creation/stretch_raycast*.so
 datatransform/template_creation/build/
+
+# Parent tubes kept between variable_remeshing.py runs
+.variable_tube_cache/
