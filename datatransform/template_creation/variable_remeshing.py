@@ -46,6 +46,7 @@ from batch_run_log import (
     add_run_log_args,
     configure_batch_logging,
     finalize_run_logs,
+    run_logged_case,
 )
 
 from vessel_pipeline import (
@@ -738,18 +739,31 @@ def process_variable_dataset(
 
 
 def _process_one(dataset_id, v_file, args):
-    process_variable_dataset(
-        dataset_id=dataset_id,
-        v_file=v_file,
-        output_dir=args.output_dir,
-        target_edge_length=args.target_edge_length,
-        extension_length=args.extension_length,
-        sample_spacing=args.sample_spacing,
-        grid_spacing=args.grid_spacing,
-        max_grid_size=args.max_grid_size,
-        speedups=args.speedups,
-        cut_frames_dir=getattr(args, "cut_frames_dir", None),
-        cut_frames_path=getattr(args, "cut_frames_file", None),
+    def work():
+        return process_variable_dataset(
+            dataset_id=dataset_id,
+            v_file=v_file,
+            output_dir=args.output_dir,
+            target_edge_length=args.target_edge_length,
+            extension_length=args.extension_length,
+            sample_spacing=args.sample_spacing,
+            grid_spacing=args.grid_spacing,
+            max_grid_size=args.max_grid_size,
+            speedups=args.speedups,
+            cut_frames_dir=getattr(args, "cut_frames_dir", None),
+            cut_frames_path=getattr(args, "cut_frames_file", None),
+        )
+
+    # Stage 2 records every case this way; without it only a crashed worker
+    # left a trace, and a finished run reported "0 success" however many
+    # templates it had delivered.
+    return run_logged_case(
+        dataset_id,
+        v_file,
+        args,
+        work,
+        log_folder_name=LOG_FOLDER,
+        default_output_dir=DEFAULT_OUTPUT_DIR,
     )
 
 
