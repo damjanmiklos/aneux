@@ -7996,8 +7996,16 @@ def _adaptive_remesh_ladder():
     Same shape as the ground-truth path's ladder in vessel_pipeline, and for
     the same reasons: the first rung is exactly what this pipeline did before,
     so a template that already converges is remeshed byte for byte as it was
-    and pays nothing for this machinery. Switching the angle collapse off comes
-    next because it removes no geometry, and only then does the weld sweep run.
+    and pays nothing for this machinery. After that comes the weld sweep.
+
+    Every rung keeps the angle collapse on. A whole-tube remesh with it off
+    used to be the second rung, because it removes no geometry, but with it off
+    vmtk only splits, so the output keeps the marching-cubes tube's density.
+    On p414 all five of those rungs came out at 0.40-0.44 of their edges
+    within x2 of the target, and REMESH_MIN_DENSITY_WITHIN_X2 refuses them.
+    The collapse-off pass now does the one job it is good at, polishing a
+    collapse-on rung that already has the right density (see
+    supervise_and_remesh_verified).
 
     The difference here is what a rung costs. On the isotropic path a rung is
     one remesh; here the weld merges points and VTK drops every point array
@@ -8006,17 +8014,32 @@ def _adaptive_remesh_ladder():
     ship nothing, and the cache in the caller keeps rungs that share a weld
     fraction from paying it twice.
     """
-    off, on = REMESH_COLLAPSE_ANGLE_OFF, REMESH_COLLAPSE_ANGLE
-    first, rest = REMESH_WELD_FRACTIONS[0], REMESH_WELD_FRACTIONS[1:]
-    return ([(first, on), (first, off)]
-            + [(f, off) for f in rest]
-            + [(f, on) for f in rest])
+    return [(f, REMESH_COLLAPSE_ANGLE) for f in REMESH_WELD_FRACTIONS]
 
 
-# Iterations of the collapse-off pass that polishes a failed collapse-on rung.
-# Measured on p414: 2 iterations clear the blade (edge ratio 18.7 -> 5.4) in 4 s
-# at 0.964 within x2; 6 do no better on any gate (4.7, 0.957) and take 10 s.
+# The collapse-off polish of a failed collapse-on rung: short rounds, each
+# resampling the target field onto the surface it starts from. Measured on p414
+# from a 3-iteration rung 0 (edge ratio 34.0), one round of 2 reaches 25.3 and
+# one of 6 still 10.0, while 2+2 reaches 6.4 and 2+2+2 5.3, all at 0.96 within
+# x2. From the 6-iteration rung 0 (18.7), one round of 2 is enough (5.4, 4 s).
 REMESH_POLISH_N_ITER = 2
+REMESH_POLISH_ROUNDS = 3
+
+# The variable path's own iteration counts, half the ground truth's. Templates
+# are rebuilt many times over and need the right topology and density, not the
+# last word in triangle shape, and REMESH_N_ITER's "4 is too few" was measured
+# on the ground truth. Over the same 42 cases (2026-09-23), 3/5 against 6/10:
+#
+#                  case s   remesh s   within x2   median q   slivers   perim/2pir p95
+#     6/10          37.9      28.4       0.993       0.985     0.14%       1.0205
+#     3/5           21.9      12.3       0.991       0.976     0.17%       1.0232
+#     2/3           17.2       7.6       0.988       0.968     0.23%       1.0229
+#
+# The rims do not move at all (the remesh preserves boundary edges), 40/42
+# ship under every setting and each needs the same single rescue. 2/3 buys
+# another 4.7 s for a third more slivers, so the line is drawn at 3/5.
+VAR_REMESH_N_ITER = 3
+VAR_REMESH_CONNECTIVITY_ITER = 5
 
 
 def _polish_input(remeshed, sup):
@@ -8151,9 +8174,9 @@ def supervise_and_remesh_verified(base_surface, vessel_mesh, centerline,
     the one the ground-truth path already uses, and it is applied the same way:
     as a rescue that runs only after the configured settings have failed.
 
-    A collapse-on rung that fails without changing the area gets one more try
-    before the ladder moves on: its own output, remeshed briefly with the
-    collapse off. The collapse-on pass has already brought the density to the
+    A collapse-on rung that fails without changing the area gets polished
+    before the ladder moves on: its own output, remeshed in up to
+    REMESH_POLISH_ROUNDS short rounds with the collapse off. The collapse-on pass has already brought the density to the
     target, which a collapse-off pass over the marching-cubes tube never can
     (see REMESH_MIN_DENSITY_WITHIN_X2), and what is left to clear is local --
     on p414 a blade beside an r=0.32 mm opening, 596 edges over 3x the target
@@ -8188,7 +8211,7 @@ def supervise_and_remesh_verified(base_surface, vessel_mesh, centerline,
         if why:
             print(f"  WARNING: adaptive remesh at {label} left the template with "
                   + " and ".join(why))
-        return not why, drift, fan, dens
+        return not why, drift, fan, dens, ratio
 
     for rung, (fraction, collapse) in enumerate(_adaptive_remesh_ladder()):
         if fraction not in supervision:
@@ -8206,28 +8229,38 @@ def supervise_and_remesh_verified(base_surface, vessel_mesh, centerline,
         t_rm = time.perf_counter()
         remeshed = remesh_surface_adaptively(
             sup["surface"], edge_array_name="TargetEdgeLength", collapse_angle=collapse,
+            n_iter=VAR_REMESH_N_ITER, connectivity_iter=VAR_REMESH_CONNECTIVITY_ITER,
         )
         remeshed = enforce_min_edge(remeshed, label="remeshed template")
         t_rm_s = time.perf_counter() - t_rm
-        ok, drift, fan, dens = judge(remeshed, sup, label)
+        ok, drift, fan, dens, ratio = judge(remeshed, sup, label)
         how = []
-        if ok and rung:
-            if collapse != REMESH_COLLAPSE_ANGLE:
-                how.append("switching the angle collapse off")
-        if (not ok and collapse != REMESH_COLLAPSE_ANGLE_OFF
-                and drift <= REMESH_MAX_AREA_DRIFT):
+        # Polish only a surface that held its area: a diverged remesh has
+        # thrown triangles across ground a split-only pass cannot win back.
+        # Each round starts from the last and stops once it no longer helps.
+        polish_from, rounds = remeshed, 0
+        while (not ok and drift <= REMESH_MAX_AREA_DRIFT
+               and rounds < REMESH_POLISH_ROUNDS):
+            rounds += 1
             t_po = time.perf_counter()
             polished = remesh_surface_adaptively(
-                _polish_input(remeshed, sup), edge_array_name="TargetEdgeLength",
+                _polish_input(polish_from, sup), edge_array_name="TargetEdgeLength",
                 n_iter=REMESH_POLISH_N_ITER, collapse_angle=REMESH_COLLAPSE_ANGLE_OFF,
+                connectivity_iter=VAR_REMESH_CONNECTIVITY_ITER,
             )
             polished = enforce_min_edge(polished, label="polished template")
             t_rm_s += time.perf_counter() - t_po
-            ok, drift, fan, dens = judge(polished, sup,
-                                         label + " then a collapse-off polish")
+            before = (fan, ratio)
+            ok, drift, fan, dens, ratio = judge(
+                polished, sup, f"{label} then {rounds} collapse-off polish round(s)"
+            )
             if ok:
                 remeshed = polished
-                how.append("polishing it with the angle collapse off")
+                how.append(f"polishing it with the angle collapse off "
+                           f"({rounds} round(s))")
+            elif fan >= before[0] and ratio >= before[1]:
+                break
+            polish_from = polished
         if ok:
             if fraction > 0:
                 how.append(f"welding at {fraction:.2f} of the mean edge")
