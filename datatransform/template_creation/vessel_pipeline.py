@@ -101,6 +101,11 @@ SANITIZE_MAX_MEDIAN_EDGE_MM = 0.22
 DEGENERATE_EDGE_MM = 1e-5
 # Extra triangles on a usage>2 edge are flaps if they are this small vs the two kept faces.
 NM_FLAP_AREA_RATIO = 0.35
+# A sheet joined to the wall by vertices alone and smaller than this across is
+# clip or weld debris, never anatomy; see drop_hanging_pieces. The two measured
+# were 0.34 and 0.39 mm. The smallest outlet in the GT set is ~0.2 mm in radius,
+# so a real branch behind a pinch is well over this.
+HANGING_PIECE_MAX_EXTENT_MM = 1.0
 REMESH_MIN_EDGE_MM = 0.01
 # VMTK uses this count twice (split/collapse loop AND final relocation).
 # 4 is too few (degenerate tails, jagged rims). 6 matches 10 on tube shape,
@@ -2841,6 +2846,123 @@ def drop_pillow_triangles(surface, label="surface"):
     out = clean_triangulate(_polydata_from_triangles(pts, faces[keep]))
     print(f"  Dropped {n_drop // 2} zero-volume triangle pillow(s) on the {label}")
     return out, n_drop // 2
+
+
+def _edge_components(faces, n_points):
+    """Component label per triangle, joined only across edges shared by exactly two.
+
+    Unlike _mesh_components, two sheets that meet at a single vertex, or on an
+    edge used three times, come out as separate components, which is what a
+    pinch point is.
+    """
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    nt = len(faces)
+    edges = np.sort(np.concatenate((faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]])), axis=1)
+    tri = np.tile(np.arange(nt), 3)
+    key = edges[:, 0].astype(np.int64) * int(n_points) + edges[:, 1]
+    order = np.argsort(key, kind="stable")
+    key, tri = key[order], tri[order]
+    _u, start, count = np.unique(key, return_index=True, return_counts=True)
+    two = start[count == 2]
+    n_comp, label_of = connected_components(
+        coo_matrix((np.ones(len(two)), (tri[two], tri[two + 1])), shape=(nt, nt)),
+        directed=False,
+    )
+    return int(n_comp), label_of
+
+
+def count_bowtie_vertices(faces, n_points):
+    """Vertices whose triangles form more than one fan around them.
+
+    A bowtie is a pinch point: two sheets that share a vertex and no edge. It
+    uses no edge more than twice, so the non-manifold edge count cannot see it.
+    """
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    faces = np.asarray(faces, dtype=np.int64)
+    nt = len(faces)
+    if nt == 0:
+        return 0
+    # One node per triangle corner; two corners on one vertex are in the same
+    # fan when their triangles share a manifold edge through that vertex.
+    corner = np.arange(nt) * 3
+    rows = []
+    for a, b in ((0, 1), (1, 2), (2, 0)):
+        rows.append(np.column_stack((faces[:, a], faces[:, b], corner + a, corner + b)))
+    e = np.vstack(rows)
+    swap = e[:, 0] > e[:, 1]
+    e[swap] = e[swap][:, [1, 0, 3, 2]]
+    key = e[:, 0] * int(n_points) + e[:, 1]
+    order = np.argsort(key, kind="stable")
+    e, key = e[order], key[order]
+    _u, start, count = np.unique(key, return_index=True, return_counts=True)
+    i = start[count == 2]
+    r = np.concatenate((e[i, 2], e[i, 3]))
+    c = np.concatenate((e[i + 1, 2], e[i + 1, 3]))
+    _n, fan = connected_components(
+        coo_matrix((np.ones(len(r)), (r, c)), shape=(nt * 3, nt * 3)), directed=False
+    )
+    pairs = np.unique(np.column_stack((faces.ravel(), fan)), axis=0)
+    fans = np.bincount(pairs[:, 0], minlength=int(n_points))
+    return int(np.sum(fans > 1))
+
+
+def drop_hanging_pieces(surface, label="surface", max_extent=HANGING_PIECE_MAX_EXTENT_MM):
+    """Remove small sheets that hang off the wall by vertices alone.
+
+    A sheet that shares no edge with the wall, only one or more corners, is not
+    anatomy: every vertex it touches the wall at is a bowtie, and the remesher
+    keeps the bowtie in its output. Two kinds reached the GT remesh. On C0058 a
+    closed 10-triangle bubble 0.39 mm across sat on one wall vertex. On
+    ANSYS_UNIGE_17_10 the profile-5 plane clip left a 26-triangle disc of cut
+    tube, 0.34 mm across, hanging off the new rim by one vertex. Its own
+    boundary was counted as a seventh opening, the capper could not close it
+    and had to fan it, and the remesh shipped the pinch as a bowtie on the rim.
+
+    Only pieces under max_extent across are removed. Anything bigger could be a
+    real branch behind a pinch, and dropping that would lose an opening, so it
+    stays for the gates to judge. A surface without a hanging piece comes back
+    as it was.
+    """
+    # Nothing to drop hands back the surface it was given, not the cleaned
+    # copy used to find the pieces: a repair must be a no-op where it has
+    # nothing to repair.
+    untouched = to_vtk_poly(surface)
+    _poly, pts, faces = _triangle_points_faces(surface)
+    if len(faces) == 0:
+        return untouched, 0
+    n_comp, label_of = _edge_components(faces, len(pts))
+    if n_comp < 2:
+        return untouched, 0
+    main = int(np.argmax(np.bincount(label_of, minlength=n_comp)))
+    on_main = np.zeros(len(pts), dtype=bool)
+    on_main[faces[label_of == main].ravel()] = True
+    drop = np.zeros(len(faces), dtype=bool)
+    dropped = []
+    for comp in range(n_comp):
+        if comp == main:
+            continue
+        mine = label_of == comp
+        ids = np.unique(faces[mine])
+        # A piece touching nothing is an island; drop_tiny_islands owns those.
+        if not on_main[ids].any():
+            continue
+        extent = float(np.ptp(pts[ids], axis=0).max())
+        if extent >= max_extent:
+            continue
+        drop |= mine
+        dropped.append((int(mine.sum()), extent))
+    if not dropped:
+        return untouched, 0
+    out = clean_triangulate(_polydata_from_triangles(pts, faces[~drop]))
+    print(
+        f"  Dropped {len(dropped)} piece(s) hanging off the {label} by a vertex: "
+        + ", ".join(f"{n} triangle(s) {e:.2f} mm across" for n, e in dropped)
+    )
+    return out, len(dropped)
 
 
 def _drop_nonmanifold_flaps(pts, faces, area_ratio=NM_FLAP_AREA_RATIO):
@@ -6050,6 +6172,9 @@ def clip_flow_extensions_and_uncap(
     current, _n_pin = close_wall_pinholes(
         current, label="uncapped surface", profiles=work_profiles
     )
+    # Before the leftover fill, so a clip flap's boundary is not taken for an
+    # opening the capper then has to fan.
+    current, _n_hanging = drop_hanging_pieces(current, label="uncapped surface")
     current, n_filled = remove_spurious_openings(current, work_profiles)
     current, _n_pillows = drop_pillow_triangles(current, label="uncapped surface")
     post = inspect_openings(current)
@@ -7083,7 +7208,13 @@ def remesh_surface_verified(
     iterations. Iterations are only given up when no tolerance worked, because a
     mesh rescued that way is a worse mesh, and the log says which happened.
     """
+    # A sheet hanging off the wall by a vertex comes out of the remesher as a
+    # bowtie whatever the rung, so it goes before the first attempt.
+    open_surface, _n_hanging = drop_hanging_pieces(open_surface, label=label)
     before = _surface_area(open_surface)
+    # Pinch points already in the input are not the remesher's doing, so an
+    # attempt is only held to adding none.
+    bowties_in = int(inspect_surface_topology(open_surface)["n_bowtie"])
     n_iter = int(n_iter)
     connectivity_iter = int(connectivity_iter)
 
@@ -7163,13 +7294,20 @@ def remesh_surface_verified(
             topo = inspect_surface_topology(out)
             n_nm = int(topo["n_nonmanifold"])
             min_edge = float(topo["min_edge"])
-            intact = n_nm == 0 and min_edge >= MIN_EDGE_LENGTH_MM
+            # A bowtie is a pinch the non-manifold count cannot see. The default
+            # rung left one on ANSYS_UNIGE_09, p120, p361 and p410 from inputs
+            # that had none; on ANSYS_UNIGE_09 the collapse-off rung right after
+            # it is clean at 0.998x with all 8 openings.
+            n_bow = max(0, int(topo["n_bowtie"]) - bowties_in)
+            intact = n_nm == 0 and n_bow == 0 and min_edge >= MIN_EDGE_LENGTH_MM
             if usable is None:
-                usable = (out, drift, hub, fraction, iters, conn, collapse, n_nm, min_edge)
+                usable = (out, drift, hub, fraction, iters, conn, collapse, n_nm, n_bow, min_edge)
             if not intact:
                 torn = []
                 if n_nm:
                     torn.append(f"{n_nm} non-manifold edge(s)")
+                if n_bow:
+                    torn.append(f"{n_bow} new bowtie vertex(es)")
                 if min_edge < MIN_EDGE_LENGTH_MM:
                     torn.append(f"an edge of {min_edge:.2e} mm")
                 print(
@@ -7206,10 +7344,12 @@ def remesh_surface_verified(
             + " and ".join(why)
         )
     if usable is not None:
-        out, drift, hub, fraction, iters, conn, collapse, n_nm, min_edge = usable
+        out, drift, hub, fraction, iters, conn, collapse, n_nm, n_bow, min_edge = usable
         torn = []
         if n_nm:
             torn.append(f"{n_nm} non-manifold edge(s)")
+        if n_bow:
+            torn.append(f"{n_bow} new bowtie vertex(es)")
         if min_edge < MIN_EDGE_LENGTH_MM:
             torn.append(f"an edge of {min_edge:.2e} mm")
         print(
@@ -7270,6 +7410,7 @@ def inspect_surface_topology(surface):
             "n_triangles": 0,
             "n_boundary_edges": 0,
             "n_nonmanifold": 0,
+            "n_bowtie": 0,
             "min_edge": 0.0,
             "median_q01": None,
             "frac_sliver": None,
@@ -7285,6 +7426,7 @@ def inspect_surface_topology(surface):
     _uniq, counts = np.unique(edges, axis=0, return_counts=True)
     n_boundary = int(np.sum(counts == 1))
     n_nonmanifold = int(np.sum(counts > 2))
+    n_bowtie = count_bowtie_vertices(faces, len(pts))
 
     med_q01 = None
     frac_sliver = None
@@ -7305,6 +7447,7 @@ def inspect_surface_topology(surface):
         "n_triangles": n_tri,
         "n_boundary_edges": n_boundary,
         "n_nonmanifold": n_nonmanifold,
+        "n_bowtie": n_bowtie,
         "min_edge": float(min_edge),
         "median_q01": med_q01,
         "frac_sliver": frac_sliver,

@@ -29,6 +29,8 @@ from vessel_pipeline import (
     _triangle_points_faces,
     add_flow_extensions,
     boundary_loop_radii,
+    count_bowtie_vertices,
+    drop_hanging_pieces,
     drop_pillow_triangles,
     fan_fill_small_loops,
     finalize_surface,
@@ -873,3 +875,121 @@ def test_a_surface_without_a_pillow_is_returned_as_it_was():
     out, n = drop_pillow_triangles(tube)
     assert n == 0
     assert out is tube
+
+
+def _with_hanging(size=0.3, closed=True):
+    """open_tube with a small sheet joined to the wall by one vertex only.
+
+    ``closed`` gives a tetrahedron on a mid-wall vertex, the bubble C0058 took
+    into the remesh. Otherwise it is a four-triangle disc on a rim vertex, the
+    clip flap ANSYS_UNIGE_17_10 did, whose own boundary reads as an opening.
+    """
+    tube = open_tube()
+    _poly, pts, faces = _triangle_points_faces(tube, clean=False)
+    n = len(pts)
+    if closed:
+        w = 15 * 40
+        tip = pts[w] + size * np.array([[1.0, 0.0, 0.0], [1.0, 0.8, 0.0], [1.0, 0.4, 0.8]])
+        a, b, c = n, n + 1, n + 2
+        extra = [(w, a, b), (w, b, c), (w, c, a), (a, c, b)]
+    else:
+        w = 0
+        centre = pts[w] + size * np.array([0.5, 0.0, -0.5])
+        ring = [centre + 0.5 * size * np.array([np.cos(t), 0.0, np.sin(t)]) for t in (0.8, 2.4, 4.0)]
+        tip = np.vstack([centre] + ring)
+        ctr, r1, r2, r3 = n, n + 1, n + 2, n + 3
+        extra = [(ctr, w, r1), (ctr, r1, r2), (ctr, r2, r3), (ctr, r3, w)]
+    pts = np.vstack([pts, tip])
+    return tube, _polydata_from_triangles(pts, np.vstack([faces, extra]))
+
+
+def test_a_vertex_joined_sheet_is_a_bowtie():
+    tube, hung = _with_hanging()
+    _p, pts, faces = _triangle_points_faces(tube)
+    assert count_bowtie_vertices(faces, len(pts)) == 0
+    _p, pts, faces = _triangle_points_faces(hung)
+    assert count_bowtie_vertices(faces, len(pts)) == 1
+    assert inspect_surface_topology(hung)["n_bowtie"] == 1
+    assert inspect_surface_topology(hung)["n_nonmanifold"] == 0
+
+
+def test_a_hanging_bubble_is_dropped():
+    tube, hung = _with_hanging(closed=True)
+    out, n = drop_hanging_pieces(hung)
+    assert n == 1
+    assert out.GetNumberOfCells() == tube.GetNumberOfCells()
+    assert inspect_surface_topology(out)["n_bowtie"] == 0
+    assert len(boundary_loop_radii(out)) == 2
+
+
+def test_a_hanging_rim_flap_is_dropped_and_its_loop_with_it():
+    tube, hung = _with_hanging(closed=False)
+    assert inspect_surface_topology(hung)["n_bowtie"] == 1
+    out, n = drop_hanging_pieces(hung)
+    assert n == 1
+    assert out.GetNumberOfCells() == tube.GetNumberOfCells()
+    assert len(boundary_loop_radii(out)) == 2
+
+
+def test_a_hanging_piece_big_enough_to_be_anatomy_is_kept():
+    _tube, hung = _with_hanging(size=2.0)
+    out, n = drop_hanging_pieces(hung)
+    assert n == 0
+    assert out.GetNumberOfCells() == hung.GetNumberOfCells()
+
+
+def test_a_surface_without_a_hanging_piece_is_returned_as_it_was():
+    tube = open_tube()
+    out, n = drop_hanging_pieces(tube)
+    assert n == 0
+    assert out.GetNumberOfCells() == tube.GetNumberOfCells()
+    assert out.GetNumberOfPoints() == tube.GetNumberOfPoints()
+    # Not even the clean that finds the pieces may touch it.
+    _p, pts, faces = _triangle_points_faces(tube, clean=False)
+    _q, out_pts, out_faces = _triangle_points_faces(out, clean=False)
+    assert np.array_equal(pts, out_pts) and np.array_equal(faces, out_faces)
+
+
+def test_remesh_ladder_moves_past_a_rung_that_adds_a_bowtie():
+    """ANSYS_UNIGE_09: collapse-on bowtied a clean input, collapse-off did not."""
+    import vessel_pipeline as vp
+
+    tube, hung = _with_hanging()
+    calls = []
+
+    def fake(surface, target_edge_length, n_iter, connectivity_iter, collapse_angle=None):
+        calls.append(collapse_angle)
+        if collapse_angle == vp.REMESH_COLLAPSE_ANGLE:
+            return vp.to_vtk_poly(hung)
+        return vp.to_vtk_poly(surface)
+
+    original = vp.remesh_surface_isotropically
+    vp.remesh_surface_isotropically = fake
+    try:
+        out = vp.remesh_surface_verified(tube, target_edge_length=0.15, n_iter=20, connectivity_iter=20)
+    finally:
+        vp.remesh_surface_isotropically = original
+
+    assert calls == [vp.REMESH_COLLAPSE_ANGLE, vp.REMESH_COLLAPSE_ANGLE_OFF], calls
+    assert inspect_surface_topology(out)["n_bowtie"] == 0
+
+
+def test_remesh_ladder_does_not_blame_the_remesher_for_an_input_bowtie():
+    """A pinch too big to drop is the input's; the first rung still stands."""
+    import vessel_pipeline as vp
+
+    _tube, hung = _with_hanging(size=2.0)
+    calls = []
+
+    def fake(surface, target_edge_length, n_iter, connectivity_iter, collapse_angle=None):
+        calls.append(collapse_angle)
+        return vp.to_vtk_poly(surface)
+
+    original = vp.remesh_surface_isotropically
+    vp.remesh_surface_isotropically = fake
+    try:
+        vp.remesh_surface_verified(hung, target_edge_length=0.15, n_iter=20, connectivity_iter=20)
+    finally:
+        vp.remesh_surface_isotropically = original
+
+    assert calls == [vp.REMESH_COLLAPSE_ANGLE], calls
