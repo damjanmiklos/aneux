@@ -2,8 +2,8 @@
 
 Priority (highest first):
   1. datatransform/hemoMesh/keep_one/surfaces
-  2. datatransform/cleaned_data/vessels_cleaned_and_decapped
-  3. datatransform/uncapped
+  2. datatransform/uncapped                     (hand-fixed in Blender; beats 3)
+  3. datatransform/cleaned_data/vessels_cleaned_and_decapped
   4. rawdata/.../vessels/original               (read-only; fallback only)
 
 Keep-one naming
@@ -179,10 +179,14 @@ def choose_sources(
             # mesh would be the same vessel a second time, still carrying every
             # aneurysm, so it is left out exactly as before.
             continue
+        elif vessel_id in uncapped:
+            # uncapped holds the hand-made Blender fixes, so it outranks the
+            # automatic cleaning: on 2026-09-24 six vessels (p095, p352, p462,
+            # p465, p512, p531) were repaired there and would otherwise have
+            # been shadowed by their unrepaired cleaned_and_decapped copies.
+            rows.append((uncapped[vessel_id].name, vessel_id, uncapped[vessel_id], "uncapped"))
         elif vessel_id in cleaned:
             rows.append((cleaned[vessel_id].name, vessel_id, cleaned[vessel_id], "cleaned_and_decapped"))
-        elif vessel_id in uncapped:
-            rows.append((uncapped[vessel_id].name, vessel_id, uncapped[vessel_id], "uncapped"))
         else:
             rows.append((original[vessel_id].name, vessel_id, original[vessel_id], "original"))
 
@@ -243,7 +247,7 @@ def main(dry_run: bool = False) -> None:
         files_by_source[label] += 1
         vessels_by_source[label].add(vid)
     print("\nvessels chosen from:")
-    for label in ("keep_one", "cleaned_and_decapped", "uncapped", "original"):
+    for label in ("keep_one", "uncapped", "cleaned_and_decapped", "original"):
         print(f"  {label}: {len(vessels_by_source[label])} vessels, "
               f"{files_by_source[label]} files")
     print(f"destination files: {len(rows)}")
