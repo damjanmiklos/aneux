@@ -593,8 +593,8 @@ def _vmtk_boundary_profiles(surface):
     return profiles
 
 
-def _keep_seed_profiles(profiles):
-    min_r = MIN_SEED_OPENING_RADIUS_MM
+def _keep_seed_profiles(profiles, min_radius=None):
+    min_r = MIN_SEED_OPENING_RADIUS_MM if min_radius is None else float(min_radius)
     kept = [
         p
         for p in profiles
@@ -611,7 +611,7 @@ def _keep_seed_profiles(profiles):
     return list(profiles)
 
 
-def measure_open_profiles(surface):
+def measure_open_profiles(surface, min_radius=None):
     """Open-boundary loops with radius, barycenter, and (when available) outward normals.
 
     vtkvmtkBoundaryReferenceSystems is preferred when it works, because it
@@ -629,6 +629,9 @@ def measure_open_profiles(surface):
     the reference systems report fewer rims than the surface has, the profiles
     are rebuilt from extract_boundary_loops -- which arbitrates both extractors
     against that same count -- and kept only if they come closer to it.
+
+    ``min_radius`` overrides the pinhole filter's MIN_SEED_OPENING_RADIUS_MM,
+    for a caller that knows by other means which rims are real.
     """
     vtk_poly = to_vtk_poly(surface)
     expected = count_boundary_regions(vtk_poly)
@@ -644,9 +647,9 @@ def measure_open_profiles(surface):
                 f"{expected} rim(s); using {len(loop_profiles)} extracted loops instead"
             )
             chosen = loop_profiles
-    profiles = _keep_seed_profiles(chosen)
+    profiles = _keep_seed_profiles(chosen, min_radius)
     if len(profiles) < 2 and chosen is vmtk_profiles:
-        loop_profiles = _keep_seed_profiles(_profiles_from_boundary_loops(vtk_poly))
+        loop_profiles = _keep_seed_profiles(_profiles_from_boundary_loops(vtk_poly), min_radius)
         if len(loop_profiles) > len(profiles):
             print(
                 f"  Boundary extractor found {len(profiles)} opening(s); "
@@ -7938,7 +7941,17 @@ def _parent_tube_attempt(
         )
 
     print("Step 1b: Detecting anatomical inlet/outlet boundaries...")
-    anatomical_profiles = measure_open_profiles(smoothed_vessel)
+    # The pinhole filter guesses which rims are debris from their size alone.
+    # With GT frames there is no guessing to do: every GT surface in the set
+    # has exactly one rim per frame, so when the working copy still has that
+    # many, every rim is an ostium however small the decimation measures it.
+    # ANSYS_UNIGE_27, ANSYS_UNIGE_17_10, SNF00000059 and UPF_P0204.01_ID3 each
+    # lost a real 0.12-0.22 mm outlet to the 0.2 mm filter; with no seed there
+    # the tube never went near it and the uncap had nothing to open.
+    seed_min_radius = None
+    if cut_frames and count_boundary_regions(smoothed_vessel) == len(cut_frames):
+        seed_min_radius = 0.0
+    anatomical_profiles = measure_open_profiles(smoothed_vessel, min_radius=seed_min_radius)
     # One opening per hole. VMTK reports a rim pinched into a figure eight as
     # two profiles, and each one then demands its own polyball stub and its own
     # pipe-section cut at a place where there is only one hole.
@@ -7956,7 +7969,7 @@ def _parent_tube_attempt(
         extended_vessel = add_flow_extensions(smoothed_vessel, extension_length=extension_length)
 
         print("Step 2b: Detecting extended-end seeds...")
-        extended_profiles = measure_open_profiles(extended_vessel)
+        extended_profiles = measure_open_profiles(extended_vessel, min_radius=seed_min_radius)
         log_profiles(extended_profiles, label="Extended")
         if len(extended_profiles) != len(anatomical_profiles):
             print(

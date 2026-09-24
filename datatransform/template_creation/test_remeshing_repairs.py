@@ -36,6 +36,7 @@ from vessel_pipeline import (
     finalize_surface,
     force_manifold_triangles,
     inspect_surface_topology,
+    measure_open_profiles,
     original_cell_mask,
     patch_wall_pinholes,
     trim_extension_patches,
@@ -993,3 +994,21 @@ def test_remesh_ladder_does_not_blame_the_remesher_for_an_input_bowtie():
         vp.remesh_surface_isotropically = original
 
     assert calls == [vp.REMESH_COLLAPSE_ANGLE], calls
+
+
+def test_frames_can_vouch_for_an_opening_the_pinhole_filter_drops():
+    """ANSYS_UNIGE_27 lost a real 0.207 mm outlet to the 0.2 mm seed filter.
+
+    A big tube and a thin one, 0.12 mm across its ends: by size alone the thin
+    one's rims read as pinholes. A caller that knows every rim is real (the GT
+    frames count them) turns the filter off and keeps all four.
+    """
+    big = open_tube(radius=1.0, n_sides=40, n_rings=20)
+    thin = open_tube(radius=0.12, length=2.0, n_sides=16, n_rings=8, center=(5.0, 0.0, 0.0))
+    _p, p1, f1 = _triangle_points_faces(big, clean=False)
+    _p, p2, f2 = _triangle_points_faces(thin, clean=False)
+    both = _polydata_from_triangles(np.vstack([p1, p2]), np.vstack([f1, f2 + len(p1)]))
+    assert len(measure_open_profiles(both)) == 2
+    kept = measure_open_profiles(both, min_radius=0.0)
+    assert len(kept) == 4
+    assert sorted(round(p["radius"], 2) for p in kept)[:2] == [0.12, 0.12]
