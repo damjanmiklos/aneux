@@ -5085,6 +5085,122 @@ def _centerline_tangent_at_id(vtk_cl, pid):
     return _unit(tangent)
 
 
+# How much centerline the axis at an opening is read over, in radii, and never
+# less than a millimetre. One neighbouring point was all the old tangent used,
+# and the trace can end in a two-point cell lying across the rim: on
+# UPF_P0258.00_ID1 both points of the inlet's last cell sit in the inlet plane,
+# so its "tangent" lay in that plane, 74 degrees off the rim normal. The cut
+# then ran lengthwise down the vessel and through the root of the r=0.44 mm
+# branch that leaves 0.35 mm from the inlet, and the uncap threw it away.
+OPENING_AXIS_ARC_RADII = 2.0
+OPENING_AXIS_ARC_FLOOR_MM = 1.0
+# A cut plane further than this from the rim's own plane is not an axis
+# estimate any more. Oblique rims exist, but the rim of an opening that was
+# cut across a vessel faces along it.
+OPENING_AXIS_MAX_TILT_DEG = 50.0
+
+
+def _centerline_graph(vtk_cl):
+    """Point coordinates and neighbour lists, coincident points of different cells joined."""
+    from scipy.spatial import cKDTree
+
+    pts = np.ascontiguousarray(vtk_to_numpy(vtk_cl.GetPoints().GetData()), dtype=np.float64)
+    node = np.arange(len(pts))
+    for a, b in sorted(cKDTree(pts).query_pairs(1e-6)):
+        ra, rb = a, b
+        while node[ra] != ra:
+            ra = node[ra]
+        while node[rb] != rb:
+            rb = node[rb]
+        if ra != rb:
+            node[max(ra, rb)] = min(ra, rb)
+    for i in range(len(node)):
+        r = i
+        while node[r] != r:
+            r = node[r]
+        node[i] = r
+    nbrs = {}
+    vtk_cl.BuildCells()
+    for c in range(vtk_cl.GetNumberOfCells()):
+        cell = vtk_cl.GetCell(c)
+        ids = [node[int(cell.GetPointId(j))] for j in range(cell.GetNumberOfPoints())]
+        for a, b in zip(ids[:-1], ids[1:]):
+            if a != b:
+                nbrs.setdefault(a, set()).add(b)
+                nbrs.setdefault(b, set()).add(a)
+    return pts, node, nbrs
+
+
+def _centerline_axis_at_opening(graph, pid, origin, outward, arc_mm):
+    """Outward axis from the trace within ``arc_mm`` of arc behind the rim, or None."""
+    import heapq
+
+    pts, node, nbrs = graph
+    start = int(node[int(pid)])
+    dist = {start: 0.0}
+    heap = [(0.0, start)]
+    while heap:
+        d, v = heapq.heappop(heap)
+        if d > dist.get(v, np.inf):
+            continue
+        for u in nbrs.get(v, ()):
+            du = d + float(np.linalg.norm(pts[u] - pts[v]))
+            if du <= arc_mm and du < dist.get(u, np.inf):
+                dist[u] = du
+                heapq.heappush(heap, (du, u))
+    # Only the lumen behind the rim: a branch that leaves right at the opening
+    # and runs out past its plane is not this vessel's axis.
+    behind = [v for v in dist if float(np.dot(pts[v] - origin, outward)) < 0.0]
+    if not behind:
+        return None
+    far = max(dist[v] for v in behind)
+    if far < 0.5 * arc_mm:
+        return None
+    axis = pts[start] - np.mean(pts[behind], axis=0)
+    if float(np.linalg.norm(axis)) < 1e-9:
+        return None
+    return _unit(axis)
+
+
+def square_frames_to_rims(frames, surface, max_tilt_deg=OPENING_AXIS_MAX_TILT_DEG):
+    """Give a stored frame whose plane lies across its own rim the rim's normal.
+
+    The frames on disk were written by opening_clip_frames before it read the
+    axis over an arc, and UPF_P0258.00_ID1's inlet frame came out 74 degrees off
+    its rim. Both the uncap cutter and the constant-R stub balls run along that
+    normal, so the template tube was cut lengthwise and its inlet stayed shut.
+    The rim of the surface being templated is right there to check against.
+    Returns (frames, n_squared); the input list is not modified.
+    """
+    if not frames:
+        return frames, 0
+    profiles = measure_open_profiles(to_vtk_poly(surface), min_radius=0.0)
+    if not profiles:
+        return frames, 0
+    centres = np.array([np.asarray(p["barycenter"], dtype=np.float64) for p in profiles])
+    cos_max = np.cos(np.radians(float(max_tilt_deg)))
+    out, n_squared = [], 0
+    for k, frame in enumerate(frames):
+        frame = dict(frame)
+        origin = np.asarray(frame["origin"], dtype=np.float64)
+        normal = _unit(frame["normal"])
+        gap = np.linalg.norm(centres - origin, axis=1)
+        j = int(np.argmin(gap))
+        reach = max(3.0 * float(frame["radius"]), 1.0)
+        rim_n = _unit(profiles[j]["normal"])
+        cos = float(np.dot(normal, rim_n))
+        if gap[j] <= reach and abs(cos) < cos_max:
+            tilt = float(np.degrees(np.arccos(min(1.0, abs(cos)))))
+            frame["normal"] = rim_n if cos >= 0.0 else -rim_n
+            n_squared += 1
+            print(
+                f"  Ostium frame {k} (r={float(frame['radius']):.3f} mm at "
+                f"{np.round(origin, 2)}) lay {tilt:.0f} deg off its rim; cutting on the rim's plane"
+            )
+        out.append(frame)
+    return out, n_squared
+
+
 def opening_clip_frames(centerline, profiles):
     """Anatomical ostium origin, outward centerline tangent, local MISR."""
     vtk_cl = to_vtk_poly(centerline)
@@ -5094,6 +5210,7 @@ def opening_clip_frames(centerline, profiles):
     locator.SetDataSet(vtk_cl)
     locator.BuildLocator()
     misr = vtk_cl.GetPointData().GetArray("MaximumInscribedSphereRadius")
+    graph = None
     frames = []
     for profile in profiles:
         origin = np.asarray(profile["barycenter"], dtype=np.float64)
@@ -5116,11 +5233,18 @@ def opening_clip_frames(centerline, profiles):
             tangent = profile_n
             radius = profile_r
         else:
-            tangent = _centerline_tangent_at_id(vtk_cl, pid)
+            if graph is None:
+                graph = _centerline_graph(vtk_cl)
+            arc = max(OPENING_AXIS_ARC_RADII * profile_r, OPENING_AXIS_ARC_FLOOR_MM)
+            tangent = _centerline_axis_at_opening(graph, pid, origin, profile_n, arc)
+            if tangent is None:
+                tangent = _centerline_tangent_at_id(vtk_cl, pid)
             if tangent is None or float(np.linalg.norm(tangent)) < 0.5:
                 tangent = profile_n
             if float(np.dot(tangent, profile_n)) < 0.0:
                 tangent = -tangent
+            if float(np.dot(tangent, profile_n)) < np.cos(np.radians(OPENING_AXIS_MAX_TILT_DEG)):
+                tangent = profile_n
             radius = profile_r
             if misr is not None:
                 radius = max(float(misr.GetComponent(pid, 0)), 0.5 * profile_r, MIN_OPENING_RADIUS_MM)

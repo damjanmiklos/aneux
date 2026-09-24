@@ -75,6 +75,7 @@ from vessel_pipeline import (
     recompute_point_normals,
     run_batch,
     save_polydata,
+    square_frames_to_rims,
     supervise_and_remesh_verified,
     to_vtk_poly,
     with_dataset_id,
@@ -752,6 +753,7 @@ def process_variable_dataset(
             f"  Item 12: consuming {len(frames)} GT ostium frames from {frames_src} "
             "(template uncap uses these planes, not a second VMTK centerline)"
         )
+        frames, _n_squared = square_frames_to_rims(frames, vessel_mesh)
     else:
         print("  Item 12: no GT ostium frames on disk; uncap uses measured template profiles")
 

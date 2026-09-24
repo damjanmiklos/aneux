@@ -22,6 +22,7 @@ from vessel_pipeline import (
     TemplateQualityError,
     assert_template_quality,
     compute_template_local_radii,
+    opening_clip_frames,
     _flow_extension_layer_estimate,
     _is_disc,
     _keep_region_with_point,
@@ -1134,3 +1135,17 @@ def test_template_radius_interpolates_along_a_tapering_segment():
     probe.SetPoints(points)
     r = compute_template_local_radii(probe, cl)[0]
     assert r == pytest.approx(1.6, abs=1e-6)
+
+
+def test_opening_axis_ignores_a_last_cell_lying_across_the_rim():
+    """UPF_P0258's inlet: the trace ends in a 2-point cell in the rim plane."""
+    stub = (np.array([[0.0, 0.0, 0.0], [0.08, 0.0, 0.0]]), np.full(2, 1.0))
+    zs = np.linspace(0.0, -10.0, 101)
+    trunk = (np.column_stack((np.full(101, 0.08), np.zeros(101), zs)), np.full(101, 1.0))
+    # A branch leaving right at the opening and running out past its plane.
+    ts = np.linspace(0.0, 1.0, 51)
+    branch = (np.column_stack((0.08 + 3.0 * ts, np.zeros(51), 5.0 * ts)), np.full(51, 0.4))
+    cl = _centerline([stub, trunk, branch])
+    profile = {"barycenter": np.zeros(3), "normal": np.array([0.0, 0.0, 1.0]), "radius": 1.0}
+    (_origin, outward, _radius), = opening_clip_frames(cl, [profile])
+    assert float(np.dot(outward, [0.0, 0.0, 1.0])) > 0.99
