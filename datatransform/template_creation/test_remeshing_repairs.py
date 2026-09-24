@@ -37,6 +37,9 @@ from vessel_pipeline import (
     force_manifold_triangles,
     inspect_surface_topology,
     measure_open_profiles,
+    stamp_polyball_image,
+    surface_genus,
+    untangle_polyball_field,
     original_cell_mask,
     patch_wall_pinholes,
     trim_extension_patches,
@@ -1012,3 +1015,60 @@ def test_frames_can_vouch_for_an_opening_the_pinhole_filter_drops():
     kept = measure_open_profiles(both, min_radius=0.0)
     assert len(kept) == 4
     assert sorted(round(p["radius"], 2) for p in kept)[:2] == [0.12, 0.12]
+
+
+def _polyball_surface(centres, radius, untangle):
+    """Marching cubes of a sphere chain, optionally untangled first."""
+    from vtk.util.numpy_support import vtk_to_numpy
+
+    centres = np.asarray(centres, dtype=np.float64)
+    spacing = 0.1
+    lo = centres.min(axis=0) - radius - 0.5
+    hi = centres.max(axis=0) + radius + 0.5
+    dims = [int(np.ceil((b - a) / spacing)) + 1 for a, b in zip(lo, hi)]
+    bounds = [lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]]
+    image = stamp_polyball_image(centres, np.full(len(centres), radius), bounds, dims, spacing)
+    n_cut = 0
+    if untangle:
+        field = vtk_to_numpy(image.GetPointData().GetScalars()).reshape(dims[2], dims[1], dims[0])
+        n_cut, _n_filled = untangle_polyball_field(field, spacing)
+        image.GetPointData().GetScalars().Modified()
+    mc = vtk.vtkMarchingCubes()
+    mc.SetInputData(image)
+    mc.SetValue(0, 0.0)
+    mc.Update()
+    return mc.GetOutput(), n_cut
+
+
+def _ring(n=60, radius=2.0):
+    t = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
+    return np.column_stack((radius * np.cos(t), radius * np.sin(t), np.zeros(n)))
+
+
+def test_surface_genus_counts_handles_and_ignores_rims():
+    torus, _n = _polyball_surface(_ring(), 0.5, untangle=False)
+    assert surface_genus(torus) == 1.0
+    assert surface_genus(open_tube(radius=1.0, n_sides=24, n_rings=8)) == 0.0
+
+
+def test_untangle_cuts_the_tunnel_where_two_branches_fuse():
+    """Two ends of a sphere chain that just overlap: p402's fused branches in miniature."""
+    # 0.84 mm between the end centres, so the two r=0.5 spheres share a lens.
+    ends_touching = _ring()[:-3]
+    fused, _n = _polyball_surface(ends_touching, 0.5, untangle=False)
+    assert surface_genus(fused) == 1.0
+    surface, n_cut = _polyball_surface(ends_touching, 0.5, untangle=True)
+    assert n_cut > 0
+    assert surface_genus(surface) == 0.0
+    # The cut is the lens where the ends overlap (0.27 mm across), not a slice
+    # through the tube, which would be ~78 voxels at r=0.5 and 0.1 mm.
+    assert n_cut < 50
+
+
+def test_untangle_leaves_a_tree_alone():
+    chain = np.column_stack((np.linspace(0.0, 4.0, 41), np.zeros(41), np.zeros(41)))
+    before, _n = _polyball_surface(chain, 0.5, untangle=False)
+    after, n_cut = _polyball_surface(chain, 0.5, untangle=True)
+    assert n_cut == 0
+    assert before.GetNumberOfPoints() == after.GetNumberOfPoints()
+    assert surface_genus(after) == 0.0

@@ -2696,6 +2696,164 @@ def stamp_polyball_image(pts, radii, model_bounds, dims, spacing):
     return img
 
 
+# Simple-point machinery for untangle_polyball_field. A voxel is simple when
+# adding it to a set changes neither the number of pieces, nor of tunnels, nor
+# of cavities: its 26-neighbourhood holds exactly one 26-connected piece of the
+# set and exactly one 6-connected piece of the rest that touches it by a face
+# (Bertrand and Malandain's local test, foreground 26 / background 6).
+_CUBE_OFFSETS = [(dz, dy, dx) for dz in (-1, 0, 1) for dy in (-1, 0, 1) for dx in (-1, 0, 1)]
+_CUBE_N26 = [i for i in range(27) if i != 13]
+_CUBE_N18 = [i for i in _CUBE_N26 if sum(map(abs, _CUBE_OFFSETS[i])) <= 2]
+_CUBE_N6 = [i for i in _CUBE_N26 if sum(map(abs, _CUBE_OFFSETS[i])) == 1]
+
+
+def _cube_adjacency(face_only):
+    adj = {}
+    for a in range(27):
+        adj[a] = []
+        for b in range(27):
+            d = [abs(_CUBE_OFFSETS[a][t] - _CUBE_OFFSETS[b][t]) for t in range(3)]
+            if a != b and max(d) <= 1 and (not face_only or sum(d) == 1):
+                adj[a].append(b)
+    return adj
+
+
+_CUBE_ADJ26 = _cube_adjacency(False)
+_CUBE_ADJ6 = _cube_adjacency(True)
+_CUBE_BITS = 1 << np.arange(27, dtype=np.int64)
+_SIMPLE_MEMO = {}
+
+
+def _count_pieces(members, adj, starts):
+    seen, n = set(), 0
+    for s in starts:
+        if s in seen or s not in members:
+            continue
+        n += 1
+        seen.add(s)
+        stack = [s]
+        while stack:
+            for b in adj[stack.pop()]:
+                if b in members and b not in seen:
+                    seen.add(b)
+                    stack.append(b)
+    return n
+
+
+def _is_simple_voxel(key):
+    simple = _SIMPLE_MEMO.get(key)
+    if simple is None:
+        inside = {i for i in _CUBE_N26 if key >> i & 1}
+        outside = {i for i in _CUBE_N18 if not key >> i & 1}
+        simple = (_count_pieces(inside, _CUBE_ADJ26, inside) == 1
+                  and _count_pieces(outside, _CUBE_ADJ6, _CUBE_N6) == 1)
+        _SIMPLE_MEMO[key] = simple
+    return simple
+
+
+def _grow_solid_ball(inside, depth):
+    """The part of ``inside`` reachable by adding simple voxels, deepest first.
+
+    Starts from the deepest voxel and only ever adds a voxel that keeps the
+    grown set a solid ball, so what comes back has no tunnel and no cavity.
+    A voxel refused now is looked at again whenever a neighbour joins; the
+    ones never taken are those that would close a loop, and because the
+    growth reaches them last they sit where the union is thinnest.
+    """
+    import heapq
+
+    B = np.pad(inside, 1)
+    depth = np.pad(np.where(inside, depth, np.inf), 1, constant_values=np.inf)
+    grown = np.zeros_like(B)
+    queued = np.zeros_like(B)
+    _nz, ny, nx = B.shape
+    offsets = np.array([o[0] * ny * nx + o[1] * nx + o[2] for o in _CUBE_OFFSETS], dtype=np.int64)
+    Bf, Gf, Qf, Df = B.ravel(), grown.ravel(), queued.ravel(), depth.ravel()
+    seed = int(np.argmin(Df))
+    heap = [(float(Df[seed]), seed)]
+    Qf[seed] = True
+    while heap:
+        _d, v = heapq.heappop(heap)
+        Qf[v] = False
+        if Gf[v]:
+            continue
+        around = v + offsets
+        if v != seed and not _is_simple_voxel(int(np.dot(Gf[around].astype(np.int64), _CUBE_BITS))):
+            continue
+        Gf[v] = True
+        for u in around:
+            if Bf[u] and not Gf[u] and not Qf[u]:
+                Qf[u] = True
+                heapq.heappush(heap, (float(Df[u]), int(u)))
+    return grown[1:-1, 1:-1, 1:-1]
+
+
+def untangle_polyball_field(field, spacing):
+    """Cut the tunnels and fill the cavities of a polyball union, in place.
+
+    ``field`` is the stamped d^2 - r^2 image, (z, y, x), inside where negative.
+    The union of the spheres of a branching centerline should be a solid tube
+    tree, but where two branches pass within a voxel of each other their
+    spheres fuse and the marching-cubes surface gets a handle the ground truth
+    does not have: p402's tube came out of step 6 at genus 6, p391's at 4 and
+    p347's at 2 from inputs of genus 0. The remesher cannot keep a neck that
+    thin; it pinches it into a bowtie vertex, and those three shipped with one.
+
+    The fix is topological, not geometric. Cavities are filled; then the
+    inside is regrown from its deepest voxel adding only simple voxels, and
+    whatever the growth cannot take is pushed outside. On those three cases
+    that is 12, 17 and 3 voxels out of 1e5-2.5e5, all at the contact
+    (d^2 - r^2 within -0.1 mm^2 of the surface), and marching cubes then gives
+    a closed surface of genus 0. Returns (n_cut, n_filled).
+    """
+    from scipy import ndimage as ndi
+
+    inside = field < 0.0
+    idx = np.argwhere(inside)
+    if not len(idx):
+        return 0, 0
+    lo = np.maximum(idx.min(axis=0) - 1, 0)
+    hi = idx.max(axis=0) + 2
+    box = tuple(slice(int(a), int(b)) for a, b in zip(lo, hi))
+    sub = field[box]
+    solid = ndi.binary_fill_holes(inside[box])
+    filled = solid & ~inside[box]
+    grown = _grow_solid_ball(solid, sub)
+    cut = solid & ~grown
+    # Put the cut halfway between the voxel's depth and the surface it now
+    # stands outside of, so marching cubes opens a gap rather than a crack.
+    sub[filled] = -0.25 * spacing * spacing
+    sub[cut] = np.maximum(-sub[cut], 0.25 * spacing * spacing)
+    return int(cut.sum()), int(filled.sum())
+
+
+def surface_genus(surface):
+    """Handles of a triangle surface, (2 * pieces - rims - euler) / 2.
+
+    A bowtie vertex counts half, so a pinched handle shows as x.5.
+    """
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    _p, pts, faces = _triangle_points_faces(surface)
+    if not len(faces):
+        return 0.0
+    edges = np.sort(np.concatenate((faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]])), axis=1)
+    uniq, count = np.unique(edges, axis=0, return_counts=True)
+    used = np.unique(faces)
+    euler = len(used) - len(uniq) + len(faces)
+    n = len(pts)
+    graph = coo_matrix((np.ones(len(uniq)), (uniq[:, 0], uniq[:, 1])), shape=(n, n))
+    pieces = connected_components(graph, directed=False)[0] - (n - len(used))
+    rim = uniq[count == 1]
+    rims = 0
+    if len(rim):
+        rim_pts = np.unique(rim)
+        rim_graph = coo_matrix((np.ones(len(rim)), (rim[:, 0], rim[:, 1])), shape=(n, n))
+        rims = connected_components(rim_graph, directed=False)[0] - (n - len(rim_pts))
+    return (2 * pieces - rims - euler) / 2.0
+
+
 def _triangle_points_faces(surface, clean=True):
     """Point coordinates and triangle vertex ids.
 
@@ -4463,11 +4621,13 @@ def generate_base_surface(
     extra_spheres=None,
     min_points=None,
     skip_decimate=False,
+    untangle=False,
 ):
     """Parent tube via a narrow-band polyball image + marching cubes.
 
     ``min_points`` / ``skip_decimate`` are for the variable-remesh path.
     Defaults keep remeshing.py and ``sanitize_vessel_for_vmtk`` on the 20k floor.
+    ``untangle`` cuts the tunnels where branches fuse (untangle_polyball_field).
     """
     if not isinstance(branched_centerline, vtk.vtkPolyData):
         branched_centerline = to_vtk_poly(branched_centerline)
@@ -4505,6 +4665,14 @@ def generate_base_surface(
         f"{(2.0 * r_min) / max(spacing, 1e-9):.1f} voxels across smallest diameter)"
     )
     image = stamp_polyball_image(pts, radii, model_bounds, dims, spacing)
+    if untangle:
+        t_un = time.perf_counter()
+        field = vtk_to_numpy(image.GetPointData().GetScalars()).reshape(dims[2], dims[1], dims[0])
+        n_cut, n_filled = untangle_polyball_field(field, spacing)
+        image.GetPointData().GetScalars().Modified()
+        image.Modified()
+        print(f"  Untangled the polyball: {n_cut} voxel(s) cut at fused branches, "
+              f"{n_filled} filled in cavities ({time.perf_counter() - t_un:.2f}s)")
     mc = vmtkscripts.vmtkMarchingCubes()
     mc.Image = image
     mc.Level = 0.0
@@ -7996,35 +8164,59 @@ def _parent_tube_attempt(
     print("Step 5b: Constant-radius polyball stubs past anatomical openings...")
     extra_pts, extra_r = extra_opening_spheres(branched_centerline, anatomical_profiles)
 
-    print("Step 6: Generating multi-branch base surface (vmtkCenterlineModeller)...")
-    base_surface = generate_base_surface(
-        branched_centerline,
-        grid_spacing=grid_spacing,
-        max_grid_size=max_grid_size,
-        reference_bounds=smoothed_vessel.GetBounds(),
-        profiles=anatomical_profiles,
-        extension_length=extension_length,
-        extra_spheres=(extra_pts, extra_r),
-        skip_decimate=skip_mc_decimate,
-    )
-
-    print("Step 7: Uncapping open boundaries with pipe-section cuts...")
-    t_un = time.perf_counter()
     uncap_cut_frames = cut_frames if cut_frames else None
-    if uncap_cut_frames:
-        print(
-            f"  Uncap: forwarding {len(uncap_cut_frames)} GT ostium cut frame(s) "
-            "(skip opening_clip_frames)"
+
+    def tube_and_uncap(untangle):
+        print("Step 6: Generating multi-branch base surface (vmtkCenterlineModeller)...")
+        base_surface = generate_base_surface(
+            branched_centerline,
+            grid_spacing=grid_spacing,
+            max_grid_size=max_grid_size,
+            reference_bounds=smoothed_vessel.GetBounds(),
+            profiles=anatomical_profiles,
+            extension_length=extension_length,
+            extra_spheres=(extra_pts, extra_r),
+            skip_decimate=skip_mc_decimate,
+            untangle=untangle,
         )
-    open_base_surface, n_clipped = clip_flow_extensions_and_uncap(
-        base_surface,
-        anatomical_profiles,
-        extension_length=extension_length,
-        centerline=branched_centerline,
-        fast_uncap=fast_uncap,
-        cut_frames=uncap_cut_frames,
-    )
-    print(f"  [t] uncap {time.perf_counter() - t_un:.2f}s")
+
+        print("Step 7: Uncapping open boundaries with pipe-section cuts...")
+        t_un = time.perf_counter()
+        if uncap_cut_frames:
+            print(
+                f"  Uncap: forwarding {len(uncap_cut_frames)} GT ostium cut frame(s) "
+                "(skip opening_clip_frames)"
+            )
+        opened = clip_flow_extensions_and_uncap(
+            base_surface,
+            anatomical_profiles,
+            extension_length=extension_length,
+            centerline=branched_centerline,
+            fast_uncap=fast_uncap,
+            cut_frames=uncap_cut_frames,
+        )
+        print(f"  [t] uncap {time.perf_counter() - t_un:.2f}s")
+        return opened
+
+    open_base_surface, n_clipped = tube_and_uncap(untangle=False)
+    # A vessel tree has no handles, and neither does any input in the set that
+    # reaches this point untouched; one on the tube is two branches fused where
+    # their spheres overlap. Most such fusions lie in the flow extensions and
+    # go with the uncap; one that survives it is rebuilt with the tunnels cut.
+    # A rescue: a tube without one is built exactly as before.
+    genus = surface_genus(open_base_surface)
+    if genus > 0:
+        print(f"  Rescue: the uncapped tube has genus {genus:g} where branches "
+              "fused; building it again with the tunnels cut.")
+        untangled, n_untangled = tube_and_uncap(untangle=True)
+        genus_after = surface_genus(untangled)
+        if genus_after < genus and n_untangled >= n_clipped:
+            print(f"  Untangled tube: genus {genus:g} -> {genus_after:g}, "
+                  f"{n_untangled} end(s) opened")
+            open_base_surface, n_clipped = untangled, n_untangled
+        else:
+            print(f"  Untangling did not help (genus {genus_after:g}, "
+                  f"{n_untangled} end(s) opened); keeping the first tube")
     print(f"  -> Open base surface points: {open_base_surface.GetNumberOfPoints()}")
     n_in = len(uncap_cut_frames) if uncap_cut_frames else len(anatomical_profiles)
     if n_clipped != n_in:
@@ -8380,8 +8572,19 @@ def supervise_and_remesh_verified(base_surface, vessel_mesh, centerline,
     on p414 a blade beside an r=0.32 mm opening, 596 edges over 3x the target
     and all within a millimetre of it. Splitting only, the polish cuts those
     and leaves the rest where it was: 18.7x -> 5.4x at 0.964 within x2, in 4 s.
+
+    A rung must also leave the tube's topology as it found it. Five of the 735
+    templates of the 2026-09-24 run shipped bowtie vertices from a clean tube:
+    on SNF00000535, p391 and p477 the first rung made one, and on p347 and p402
+    it left 2 and 5 non-manifold edges that enforce_min_edge then unzipped into
+    1 and 4 bowties. None of the geometric checks sees a pinch, so such a rung
+    is refused and the ladder moves on. It is not polished: a split-only pass
+    cannot change which triangles meet at a vertex.
     """
     base_area = _surface_area(base_surface)
+    base_topo = inspect_surface_topology(base_surface)
+    base_nm = int(base_topo["n_nonmanifold"])
+    base_bow = int(base_topo["n_bowtie"])
     supervision = {}
     best = None
 
@@ -8394,10 +8597,18 @@ def supervise_and_remesh_verified(base_surface, vessel_mesh, centerline,
         fan = worst_hub_ring_edges(remeshed)
         ratio = worst_local_edge_ratio(remeshed, reference=sup["surface"])
         dens = density_within_x2(remeshed, sup["surface"])
-        score = (dens < REMESH_MIN_DENSITY_WITHIN_X2, abs(drift - 1.0), fan, ratio)
+        topo = inspect_surface_topology(remeshed)
+        new_nm = max(0, int(topo["n_nonmanifold"]) - base_nm)
+        new_bow = max(0, int(topo["n_bowtie"]) - base_bow)
+        torn = bool(new_nm or new_bow)
+        score = (dens < REMESH_MIN_DENSITY_WITHIN_X2, torn, abs(drift - 1.0), fan, ratio)
         if best is None or score < best[0]:
             best = (score, drift, fan, ratio, dens, label)
         why = []
+        if new_nm:
+            why.append(f"{new_nm} new non-manifold edge(s)")
+        if new_bow:
+            why.append(f"{new_bow} new bowtie vertex(es)")
         if drift > REMESH_MAX_AREA_DRIFT:
             why.append(f"area {drift:.2f}x ({base_area:.1f} -> {after:.1f} mm^2)")
         if fan > REMESH_MAX_HUB_RING_EDGES:
@@ -8409,7 +8620,7 @@ def supervise_and_remesh_verified(base_surface, vessel_mesh, centerline,
         if why:
             print(f"  WARNING: adaptive remesh at {label} left the template with "
                   + " and ".join(why))
-        return not why, drift, fan, dens, ratio
+        return not why, drift, fan, dens, ratio, torn
 
     for rung, (fraction, collapse) in enumerate(_adaptive_remesh_ladder()):
         if fraction not in supervision:
@@ -8431,13 +8642,13 @@ def supervise_and_remesh_verified(base_surface, vessel_mesh, centerline,
         )
         remeshed = enforce_min_edge(remeshed, label="remeshed template")
         t_rm_s = time.perf_counter() - t_rm
-        ok, drift, fan, dens, ratio = judge(remeshed, sup, label)
+        ok, drift, fan, dens, ratio, torn = judge(remeshed, sup, label)
         how = []
         # Polish only a surface that held its area: a diverged remesh has
         # thrown triangles across ground a split-only pass cannot win back.
         # Each round starts from the last and stops once it no longer helps.
         polish_from, rounds = remeshed, 0
-        while (not ok and drift <= REMESH_MAX_AREA_DRIFT
+        while (not ok and not torn and drift <= REMESH_MAX_AREA_DRIFT
                and rounds < REMESH_POLISH_ROUNDS):
             rounds += 1
             t_po = time.perf_counter()
@@ -8449,7 +8660,7 @@ def supervise_and_remesh_verified(base_surface, vessel_mesh, centerline,
             polished = enforce_min_edge(polished, label="polished template")
             t_rm_s += time.perf_counter() - t_po
             before = (fan, ratio)
-            ok, drift, fan, dens, ratio = judge(
+            ok, drift, fan, dens, ratio, torn = judge(
                 polished, sup, f"{label} then {rounds} collapse-off polish round(s)"
             )
             if ok:
