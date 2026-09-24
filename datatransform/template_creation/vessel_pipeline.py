@@ -6485,8 +6485,26 @@ def clip_centerline_at_profiles(centerline, profiles, extension_length=DEFAULT_E
     return out
 
 
+# R_template is the radius of the ball the vertex's wall was made from, which is
+# not the same thing as the nearest stretch of centerline. The tube is a union
+# of balls, so a vertex belongs to the ball with the smallest power distance
+# |x - c|^2 - r^2 -- zero on that ball's own sphere. The nearest centerline is
+# a different question wherever a thin branch leaves a thick one: a vertex on
+# the thick vessel's wall 2.6 mm from its own axis can sit 2.1 mm from the thin
+# branch's first points, and the old projection then gave it the thin branch's
+# 0.35 mm. That is not cosmetic. The raycast refuses any hit past 3.5 R, so on
+# p388 a 1.2-1.7 mm stretch on a 2.6 mm vessel was clamped to 1.225 mm on 970
+# vertices (3.4% of the template), and UPF_P0266 lost 645 the same way;
+# k = 1 + d / R also densified that wall as if it were a 0.35 mm tube.
+#
+# Lifting every centerline point to 4D as (c, sqrt(R^2 - r^2)), R the largest
+# radius, turns the power distance into an ordinary squared distance to
+# (x, 0), so the owning ball is a KD-tree nearest neighbour. The segments on
+# either side of it then give the exact minimum along the interpolated balls.
 def compute_template_local_radii(template_mesh, branched_centerline):
-    """R_template from the closest point on the centerline polyline, not the nearest vertex."""
+    """R_template: the radius of the centerline ball whose sphere a vertex is on."""
+    from scipy.spatial import cKDTree
+
     vtk_template = to_vtk_poly(template_mesh)
     vtk_cl = to_vtk_poly(branched_centerline)
     n_pts = vtk_template.GetNumberOfPoints()
@@ -6497,41 +6515,58 @@ def compute_template_local_radii(template_mesh, branched_centerline):
     misr_arr = vtk_cl.GetPointData().GetArray("MaximumInscribedSphereRadius")
     if misr_arr is None:
         return r_template
-    misr = np.ascontiguousarray(vtk_to_numpy(misr_arr), dtype=np.float64)
-    query = np.ascontiguousarray(vtk_to_numpy(vtk_template.GetPoints().GetData()), dtype=np.float64)
+    radius = np.maximum(np.ascontiguousarray(vtk_to_numpy(misr_arr), dtype=np.float64).reshape(-1), 0.0)
+    _, cl_pts = _poly_points(vtk_cl)
+    _, query = _poly_points(vtk_template)
 
-    vtk_cl.BuildCells()
-    locator = vtk.vtkCellLocator()
-    locator.SetDataSet(vtk_cl)
-    locator.BuildLocator()
-    closest = [0.0, 0.0, 0.0]
-    cell_id = vtk.mutable(0)
-    sub_id = vtk.mutable(0)
-    dist2 = vtk.mutable(0.0)
-    for i, p in enumerate(query):
-        locator.FindClosestPoint(_vec3(p), closest, cell_id, sub_id, dist2)
-        cell = vtk_cl.GetCell(int(cell_id.get()))
-        n = cell.GetNumberOfPoints()
-        if n < 2:
-            pid = cell.GetPointId(0) if n == 1 else 0
-            r_val = float(misr[pid]) if pid < misr.size else R_TEMPLATE_FLOOR_MM
-            r_template[i] = max(R_TEMPLATE_FLOOR_MM, r_val)
-            continue
-        sid = int(sub_id.get())
-        sid = max(0, min(sid, n - 2))
-        i0 = cell.GetPointId(sid)
-        i1 = cell.GetPointId(sid + 1)
-        p0 = np.asarray(vtk_cl.GetPoint(i0), dtype=np.float64)
-        p1 = np.asarray(vtk_cl.GetPoint(i1), dtype=np.float64)
-        seg = p1 - p0
-        denom = float(np.dot(seg, seg))
-        if denom < 1e-18:
-            t = 0.0
-        else:
-            t = float(np.clip(np.dot(np.asarray(closest, dtype=np.float64) - p0, seg) / denom, 0.0, 1.0))
-        r_val = (1.0 - t) * float(misr[i0]) + t * float(misr[i1])
-        r_template[i] = max(R_TEMPLATE_FLOOR_MM, r_val)
-    return r_template
+    lift = float(radius.max())
+    lifted = np.column_stack([cl_pts, np.sqrt(np.maximum(lift * lift - radius * radius, 0.0))])
+    _, owner = cKDTree(lifted).query(np.column_stack([query, np.zeros(n_pts)]))
+    owner = np.asarray(owner, dtype=np.int64)
+    best_r = radius[owner]
+    best_p = np.einsum("ij,ij->i", query - cl_pts[owner], query - cl_pts[owner]) - best_r ** 2
+
+    seg_a, seg_b = [], []
+    lines = vtk_cl.GetLines()
+    if lines is not None and lines.GetNumberOfCells() > 0:
+        offsets = vtk_to_numpy(lines.GetOffsetsArray()).astype(np.int64)
+        conn = vtk_to_numpy(lines.GetConnectivityArray()).astype(np.int64)
+        for c in range(offsets.size - 1):
+            ids = conn[offsets[c]:offsets[c + 1]]
+            if ids.size >= 2:
+                seg_a.append(ids[:-1])
+                seg_b.append(ids[1:])
+    if seg_a:
+        seg_a = np.concatenate(seg_a)
+        seg_b = np.concatenate(seg_b)
+        n_cl = cl_pts.shape[0]
+        ends = np.concatenate([seg_a, seg_b])
+        segs = np.concatenate([np.arange(seg_a.size)] * 2)
+        order = np.argsort(ends, kind="stable")
+        inc_seg = segs[order]
+        inc_ptr = np.concatenate([[0], np.cumsum(np.bincount(ends, minlength=n_cl))])
+        degree = inc_ptr[owner + 1] - inc_ptr[owner]
+        for d in range(int(degree.max()) if degree.size else 0):
+            has = np.flatnonzero(degree > d)
+            s = inc_seg[inc_ptr[owner[has]] + d]
+            a, b = seg_a[s], seg_b[s]
+            ra, dr = radius[a], radius[b] - radius[a]
+            axis = cl_pts[b] - cl_pts[a]
+            rel = query[has] - cl_pts[a]
+            curv = np.einsum("ij,ij->i", axis, axis) - dr * dr
+            lin = np.einsum("ij,ij->i", rel, axis) + ra * dr
+            # Power along the segment is a quadratic in t; when it is not convex
+            # (the radius changes faster than the axis moves) an end is the minimum.
+            # p(1) - p(0) = curv - 2 lin.
+            t_end = (curv - 2.0 * lin < 0.0).astype(np.float64)
+            t = np.where(curv > 1e-18, np.clip(lin / np.maximum(curv, 1e-18), 0.0, 1.0), t_end)
+            r_t = ra + t * dr
+            off = rel - t[:, None] * axis
+            p_t = np.einsum("ij,ij->i", off, off) - r_t * r_t
+            better = p_t < best_p[has]
+            best_p[has[better]] = p_t[better]
+            best_r[has[better]] = r_t[better]
+    return np.maximum(R_TEMPLATE_FLOOR_MM, best_r)
 
 
 def _cell_centroids(poly):

@@ -21,6 +21,7 @@ from vessel_pipeline import (
     MIN_OPENING_LOOP_POINTS,
     TemplateQualityError,
     assert_template_quality,
+    compute_template_local_radii,
     _flow_extension_layer_estimate,
     _is_disc,
     _keep_region_with_point,
@@ -1079,3 +1080,57 @@ def test_quality_gate_refuses_a_surface_with_a_tunnel():
     torus, _n = _polyball_surface(_ring(), 0.5, untangle=False)
     with pytest.raises(TemplateQualityError, match="genus 1"):
         assert_template_quality(torus, context="torus")
+
+
+def _centerline(tracts):
+    """Polyline centerline, one cell per (points, radii) tract."""
+    points = vtk.vtkPoints()
+    lines = vtk.vtkCellArray()
+    radii = vtk.vtkDoubleArray()
+    radii.SetName("MaximumInscribedSphereRadius")
+    for pts, r in tracts:
+        ids = vtk.vtkIdList()
+        for p, rv in zip(pts, r):
+            ids.InsertNextId(points.InsertNextPoint(*map(float, p)))
+            radii.InsertNextValue(float(rv))
+        lines.InsertNextCell(ids)
+    cl = vtk.vtkPolyData()
+    cl.SetPoints(points)
+    cl.SetLines(lines)
+    cl.GetPointData().AddArray(radii)
+    return cl
+
+
+def test_template_radius_comes_from_the_ball_the_wall_is_on():
+    """p388: a thick wall next to a thin branch's first points keeps the thick radius."""
+    xs = np.linspace(0.0, 10.0, 51)
+    trunk = (np.column_stack((xs, np.zeros(51), np.zeros(51))), np.full(51, 2.5))
+    ys = np.linspace(0.0, 6.0, 31)
+    branch = (np.column_stack((np.full(31, 5.0), ys, np.zeros(31))), np.full(31, 0.35))
+    cl = _centerline([trunk, branch])
+    points = vtk.vtkPoints()
+    # On the trunk wall 2 mm from the branch (the nearest centerline there is
+    # the branch's, 2.0 mm against the trunk's 2.5); on the branch wall outside
+    # the trunk; and midway along the trunk where the radius tapers.
+    for p in ((3.0, 2.5, 0.0), (5.0, 4.0, 0.35), (8.0, 0.0, -2.5)):
+        points.InsertNextPoint(*p)
+    probe = vtk.vtkPolyData()
+    probe.SetPoints(points)
+    r = compute_template_local_radii(probe, cl)
+    assert r[0] == pytest.approx(2.5, abs=1e-6)
+    assert r[1] == pytest.approx(0.35, abs=1e-6)
+    assert r[2] == pytest.approx(2.5, abs=1e-6)
+
+
+def test_template_radius_interpolates_along_a_tapering_segment():
+    xs = np.array([0.0, 4.0])
+    cl = _centerline([(np.column_stack((xs, np.zeros(2), np.zeros(2))), np.array([2.0, 1.0]))])
+    points = vtk.vtkPoints()
+    # Over the middle of the segment. The ball that touches a cone's wall sits a
+    # little upstream of the foot of the perpendicular (t = 0.4, r = 1.6 here),
+    # so the answer is the interpolated radius, not either end's.
+    points.InsertNextPoint(2.0, 1.5, 0.0)
+    probe = vtk.vtkPolyData()
+    probe.SetPoints(points)
+    r = compute_template_local_radii(probe, cl)[0]
+    assert r == pytest.approx(1.6, abs=1e-6)
