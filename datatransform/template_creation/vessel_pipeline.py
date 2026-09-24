@@ -7926,6 +7926,14 @@ def assert_template_quality(surface, context="template"):
     )
     if topo["n_nonmanifold"] > 0:
         issues.append(f"{topo['n_nonmanifold']} non-manifold edges")
+    if topo["n_bowtie"] > 0:
+        issues.append(f"{topo['n_bowtie']} bowtie vertices")
+    # A vessel tree has no tunnels. One in the output is two walls fused where
+    # they nearly touch -- by the pipeline, or already in the source mesh, in
+    # which case the source has to be fixed; either way it must not ship.
+    genus = surface_genus(vtk_poly)
+    if genus != 0:
+        issues.append(f"genus {genus:g} (a vessel tree has none: two walls are fused)")
     if topo["n_triangles"] > 0 and topo["min_edge"] < MIN_EDGE_LENGTH_MM:
         issues.append(
             f"degenerate min edge {topo['min_edge']:.6f} mm (floor {MIN_EDGE_LENGTH_MM} mm)"

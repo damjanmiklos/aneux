@@ -20,6 +20,7 @@ from vessel_pipeline import (
     MIN_EDGE_LENGTH_MM,
     MIN_OPENING_LOOP_POINTS,
     TemplateQualityError,
+    assert_template_quality,
     _flow_extension_layer_estimate,
     _is_disc,
     _keep_region_with_point,
@@ -1072,3 +1073,9 @@ def test_untangle_leaves_a_tree_alone():
     assert n_cut == 0
     assert before.GetNumberOfPoints() == after.GetNumberOfPoints()
     assert surface_genus(after) == 0.0
+
+
+def test_quality_gate_refuses_a_surface_with_a_tunnel():
+    torus, _n = _polyball_surface(_ring(), 0.5, untangle=False)
+    with pytest.raises(TemplateQualityError, match="genus 1"):
+        assert_template_quality(torus, context="torus")
