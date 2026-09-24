@@ -5178,6 +5178,7 @@ def square_frames_to_rims(frames, surface, max_tilt_deg=OPENING_AXIS_MAX_TILT_DE
     if not profiles:
         return frames, 0
     centres = np.array([np.asarray(p["barycenter"], dtype=np.float64) for p in profiles])
+    wall = None
     cos_max = np.cos(np.radians(float(max_tilt_deg)))
     out, n_squared = [], 0
     for k, frame in enumerate(frames):
@@ -5191,11 +5192,31 @@ def square_frames_to_rims(frames, surface, max_tilt_deg=OPENING_AXIS_MAX_TILT_DE
         cos = float(np.dot(normal, rim_n))
         if gap[j] <= reach and abs(cos) < cos_max:
             tilt = float(np.degrees(np.arccos(min(1.0, abs(cos)))))
-            frame["normal"] = rim_n if cos >= 0.0 else -rim_n
+            # The old normal cannot sign the new one: it lies across the rim,
+            # so its dot with the rim normal is noise. p531's frame 7 sat at 89
+            # deg, took the inward sign, and the cutter then ran into the
+            # vessel and removed nothing. The wall can: it lies behind the
+            # opening, never in front of it.
+            if wall is None:
+                wall = vtk_to_numpy(to_vtk_poly(surface).GetPoints().GetData()).astype(np.float64)
+            centre = centres[j]
+            near = wall[np.linalg.norm(wall - centre, axis=1)
+                        <= 2.0 * max(float(profiles[j]["radius"]), 0.25)]
+            behind = float(np.mean((near - centre) @ rim_n)) if len(near) else -1.0
+            frame["normal"] = rim_n if behind <= 0.0 else -rim_n
             n_squared += 1
+            # The radius came from the same centerline point as the axis, so
+            # it is no better. p531's frame 7 read 0.585 mm there against a
+            # 0.391 mm rim -- the only frame of 4154 over 1.3x its rim -- and
+            # the cutter sized from it took the r=0.21 mm ostium 1.1 mm away
+            # into the same hole, leaving three bowties where the rims met.
+            old_r = float(frame["radius"])
+            rim_r = max(float(profiles[j]["radius"]), MIN_OPENING_RADIUS_MM)
+            frame["radius"] = min(old_r, rim_r)
             print(
-                f"  Ostium frame {k} (r={float(frame['radius']):.3f} mm at "
+                f"  Ostium frame {k} (r={old_r:.3f} mm at "
                 f"{np.round(origin, 2)}) lay {tilt:.0f} deg off its rim; cutting on the rim's plane"
+                + (f" at the rim's r={rim_r:.3f} mm" if rim_r < old_r else "")
             )
         out.append(frame)
     return out, n_squared
@@ -5243,11 +5264,16 @@ def opening_clip_frames(centerline, profiles):
                 tangent = profile_n
             if float(np.dot(tangent, profile_n)) < 0.0:
                 tangent = -tangent
-            if float(np.dot(tangent, profile_n)) < np.cos(np.radians(OPENING_AXIS_MAX_TILT_DEG)):
+            refused = float(np.dot(tangent, profile_n)) < np.cos(np.radians(OPENING_AXIS_MAX_TILT_DEG))
+            if refused:
                 tangent = profile_n
             radius = profile_r
             if misr is not None:
                 radius = max(float(misr.GetComponent(pid, 0)), 0.5 * profile_r, MIN_OPENING_RADIUS_MM)
+                if refused:
+                    # A point whose axis crosses the rim is on another vessel,
+                    # and so is its inscribed sphere (see square_frames_to_rims).
+                    radius = min(radius, profile_r)
         frames.append((origin, _unit(tangent), float(radius)))
     return frames
 

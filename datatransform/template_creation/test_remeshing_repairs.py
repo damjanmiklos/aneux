@@ -1149,3 +1149,33 @@ def test_opening_axis_ignores_a_last_cell_lying_across_the_rim():
     profile = {"barycenter": np.zeros(3), "normal": np.array([0.0, 0.0, 1.0]), "radius": 1.0}
     (_origin, outward, _radius), = opening_clip_frames(cl, [profile])
     assert float(np.dot(outward, [0.0, 0.0, 1.0])) > 0.99
+
+
+def test_a_squared_frame_takes_its_radius_from_the_rim_too():
+    """A frame whose axis lay across its rim got its radius off the same point.
+
+    p531's frame 7 carried a 0.585 mm inscribed radius into a 0.391 mm rim, and
+    the cutter sized from it swallowed the ostium next door. A frame narrower
+    than its rim keeps its own radius: only the foreign excess is dropped.
+    """
+    from vessel_pipeline import square_frames_to_rims
+
+    tube = open_tube(radius=0.4, length=6.0, n_sides=40, n_rings=30)
+    _poly, pts, _faces = _triangle_points_faces(tube)
+    top = np.array([0.0, 0.0, pts[:, 2].max()])
+    bottom = np.array([0.0, 0.0, pts[:, 2].min()])
+    frames = [
+        {"origin": top, "normal": np.array([1.0, 0.0, 0.0]), "radius": 0.6},
+        {"origin": bottom, "normal": np.array([0.0, 1.0, 0.05]), "radius": 0.3},
+        {"origin": top, "normal": np.array([0.0, 1.0, -0.05]), "radius": 0.3},
+    ]
+    squared, n = square_frames_to_rims(frames, tube)
+    assert n == 3
+    # Outward is read off the wall, not the old normal: +z at the top even
+    # though the bottom frame's old normal leaned the other way.
+    assert squared[0]["normal"][2] == pytest.approx(1.0, abs=1e-6)
+    assert squared[1]["normal"][2] == pytest.approx(-1.0, abs=1e-6)
+    assert squared[2]["normal"][2] == pytest.approx(1.0, abs=1e-6)
+    assert squared[0]["radius"] == pytest.approx(0.4, abs=0.01)
+    assert squared[1]["radius"] == pytest.approx(0.3)
+    assert frames[0]["radius"] == 0.6
