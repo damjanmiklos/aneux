@@ -1179,3 +1179,25 @@ def test_a_squared_frame_takes_its_radius_from_the_rim_too():
     assert squared[0]["radius"] == pytest.approx(0.4, abs=0.01)
     assert squared[1]["radius"] == pytest.approx(0.3)
     assert frames[0]["radius"] == 0.6
+
+
+def test_a_centerline_end_is_trimmed_only_at_its_own_opening():
+    """C0048: two side-by-side outlets must not trim each other's branch."""
+    from vessel_pipeline import clip_centerline_at_profiles
+
+    xs = np.linspace(0.0, 15.0, 151)
+    a = (np.column_stack((xs, np.zeros_like(xs), np.zeros_like(xs))), np.full(xs.size, 0.5))
+    xb = np.linspace(0.0, 14.0, 141)
+    b = (np.column_stack((xb, np.full(xb.size, 2.0), np.zeros_like(xb))), np.full(xb.size, 0.5))
+    profiles = [
+        {"barycenter": np.array([10.0, 0.0, 0.0]), "normal": np.array([1.0, 0.0, 0.0]), "radius": 0.5},
+        {"barycenter": np.array([9.0, 2.0, 0.0]), "normal": np.array([1.0, 0.0, 0.0]), "radius": 0.5},
+    ]
+    out = clip_centerline_at_profiles(_centerline([a, b]), profiles, extension_length=5.0)
+    pts = np.array([out.GetPoint(i) for i in range(out.GetNumberOfPoints())])
+    on_a = pts[np.abs(pts[:, 1]) < 1e-9]
+    on_b = pts[np.abs(pts[:, 1] - 2.0) < 1e-9]
+    # Tract a ends within reach of b's opening and outside its plane, so it
+    # used to be cut back to x=9 as well.
+    assert on_a[:, 0].max() == pytest.approx(10.0, abs=0.11)
+    assert on_b[:, 0].max() == pytest.approx(9.0, abs=0.11)

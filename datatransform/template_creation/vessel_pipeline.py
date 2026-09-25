@@ -6561,17 +6561,39 @@ def _copy_cell_arrays_for_kept_cells(src_poly, dst_poly, kept_cell_ids):
         dst_poly.GetCellData().AddArray(arr)
 
 
-def _trim_polyline_end(pts, origin, plane_normal, max_end_dist):
+def _profile_owning_end(end, profiles, extension_length=DEFAULT_EXTENSION_LENGTH):
+    """The opening a polyline end leaves through: nearest to its flow-extension axis.
+
+    The extension runs from the barycenter along the outward normal for
+    ``extension_length``, so the end of a tract that exits there lies on that
+    segment. None when no opening is within trimming reach.
+    """
+    end = np.asarray(end, dtype=np.float64)
+    best, best_d = None, np.inf
+    for profile in profiles:
+        origin = np.asarray(profile["barycenter"], dtype=np.float64)
+        reach = float(extension_length) + 3.0 * max(float(profile["radius"]), 0.5)
+        if np.linalg.norm(end - origin) > reach:
+            continue
+        normal = _unit(profile["normal"])
+        t = float(np.clip(np.dot(end - origin, normal), 0.0, float(extension_length)))
+        d = float(np.linalg.norm(end - (origin + t * normal)))
+        if d < best_d:
+            best, best_d = profile, d
+    return best
+
+
+def _trim_polyline_end(pts, origin, plane_normal, max_end_dist, head=True, tail=True):
     origin = np.asarray(origin, dtype=np.float64)
     plane_normal = _unit(plane_normal)
-    if np.linalg.norm(pts[0] - origin) <= max_end_dist:
+    if head and np.linalg.norm(pts[0] - origin) <= max_end_dist:
         i = 0
         while i < len(pts) - 2 and float(np.dot(plane_normal, pts[i] - origin)) < 0.0:
             i += 1
         pts = pts[i:]
     if len(pts) < 2:
         return pts
-    if np.linalg.norm(pts[-1] - origin) <= max_end_dist:
+    if tail and np.linalg.norm(pts[-1] - origin) <= max_end_dist:
         i = len(pts) - 1
         while i > 1 and float(np.dot(plane_normal, pts[i] - origin)) < 0.0:
             i -= 1
@@ -6590,14 +6612,27 @@ def clip_centerline_at_profiles(centerline, profiles, extension_length=DEFAULT_E
     kept = []
     kept_cell_ids = []
     for pts, ci in zip(cells, cell_ids):
+        # Each end is trimmed at the opening it leaves through and no other.
+        # Trimming it against every opening in reach cut it back to whichever
+        # neighbour's plane it happened to lie outside: C0048's two 1.1 mm
+        # outlets 6 mm apart, facing the same way, each lost 4-5 radii of
+        # branch to the other's plane, and 152 ostia of r >= 0.3 mm across
+        # the set were left with no centerline within 3 radii.
         trimmed = pts
-        for profile in profiles:
+        for at_start in (True, False):
+            if len(trimmed) < 2:
+                break
+            end = trimmed[0] if at_start else trimmed[-1]
+            profile = _profile_owning_end(end, profiles, extension_length)
+            if profile is None:
+                continue
             origin = profile["barycenter"]
             plane_normal = -_unit(profile["normal"])
             max_end_dist = float(extension_length) + 3.0 * max(float(profile["radius"]), 0.5)
-            trimmed = _trim_polyline_end(trimmed, origin, plane_normal, max_end_dist)
-            if len(trimmed) < 2:
-                break
+            if at_start:
+                trimmed = _trim_polyline_end(trimmed, origin, plane_normal, max_end_dist, tail=False)
+            else:
+                trimmed = _trim_polyline_end(trimmed, origin, plane_normal, max_end_dist, head=False)
         if len(trimmed) >= 2:
             kept.append(trimmed)
             kept_cell_ids.append(ci)
@@ -9047,11 +9082,16 @@ def compute_centerline_from_mesh(
     vessel_mesh,
     extension_length=DEFAULT_EXTENSION_LENGTH,
     sample_spacing=DEFAULT_SAMPLE_SPACING,
+    expected_openings=None,
 ):
     """Voronoi centerline for an in-memory surface. Same steps as centerline_creation.py.
 
     Does not read or write files. Callers that need a ``.vtp`` should use
     ``process_centerline_dataset``.
+
+    ``expected_openings`` is how many ostia the surface is known to have (its
+    ostium frames). When every rim is accounted for by one, none of them is a
+    pinhole and each is seeded, however small.
     """
     from batch_run_log import set_step
 
@@ -9061,14 +9101,24 @@ def compute_centerline_from_mesh(
     smoothed_vessel = apply_taubin_smoothing(work)
     print("Step 1b: Detecting anatomical inlet/outlet boundaries...")
     set_step("1b_anatomical_openings")
-    anatomical_profiles = measure_open_profiles(smoothed_vessel)
+    # The pinhole filter drops every rim under MIN_SEED_OPENING_RADIUS_MM, which
+    # on a stage-2 surface is always a real ostium: that stage closes every
+    # hole that is not one and ships exactly one rim per frame. ANSYS_UNIGE_27's
+    # r=0.21 mm ostium measured just under 0.2 mm after the Taubin pass, took
+    # no seed, and its branch was missing from the centerline 17 mm deep.
+    seed_min_radius = None
+    if expected_openings:
+        every_rim = measure_open_profiles(smoothed_vessel, min_radius=0.0)
+        if len(every_rim) == int(expected_openings):
+            seed_min_radius = 0.0
+    anatomical_profiles = measure_open_profiles(smoothed_vessel, min_radius=seed_min_radius)
     log_profiles(anatomical_profiles, label="Anatomical")
     seed_points_from_profiles(anatomical_profiles)
 
     print("Step 2: Adding flow extensions on the open surface...")
     set_step("2_flow_extensions")
     extended_vessel = add_flow_extensions(smoothed_vessel, extension_length=extension_length)
-    extended_profiles = measure_open_profiles(extended_vessel)
+    extended_profiles = measure_open_profiles(extended_vessel, min_radius=seed_min_radius)
     log_profiles(extended_profiles, label="Extended")
 
     print("Step 3: Extracting Voronoi centerline and MISR...")
@@ -9103,10 +9153,16 @@ def process_centerline_dataset(
 ):
     print(f"\n=========================================\nProcessing Centerline Case: {dataset_id}")
     vessel_mesh = pv.read(v_file)
+    frames_path = os.path.splitext(v_file)[0] + ".ostium_frames.npz"
+    expected = None
+    if os.path.isfile(frames_path):
+        with np.load(frames_path) as frames:
+            expected = int(len(frames["radius"]))
     final_centerline = compute_centerline_from_mesh(
         vessel_mesh,
         extension_length=extension_length,
         sample_spacing=sample_spacing,
+        expected_openings=expected,
     )
     os.makedirs(output_dir, exist_ok=True)
     out_file = os.path.join(output_dir, f"{dataset_id}.vtp")
