@@ -1276,3 +1276,93 @@ def test_a_float32_surface_is_refused_at_save(tmp_path):
     assert tube.GetPoints().GetDataType() == vtk.VTK_FLOAT
     with pytest.raises(TemplateQualityError, match="float64"):
         save_polydata(tube, str(tmp_path / "t.vtp"))
+
+
+def _tube_with_a_hole_beside_its_mouth():
+    """Open tube (r=1, z in [-3, 3]) with a r~0.6 hole in the wall 1 mm below its top rim."""
+    tube = open_tube(radius=1.0, length=6.0, n_sides=40, n_rings=30)
+    _poly, pts, faces = _triangle_points_faces(tube)
+    centroids = pts[faces].mean(axis=1)
+    keep = np.linalg.norm(centroids - np.array([1.0, 0.0, 2.0]), axis=1) > 0.6
+    return _polydata_from_triangles(pts, faces[keep])
+
+
+def test_a_leftover_beside_an_ostium_is_capped_by_the_fan():
+    """p136: a clip leftover 2 mm from an ostium matched it too and stayed open."""
+    from vessel_pipeline import boundary_loop_radii, cap_unmatched_loops
+
+    holed = _tube_with_a_hole_beside_its_mouth()
+    assert len(boundary_loop_radii(holed)) == 3
+    profiles = [
+        {"barycenter": np.array([0.0, 0.0, 3.0]), "normal": np.array([0.0, 0.0, 1.0]), "radius": 1.0},
+        {"barycenter": np.array([0.0, 0.0, -3.0]), "normal": np.array([0.0, 0.0, -1.0]), "radius": 1.0},
+    ]
+    capped, n = cap_unmatched_loops(holed, profiles, label="test surface")
+    assert n == 1
+    loops = boundary_loop_radii(capped)
+    assert len(loops) == 2
+    assert sorted(round(float(b[2])) for _r, _n, b in loops) == [-3, 3]
+
+
+def test_two_close_ostia_each_keep_their_own_loop():
+    """Two genuine openings in reach of each other must both stay open."""
+    from vessel_pipeline import boundary_loop_radii, cap_unmatched_loops
+
+    tube = open_tube(radius=1.0, length=2.0, n_sides=40, n_rings=10)
+    profiles = [
+        {"barycenter": np.array([0.0, 0.0, 1.0]), "normal": np.array([0.0, 0.0, 1.0]), "radius": 1.0},
+        {"barycenter": np.array([0.0, 0.0, -1.0]), "normal": np.array([0.0, 0.0, -1.0]), "radius": 1.0},
+    ]
+    capped, n = cap_unmatched_loops(tube, profiles, label="test surface")
+    assert n == 0
+    assert len(boundary_loop_radii(capped)) == 2
+
+
+def _square_tube_with_a_collinear_crack():
+    """Open square tube, z in [0, 4], with one wall triangle split at an exact edge midpoint.
+
+    The split leaves a three-point boundary loop whose points lie on one line:
+    a crack with no area and, to vtkvmtkCapPolyData, no normal.
+    """
+    from vessel_pipeline import _polydata_from_triangles
+
+    ring = [(0, 0), (1, 0), (2, 0), (2, 1), (2, 2), (1, 2), (0, 2), (0, 1)]
+    n = len(ring)
+    pts = [(float(x), float(y), float(z)) for z in range(5) for (x, y) in ring]
+    faces = []
+    for k in range(4):
+        for i in range(n):
+            a, b = k * n + i, k * n + (i + 1) % n
+            c, d = (k + 1) * n + (i + 1) % n, (k + 1) * n + i
+            faces += [(a, b, c), (a, c, d)]
+    a, b, c = 2 * n, 2 * n + 1, 3 * n + 1
+    faces.remove((a, b, c))
+    m = len(pts)
+    pts.append(tuple((np.array(pts[a]) + np.array(pts[c])) / 2.0))
+    faces += [(a, b, m), (m, b, c)]
+    return _polydata_from_triangles(np.array(pts, dtype=np.float64), np.array(faces, dtype=np.int64))
+
+
+def test_a_collinear_rim_gets_a_finite_cap_centre():
+    """vmtk puts a NaN centre on a rim with no normal; no capped surface may carry it."""
+    from vessel_pipeline import _cap_surface_with_entity_ids
+
+    cracked = _square_tube_with_a_collinear_crack()
+    assert len(boundary_loop_radii(cracked)) == 3
+    for displacement in (0.0, 0.01):
+        _capper, capped = _cap_surface_with_entity_ids(cracked, displacement)
+        _p, pts, _f = _triangle_points_faces(capped, clean=False)
+        assert np.all(np.isfinite(pts))
+    closed = cap_surface(cracked)
+    _p, pts, _f = _triangle_points_faces(closed, clean=False)
+    assert np.all(np.isfinite(pts))
+
+
+def test_the_pinhole_patch_keeps_the_ends_beside_a_collinear_crack_open():
+    """p480/p550: the NaN cap centre reopened the crack and capped a real outlet."""
+    from vessel_pipeline import patch_wall_pinholes
+
+    patched, n = patch_wall_pinholes(_square_tube_with_a_collinear_crack(), label="test surface")
+    assert n == 1
+    loops = boundary_loop_radii(patched)
+    assert sorted(round(float(b[2])) for _r, _n, b in loops) == [0, 4]

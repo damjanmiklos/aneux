@@ -1084,7 +1084,10 @@ def cap_surface(open_surface, displacement=DEFAULT_CAP_DISPLACEMENT):
     capper.SetInPlaneDisplacement(0.0)
     capper.SetCellEntityIdsArrayName("CellEntityIds")
     capper.Update()
-    capped = clean_triangulate(capper.GetOutput())
+    raw = vtk.vtkPolyData()
+    raw.DeepCopy(capper.GetOutput())
+    _cap_rim_centres(capper, raw)
+    capped = clean_triangulate(raw)
     n_open = extract_boundary_loops(capped).GetNumberOfCells()
     if n_open != 0:
         # The capper walks rims; a fragmented vessel has rims it cannot walk, and
@@ -4433,12 +4436,7 @@ def patch_wall_pinholes(surface, min_radius=WALL_PINHOLE_RADIUS_MM, label="surfa
     if ids is None or center_ids is None or center_ids.GetNumberOfIds() == 0:
         print(f"  Capper produced no CellEntityIds for the {label}; fan-filling instead")
         return fan_fill_small_loops(poly, min_radius=min_radius, profiles=profiles)
-    offset = int(capper.GetCellEntityIdOffset())
-    cap_centers = [
-        np.array(capped.GetPoint(center_ids.GetId(i)), dtype=np.float64)
-        for i in range(center_ids.GetNumberOfIds())
-    ]
-    cap_eids = [offset + 1 + i for i in range(len(cap_centers))]
+    cap_eids, cap_centers = _cap_rim_centres(capper, capped)
     remaining = list(range(len(cap_centers)))
     reopen = set()
     for _radius, _n, bary in keep:
@@ -5669,7 +5667,64 @@ def _cap_surface_with_entity_ids(surface, displacement):
     capper.Update()
     capped = vtk.vtkPolyData()
     capped.DeepCopy(capper.GetOutput())
+    _cap_rim_centres(capper, capped)
     return capper, capped
+
+
+def _cap_rim_centres(capper, capped):
+    """(entity id, rim centroid) for every cap, with every cap centre made finite.
+
+    vtkvmtkCapPolyData places a cap's centre off the rim's normal, scaled by
+    the displacement, and a three-point rim whose points fall in a line has no
+    normal: the centre comes back NaN even at zero displacement. It did not
+    under float32, where rounding kept that rim a sliver rather than a line.
+    Matching caps to openings by distance to that centre then went wrong
+    silently -- every comparison against NaN is false, so ``min`` keeps
+    whichever cap it saw first. On p480 and p550 the pinhole patch reopened a
+    0.07 mm three-point tear and left the 1.2 mm outlet beside it capped, and
+    the GT shipped one ostium short with frames that agreed with it.
+
+    The rim is the cap's own vertices, which are the input surface's boundary
+    points, so its centroid is exactly the barycentre the loop reports, with no
+    normal involved. A non-finite centre is moved there so the capped surface
+    never carries a NaN point.
+    """
+    ids = capped.GetCellData().GetArray("CellEntityIds")
+    centre_ids = capper.GetCapCenterIds()
+    if ids is None or centre_ids is None:
+        return [], []
+    offset = int(capper.GetCellEntityIdOffset())
+    n_caps = int(centre_ids.GetNumberOfIds())
+    eids = np.rint(vtk_to_numpy(ids)).astype(np.int64).reshape(-1)
+    rims = {offset + 1 + i: set() for i in range(n_caps)}
+    cell_pts = vtk.vtkIdList()
+    for ci in np.flatnonzero(eids > offset):
+        rim = rims.get(int(eids[ci]))
+        if rim is None:
+            continue
+        capped.GetCellPoints(int(ci), cell_pts)
+        rim.update(cell_pts.GetId(k) for k in range(cell_pts.GetNumberOfIds()))
+    points = capped.GetPoints()
+    cap_eids, centres = [], []
+    moved = False
+    for i in range(n_caps):
+        eid = offset + 1 + i
+        centre_id = int(centre_ids.GetId(i))
+        rim = sorted(rims[eid] - {centre_id})
+        centre = np.array(points.GetPoint(centre_id), dtype=np.float64)
+        if rim:
+            rim_centre = np.array([points.GetPoint(p) for p in rim], dtype=np.float64).mean(axis=0)
+        else:
+            rim_centre = centre
+        if not np.all(np.isfinite(centre)) and np.all(np.isfinite(rim_centre)):
+            points.SetPoint(centre_id, *rim_centre)
+            moved = True
+        cap_eids.append(eid)
+        centres.append(rim_centre)
+    if moved:
+        points.Modified()
+        capped.Modified()
+    return cap_eids, centres
 
 
 def _polydata_from_kept_cells(poly, keep_cell_ids):
@@ -5885,18 +5940,26 @@ def cap_unmatched_loops(surface, profiles, label="surface"):
     if not loops:
         return poly, 0
 
-    matched_profiles = set()
-    unmatched = []
-    for ids, center, radius, n in loops:
-        hit = None
+    # Each ostium keeps one loop, the nearest that matches it. A clip leftover
+    # beside an ostium is in reach of it and big enough to pass for it: on p136 a
+    # r=1.13 mm hole 2 mm from a 1.55 mm ostium matched it as well as the real
+    # rim did, so neither was capped and the mesh kept five openings for four
+    # ostia. Pairs are taken nearest first, so two genuine ostia in reach of
+    # each other still each keep their own rim.
+    pairs = []
+    for li, (_ids, center, radius, n) in enumerate(loops):
         for k, profile in enumerate(profiles):
             if _loop_at_a_profile(center, [profile], radius=radius, n_points=n):
-                hit = k
-                break
-        if hit is None:
-            unmatched.append((ids, center, radius, n))
-        else:
-            matched_profiles.add(hit)
+                d = float(np.linalg.norm(center - np.asarray(profile["barycenter"], dtype=np.float64)))
+                pairs.append((d, k, li))
+    matched_profiles = set()
+    owned_loops = set()
+    for _d, k, li in sorted(pairs):
+        if k in matched_profiles or li in owned_loops:
+            continue
+        matched_profiles.add(k)
+        owned_loops.add(li)
+    unmatched = [loop for li, loop in enumerate(loops) if li not in owned_loops]
 
     if not unmatched:
         return poly, 0
@@ -5977,15 +6040,8 @@ def remove_spurious_openings(surface, profiles):
         print("  Capper produced no CellEntityIds; fanning the leftovers instead")
         return cap_unmatched_loops(poly, profiles, label="remeshed surface")
 
-    offset = int(capper.GetCellEntityIdOffset())
-    n_caps = int(center_ids.GetNumberOfIds())
-    cap_centers = []
-    cap_eids = []
-    for i in range(n_caps):
-        cap_centers.append(np.array(capped.GetPoint(center_ids.GetId(i)), dtype=np.float64))
-        cap_eids.append(offset + 1 + i)
-
-    remaining = list(range(n_caps))
+    cap_eids, cap_centers = _cap_rim_centres(capper, capped)
+    remaining = list(range(len(cap_centers)))
     reopen = []
     for profile in profiles:
         bary = np.asarray(profile["barycenter"], dtype=np.float64)
