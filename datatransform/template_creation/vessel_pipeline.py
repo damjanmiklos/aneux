@@ -1391,6 +1391,233 @@ def _retrace_outlets(surface, source_anat, seeds, profiles, missing, ref_bounds,
     return extra, gained
 
 
+# The local re-trace below densifies a piece of the vessel rather than all of
+# it, so it can afford the density a thin neck needs on a surface the global
+# subdivision has to refuse. The budget is for the densified crop; the reach
+# starts at a few millimetres and doubles until the crop takes in the vessel
+# the missing branch leaves from.
+CROP_RETRACE_MAX_POINTS = 150_000
+CROP_RETRACE_START_MM = 8.0
+CROP_RETRACE_LEVELS = (0, 1, 2, 3)
+
+
+def _trace_tracts(centerline):
+    """[(points, MISR)] for every tract that is a path, the same rule as _traced_points."""
+    poly = to_vtk_poly(centerline)
+    arr = poly.GetPointData().GetArray("MaximumInscribedSphereRadius")
+    if arr is None:
+        return []
+    misr = vtk_to_numpy(arr).astype(np.float64)
+    poly.BuildCells()
+    out = []
+    for ci in range(int(poly.GetNumberOfCells())):
+        cell = poly.GetCell(ci)
+        ids = [int(cell.GetPointId(j)) for j in range(cell.GetNumberOfPoints())]
+        if len(ids) < 2:
+            continue
+        pts = np.array([poly.GetPoint(i) for i in ids], dtype=np.float64)
+        segs = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+        if float(segs.max()) > 10.0 or float(segs.sum()) < 1.0:
+            continue
+        out.append((pts, misr[ids]))
+    return out
+
+
+def _geodesic_crop(closed_surface, centre, reach_mm):
+    """The piece of the surface within ``reach_mm`` of ``centre``, walking on it.
+
+    A ball in space is the wrong shape for this: SNF00000538_01's missing
+    0.29 mm branch passes within 0.4 mm of a neighbouring vessel on its way to
+    a junction 23 mm away, so a ball around the nearest traced point holds the
+    wrong vessel and never the junction. Distance along the wall follows the
+    branch itself.
+    """
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import dijkstra
+
+    mesh = pv.wrap(to_vtk_poly(closed_surface)).triangulate()
+    pts = np.asarray(mesh.points, dtype=np.float64)
+    faces = mesh.faces.reshape(-1, 4)[:, 1:]
+    edges = np.vstack([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
+    # Once per edge: every interior edge is listed by both its triangles, and
+    # the sparse matrix sums duplicates, which walks every step twice.
+    edges = np.unique(np.sort(edges, axis=1), axis=0)
+    w = np.linalg.norm(pts[edges[:, 0]] - pts[edges[:, 1]], axis=1)
+    n = len(pts)
+    graph = coo_matrix(
+        (np.r_[w, w], (np.r_[edges[:, 0], edges[:, 1]], np.r_[edges[:, 1], edges[:, 0]])),
+        shape=(n, n),
+    ).tocsr()
+    start = int(np.argmin(np.linalg.norm(pts - np.asarray(centre, dtype=np.float64), axis=1)))
+    dist = dijkstra(graph, indices=start, limit=float(reach_mm))
+    keep = np.flatnonzero(np.all(np.isfinite(dist[faces]), axis=1))
+    if keep.size == len(faces):
+        return None
+    ids = vtk.vtkIdList()
+    for c in keep:
+        ids.InsertNextId(int(c))
+    extract = vtk.vtkExtractCells()
+    extract.SetInputData(to_vtk_poly(mesh))
+    extract.SetCellList(ids)
+    surface = vtk.vtkGeometryFilter()
+    surface.SetInputConnection(extract.GetOutputPort())
+    conn = vtk.vtkPolyDataConnectivityFilter()
+    conn.SetInputConnection(surface.GetOutputPort())
+    conn.SetExtractionModeToClosestPointRegion()
+    conn.SetClosestPoint(*[float(v) for v in centre])
+    conn.Update()
+    return clean_triangulate(conn.GetOutput())
+
+
+def _splice_onto_trace(trace_tracts, branch, branch_misr):
+    """The existing trace up to where ``branch`` leaves it, then ``branch`` on.
+
+    ``branch`` runs from a crop cut to the ostium. Where it leaves the trace is
+    the last point it shares with it -- within half the trace's own inscribed
+    radius -- and from there on it is the one part of the vessel the trace
+    never visited. Returns ``(points, misr, leave_index, trace_misr)`` or None.
+    """
+    from scipy.spatial import cKDTree
+
+    allp = np.vstack([t[0] for t in trace_tracts])
+    allm = np.concatenate([t[1] for t in trace_tracts])
+    owner = np.concatenate([np.full(len(t[0]), i) for i, t in enumerate(trace_tracts)])
+    local = np.concatenate([np.arange(len(t[0])) for t in trace_tracts])
+    d, j = cKDTree(allp).query(branch)
+    shared = np.flatnonzero(d <= np.maximum(0.5 * allm[j], 0.1))
+    if shared.size == 0:
+        return None
+    k = int(shared.max())
+    if k >= len(branch) - 2:
+        return None
+    tract, at = trace_tracts[int(owner[j[k]])], int(local[j[k]])
+    pts = np.vstack([tract[0][: at + 1], branch[k + 1:]])
+    misr = np.concatenate([tract[1][: at + 1], branch_misr[k + 1:]])
+    return pts, misr, k, float(allm[j[k]])
+
+
+def _points_inside(points, closed_surface):
+    sel = vtk.vtkSelectEnclosedPoints()
+    sel.SetInputData(pv.PolyData(np.asarray(points, dtype=np.float64)))
+    sel.SetSurfaceData(to_vtk_poly(closed_surface))
+    sel.Update()
+    return vtk_to_numpy(sel.GetOutput().GetPointData().GetArray("SelectedPoints")).astype(bool)
+
+
+def _polyline_with_misr(points, misr):
+    """One polyline cell, the shape vmtkCenterlines writes a tract in.
+
+    Not pv.lines_from_points: that writes one two-point cell per segment, and
+    every one of those is shorter than the 1 mm a tract must be to count.
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    poly = pv.PolyData(pts, lines=np.r_[len(pts), np.arange(len(pts))])
+    poly.point_data["MaximumInscribedSphereRadius"] = np.asarray(misr, dtype=np.float64)
+    return to_vtk_poly(poly)
+
+
+def _retrace_on_geodesic_crop(trace, closed_anat, profile):
+    """Trace one missed ostium on a densified piece of the vessel around it.
+
+    The whole-surface re-trace fails on a thin neck because the tessellation is
+    too coarse there, and subdividing the whole surface to fix that stops being
+    affordable on a float64 GT of 70-110k points: on UPF_P0057.00_ID1 the 1x
+    level (269k points) still dead-ends and 2x would be a million;
+    SNF00000426_03's 1x (440k) never came back. The neck needs the density,
+    the rest of the vessel does not.
+
+    So the surface is cut down to what lies within a walking distance of the
+    ostium, the cut rims are capped, and the crop is densified and traced from
+    the ostium to every cut. The reach doubles until the crop takes in vessel
+    the existing trace already runs through; a tract that arrives there is
+    spliced onto the trace where it leaves it, well clear of any cut, since the
+    cut caps bend the Voronoi diagram near them. What is added is only ever the
+    branch beyond the junction, and all of it must lie inside the lumen.
+
+    On SNF00000538_01 the branch this finds (21.6 mm) sits a median 0.019 mm
+    from the one a 454k-point whole-surface trace found, with the same MISR, in
+    57 s against 783 s.
+    """
+    b = np.asarray(profile["barycenter"], dtype=np.float64)
+    limit = max(CENTERLINE_ARRIVAL_RADII * float(profile["radius"]),
+                CENTERLINE_ARRIVAL_FLOOR_MM)
+    tracts = _trace_tracts(trace)
+    if not tracts:
+        return None
+    from scipy.spatial import cKDTree
+
+    allp = np.vstack([t[0] for t in tracts])
+    allm = np.concatenate([t[1] for t in tracts])
+    gap = float(np.linalg.norm(allp - b, axis=1).min())
+    reach = max(CROP_RETRACE_START_MM, 2.0 * gap)
+    while True:
+        crop = _geodesic_crop(closed_anat, b, reach)
+        if crop is None:
+            return None
+        try:
+            cuts = [np.asarray(r["barycenter"], dtype=np.float64)
+                    for r in measure_open_profiles(crop, min_radius=0.0)]
+            capped = cap_surface(crop)
+        except TemplateQualityError:
+            return None
+        n0 = to_vtk_poly(capped).GetNumberOfPoints()
+        if not cuts or n0 > CROP_RETRACE_MAX_POINTS:
+            return None
+        near, _ = cKDTree(np.asarray(pv.wrap(to_vtk_poly(crop)).points)).query(allp)
+        if not np.any(near <= 1.5 * allm + 0.1):
+            reach *= 2.0
+            continue
+        for n_sub in CROP_RETRACE_LEVELS:
+            if n0 * (4 ** n_sub) > CROP_RETRACE_MAX_POINTS:
+                break
+            surface = capped if n_sub == 0 else _densify_for_tracing(capped, n_subdivisions=n_sub)
+            if surface is None:
+                break
+            local = _centerlines_in_child(
+                surface, [b], cuts, CENTERLINE_TIMEOUT_S, label="ostium crop",
+            )
+            if local is None:
+                continue
+            best = None
+            for pts, misr in _trace_tracts(local):
+                if np.linalg.norm(pts[0] - b) < np.linalg.norm(pts[-1] - b):
+                    pts, misr = pts[::-1], misr[::-1]
+                if float(np.linalg.norm(pts[-1] - b)) > limit:
+                    continue
+                spliced = _splice_onto_trace(tracts, pts, misr)
+                if spliced is None:
+                    continue
+                joined, joined_misr, k, trunk_r = spliced
+                clear = min(float(np.linalg.norm(pts[k] - c)) for c in cuts)
+                if clear < 3.0 * trunk_r:
+                    continue
+                if not bool(_points_inside(pts[k + 1:], closed_anat).all()):
+                    continue
+                length = float(np.linalg.norm(np.diff(pts[k:], axis=0), axis=1).sum())
+                if best is None or length < best[0]:
+                    best = (length, joined, joined_misr)
+            if best is not None:
+                print(
+                    f"  Reached profile {profile['index']} on a {reach:.0f} mm crop "
+                    f"({to_vtk_poly(surface).GetNumberOfPoints()} points, "
+                    f"{n_sub}x subdivided): a {best[0]:.1f} mm branch"
+                )
+                return _polyline_with_misr(best[1], best[2])
+        reach *= 2.0
+
+
+def _merge_traces(chosen, extras):
+    """One polydata holding the chosen trace and every re-traced tract."""
+    if not extras:
+        return to_vtk_poly(chosen)
+    append = vtk.vtkAppendPolyData()
+    append.AddInputData(to_vtk_poly(chosen))
+    for extra in extras:
+        append.AddInputData(to_vtk_poly(extra))
+    append.Update()
+    return to_vtk_poly(append.GetOutput())
+
+
 def _complete_missing_outlets(chosen, label, closed_anat, source_anat,
                               profiles, arrived, ref_bounds):
     """Ask again for the outlets this trace never reached, and add them to it.
@@ -1432,11 +1659,31 @@ def _complete_missing_outlets(chosen, label, closed_anat, source_anat,
     # level is enough for some ostia and not for others: on SNF00000426_03 the
     # 0.374 mm ostium is reached at 81k points and the 0.349 mm one only at
     # 323k, and stopping at the first success left the second shut.
+    #
+    # Between the plain attempt and the whole-surface ones comes the ostium
+    # crop: the same density, spent only around the ostium still missing. It is
+    # far cheaper, and on the large float64 surfaces it is the only density
+    # that is affordable at all.
+    attempts.append((None, "crop"))
     for n_sub in DENSE_RETRACE_LEVELS:
         attempts.append((None, n_sub))
     for surface, how in attempts:
         if not outstanding:
             break
+        if how == "crop":
+            for i in list(outstanding):
+                extra = _retrace_on_geodesic_crop(
+                    _merge_traces(chosen, found), closed_anat, profiles[i]
+                )
+                if extra is None:
+                    print(
+                        "  The ostium crop re-trace did not reach profile "
+                        f"{profiles[i]['index']} either."
+                    )
+                    continue
+                found.append(extra)
+                outstanding.remove(i)
+            continue
         if surface is None:
             surface = _densify_for_tracing(closed_anat, n_subdivisions=how)
             if surface is None:
@@ -1458,12 +1705,7 @@ def _complete_missing_outlets(chosen, label, closed_anat, source_anat,
     if not found:
         print("  Keeping the original trace.")
         return chosen, label
-    append = vtk.vtkAppendPolyData()
-    append.AddInputData(to_vtk_poly(chosen))
-    for extra in found:
-        append.AddInputData(to_vtk_poly(extra))
-    append.Update()
-    merged = to_vtk_poly(append.GetOutput())
+    merged = _merge_traces(chosen, found)
     if merged.GetPointData().GetArray("MaximumInscribedSphereRadius") is None:
         print("  The merged trace lost its MISR array; keeping the original.")
         return chosen, label
@@ -1475,6 +1717,21 @@ def _complete_missing_outlets(chosen, label, closed_anat, source_anat,
         f"  Added {n_tracts} tract(s) from {len(found)} re-trace(s); together they "
         f"reach {len(missing) - len(outstanding)} of the {len(missing)} missed opening(s)"
     )
+    # vmtkCenterlines wrote a two-point stub for each outlet it could not
+    # descend to, and those stubs outlive the rescue: on SNF00000426_03,
+    # SNF00000538_01 and UPF_P0057 each shipped as a centerline of its own,
+    # 4-5 mm from the ostium the re-trace had just reached. Once every opening
+    # is reached by a real tract they stand for nothing. Only then, and only
+    # while a tract per outlet remains, are they dropped.
+    if not outstanding:
+        pruned, n_junk = drop_degenerate_tracts(merged)
+        if (
+            n_junk
+            and _centerline_reaches_targets(pruned, len(profiles) - 1)
+            and centerline_looks_valid(pruned, ref_bounds)
+        ):
+            merged = pruned
+            print(f"  Dropped {n_junk} stub(s) left by the outlet(s) the first trace missed")
     return merged, f"{label} plus a re-trace"
 
 
@@ -9256,6 +9513,16 @@ def compute_centerline_from_mesh(
     centerline = extract_centerlines_for_tube(
         extended_vessel, smoothed_vessel, anatomical_profiles, extended_profiles
     )
+    try:
+        closed_vessel = cap_surface(smoothed_vessel)
+    except TemplateQualityError:
+        closed_vessel = None
+    if closed_vessel is not None:
+        centerline, n_runs = extend_tract_ends_to_openings(
+            centerline, anatomical_profiles, closed_vessel, step_mm=sample_spacing
+        )
+        if n_runs:
+            print(f"  Carried {n_runs} tract end(s) on to the opening they stop short of")
     print(f"Step 4: Spline resampling ({sample_spacing} mm) and trajectory smoothing...")
     set_step("4_resample_smooth")
     resampled = resample_centerline(centerline, sample_spacing=sample_spacing)
@@ -9271,6 +9538,127 @@ def compute_centerline_from_mesh(
     if final_centerline.GetNumberOfCells() < 1:
         raise TemplateQualityError("Clipped centerline has no cells.")
     return final_centerline
+
+
+# How far short of its opening a tract end may stop before it is carried on to
+# it. The Voronoi trace cannot end on the cap: its last pole sits about one
+# radius inside, where the cap bends the medial axis. The extended surface
+# hides that by ending in the flow extension, beyond the plane; the
+# bare-vessel trace does not. Over the 742 float64 GT surfaces this carried
+# ends on in 36 cases and left the other 703 bit-identical; frames more than
+# 1.5 radii from their centerline went from 23 to 4.
+CENTERLINE_END_EXTENSION_MIN_MM = 0.05
+
+
+def extend_tract_ends_to_openings(centerline, profiles, closed_surface=None,
+                                  step_mm=DEFAULT_SAMPLE_SPACING):
+    """Carry each tract that stops short of an opening straight on to it.
+
+    On USFD_0002 the extended trace reaches 7 of 9 openings, so the bare-vessel
+    trace ships, and every one of its ends stops short: the median frame sits
+    one radius beyond the last centerline point, the inlet 1.70 mm beyond it,
+    and the 0.30 mm ostium of frame 8 1.12 mm -- 3.7 radii -- beyond it. The
+    trace did arrive at every one of them (arrival allows two radii); it just
+    stops where the cap bends the Voronoi diagram, and the clip at the
+    anatomical plane can only trim, never lengthen.
+
+    An end is carried on only when it has already arrived at that opening, the
+    opening lies ahead of it along the tract, and the straight run to the
+    barycentre stays inside the lumen. Where a tract already runs past the
+    plane -- every extended-surface trace -- nothing lies ahead and nothing
+    changes. MISR is held at the end's own value: the trace has no better
+    measurement of the last stretch, and the clip will cut on the plane.
+    """
+    poly = to_vtk_poly(centerline)
+    misr_arr = poly.GetPointData().GetArray("MaximumInscribedSphereRadius")
+    if misr_arr is None or not profiles:
+        return centerline, 0
+    misr = vtk_to_numpy(misr_arr).astype(np.float64)
+    bary = np.array([np.asarray(p["barycenter"], dtype=np.float64) for p in profiles])
+    limits = np.array(
+        [max(CENTERLINE_ARRIVAL_RADII * float(p["radius"]), CENTERLINE_ARRIVAL_FLOOR_MM)
+         for p in profiles],
+        dtype=np.float64,
+    )
+    poly.BuildCells()
+    lines = []
+    runs = []
+    for ci in range(int(poly.GetNumberOfCells())):
+        cell = poly.GetCell(ci)
+        ids = [int(cell.GetPointId(j)) for j in range(cell.GetNumberOfPoints())]
+        pts = np.array([poly.GetPoint(i) for i in ids], dtype=np.float64)
+        rad = misr[ids] if ids else np.zeros(0)
+        if len(ids) >= 5:
+            segs = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+            if float(segs.sum()) >= 1.0 and float(segs.max()) <= 10.0:
+                for at_end in (True, False):
+                    P = pts if at_end else pts[::-1]
+                    R = rad if at_end else rad[::-1]
+                    run = _run_on_to_opening(P, bary, limits, step_mm)
+                    if run is None:
+                        continue
+                    runs.append(run)
+                    P = np.vstack([P, run])
+                    R = np.concatenate([R, np.full(len(run), R[-1])])
+                    pts, rad = (P, R) if at_end else (P[::-1], R[::-1])
+        lines.append((pts, rad))
+    if not runs:
+        return centerline, 0
+    if closed_surface is not None:
+        probe = np.vstack([r[:-1] for r in runs if len(r) > 1] or [np.zeros((0, 3))])
+        if len(probe):
+            sel = vtk.vtkSelectEnclosedPoints()
+            sel.SetInputData(pv.PolyData(probe))
+            sel.SetSurfaceData(to_vtk_poly(closed_surface))
+            sel.Update()
+            inside = vtk_to_numpy(sel.GetOutput().GetPointData().GetArray("SelectedPoints"))
+            if not bool(inside.all()):
+                print(
+                    f"  NOTE: {int((inside == 0).sum())} of {len(inside)} points on the "
+                    "runs to the openings fall outside the lumen; the ends stay as traced."
+                )
+                return centerline, 0
+    out_pts = []
+    out_rad = []
+    cells = vtk.vtkCellArray()
+    offset = 0
+    for pts, rad in lines:
+        n = len(pts)
+        cells.InsertNextCell(n)
+        for j in range(n):
+            cells.InsertCellPoint(offset + j)
+        out_pts.append(pts)
+        out_rad.append(rad)
+        offset += n
+    out = vtk.vtkPolyData()
+    vpts = vtk.vtkPoints()
+    vpts.SetDataTypeToDouble()
+    vpts.SetData(numpy_to_vtk(np.vstack(out_pts), deep=True))
+    out.SetPoints(vpts)
+    out.SetLines(cells)
+    arr = numpy_to_vtk(np.concatenate(out_rad), deep=True)
+    arr.SetName("MaximumInscribedSphereRadius")
+    out.GetPointData().AddArray(arr)
+    return out, len(runs)
+
+
+def _run_on_to_opening(P, bary, limits, step_mm):
+    """Points from the end of P on to the opening it arrived at, or None."""
+    end = P[-1]
+    d = np.linalg.norm(bary - end, axis=1)
+    k = int(np.argmin(d))
+    if d[k] > limits[k] or d[k] < CENTERLINE_END_EXTENSION_MIN_MM:
+        return None
+    back = np.cumsum(np.linalg.norm(np.diff(P[::-1], axis=0), axis=1))
+    j = min(int(np.searchsorted(back, 0.5)) + 1, len(P) - 1)
+    tangent = P[-1] - P[-1 - j]
+    tn = float(np.linalg.norm(tangent))
+    if tn == 0.0:
+        return None
+    if float(np.dot(bary[k] - end, tangent / tn)) < CENTERLINE_END_EXTENSION_MIN_MM:
+        return None
+    n = max(1, int(np.ceil(d[k] / float(step_mm))))
+    return end + np.outer(np.arange(1, n + 1) / n, bary[k] - end)
 
 
 @with_dataset_id

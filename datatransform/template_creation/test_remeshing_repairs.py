@@ -1366,3 +1366,108 @@ def test_the_pinhole_patch_keeps_the_ends_beside_a_collinear_crack_open():
     assert n == 1
     loops = boundary_loop_radii(patched)
     assert sorted(round(float(b[2])) for _r, _n, b in loops) == [0, 4]
+
+
+def _capped_tube(length=6.0):
+    return cap_surface(open_tube(radius=1.0, length=length, n_sides=40, n_rings=int(5 * length)))
+
+
+def _z_tract(z0, z1):
+    zs = np.linspace(z0, z1, int(round(abs(z1 - z0) / 0.1)) + 1)
+    return np.column_stack((np.zeros_like(zs), np.zeros_like(zs), zs)), np.full(zs.size, 0.9)
+
+
+def _z_profiles(half):
+    return [
+        {"index": 0, "barycenter": np.array([0.0, 0.0, -half]), "normal": np.array([0.0, 0.0, -1.0]), "radius": 1.0},
+        {"index": 1, "barycenter": np.array([0.0, 0.0, half]), "normal": np.array([0.0, 0.0, 1.0]), "radius": 1.0},
+    ]
+
+
+def _cl_points(cl):
+    return np.array([cl.GetPoint(i) for i in range(cl.GetNumberOfPoints())])
+
+
+def test_a_tract_that_stops_short_is_carried_on_to_its_openings():
+    """USFD_0002: the bare-vessel trace stops about a radius inside every opening."""
+    from vtk.util.numpy_support import vtk_to_numpy
+
+    from vessel_pipeline import extend_tract_ends_to_openings
+
+    cl = _centerline([_z_tract(-2.2, 2.2)])
+    out, n_runs = extend_tract_ends_to_openings(cl, _z_profiles(3.0), _capped_tube())
+    assert n_runs == 2
+    z = _cl_points(out)[:, 2]
+    assert z.min() == pytest.approx(-3.0, abs=1e-9)
+    assert z.max() == pytest.approx(3.0, abs=1e-9)
+    misr = vtk_to_numpy(out.GetPointData().GetArray("MaximumInscribedSphereRadius"))
+    assert np.allclose(misr, 0.9)
+    assert np.all(np.diff(z) > 0)
+
+
+def test_a_tract_already_past_its_opening_is_left_alone():
+    """An extended-surface trace runs on into the flow extension; nothing lies ahead."""
+    from vessel_pipeline import extend_tract_ends_to_openings
+
+    cl = _centerline([_z_tract(-4.0, 4.0)])
+    out, n_runs = extend_tract_ends_to_openings(cl, _z_profiles(3.0), _capped_tube())
+    assert n_runs == 0
+    assert out is cl
+
+
+def test_a_tract_that_never_arrived_is_not_carried_anywhere():
+    """An end three radii from the opening did not arrive; bridging it would invent a branch."""
+    from vessel_pipeline import extend_tract_ends_to_openings
+
+    cl = _centerline([_z_tract(-2.5, 0.0)])
+    out, n_runs = extend_tract_ends_to_openings(cl, _z_profiles(3.0), _capped_tube())
+    assert n_runs == 1
+    z = _cl_points(out)[:, 2]
+    assert z.min() == pytest.approx(-3.0, abs=1e-9)
+    assert z.max() == pytest.approx(0.0, abs=1e-9)
+
+
+def test_the_ostium_crop_follows_the_wall_and_knows_when_it_has_everything():
+    from vessel_pipeline import _geodesic_crop
+
+    closed = _capped_tube(length=20.0)
+    crop = _geodesic_crop(closed, np.array([0.0, 0.0, -10.0]), 5.0)
+    assert crop is not None
+    zmax = _cl_points(crop)[:, 2].max()
+    assert -7.0 < zmax < -4.0
+    assert _geodesic_crop(closed, np.array([0.0, 0.0, -10.0]), 100.0) is None
+
+
+def test_a_re_traced_branch_is_spliced_where_it_leaves_the_trace():
+    """Only the part of the re-trace the trace never visited is added."""
+    from vessel_pipeline import _splice_onto_trace
+
+    xs = np.linspace(0.0, 20.0, 201)
+    trunk = (np.column_stack((xs, np.zeros_like(xs), np.zeros_like(xs))), np.full(xs.size, 1.0))
+    along = np.column_stack((np.linspace(5.0, 10.0, 51), np.zeros(51), np.zeros(51)))
+    up = np.column_stack((np.full(80, 10.0), np.linspace(0.1, 8.0, 80), np.zeros(80)))
+    branch = np.vstack([along, up])
+    misr = np.r_[np.full(51, 0.8), np.full(80, 0.3)]
+    pts, joined_misr, k, trunk_r = _splice_onto_trace([trunk], branch, misr)
+    assert trunk_r == pytest.approx(1.0)
+    # The branch shares the trunk up to about half a radius past x=10.
+    assert pts[0] == pytest.approx([0.0, 0.0, 0.0])
+    assert pts[-1] == pytest.approx([10.0, 8.0, 0.0])
+    assert pts[:, 0].max() <= 10.0 + 1e-9
+    assert np.all(joined_misr[pts[:, 1] > 0.5] == 0.3)
+    assert _splice_onto_trace([trunk], up + np.array([0.0, 3.0, 0.0]), np.full(80, 0.3)) is None
+
+
+def test_a_spliced_branch_is_one_tract_that_arrives():
+    """lines_from_points wrote a cell per segment, every one too short to count as a tract."""
+    from vessel_pipeline import _polyline_with_misr, centerline_arrivals
+
+    xs = np.linspace(0.0, 10.0, 101)
+    pts = np.column_stack((xs, np.zeros_like(xs), np.zeros_like(xs)))
+    tract = _polyline_with_misr(pts, np.full(xs.size, 0.4))
+    assert tract.GetNumberOfCells() == 1
+    assert tract.GetCell(0).GetNumberOfPoints() == 101
+    arrived, _gaps = centerline_arrivals(
+        tract, [{"barycenter": np.array([10.0, 0.0, 0.0]), "radius": 0.3}]
+    )
+    assert bool(arrived.all())
