@@ -6609,6 +6609,17 @@ def clip_centerline_at_profiles(centerline, profiles, extension_length=DEFAULT_E
     vertex as before.
     """
     cells, cell_ids, vtk_cl = _polyline_cells(centerline)
+    # A branch-split centerline ends its cells at bifurcations too, where one
+    # cell's tail is the next one's head. Such a junction leaves through no
+    # opening, and trimming it against the one nearby cut C0040's two outlet
+    # branches, which start 4.5 mm from a third ostium and run beyond its plane,
+    # down to two points.
+    heads = np.array([c[0] for c in cells if len(c)], dtype=np.float64).reshape(-1, 3)
+    tails = np.array([c[-1] for c in cells if len(c)], dtype=np.float64).reshape(-1, 3)
+
+    def _meets(point, others):
+        return len(others) > 0 and float(np.min(np.linalg.norm(others - point, axis=1))) <= 1e-6
+
     kept = []
     kept_cell_ids = []
     for pts, ci in zip(cells, cell_ids):
@@ -6622,6 +6633,8 @@ def clip_centerline_at_profiles(centerline, profiles, extension_length=DEFAULT_E
         for at_start in (True, False):
             if len(trimmed) < 2:
                 break
+            if _meets(pts[0], tails) if at_start else _meets(pts[-1], heads):
+                continue
             end = trimmed[0] if at_start else trimmed[-1]
             profile = _profile_owning_end(end, profiles, extension_length)
             if profile is None:

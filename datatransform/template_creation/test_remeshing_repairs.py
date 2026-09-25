@@ -1201,3 +1201,31 @@ def test_a_centerline_end_is_trimmed_only_at_its_own_opening():
     # used to be cut back to x=9 as well.
     assert on_a[:, 0].max() == pytest.approx(10.0, abs=0.11)
     assert on_b[:, 0].max() == pytest.approx(9.0, abs=0.11)
+
+
+def test_a_branch_junction_is_never_trimmed_as_an_opening():
+    """C0040: a branch that starts beside another ostium must survive the clip."""
+    from vessel_pipeline import clip_centerline_at_profiles
+
+    def seg(p, q, n):
+        t = np.linspace(0.0, 1.0, n)[:, None]
+        pts = (1.0 - t) * np.asarray(p, float) + t * np.asarray(q, float)
+        return pts, np.full(n, 0.5)
+
+    # Trunk to a bifurcation at (5,0,0), then one branch out through b at y=8
+    # and one out through c, whose mouth faces +y 1.4 mm from the junction.
+    trunk = seg((0, 0, 0), (5, 0, 0), 51)
+    to_b = seg((5, 0, 0), (5, 13, 0), 131)
+    to_c = seg((5, 0, 0), (6, -1, 0), 11)
+    c_ext = seg((6, -1, 0), (6, 4, 0), 51)
+    profiles = [
+        {"barycenter": np.array([5.0, 8.0, 0.0]), "normal": np.array([0.0, 1.0, 0.0]), "radius": 0.5},
+        {"barycenter": np.array([6.0, -1.0, 0.0]), "normal": np.array([0.0, 1.0, 0.0]), "radius": 0.5},
+    ]
+    out = clip_centerline_at_profiles(_centerline([trunk, to_b, to_c, c_ext]), profiles, extension_length=5.0)
+    pts = np.array([out.GetPoint(i) for i in range(out.GetNumberOfPoints())])
+    on_b = pts[np.abs(pts[:, 0] - 5.0) < 1e-9]
+    # The whole branch to b lies beyond c's plane, and its head used to be cut
+    # to within two points of its tail.
+    assert on_b[:, 1].min() == pytest.approx(0.0, abs=1e-9)
+    assert on_b[:, 1].max() == pytest.approx(8.0, abs=0.11)
