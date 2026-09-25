@@ -63,6 +63,28 @@ except ImportError:
 if _stretch_raycast_c is None:
     print("WARNING: stretch_raycast C extension not loaded; variable remesh uses the Python raycast loop")
 
+# The GT remesh and the centerlines run in float64. VTK's own filters keep their
+# input's precision, but every VMTK filter this pipeline calls -- the capper,
+# the boundary extractor, flow extensions, the remesher, vmtkCenterlines and its
+# Voronoi diagram, resampling, the branch extractor, marching cubes -- builds its
+# output with the default vtkPoints::New(), which is float32, so the shipped GT
+# and centerlines were float32 whatever went in. vtk_double_points registers an
+# object-factory override that makes that default float64 in every library in
+# the process. There is no fallback: without it the pipeline would quietly run
+# in float32 again.
+try:
+    import vtk_double_points
+except ImportError:
+    try:
+        from . import vtk_double_points
+    except ImportError as exc:
+        raise ImportError(
+            "vtk_double_points is not built. Run "
+            "`python _build_vtk_double_points.py` in datatransform/template_creation "
+            "with the hemomesh env active."
+        ) from exc
+vtk_double_points.install()
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 from aneux_paths import (
     CLEANDATA_ORIGINAL_CENTERLINE,
@@ -179,9 +201,10 @@ PROFILE_PROTECT_MIN_MM = 0.5
 PROFILE_PROTECT_MIN_RADIUS_FRACTION = 0.5
 # An extension cell this far outboard of its ostium plane is leftover tube.
 EXTENSION_PLANE_TOL_MM = 1e-3
-# VMTK writes float32 point coordinates, so a vessel a few tens of mm across comes
-# back displaced by ~1e-7 mm. Still 100x under WELD_TOLERANCE_MM, so no two
-# distinct vertices can be confused.
+# VMTK used to write float32 point coordinates, displacing a vertex by ~1e-7 mm
+# on a vessel a few tens of mm across; with vtk_double_points it writes float64.
+# Still 100x under WELD_TOLERANCE_MM either way, so no two distinct vertices can
+# be confused.
 ORIGINAL_MATCH_TOL_MM = 1e-5
 # A flat end cap is planar to machine precision; an anatomical wall is not.
 CAP_PLANARITY_MM = 0.02
@@ -297,15 +320,41 @@ def _poly_points(surface):
     return poly, np.ascontiguousarray(vtk_to_numpy(poly.GetPoints().GetData()), dtype=np.float64)
 
 
+def _promote_points_to_double(vtk_poly):
+    """Give ``vtk_poly`` float64 points in place, if they are not already."""
+    points = vtk_poly.GetPoints()
+    if points is None or points.GetDataType() == vtk.VTK_DOUBLE:
+        return vtk_poly
+    coords = np.asarray(vtk_to_numpy(points.GetData()), dtype=np.float64)
+    double = vtk.vtkPoints()
+    double.SetDataTypeToDouble()
+    double.SetData(numpy_to_vtk(np.ascontiguousarray(coords), deep=True))
+    vtk_poly.SetPoints(double)
+    return vtk_poly
+
+
 def to_vtk_poly(mesh):
-    """Detached vtkPolyData copy for VMTK (never pass a live PyVista pipeline)."""
+    """Detached float64 vtkPolyData copy for VMTK (never pass a live PyVista pipeline).
+
+    A float32 input -- an STL source, or a file written before the pipeline ran
+    in float64 -- is promoted here, so everything downstream computes in float64.
+    """
     if mesh is None:
         return vtk.vtkPolyData()
     if isinstance(mesh, pv.UnstructuredGrid):
         mesh = mesh.extract_surface()
     vtk_poly = vtk.vtkPolyData()
     vtk_poly.DeepCopy(mesh)
-    return vtk_poly
+    return _promote_points_to_double(vtk_poly)
+
+
+def read_polydata(path):
+    """Read a surface or centerline as a float64 PyVista mesh."""
+    mesh = pv.read(path)
+    if isinstance(mesh, pv.UnstructuredGrid):
+        mesh = mesh.extract_surface()
+    _promote_points_to_double(mesh)
+    return mesh
 
 
 def _as_poly(mesh):
@@ -1569,7 +1618,7 @@ def _centerlines_in_child(closed_surface, source_points, target_points, timeout_
                 f"({tail[0][:120]}); it takes no further part in the trace."
             )
             return None
-        return to_vtk_poly(pv.read(out_path))
+        return to_vtk_poly(read_polydata(out_path))
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -5994,8 +6043,8 @@ def original_cell_mask(extended_surface, original_surface, tol=ORIGINAL_MATCH_TO
     vmtkFlowExtensions grows tubes out of every boundary loop and returns them
     fused with the input, untagged. Matching triangles by vertex identity is
     exact and does not depend on the filter's cell ordering, so the extension can
-    be isolated and trimmed geometrically later on. ``tol`` is not zero because
-    VMTK stores points as float32, so every coordinate comes back rounded.
+    be isolated and trimmed geometrically later on. ``tol`` is not zero so that a
+    surface VMTK rounded to float32 (without vtk_double_points) still matches.
     """
     ext = clean_triangulate(extended_surface)
     orig = clean_triangulate(original_surface)
@@ -6617,9 +6666,10 @@ def clip_centerline_at_profiles(centerline, profiles, extension_length=DEFAULT_E
     heads = np.array([c[0] for c in cells if len(c)], dtype=np.float64).reshape(-1, 3)
     tails = np.array([c[-1] for c in cells if len(c)], dtype=np.float64).reshape(-1, 3)
 
-    # The two sides of a junction agree only to float32 noise (2.3e-4 mm on
-    # ANSYS_UNIGE_17_10, where an exact test called both free and emptied the
-    # 2.6 mm between them); samples are 0.1 mm apart, so 0.01 mm is still a join.
+    # In float32 the two sides of a junction agreed only to rounding noise
+    # (2.3e-4 mm on ANSYS_UNIGE_17_10, where an exact test called both free and
+    # emptied the 2.6 mm between them). In float64 they agree exactly, but samples
+    # are 0.1 mm apart, so a 0.01 mm tolerance costs nothing and still only joins.
     def _meets(point, others):
         return len(others) > 0 and float(np.min(np.linalg.norm(others - point, axis=1))) <= 1e-2
 
@@ -8180,6 +8230,14 @@ def assert_template_quality(surface, context="template"):
 
 
 def save_polydata(surface, out_file):
+    # Refused rather than promoted: a float32 surface here means some step
+    # dropped precision, and promoting it on the way out would hide which.
+    points = surface.GetPoints() if isinstance(surface, vtk.vtkPointSet) else None
+    if points is not None and points.GetNumberOfPoints() and points.GetDataType() != vtk.VTK_DOUBLE:
+        raise TemplateQualityError(
+            f"Refusing to write {out_file}: its points are "
+            f"{points.GetData().GetDataTypeAsString()}, and this pipeline runs in float64."
+        )
     vtk_poly = to_vtk_poly(surface)
     writer = vtk.vtkXMLPolyDataWriter()
     writer.SetFileName(out_file)
@@ -8205,7 +8263,7 @@ def _try_reuse_centerline(reuse_centerline, reference_bounds, profiles=None):
     if isinstance(reuse_centerline, str):
         if not os.path.isfile(reuse_centerline):
             return None
-        cl = to_vtk_poly(pv.read(reuse_centerline))
+        cl = to_vtk_poly(read_polydata(reuse_centerline))
         source = reuse_centerline
     else:
         cl = to_vtk_poly(reuse_centerline)
@@ -8948,7 +9006,7 @@ def process_variable_dataset(
 ):
     print(f"\n=========================================\nProcessing Adaptive Variable Remeshing Case: {dataset_id}")
     t_all = time.perf_counter()
-    vessel_mesh = pv.read(v_file)
+    vessel_mesh = read_polydata(v_file)
     reuse = None
     if speedups:
         cl_path = os.path.join(CLEANDATA_ORIGINAL_CENTERLINE, f"{dataset_id}.vtp")
@@ -9042,7 +9100,7 @@ def process_uniform_dataset(
     max_grid_size=DEFAULT_MAX_GRID_SIZE,
 ):
     print(f"\n=========================================\nProcessing Uniform Remeshing Case: {dataset_id}")
-    vessel_mesh = pv.read(v_file)
+    vessel_mesh = read_polydata(v_file)
     built = build_parent_tube(
         vessel_mesh,
         extension_length=extension_length,
@@ -9168,7 +9226,7 @@ def process_centerline_dataset(
     sample_spacing=DEFAULT_SAMPLE_SPACING,
 ):
     print(f"\n=========================================\nProcessing Centerline Case: {dataset_id}")
-    vessel_mesh = pv.read(v_file)
+    vessel_mesh = read_polydata(v_file)
     frames_path = os.path.splitext(v_file)[0] + ".ostium_frames.npz"
     expected = None
     if os.path.isfile(frames_path):

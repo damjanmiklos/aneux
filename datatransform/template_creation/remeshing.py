@@ -104,6 +104,7 @@ from vessel_pipeline import (
     run_batch,
     sanitize_vessel_for_vmtk,
     save_ostium_frames,
+    read_polydata,
     save_polydata,
     seed_points_from_profiles,
     smooth_centerline_preserve_misr,
@@ -410,7 +411,7 @@ def process_gt_remesh_dataset(
     """
     print(f"\n=========================================\nProcessing GT remesh: {dataset_id}")
     ensure_cleandata_layout()
-    original = pv.read(v_file)
+    original = read_polydata(v_file)
 
     print("Step 1: Preparing original surface (keep detail, drop degenerates)...")
     _set_step("1_prepare_original")

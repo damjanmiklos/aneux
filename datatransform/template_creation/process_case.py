@@ -420,7 +420,7 @@ def _maybe_shared_centerline(
         import vessel_pipeline as vp
     except ImportError:
         return None, None
-    original = pv.read(v_file)
+    original = vp.read_polydata(v_file)
     gt_surface = remeshing.prepare_gt_surface(original)
     gt_profiles = vp.measure_open_profiles(gt_surface)
     if not hasattr(remeshing, "_gt_centerline"):

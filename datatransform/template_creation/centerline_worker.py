@@ -22,7 +22,7 @@ def main(argv):
     import vessel_pipeline as vp
 
     seeds = json.loads(open(seeds_path, encoding="utf-8").read())
-    surface = vp.to_vtk_poly(pv.read(surface_path))
+    surface = vp.to_vtk_poly(vp.read_polydata(surface_path))
     centerline = vp.extract_voronoi_centerlines(
         surface, seeds["source"], seeds["target"]
     )

@@ -1251,3 +1251,28 @@ def test_a_junction_joined_only_to_float_noise_is_still_a_junction():
     on_b = pts[np.abs(pts[:, 0] - 5.0) < 1e-9]
     assert on_b[:, 1].min() == pytest.approx(0.0, abs=1e-3)
     assert on_b[:, 1].max() == pytest.approx(8.0, abs=0.11)
+
+
+def test_vmtk_filters_write_float64_points():
+    """The capper built its output with the float32 default whatever went in."""
+    from vessel_pipeline import cap_surface, to_vtk_poly
+
+    tube = to_vtk_poly(open_tube(radius=1.0, length=6.0, n_sides=40, n_rings=30))
+    assert tube.GetPoints().GetDataType() == vtk.VTK_DOUBLE
+    capped = to_vtk_poly(cap_surface(tube))
+    assert capped.GetPoints().GetDataType() == vtk.VTK_DOUBLE
+    assert vtk.vtkPoints().GetDataType() == vtk.VTK_DOUBLE
+
+
+def test_a_float32_surface_is_refused_at_save(tmp_path):
+    from vessel_pipeline import TemplateQualityError, save_polydata, to_vtk_poly
+
+    tube = to_vtk_poly(open_tube(radius=1.0, length=6.0, n_sides=40, n_rings=30))
+    single = vtk.vtkPoints()
+    single.SetDataTypeToFloat()
+    single.DeepCopy(tube.GetPoints())
+    single.SetDataTypeToFloat()
+    tube.SetPoints(single)
+    assert tube.GetPoints().GetDataType() == vtk.VTK_FLOAT
+    with pytest.raises(TemplateQualityError, match="float64"):
+        save_polydata(tube, str(tmp_path / "t.vtp"))
