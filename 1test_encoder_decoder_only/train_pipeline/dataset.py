@@ -130,6 +130,34 @@ def _infer_has_true_normal(data):
     return bool(torch.isfinite(nrm).all() and nrm.norm(dim=-1).mean() > 0.5)
 
 
+def _refresh_r_star_smoothness(data):
+    """Rewrite cached dθ/du from r* in millimetres.
+
+    Older caches stored |Δr*| / edge_length. On the dense sac that slope is
+    10–20, which zeroed the Dirichlet and Laplacian weights exactly where
+    neighboring displacements have to stay coupled.
+    """
+    r_star = getattr(data, "r_star", None)
+    valid = getattr(data, "r_star_valid", None)
+    edge_index = getattr(data, "edge_index", None)
+    pos = getattr(data, "x", None)
+    if not all(torch.is_tensor(t) for t in (r_star, valid, edge_index, pos)):
+        return data
+    if pos.size(0) == 0 or edge_index.numel() == 0 or r_star.reshape(-1).numel() != pos.size(0):
+        return data
+    edges = edge_index.detach().cpu().numpy().T
+    dth, du, med = mesh_r_star_edge_stats(
+        pos.detach().cpu().numpy(),
+        r_star.detach().cpu().numpy(),
+        valid.detach().cpu().numpy().astype(bool),
+        edges,
+    )
+    data.r_dth = torch.from_numpy(np.ascontiguousarray(dth)).float()
+    data.r_du = torch.from_numpy(np.ascontiguousarray(du)).float()
+    data.r_ring_med = torch.from_numpy(np.ascontiguousarray(med)).float()
+    return data
+
+
 def _finalize_item(data):
     if getattr(data, "face", None) is None and getattr(data, "faces", None) is not None:
         faces = data.faces
@@ -137,6 +165,7 @@ def _finalize_item(data):
     if not isinstance(data, AneurysmData):
         data = _as_aneurysm_data(data)
     data = _ensure_fp32_data(data)
+    data = _refresh_r_star_smoothness(data)
     data.has_true_normal = torch.tensor(
         1 if _infer_has_true_normal(data) else 0, dtype=torch.uint8
     )

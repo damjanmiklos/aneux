@@ -42,6 +42,7 @@ from config import (
     SIGMA_MIN,
     SKIP_GATE_INIT,
     SMOOTH_W_AMBIGUOUS,
+    SPLINE_DEGREE,
     SPLINE_KERNEL_SIZE,
     TOKEN_SPACING_MM,
     Z_ATTN_ALPHA_INIT,
@@ -104,6 +105,7 @@ from ops import composed_radius, fps_indices, make_spline_conv
 from raycast import (
     choose_normal_sign,
     compute_level_r_star,
+    mesh_r_star_edge_stats,
     r_star_grid_stats,
     select_r_star_from_hits,
     template_ray_r_star,
@@ -254,7 +256,8 @@ def test_config_contracts():
     _assert(LEVEL_FINE[1] == 64, LEVEL_FINE)
     _assert(abs(N_TRUE_FAR_FRAC - 0.25) < 1e-12, N_TRUE_FAR_FRAC)
     _assert(N_CONV_PER_LEVEL == 6, N_CONV_PER_LEVEL)
-    _assert(tuple(SPLINE_KERNEL_SIZE) == (5, 5, 2), SPLINE_KERNEL_SIZE)
+    _assert(tuple(SPLINE_KERNEL_SIZE) == (5, 5, 3), SPLINE_KERNEL_SIZE)
+    _assert(min(SPLINE_KERNEL_SIZE) > SPLINE_DEGREE, (SPLINE_KERNEL_SIZE, SPLINE_DEGREE))
     _assert(CHAMFER_WEIGHT_CAP == 4.0, CHAMFER_WEIGHT_CAP)
     _assert(abs(SKIP_GATE_INIT - 0.1) < 1e-12, SKIP_GATE_INIT)
     _assert(Z_ATTN_HEADS == 4, Z_ATTN_HEADS)
@@ -804,8 +807,36 @@ def test_spline_conv_backend():
     res = ResidualSplineConv(8)
     kraw = res.conv.kernel_size
     ks = tuple(int(v) for v in (kraw.tolist() if hasattr(kraw, "tolist") else kraw))
-    _assert(ks == (5, 5, 2), ks)
+    _assert(ks == (5, 5, 3), ks)
+    _assert(int(res.conv.degree) < min(ks), (res.conv.degree, ks))
     _assert(bool(res.conv.root_weight), "SplineConv root_weight")
+
+
+def test_disp_sees_upsampled_spikes():
+    """Flat Δr/Δs must not hide a spiky composed displacement."""
+    n = 4
+    x = torch.zeros(n, 3)
+    x[:, 0] = torch.arange(n)
+    true = x.clone()
+    ei = torch.tensor([[0, 1, 2], [1, 2, 3]])
+    batch = torch.zeros(n, dtype=torch.long)
+    mu = torch.zeros(1, 2, 4)
+    logvar = torch.zeros(1, 2, 4)
+    dr = torch.zeros(n, 1)
+    ds = torch.zeros(n, 2)
+    smooth = torch.zeros(n, 3)
+    spiky = torch.zeros(n, 3)
+    spiky[1, 2] = 8.0
+
+    def _disp(delta_x):
+        terms = compute_losses(
+            x, true, mu, logvar, x, ei, batch, 1,
+            delta_x=delta_x, delta_r=dr, delta_s=ds, batch_tube=batch,
+        )
+        return float(terms["disp"])
+
+    _assert(_disp(smooth) < 1e-8, "flat field")
+    _assert(_disp(spiky) > 1.0, "upsampled spike must enter disp")
 
 
 def test_dirichlet_zero_on_rigid():
@@ -1621,6 +1652,42 @@ def test_huber_and_radial_loss():
     _assert(float(loss0) == 0.0, "all-invalid radial must be 0")
 
 
+def test_mesh_r_star_stats_stay_in_millimetres():
+    """A short sac edge with a small |Δr*| must not look like a steep neck."""
+    pos = np.array([[0.0, 0.0, 0.0], [0.2, 0.0, 0.0]], dtype=np.float64)
+    r_star = np.array([2.0, 2.4], dtype=np.float64)
+    valid = np.array([True, True])
+    edges = np.array([[0, 1]], dtype=np.int64)
+    dth, du, med = mesh_r_star_edge_stats(pos, r_star, valid, edges)
+    _assert(abs(float(dth[0]) - 0.4) < 1e-6, dth)
+    _assert(float(du[0]) == 0.0, du)
+    _assert(abs(float(med[0]) - 2.2) < 1e-6, med)
+    src = torch.tensor([0])
+    dst = torch.tensor([1])
+    w = smoothness_edge_weights(
+        src,
+        dst,
+        torch.tensor(r_star),
+        torch.tensor(valid),
+        torch.tensor(dth),
+        torch.tensor(du),
+        torch.tensor(med),
+    )
+    _assert(float(w[0]) > 0.7, f"0.4 mm step must stay coupled, got {float(w[0])}")
+
+
+def test_kl_penalty_is_excess_over_target():
+    mu = torch.zeros(1, 2, 4)
+    logvar = torch.zeros(1, 2, 4)
+    under, info = vae_kl_loss(mu, logvar, beta=1.0)
+    _assert(float(info["kl_mean_raw"]) < 12.0, info["kl_mean_raw"])
+    _assert(float(under) == 0.0, f"under-target KL must not be penalised, got {float(under)}")
+    mu_hi = torch.full((1, 2, 4), 3.0)
+    over, info_hi = vae_kl_loss(mu_hi, logvar, beta=1.0)
+    _assert(float(info_hi["kl_mean_raw"]) > 12.0, info_hi["kl_mean_raw"])
+    _assert(float(over) > 0.0, over)
+
+
 def test_smoothness_edge_weights():
     r_star = torch.tensor([2.0, 2.0, 8.0, 8.0])
     valid = torch.tensor([True, True, True, True])
@@ -1886,7 +1953,7 @@ def test_full_capacity_model_forward():
     _assert(len(model.decoder.coarse_convs) == N_CONV_PER_LEVEL, len(model.decoder.coarse_convs))
     kraw = model.decoder.fine_convs[0].conv.kernel_size
     ks = tuple(int(v) for v in (kraw.tolist() if hasattr(kraw, "tolist") else kraw))
-    _assert(ks == tuple(SPLINE_KERNEL_SIZE) == (5, 5, 2), ks)
+    _assert(ks == tuple(SPLINE_KERNEL_SIZE) == (5, 5, 3), ks)
     terms = compute_losses(
         out.x_pred,
         batch.x_true,
@@ -2268,6 +2335,7 @@ def main():
         test_stretch_identity_on_skinny_triangle,
         test_mesh_losses_match_pytorch3d,
         test_spline_conv_backend,
+        test_disp_sees_upsampled_spikes,
         test_dirichlet_zero_on_rigid,
         test_unique_tracts_from_overlapping_paths,
         test_groupid_tracts_one_polyline_per_group,
@@ -2299,6 +2367,8 @@ def main():
         test_add_meter_accepts_fold_and_stretch,
         test_chamfer_weight_cap,
         test_huber_and_radial_loss,
+        test_mesh_r_star_stats_stay_in_millimetres,
+        test_kl_penalty_is_excess_over_target,
         test_smoothness_edge_weights,
         test_r_star_hit_selection_and_voronoi,
         test_r_star_grid_stats_and_cylinder_raycast,

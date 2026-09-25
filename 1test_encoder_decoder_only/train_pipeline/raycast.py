@@ -255,10 +255,16 @@ def stretch_distance_r_star(r_local, stretch):
 def mesh_r_star_edge_stats(pos, r_star, valid, edges):
     """Edge-based dθ / du / 1-ring median of r* for an unstructured mesh (§7.2).
 
-    `dth` is the max |r*_i − r*_j| / edge_len over valid 1-ring neighbours
-    (the StretchDistance gradient at the neck). `du` copies that physical
-    gradient so Dirichlet sees it on either axis. `ring_med` is the median of
-    r* over the vertex and its valid neighbours.
+    `dth` is the max |r*_i − r*_j| in millimetres over valid 1-ring neighbours.
+    Smoothness weights use β ≈ 1 on this scale (a 4 mm neck jump softens,
+    a 0.4 mm step on a dense sac edge does not). Dividing by edge length
+    turned every short sac edge into a slope of 10–20 and dropped the
+    Dirichlet / Laplacian weight to ~0 there, so Δr and Δs stopped
+    coupling across the aneurysm.
+
+    `du` stays 0. The loss adds dθ and du, and this mesh has one scalar
+    |Δr*|; copying it into both channels halved the weight again.
+    `ring_med` is the median of r* over the vertex and its valid neighbours.
     """
     pos = np.asarray(pos, dtype=np.float64).reshape(-1, 3)
     r_star = np.asarray(r_star, dtype=np.float64).reshape(-1)
@@ -296,12 +302,12 @@ def mesh_r_star_edge_stats(pos, r_star, valid, edges):
             elen = float(np.linalg.norm(pos[j] - pi))
             if elen < 1e-8:
                 continue
-            g = abs(ri - float(r_star[j])) / elen
+            g = abs(ri - float(r_star[j]))
             if g > grad:
                 grad = g
             acc_vals[i].append(float(r_star[j]))
         dth[i] = grad
-        du[i] = grad
+        du[i] = 0.0
         if acc_vals[i]:
             ring_med[i] = float(np.median(np.asarray(acc_vals[i], dtype=np.float64)))
         elif not valid[i]:

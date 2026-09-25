@@ -66,14 +66,14 @@ def _cfg_get(name: str, default):
 
 
 def _spline_kernel_size():
-    ks = _cfg_get("SPLINE_KERNEL_SIZE", (5, 5, 2))
+    ks = _cfg_get("SPLINE_KERNEL_SIZE", (5, 5, 3))
     if isinstance(ks, int):
-        return (5, 5, 2)
+        return (5, 5, 3)
     return tuple(int(v) for v in ks)
 
 
 def _spline_degree() -> int:
-    """PyG SplineConv.degree is a single int; kernel (5,5,2) already has 2 kind knots."""
+    """PyG SplineConv.degree is one int and must be < every kernel axis."""
     return int(_cfg_get("SPLINE_DEGREE", 2))
 
 
@@ -1075,6 +1075,13 @@ class ResidualSplineConv(nn.Module):
             kernel_size = _spline_kernel_size()
         if degree is None:
             degree = _spline_degree()
+        degree = int(degree)
+        if int(min(kernel_size)) <= degree:
+            raise ValueError(
+                f"SplineConv degree {degree} requires kernel_size > degree on every "
+                f"axis, got {tuple(kernel_size)}. A smaller axis makes that "
+                "B-spline basis identical for every edge."
+            )
         self.norm = nn.LayerNorm(dim)
         self.conv = make_spline_conv(
             dim,

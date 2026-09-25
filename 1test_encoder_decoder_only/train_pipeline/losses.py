@@ -150,7 +150,10 @@ def update_geco_beta(
     kl = float(kl_mean_raw.detach().cpu()) if torch.is_tensor(kl_mean_raw) else float(kl_mean_raw)
     b = float(beta.detach().cpu()) if torch.is_tensor(beta) else float(beta)
     new_b = b * math.exp(float(eta) * (kl - float(rate_target)))
-    lo = float(beta_min)
+    # Stay at least at the init weight. Decaying to β_min while KL < R*
+    # (the usual early state) removed the rate cap for the rest of the run.
+    init = float(_cfg("GECO_BETA_INIT", 1.0))
+    lo = max(float(beta_min), init)
     hi = float(beta_max)
     if epoch is not None:
         hi = geco_beta_max_for_epoch(
@@ -177,8 +180,9 @@ def vae_kl_loss(
     The mean is over *valid* tokens so β and R* mean the same on short and long
     trees. Raw per-token KL is unclamped and reported before β.
 
-    Returns ``(loss, info_dict)``. ``loss`` is ``β · mean_valid(KL)`` when ``beta``
-    is set; otherwise the unweighted valid-token mean (unit-test fallback).
+    Returns ``(loss, info_dict)``. ``loss`` is ``β · relu(mean_valid(KL) − R*)``
+    when ``beta`` is set (no penalty while the rate is under target);
+    otherwise the unweighted valid-token mean (unit-test fallback).
     ``LAMBDA_KL`` is not the primary weight; pass ``use_lambda_kl=True`` only
     for callers that still multiply by the old fixed λ inside this function.
     Optional ``token_floor`` applies ``max(λ_tok, Σ_j KL_j)`` to this call's
@@ -205,7 +209,11 @@ def vae_kl_loss(
             b = beta.to(dtype=kl_for_loss.dtype, device=kl_for_loss.device)
         else:
             b = kl_for_loss.new_tensor(float(beta))
-        loss = b * kl_for_loss
+        # Upper rate constraint only. β · KL with β ≈ 1 and KL ≈ 9 nats
+        # dominated chamfer (~1) from epoch 1 and collapsed μ before the
+        # decoder could use the latent. Excess over R* is what the dual prices.
+        rate = kl_for_loss.new_tensor(float(_cfg("RATE_TARGET_NATS", 12.0)))
+        loss = b * (kl_for_loss - rate).clamp_min(0.0)
         beta_used = b.detach() if torch.is_tensor(b) else kl_for_loss.new_tensor(float(b))
     n_valid = w_sum.detach()
     ln2 = math.log(2.0)
@@ -991,18 +999,24 @@ def compute_losses(
     elif tract_id is not None and edge_index.numel():
         src_d, dst_d = edge_index[0], edge_index[1]
         disp_w = _cross_tract_smooth(None, src_d, dst_d, tract_id)
-    if delta_r is not None and delta_s is not None:
-        loss_disp = displacement_dirichlet_local(delta_r, delta_s, edge_index, edge_weight=disp_w)
+    src, dst = edge_index[0], edge_index[1]
+    if edge_index.numel() == 0:
+        loss_cart = delta_x.new_zeros(())
     else:
-        src, dst = edge_index[0], edge_index[1]
-        if edge_index.numel() == 0:
-            loss_disp = delta_x.new_zeros(())
+        err = (delta_x[src] - delta_x[dst]).pow(2).sum(dim=-1)
+        if disp_w is None:
+            loss_cart = err.mean()
         else:
-            err = (delta_x[src] - delta_x[dst]).pow(2).sum(dim=-1)
-            if disp_w is None:
-                loss_disp = err.mean()
-            else:
-                loss_disp = (disp_w * err).sum() / disp_w.sum().clamp_min(1e-8)
+            loss_cart = (disp_w * err).sum() / disp_w.sum().clamp_min(1e-8)
+    # Local Δr/Δs misses the upsampled field. On the failed run that field
+    # carried the sac spikes (fine residual looked only moderately rough)
+    # while this Cartesian term is exactly the displacement written to the mesh.
+    if delta_r is not None and delta_s is not None:
+        loss_disp = displacement_dirichlet_local(
+            delta_r, delta_s, edge_index, edge_weight=disp_w
+        ) + loss_cart
+    else:
+        loss_disp = loss_cart
 
     lap_w = None
     if face is not None and r_star is not None and r_star_valid is not None and r_dth is not None:

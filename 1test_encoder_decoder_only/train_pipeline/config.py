@@ -142,12 +142,12 @@ INVRES_ALPHA_INIT = 0.1
 # --- SplineConv decoder ---
 DECODER_HIDDEN_DIM = 128
 ATTN_DIM = 128
-# (u, θ, kind). Kind is one bit: 2 knots (§6.2). Mean aggregation so
-# updates do not scale with degree (§6.4). PyG SplineConv takes one integer
-# `degree`, not a per-axis tuple, so the conv uses 2 (the u/θ value). Kernel
-# size (5,5,2) is what cuts parameters vs a 5³ kernel; degree is interpolation
-# order, not weight count.
-SPLINE_KERNEL_SIZE = (5, 5, 2)
+# (u, θ, kind). Mean aggregation so updates do not scale with degree (§6.4).
+# PyG applies one integer `degree` on every axis. An open B-spline of degree
+# d needs kernel_size >= d+1 on that axis; (5,5,2) with degree 2 made the
+# kind basis identical for every edge, so cross-tract edges shared the
+# same-tract kernel. Kind uses 3 knots, the minimum that degree 2 can see.
+SPLINE_KERNEL_SIZE = (5, 5, 3)
 SPLINE_DEGREE = 2
 SPLINE_AGGR = "mean"
 SPLINE_ROOT_WEIGHT = True  # §6.4; vertex self-weight, not residual-only
