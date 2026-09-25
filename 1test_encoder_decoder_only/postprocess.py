@@ -64,9 +64,11 @@ LOSS_KEYS = (
     "lap",
     "norm",
     "fold",
+    "conf",
+    "fold_tpl",
     "stretch",
 )
-WEIGHT_KEYS = ("recon", "rad", "kl", "disp", "lap", "norm")
+WEIGHT_KEYS = ("recon", "rad", "kl", "disp", "lap", "norm", "fold", "conf")
 SUMMARY_KEYS = ("total",) + LOSS_KEYS + tuple(f"w_{key}" for key in WEIGHT_KEYS)
 SPLIT_ORDER = ("train", "val", "test")
 

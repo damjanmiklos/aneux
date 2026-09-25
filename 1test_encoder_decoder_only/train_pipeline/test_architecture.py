@@ -762,6 +762,30 @@ def test_stretch_identity_on_skinny_triangle():
     _assert(math.isfinite(bad) and bad < 2000.0, bad)
 
 
+def test_mesh_terms_have_finite_gradients_at_identity():
+    """At init the heads are zero, so pred == template exactly.
+
+    sqrt of a repeated eigenvalue (0) back-propagates 0 * inf = NaN; one such
+    term poisons every parameter even at weight 0, since 0 * NaN is NaN.
+    """
+    from losses import conformal_distortion_loss, dihedral_fold_penalty, triangle_stretch_loss
+
+    tpl = torch.tensor(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.2]],
+        dtype=torch.float32,
+    )
+    face = torch.tensor([[0, 1], [1, 3], [2, 2]], dtype=torch.long)
+    batch = torch.zeros(4, dtype=torch.long)
+    for name, fn in (
+        ("stretch", lambda x: triangle_stretch_loss(x, tpl, face)),
+        ("conf", lambda x: conformal_distortion_loss(x, tpl, face, batch, 1)),
+        ("fold", lambda x: dihedral_fold_penalty(x, face, batch, 1)),
+    ):
+        x = tpl.clone().requires_grad_(True)
+        (0.0 * fn(x)).backward()
+        _assert(torch.isfinite(x.grad).all(), f"{name}: non-finite grad at identity {x.grad}")
+
+
 def test_mesh_losses_match_pytorch3d():
     from pytorch3d.loss import mesh_laplacian_smoothing, mesh_normal_consistency
     from pytorch3d.structures import Meshes
@@ -2159,23 +2183,40 @@ def test_ring_neighbour_eth_at_cube_edge():
     )
 
 
-def test_decimation_keeps_profile_loops():
+def test_template_levels_keep_loops_density_and_nest():
+    """Sizing-field collapse: loops kept, manifold, nested, density ratio kept."""
+    from coarsen import build_levels
+
     factory = _make_factory()
-    mesh = _open_cylinder_surface(radius=2.0, height=20.0, n_th=24, n_z=80, bulge=0.0)
-    _, faces0 = factory._polydata_triangles(mesh)
-    _n0, _nm0, n_loops0 = factory._face_topology(faces0, int(mesh.n_points))
+    mesh = _open_cylinder_surface(radius=2.0, height=20.0, n_th=48, n_z=160, bulge=0.0)
+    mesh, faces0 = factory._polydata_triangles(mesh)
+    pts = np.asarray(mesh.points, dtype=np.float64)
+    _n0, _nm0, n_loops0 = factory._face_topology(faces0, pts.shape[0])
     _assert(n_loops0 == 2, f"open cylinder should have 2 loops, got {n_loops0}")
-    mid = factory._decimate_keep(mesh, 0.25, 64)
-    coarse = factory._decimate_keep(mesh, 0.08, 32)
-    _, faces_m = factory._polydata_triangles(mid)
-    _, faces_c = factory._polydata_triangles(coarse)
-    _nm_m_unused, nman_m, n_m = factory._face_topology(faces_m, int(mid.n_points))
-    _nm_c_unused, nman_c, n_c = factory._face_topology(faces_c, int(coarse.n_points))
-    del _nm_m_unused, _nm_c_unused
-    _assert(nman_m == 0, f"mid non-manifold {nman_m}")
-    _assert(nman_c == 0, f"coarse non-manifold {nman_c}")
-    _assert(n_m == n_loops0, f"mid loops {n_m} vs {n_loops0}")
-    _assert(n_c == n_loops0, f"coarse loops {n_c} vs {n_loops0}")
+    # a dense band in the middle third, like a sac on a variable template
+    edge0 = 2.0 * np.pi * 2.0 / 48
+    dense = np.abs(pts[:, 2] - pts[:, 2].mean()) < 20.0 / 6
+    tel = np.where(dense, edge0, 3.0 * edge0)
+    lv = build_levels(pts, faces0, tel, np.full(pts.shape[0], 2.0))
+    for name in ("mid", "coarse"):
+        keep, f = lv["keep_" + name], lv["faces_" + name]
+        _n, nman, n_loops = factory._face_topology(f, keep.shape[0])
+        _assert(nman == 0, f"{name} non-manifold {nman}")
+        _assert(n_loops == n_loops0, f"{name} loops {n_loops} vs {n_loops0}")
+        _assert(keep.shape[0] < pts.shape[0], f"{name} did not coarsen")
+        frac_dense = dense[keep].mean()
+        _assert(frac_dense > 0.45, f"{name} lost the dense band: {frac_dense:.2f} of vertices in it")
+    _assert(np.isin(lv["keep_coarse"], lv["keep_mid"]).all(), "coarse is not a subset of mid")
+    for name, n_dst in (("mid", lv["keep_mid"].shape[0]), ("fine", pts.shape[0])):
+        w = lv["upsample_w_" + name]
+        _assert(lv["upsample_idx_" + name].shape == (n_dst, 3), f"{name} idx shape")
+        _assert(np.allclose(w.sum(1), 1.0) and (w >= 0).all(), f"{name} weights not barycentric")
+    # a nested vertex prolongs to itself
+    pos_in_mid = np.searchsorted(lv["keep_mid"], lv["keep_mid"])
+    w_self = lv["upsample_w_fine"][lv["keep_mid"]]
+    i_self = lv["upsample_idx_fine"][lv["keep_mid"]]
+    got = (w_self * (i_self == pos_in_mid[:, None])).sum(1)
+    _assert(float(got.min()) > 0.999, f"nested vertex weight on itself {got.min():.4f}")
 
 
 def test_forward_model_passes_sample_through_ddp_wrapper():
@@ -2388,11 +2429,12 @@ def main():
         test_smoothness_weights_not_all_ones_on_bulge,
         test_token_spacing_independent_of_length,
         test_ring_neighbour_eth_at_cube_edge,
-        test_decimation_keeps_profile_loops,
+        test_template_levels_keep_loops_density_and_nest,
         test_forward_model_passes_sample_through_ddp_wrapper,
         test_reparameterize_eval_samples_and_logvar_floor,
         test_mixer_before_sampling,
         test_null_code_decodes_to_template,
+        test_mesh_terms_have_finite_gradients_at_identity,
     ]
     failed = 0
     skipped = 0

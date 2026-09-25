@@ -23,11 +23,10 @@ from config import (
     MIN_RINGS_PER_BRANCH,
     N_TRUE,
     N_TRUE_FAR_FRAC,
-    TEMPLATE_COARSE_KEEP,
-    TEMPLATE_MID_KEEP,
-    TEMPLATE_MIN_COARSE,
-    TEMPLATE_MIN_MID,
-    TEMPLATE_UPSAMPLE_K,
+    TEMPLATE_COARSE_K,
+    TEMPLATE_COARSE_N_MIN,
+    TEMPLATE_MID_K,
+    TEMPLATE_MID_N_MIN,
     TUBE_RADIUS_MM,
 )
 from cleaned_io import (
@@ -41,7 +40,9 @@ from cleaned_io import (
     summarize_cleandata,
     vtp_path,
 )
-from geometry import fps_metric, knn_upsample_tables, point_to_polyline_dist
+from geometry import fps_metric, point_to_polyline_dist
+from coarsen import build_core as build_coarsen_core
+from coarsen import build_levels as build_template_levels
 from raycast import (
     closest_cell_normals,
     compute_level_r_star,
@@ -1787,31 +1788,43 @@ class AneurysmDataset(Dataset):
         step[mask] = np.maximum(acc[mask] / cnt[mask], 1e-4)
         return step
 
-    def _decimate_keep(self, mesh, keep_frac, min_points):
-        mesh = pv.wrap(mesh)
-        n = int(mesh.n_points)
-        target_n = max(int(min_points), int(round(n * float(keep_frac))))
-        target_n = min(target_n, n)
-        if target_n >= n or n < 8:
-            return mesh
-        reduction = float(np.clip(1.0 - (target_n / max(n, 1)), 0.0, 0.99))
-        for fn in ("decimate", "decimate_pro"):
-            try:
-                out = getattr(mesh, fn)(reduction)
-                if out is not None and int(out.n_points) >= 4:
-                    return out
-            except Exception:
-                continue
-        try:
-            from ops import fps_indices
+    def _template_levels(self, posed_tpl, fine_faces, fine):
+        """Nested mid/coarse levels by sizing-field edge collapse (coarsen.py).
 
-            keep = fps_indices(_torch_f32(mesh.points), target_n).detach().cpu().numpy()
-            sub = mesh.extract_points(keep, adjacent_cells=True)
-            if sub is not None and int(sub.n_points) >= 4:
-                return sub.triangulate() if sub.n_cells > 0 else sub
-        except Exception:
-            pass
-        return mesh
+        Decimation erased the template's density: the flat, finely meshed sac
+        went first, and on p131 the sac/parent edge ratio fell from 4.9 to
+        0.83.  The collapse keeps the ratio, keeps >= N_min vertices around
+        thin branches and rims, and prolongs by barycentric projection instead
+        of a Euclidean kNN that reached across thin branches.
+        """
+        pts = _as_f64(posed_tpl.points)
+        tel = _point_data_array(posed_tpl, "TargetEdgeLength")
+        r_tpl = _point_data_array(posed_tpl, "R_template")
+        if tel is None or tel.shape[0] != pts.shape[0]:
+            # templates without a sizing field: their own mean incident edge length
+            e = np.concatenate([fine_faces[:, [0, 1]], fine_faces[:, [1, 2]], fine_faces[:, [2, 0]]], axis=0)
+            le = np.linalg.norm(pts[e[:, 0]] - pts[e[:, 1]], axis=1)
+            acc = np.bincount(e[:, 0], le, minlength=pts.shape[0]) + np.bincount(e[:, 1], le, minlength=pts.shape[0])
+            cnt = np.bincount(e[:, 0], minlength=pts.shape[0]) + np.bincount(e[:, 1], minlength=pts.shape[0])
+            tel = acc / np.maximum(cnt, 1)
+        if r_tpl is None or r_tpl.shape[0] != pts.shape[0]:
+            r_tpl = fine["r_local"].numpy().astype(np.float64)
+        tel = np.clip(np.asarray(tel, dtype=np.float64), 1e-3, None)
+        r_tpl = np.clip(np.asarray(r_tpl, dtype=np.float64), 1e-2, None)
+        lv = build_template_levels(
+            pts, fine_faces, tel, r_tpl,
+            k_mid=TEMPLATE_MID_K, k_coarse=TEMPLATE_COARSE_K,
+            n_min_mid=TEMPLATE_MID_N_MIN, n_min_coarse=TEMPLATE_COARSE_N_MIN,
+            min_rim_mid=TEMPLATE_MID_N_MIN, min_rim_coarse=TEMPLATE_COARSE_N_MIN,
+        )
+
+        def sub_mesh(keep, faces):
+            cells = np.hstack([np.full((faces.shape[0], 1), 3, dtype=np.int64), faces]).ravel()
+            return pv.PolyData(pts[keep], cells)
+
+        lv["mid_mesh"] = sub_mesh(lv["keep_mid"], lv["faces_mid"])
+        lv["coarse_mesh"] = sub_mesh(lv["keep_coarse"], lv["faces_coarse"])
+        return lv
 
     def _surface_normals(self, mesh, n_points):
         nrm = getattr(mesh, "point_normals", None)
@@ -2354,17 +2367,15 @@ class AneurysmDataset(Dataset):
         fine = self._level_from_surface(posed_tpl, dense_tracts)
         _, fine_faces = self._polydata_triangles(posed_tpl)
         self._assert_surface_topology(fine_faces, int(fine["pos"].size(0)), name="template fine")
-        mid_mesh = self._decimate_keep(posed_tpl, TEMPLATE_MID_KEEP, TEMPLATE_MIN_MID)
-        coarse_mesh = self._decimate_keep(posed_tpl, TEMPLATE_COARSE_KEEP, TEMPLATE_MIN_COARSE)
+        levels = self._template_levels(posed_tpl, fine_faces, fine)
+        mid_mesh, coarse_mesh = levels["mid_mesh"], levels["coarse_mesh"]
         mid = self._level_from_surface(mid_mesh, dense_tracts)
         coarse = self._level_from_surface(coarse_mesh, dense_tracts)
-        _, mid_faces = self._polydata_triangles(mid_mesh)
-        self._assert_surface_topology(mid_faces, int(mid["pos"].size(0)), name="template mid")
-        _, coarse_faces = self._polydata_triangles(coarse_mesh)
-        self._assert_surface_topology(coarse_faces, int(coarse["pos"].size(0)), name="template coarse")
+        self._assert_surface_topology(levels["faces_mid"], int(mid["pos"].size(0)), name="template mid")
+        self._assert_surface_topology(levels["faces_coarse"], int(coarse["pos"].size(0)), name="template coarse")
 
-        idx_mid, w_mid = knn_upsample_tables(coarse["pos"].numpy(), mid["pos"].numpy(), TEMPLATE_UPSAMPLE_K)
-        idx_fine, w_fine = knn_upsample_tables(mid["pos"].numpy(), fine["pos"].numpy(), TEMPLATE_UPSAMPLE_K)
+        idx_mid, w_mid = levels["upsample_idx_mid"], levels["upsample_w_mid"]
+        idx_fine, w_fine = levels["upsample_idx_fine"], levels["upsample_w_fine"]
         extra = {
             "upsample_idx_mid": _torch_long(idx_mid),
             "upsample_w_mid": _torch_f32(w_mid),
@@ -2577,6 +2588,8 @@ class AneurysmDataset(Dataset):
 
         workers = max(1, int(num_workers))
         workers = min(workers, len(missing))
+        # compile the collapse core once here, not in every spawned worker
+        build_coarsen_core()
         print(f"Tube cache: {n_hit} ready, {len(missing)} to build, {workers} process(es)")
         errors = []
         if workers == 1 or not getattr(self, "_init_kwargs", None):

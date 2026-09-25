@@ -324,11 +324,14 @@ def _level_geom_features(data, n: int, level: str, fallback_r: float) -> Tensor:
     return torch.stack([r, k, tau, d_ost], dim=-1)
 
 
-def apply_boundary_plane_projection(x: Tensor, data, suffix: str = "") -> Tensor:
+def apply_boundary_plane_projection(x: Tensor, data, suffix: str = "", anchor: Tensor | None = None) -> Tensor:
     """Slide rim vertices in their ostium cut plane. No-op when planes are missing.
 
     Accepts packed [N, 3] origin+normal (optionally with a boolean mask), or a
     packed-boundary layout [n_boundary, 3] plus a [N] mask of rim vertices.
+    With `anchor` (the template positions) the rim keeps its template offset
+    along the plane normal and only the displacement is projected, so the
+    identity decode leaves the rim exactly where the template has it.
     """
     if x.numel() == 0:
         return x
@@ -365,12 +368,16 @@ def apply_boundary_plane_projection(x: Tensor, data, suffix: str = "") -> Tensor
     if normal.dim() == 1:
         normal = normal.unsqueeze(0)
 
-    def _project(pts, org, nrm):
+    if anchor is not None:
+        anchor = anchor.to(device=x.device, dtype=x.dtype)
+
+    def _project(pts, org, nrm, anc=None):
         nrm = F.normalize(nrm, dim=-1, eps=1e-8)
-        return pts - nrm * ((pts - org) * nrm).sum(dim=-1, keepdim=True)
+        ref = org if anc is None else anc
+        return pts - nrm * ((pts - ref) * nrm).sum(dim=-1, keepdim=True)
 
     if origin.size(0) == n and normal.size(0) == n:
-        x_proj = _project(x, origin, normal)
+        x_proj = _project(x, origin, normal, anchor)
         if mask is None:
             live = normal.norm(dim=-1, keepdim=True) > 1e-6
             return torch.where(live, x_proj, x)
@@ -378,7 +385,7 @@ def apply_boundary_plane_projection(x: Tensor, data, suffix: str = "") -> Tensor
     if mask is not None and origin.size(0) == int(mask.sum()) and normal.size(0) == int(mask.sum()):
         idx = mask.nonzero(as_tuple=False).view(-1)
         x = x.clone()
-        x[idx] = _project(x[idx], origin, normal)
+        x[idx] = _project(x[idx], origin, normal, None if anchor is None else anchor[idx])
         return x
     return x
 
@@ -1147,6 +1154,43 @@ class DecoupledDisplacementHead(nn.Module):
         return delta_r, delta_s
 
 
+class BoundedResidualHead(nn.Module):
+    """Δr / Δs residual bounded by a per-vertex length (mid and fine levels).
+
+    Δr = b·tanh(a_r), Δs = b·tanh(a_s) with b = RESIDUAL_BOUND_EDGES × the
+    local template edge length of this level.  Identity at init (W = 0).
+    """
+
+    def __init__(self, hidden: int):
+        super().__init__()
+        self.radial = nn.Linear(hidden, 1)
+        self.shear = nn.Linear(hidden, 2)
+        for lin in (self.radial, self.shear):
+            nn.init.zeros_(lin.weight)
+            nn.init.zeros_(lin.bias)
+
+    def forward(self, h: Tensor, bound: Tensor):
+        h = h.to(dtype=torch.float32)
+        b = bound.to(dtype=h.dtype, device=h.device).reshape(-1, 1)
+        return b * torch.tanh(self.radial(h)), b * torch.tanh(self.shear(h))
+
+
+def mean_edge_length(pos: Tensor, edge_index: Tensor) -> Tensor:
+    """Mean incident edge length per vertex (template scale of a level)."""
+    n = pos.size(0)
+    if edge_index.numel() == 0:
+        return pos.new_full((n,), 1.0)
+    src, dst = edge_index[0], edge_index[1]
+    le = (pos[src] - pos[dst]).norm(dim=-1).to(torch.float32)
+    tot = torch.zeros(n, device=pos.device, dtype=torch.float32)
+    cnt = torch.zeros(n, device=pos.device, dtype=torch.float32)
+    tot = tot.index_add(0, src, le).index_add(0, dst, le)
+    cnt = cnt.index_add(0, src, torch.ones_like(le)).index_add(0, dst, torch.ones_like(le))
+    mean = tot / cnt.clamp_min(1.0)
+    fallback = le.mean() if le.numel() else pos.new_tensor(1.0)
+    return torch.where(cnt > 0, mean, fallback)
+
+
 class FreeDisplacementHead(nn.Module):
     """Unconstrained 3-D displacement (coarse level). Identity Δx = 0 at init."""
 
@@ -1271,8 +1315,25 @@ class ProgressiveSplineDecoder(nn.Module):
         self.alpha_c_raw = nn.Parameter(torch.tensor(_logit(SKIP_GATE_INIT)))
         self.alpha_m_raw = nn.Parameter(torch.tensor(_logit(SKIP_GATE_INIT)))
         self.coarse_head = FreeDisplacementHead(hidden_dim)
-        self.mid_head = DecoupledDisplacementHead(hidden_dim, r_margin=r_margin, s_max=s_max)
-        self.head = DecoupledDisplacementHead(hidden_dim, r_margin=r_margin, s_max=s_max)
+        self.residual_bound = _cfg_get("RESIDUAL_BOUND_EDGES", None)
+        self.rim_project_displacement = bool(_cfg_get("RIM_PROJECT_DISPLACEMENT", False))
+        if self.residual_bound is not None:
+            self.mid_head = BoundedResidualHead(hidden_dim)
+            self.head = BoundedResidualHead(hidden_dim)
+        else:
+            self.mid_head = DecoupledDisplacementHead(hidden_dim, r_margin=r_margin, s_max=s_max)
+            self.head = DecoupledDisplacementHead(hidden_dim, r_margin=r_margin, s_max=s_max)
+
+    def _residual(self, head, h, r_local, pos, edge_index):
+        if self.residual_bound is None:
+            return head(h, r_local=r_local)
+        bound = float(self.residual_bound) * mean_edge_length(pos, edge_index)
+        return head(h, bound)
+
+    def _rim(self, x, data, suffix, pos):
+        return apply_boundary_plane_projection(
+            x, data, suffix=suffix, anchor=pos if self.rim_project_displacement else None
+        )
 
     def _run_convs(self, h, edge_index, pseudo, convs, checkpoint_ok):
         use_ckpt = self.training and bool(checkpoint_ok)
@@ -1367,7 +1428,7 @@ class ProgressiveSplineDecoder(nn.Module):
             self.gradient_checkpointing == "all",
         )
         dx_c = self.coarse_head(h_c)
-        x_c = apply_boundary_plane_projection(pos_c + dx_c, data, suffix="_coarse")
+        x_c = self._rim(pos_c + dx_c, data, "_coarse", pos_c)
         dx_c = x_c - pos_c
 
         dx_m0 = _upsample_level(
@@ -1399,12 +1460,12 @@ class ProgressiveSplineDecoder(nn.Module):
             self.gradient_checkpointing == "all",
         )
         floor_m = RADIAL_FLOOR_FRAC * r_m
-        dr_m, ds_m = self.mid_head(h_m, r_local=r_m)
+        dr_m, ds_m = self._residual(self.mid_head, h_m, r_m, pos_m, data.edge_index_mid)
         dr_m = _clamp_residual_radial(dr_m, dx_m0, data.normal_mid, floor_m)
         dx_m = dx_m0 + decoupled_displacement(
             dr_m, ds_m, data.normal_mid, data.tangent_mid, data.binormal_mid
         )
-        x_m = apply_boundary_plane_projection(pos_m + dx_m, data, suffix="_mid")
+        x_m = self._rim(pos_m + dx_m, data, "_mid", pos_m)
         dx_m = x_m - pos_m
 
         dx_f0 = _upsample_level(
@@ -1435,13 +1496,13 @@ class ProgressiveSplineDecoder(nn.Module):
             self.gradient_checkpointing in ("all", "fine"),
         )
         floor_f = RADIAL_FLOOR_FRAC * r_f
-        delta_r, delta_s = self.head(h_f, r_local=r_f)
+        delta_r, delta_s = self._residual(self.head, h_f, r_f, pos_f, data.edge_index)
         delta_r = _clamp_residual_radial(delta_r, dx_f0, data.normal, floor_f)
         dx_decoupled = decoupled_displacement(
             delta_r, delta_s, data.normal, data.tangent, data.binormal
         )
         delta_x = dx_f0 + dx_decoupled
-        x_pred = apply_boundary_plane_projection(pos_f + delta_x, data, suffix="")
+        x_pred = self._rim(pos_f + delta_x, data, "", pos_f)
         delta_x = x_pred - pos_f
         return x_pred, delta_x, x_c, x_m, delta_r, delta_s, dx_c
 

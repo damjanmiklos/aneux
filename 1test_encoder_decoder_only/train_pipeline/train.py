@@ -257,7 +257,7 @@ def weighted_total(terms, weights):
     )
     if "rad" in terms:
         total = total + float(weights.get("rad", 0.0)) * terms["rad"]
-    for extra in ("fold", "stretch"):
+    for extra in ("fold", "conf", "stretch"):
         if extra in terms and extra in weights:
             total = total + float(weights[extra]) * terms[extra]
     return total
@@ -547,6 +547,21 @@ def losses_from_output(out, batch, kl_beta=None):
         tract_id=getattr(batch, "tract_id", None),
         pos_coarse=getattr(batch, "pos_coarse", None),
         normal_coarse=getattr(batch, "normal_coarse", None),
+        # Without these the radial term read r = 2 mm + n·Δx against
+        # r* = r_local + stretch (a 0.5 mm branch was driven 1.5 mm inward,
+        # through its own axis) and the Chamfer target was the 16k subsample.
+        r_local=getattr(batch, "r_local", None),
+        r_local_mid=getattr(batch, "r_local_mid", None),
+        r_local_coarse=getattr(batch, "r_local_coarse", None),
+        gt_points=getattr(batch, "gt_points", None),
+        gt_normals=getattr(batch, "gt_normals", None),
+        gt_batch=getattr(batch, "gt_points_batch", None),
+        gt_cl_dist=getattr(batch, "gt_cl_dist", None),
+        x_template=batch.x,
+        face_mid=getattr(batch, "face_mid", None),
+        face_coarse=getattr(batch, "face_coarse", None),
+        edge_index_mid=getattr(batch, "edge_index_mid", None),
+        edge_index_coarse=getattr(batch, "edge_index_coarse", None),
         **extra,
     )
     if isinstance(terms, tuple) and len(terms) == 2 and isinstance(terms[0], dict):
@@ -654,6 +669,8 @@ def _zero_meters():
         "kl_mean_raw": 0.0,
         "rate_gap": 0.0,
         "fold": 0.0,
+        "conf": 0.0,
+        "fold_tpl": 0.0,
         "stretch": 0.0,
     }
 
@@ -970,14 +987,20 @@ def _axis_angle_rotation(max_deg, device, dtype, generator=None):
     return R
 
 
+# Every xyz position and every direction in the batch must turn together:
+# a rim plane left behind drags the rim off its ostium by the jitter angle.
 _POS_KEYS = (
     "x",
     "pos_mid",
     "pos_coarse",
     "x_true",
     "latent_pos",
+    "token_pos",
     "gt_points",
     "gt_points_mirror",
+    "boundary_plane_origin",
+    "boundary_plane_origin_mid",
+    "boundary_plane_origin_coarse",
 )
 _VEC_KEYS = (
     "normal",
@@ -993,6 +1016,10 @@ _VEC_KEYS = (
     "gt_normals",
     "gt_normals_mirror",
     "gt_points_normal",
+    "gt_points_normal_mirror",
+    "boundary_plane_normal",
+    "boundary_plane_normal_mid",
+    "boundary_plane_normal_coarse",
 )
 
 
@@ -1047,9 +1074,16 @@ def apply_pose_jitter(batch, max_deg=POSE_JITTER_DEG, generator=None):
 
 
 def apply_train_augmentations(batch, generator=None):
-    """§8 train-time augs only: cached L/R mirror, θ-phase, ±5° pose jitter."""
+    """§8 train-time augs: cached L/R mirror and ±5° pose jitter.
+
+    No θ-phase.  It rotated only the decoder's θ labels while the encoder saw
+    the unrotated points and the scaffold kept its geometry, so the angular
+    position the decoder queries the latent with no longer matched where the
+    aneurysm is -- the latent could not say *where* around the vessel anything
+    sits, and the decoder fell back to finding the sac from template density
+    (z = 0 decoded the same mesh as μ on the failed run).
+    """
     maybe_apply_cached_mirror(batch, p=0.5, generator=generator)
-    apply_theta_phase(batch, generator=generator)
     apply_pose_jitter(batch, max_deg=POSE_JITTER_DEG, generator=generator)
     resample_x_true(batch, generator=generator)
     return batch
@@ -1167,7 +1201,7 @@ def train_epoch(
 
         scale = float(window_len * batch_size)
         _add_meter(totals, "loss", loss, scale)
-        for key in ("recon", "kl", "disp", "lap", "norm", "rad", "kl_mean_raw", "rate_gap", "fold", "stretch"):
+        for key in ("recon", "kl", "disp", "lap", "norm", "rad", "kl_mean_raw", "rate_gap", "fold", "conf", "fold_tpl", "stretch"):
             if key in terms:
                 val = terms[key]
                 if not torch.is_tensor(val):
@@ -1205,7 +1239,7 @@ def evaluate_epoch(model, dataloader, weights, device, sample=False, kl_beta=Non
             terms = losses_from_output(out, batch, kl_beta=kl_beta)
             loss = _weighted_total(terms, weights)
             _add_meter(totals, "loss", loss, float(batch_size))
-            for key in ("recon", "kl", "disp", "lap", "norm", "rad", "kl_mean_raw", "rate_gap", "fold", "stretch"):
+            for key in ("recon", "kl", "disp", "lap", "norm", "rad", "kl_mean_raw", "rate_gap", "fold", "conf", "fold_tpl", "stretch"):
                 if key in terms:
                     val = terms[key]
                     if not torch.is_tensor(val):
@@ -1229,6 +1263,9 @@ def _format_metrics(metrics, weights, tag, epoch, epochs):
         f"Disp: {metrics['disp']:.4f} | "
         f"Lap: {metrics['lap']:.4f} | "
         f"Norm: {metrics['norm']:.4f} | "
+        f"Fold: {metrics.get('fold', 0.0):.4f} | "
+        f"Conf: {metrics.get('conf', 0.0):.4f} | "
+        f"FoldTpl: {metrics.get('fold_tpl', 0.0):.4f} | "
         f"w_recon: {metrics['recon'] * weights['recon']:.4f} | "
         f"w_rad: {w_rad:.4f} | "
         f"w_kl: {metrics['kl'] * weights['kl']:.4f} | "

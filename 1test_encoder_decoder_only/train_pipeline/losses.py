@@ -406,7 +406,15 @@ def _cl_radius(points, cl_xyz):
     return _knn_min_sq(points, cl_xyz[:, :3]).sqrt()
 
 
-def _chamfer_pair(pred, true, w_pred, w_true, n_true=None):
+def _chamfer_pair(pred, true, w_pred, w_true, n_true=None, pred_v=None, w_v=None):
+    """Two-sided Chamfer.  `pred_v` / `w_v`: the mesh vertices themselves.
+
+    Area samples alone left most vertices without a gradient in any given
+    step: 16k samples over p131's 85k faces reach ~1 in 100 of the 0.002 mm2
+    sac triangles, so each step pulled a random handful of sac vertices while
+    their neighbours stayed put.  The vertex term (area-weighted, so dense
+    regions do not outvote sparse ones) gives every vertex a pull every step.
+    """
     if pred.size(0) == 0 or true.size(0) == 0:
         return pred.new_zeros(())
     use_plane = (
@@ -415,20 +423,30 @@ def _chamfer_pair(pred, true, w_pred, w_true, n_true=None):
         and n_true.size(0) == true.size(0)
         and n_true.size(-1) == 3
     )
+    has_v = pred_v is not None and w_v is not None and pred_v.size(0) > 0
+    pred_all = torch.cat([pred, pred_v], dim=0) if has_v else pred
+
+    def to_true(src):
+        if use_plane:
+            return _plane_l2_pair(src, true, n_true, n_is_at_dst=True)
+        return _knn_min_sq(src, true)
+
+    loss_p = (w_pred * to_true(pred)).sum() / w_pred.sum().clamp_min(1e-8)
+    if has_v:
+        loss_v = (w_v * to_true(pred_v)).sum() / w_v.sum().clamp_min(1e-8)
+        loss_p = 0.5 * (loss_p + loss_v)
     if use_plane:
-        min_true = _plane_l2_pair(pred, true, n_true, n_is_at_dst=True)
-        min_pred = _plane_l2_pair(true, pred, n_true, n_is_at_dst=False)
+        min_pred = _plane_l2_pair(true, pred_all, n_true, n_is_at_dst=False)
     else:
-        min_true = _knn_min_sq(pred, true)
-        min_pred = _knn_min_sq(true, pred)
-    loss_p = (w_pred * min_true).sum() / w_pred.sum().clamp_min(1e-8)
+        min_pred = _knn_min_sq(true, pred_all)
     loss_t = (w_true * min_pred).sum() / w_true.sum().clamp_min(1e-8)
     return 0.5 * (loss_p + loss_t)
 
 
-def _weighted_chamfer(pred, pred_batch, true, true_batch, w_pred, w_true, num_graphs, n_true=None):
+def _weighted_chamfer(pred, pred_batch, true, true_batch, w_pred, w_true, num_graphs, n_true=None,
+                      pred_v=None, pred_v_batch=None, w_v=None):
     if int(num_graphs) == 1:
-        return _chamfer_pair(pred, true, w_pred, w_true, n_true=n_true)
+        return _chamfer_pair(pred, true, w_pred, w_true, n_true=n_true, pred_v=pred_v, w_v=w_v)
     loss = pred.new_zeros(())
     n_ok = 0
     for i in range(num_graphs):
@@ -437,13 +455,31 @@ def _weighted_chamfer(pred, pred_batch, true, true_batch, w_pred, w_true, num_gr
         if p.size(0) == 0 or t.size(0) == 0:
             continue
         n_t = n_true[true_batch == i] if n_true is not None else None
+        pv = wv = None
+        if pred_v is not None and pred_v_batch is not None and w_v is not None:
+            mv = pred_v_batch == i
+            pv, wv = pred_v[mv], w_v[mv]
         loss = loss + _chamfer_pair(
-            p, t, w_pred[pred_batch == i], w_true[true_batch == i], n_true=n_t
+            p, t, w_pred[pred_batch == i], w_true[true_batch == i], n_true=n_t, pred_v=pv, w_v=wv
         )
         n_ok += 1
     if n_ok > 0:
         loss = loss / n_ok
     return loss
+
+
+def vertex_areas(verts, face):
+    """One third of the incident triangle areas per vertex (detached)."""
+    face = _as_face_index(face)
+    n = verts.size(0)
+    if face is None or face.numel() == 0:
+        return verts.new_ones(n)
+    with torch.no_grad():
+        a = _face_areas(verts.detach(), face).float() / 3.0
+        out = torch.zeros(n, device=verts.device, dtype=torch.float32)
+        for k in range(3):
+            out = out.index_add(0, face[k], a)
+    return out.clamp_min(1e-12)
 
 
 def _oriented_face_edges(face):
@@ -658,6 +694,60 @@ def fold_penalty(x_pred, x_template, face, batch=None, num_graphs=1):
     return _mean_over_faces(pen, face, batch, num_graphs, x_pred)
 
 
+def dihedral_fold_penalty(verts, face, batch=None, num_graphs=1):
+    """Hinge on adjacent-face normals turned more than 90 degrees apart.
+
+    Replaces the template-relative hinge as the fold measure: a sac grows
+    from a flat patch into a berry whose neck curls back past 90 degrees from
+    the template normal, so "n_pred . n_template < 0" charged correct
+    inflation, while a crumpled patch that stays roughly template-facing
+    went free.  A fold is a sharp crease between neighbours.
+    """
+    face = _as_face_index(face)
+    if face is None or face.numel() == 0 or verts.size(0) == 0:
+        return verts.new_zeros(())
+    pairs = _adjacent_face_pairs(face, verts.size(0))
+    if pairs.size(1) == 0:
+        return verts.new_zeros(())
+    n = F.normalize(_face_normals(verts.float(), face), dim=-1, eps=1e-12)
+    pen = F.relu(-(n[pairs[0]] * n[pairs[1]]).sum(dim=-1))
+    if batch is None:
+        return pen.mean()
+    pair_batch = batch[face[0, pairs[0]]]
+    counts = torch.bincount(pair_batch, minlength=num_graphs).to(dtype=pen.dtype).clamp_min(1.0)
+    return (pen * counts[pair_batch].reciprocal()).sum() / float(num_graphs)
+
+
+def conformal_distortion_loss(x_pred, x_template, face, batch=None, num_graphs=1):
+    """log(1 + MIPS), MIPS = s1/s2 + s2/s1 - 2 per triangle against the template.
+
+    Zero for any similarity (rotation + uniform scale), so a sac may inflate
+    freely, while slivers and shards -- one direction stretched, the other
+    not -- are charged.  In closed form from the two metrics
+    C0 = [[p, q], [q, r]] (template) and C1 = [[a, b], [b, c]] (prediction):
+    s1^2 + s2^2 = (r a - 2 q b + p c) / det C0 and s1 s2 = A1 / A0, so
+    MIPS = (r a - 2 q b + p c) / (4 A0 A1) - 2.  log1p keeps a collapsed
+    triangle expensive without letting one triangle own the gradient.
+    """
+    face = _as_face_index(face)
+    if face is None or face.numel() == 0 or x_pred.size(0) == 0:
+        return x_pred.new_zeros(())
+    pred = x_pred.float()
+    tpl = x_template.float()
+    e1t, e2t = tpl[face[1]] - tpl[face[0]], tpl[face[2]] - tpl[face[0]]
+    e1p, e2p = pred[face[1]] - pred[face[0]], pred[face[2]] - pred[face[0]]
+    p, q, r = (e1t * e1t).sum(-1), (e1t * e2t).sum(-1), (e2t * e2t).sum(-1)
+    a, b, c = (e1p * e1p).sum(-1), (e1p * e2p).sum(-1), (e2p * e2p).sum(-1)
+    area0 = 0.5 * torch.cross(e1t, e2t, dim=-1).norm(dim=-1)
+    area1 = 0.5 * torch.cross(e1p, e2p, dim=-1).norm(dim=-1)
+    ok = area0 > 1e-10
+    a0 = area0.clamp_min(1e-10)
+    a1 = torch.maximum(area1, 1e-3 * a0)
+    mips = ((r * a - 2.0 * q * b + p * c) / (4.0 * a0 * a1) - 2.0).clamp_min(0.0)
+    per = torch.where(ok, torch.log1p(mips), torch.zeros_like(mips))
+    return _mean_over_faces(per, face, batch, num_graphs, x_pred)
+
+
 def _symmetric_eigvals_2x2(mat):
     """Eigenvalues of symmetric ``[..., 2, 2]`` without ``eigvalsh``.
 
@@ -669,7 +759,9 @@ def _symmetric_eigvals_2x2(mat):
     q = mat[..., 0, 1]
     r = mat[..., 1, 1]
     tr = p + r
-    disc = ((p - r).square() + 4.0 * q.square()).clamp_min(0.0).sqrt()
+    # The floor keeps the backward finite at a repeated root: at the
+    # identity p = r, q = 0, and sqrt(0)' = inf times a zero upstream is NaN.
+    disc = ((p - r).square() + 4.0 * q.square()).clamp_min(1e-20).sqrt()
     return torch.stack((0.5 * (tr + disc), 0.5 * (tr - disc)), dim=-1)
 
 
@@ -722,8 +814,10 @@ def triangle_stretch_loss(
     eye = torch.eye(2, device=pred.device, dtype=pred.dtype).expand(c0.size(0), 2, 2)
     a = torch.linalg.solve(c0 + eps * eye, c1 + eps * eye)
     a = 0.5 * (a + a.transpose(-1, -2))
-    ev = _symmetric_eigvals_2x2(a).clamp_min(0.0)
-    sigma = ev.sqrt().clamp(1e-3, 1e3)
+    # clamp before the sqrt, not after: a clamp downstream of sqrt(0) still
+    # back-propagates 0 * inf = NaN
+    ev = _symmetric_eigvals_2x2(a).clamp(1e-6, 1e6)
+    sigma = ev.sqrt()
     per = (sigma + sigma.reciprocal() - 2.0).mean(dim=-1)
     area = _face_areas(tpl, face)
     per = torch.where(area > 1e-12, per, torch.zeros_like(per))
@@ -840,6 +934,10 @@ def compute_losses(
     chamfer_pred_samples=None,
     chamfer_face_sample_mode=None,
     stretch_method="svd",
+    face_mid=None,
+    face_coarse=None,
+    edge_index_mid=None,
+    edge_index_coarse=None,
 ):
     """Return a dict of unweighted loss terms."""
     x_pred = x_pred.float()
@@ -966,13 +1064,23 @@ def compute_losses(
         x_pred, batch_tube, face, normal, x_tube, r_local
     )
     w_pred = pred_weights(pred_cd, batch_cd, tube=tube_cd, nrm=nrm_cd, rloc=rloc_cd)
+    w_vert = None
+    if face is not None and pred_cd is not x_pred:
+        w_vert = pred_weights(x_pred, batch_tube, tube=x_tube, nrm=normal, rloc=r_local) * vertex_areas(
+            x_pred, face
+        )
     loss_recon = _weighted_chamfer(
-        pred_cd, batch_cd, true_pts, true_batch, w_pred, w_true, num_graphs, n_true=n_true
+        pred_cd, batch_cd, true_pts, true_batch, w_pred, w_true, num_graphs, n_true=n_true,
+        pred_v=x_pred if w_vert is not None else None, pred_v_batch=batch_tube, w_v=w_vert,
     )
+    # Mid and coarse Chamfer run on the vertices, so weight each by its area:
+    # the sac is 3-5x denser than the parent on every level now.
     if x_pred_mid is not None and batch_mid is not None:
         w_mid = pred_weights(
             x_pred_mid, batch_mid, tube=pos_mid, nrm=normal_mid, rloc=r_local_mid
         )
+        if face_mid is not None:
+            w_mid = w_mid * vertex_areas(x_pred_mid, face_mid)
         loss_recon = loss_recon + lambda_cd_mid * _weighted_chamfer(
             x_pred_mid, batch_mid, true_pts, true_batch, w_mid, w_true, num_graphs, n_true=n_true
         )
@@ -980,6 +1088,8 @@ def compute_losses(
         w_c = pred_weights(
             x_pred_coarse, batch_coarse, tube=pos_coarse, nrm=normal_coarse, rloc=r_local_coarse
         )
+        if face_coarse is not None:
+            w_c = w_c * vertex_areas(x_pred_coarse, face_coarse)
         loss_recon = loss_recon + lambda_cd_coarse * _weighted_chamfer(
             x_pred_coarse, batch_coarse, true_pts, true_batch, w_c, w_true, num_graphs, n_true=n_true
         )
@@ -1027,12 +1137,32 @@ def compute_losses(
                 ambiguous=r_star_ambiguous,
             )
             lap_w = _cross_tract_smooth(lap_w, src_l, dst_l, tract_id)
-    loss_lap = _uniform_laplacian_smoothing(x_pred, face, batch_tube, num_graphs, edge_weight=lap_w)
+    # Laplacian of the displacement, not of the positions: the positional
+    # Laplacian is non-zero on the template itself (curvature, and on a
+    # variable-density mesh the neighbour centroid is off the vertex), so it
+    # fought the identity and shrank the sac.  The delta-Laplacian is zero
+    # for any smooth deformation of the template (Pixel2Mesh, Wang et al. 2018).
+    loss_lap = _uniform_laplacian_smoothing(delta_x, face, batch_tube, num_graphs, edge_weight=lap_w)
     loss_norm = _mesh_normal_consistency(x_pred, face, batch_tube, num_graphs)
-    loss_fold = fold_penalty(x_pred, x_template, face, batch=batch_tube, num_graphs=num_graphs)
+    loss_fold = dihedral_fold_penalty(x_pred, face, batch=batch_tube, num_graphs=num_graphs)
+    loss_conf = conformal_distortion_loss(x_pred, x_template, face, batch=batch_tube, num_graphs=num_graphs)
+    loss_fold_tpl = fold_penalty(x_pred, x_template, face, batch=batch_tube, num_graphs=num_graphs)
     loss_stretch = triangle_stretch_loss(
         x_pred, x_template, face, batch=batch_tube, num_graphs=num_graphs, method=stretch_method
     )
+    # Same regularisers on mid and coarse: they carry most of the deformation
+    # now, and nothing finer can repair a crumpled coarse level.
+    for xp, pos_l, face_l, b_l in (
+        (x_pred_mid, pos_mid, face_mid, batch_mid),
+        (x_pred_coarse, pos_coarse, face_coarse, batch_coarse),
+    ):
+        f_l = _as_face_index(face_l)
+        if xp is None or pos_l is None or f_l is None or b_l is None:
+            continue
+        pos_l = pos_l.float()
+        loss_lap = loss_lap + _uniform_laplacian_smoothing(xp - pos_l, f_l, b_l, num_graphs)
+        loss_fold = loss_fold + dihedral_fold_penalty(xp, f_l, batch=b_l, num_graphs=num_graphs)
+        loss_conf = loss_conf + conformal_distortion_loss(xp, pos_l, f_l, batch=b_l, num_graphs=num_graphs)
 
     loss_rad = x_pred.new_zeros(())
     if r_star is not None and normal is not None:
@@ -1059,5 +1189,7 @@ def compute_losses(
         "norm": loss_norm,
         "rad": loss_rad,
         "fold": loss_fold,
+        "conf": loss_conf,
+        "fold_tpl": loss_fold_tpl,
         "stretch": loss_stretch,
     }

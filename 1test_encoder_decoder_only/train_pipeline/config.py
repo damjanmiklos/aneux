@@ -59,7 +59,8 @@ N_TRUE = 16384
 N_TRUE_FAR_FRAC = 0.25
 FAR_CL_MARGIN_MM = 1.0
 # Cache contents change with this bump: full GT, latent_valid, r*, 2 mm tokens.
-CACHE_VERSION = 10
+# 11: mid/coarse by sizing-field collapse + barycentric prolongation tables.
+CACHE_VERSION = 11
 
 # (n_length, n_radial) per hierarchy level
 LEVEL_COARSE = (40, 6)
@@ -67,13 +68,16 @@ LEVEL_MID = (250, 12)
 LEVEL_FINE = (1000, 64)
 HIERARCHY_LEVELS = (LEVEL_COARSE, LEVEL_MID, LEVEL_FINE)
 
-# Template hierarchy is built at cache time by decimating template_mesh.
-# No coarse_remeshed folder: mid/coarse are derived from the same template.
-TEMPLATE_MID_KEEP = 0.25
-TEMPLATE_COARSE_KEEP = 0.08
-TEMPLATE_MIN_MID = 256
-TEMPLATE_MIN_COARSE = 64
-TEMPLATE_UPSAMPLE_K = 3
+# Template hierarchy is built at cache time from template_mesh by sizing-field
+# edge collapse (coarsen.py): h_L = max(h, min(k_L h, 2 pi R_template / N_min)),
+# with h the template's TargetEdgeLength.  k keeps the sac/parent density
+# ratio (decimation erased it); N_min is the fewest vertices a thin branch or
+# a rim may keep around its circumference.  Over the 742 templates this gives
+# mid ~24 % and coarse ~10 % of the fine vertices.
+TEMPLATE_MID_K = 2.0
+TEMPLATE_COARSE_K = 3.5
+TEMPLATE_MID_N_MIN = 8
+TEMPLATE_COARSE_N_MIN = 6
 
 JUNCTION_COUPLE_RADIUS_MM = 4.0
 JUNCTION_COUPLE_K = 2
@@ -168,6 +172,18 @@ SHEAR_MAX_MM = SHEAR_MAX_BASE_MM  # fallback alias; prefer SHEAR_MAX_BASE_MM
 # Softplus margin fallback when r_local is unavailable. Prefer
 # −RADIAL_FLOOR_FRAC * r_local. Mid/fine residuals stay ≥ that floor.
 R_MARGIN_MM = TUBE_RADIUS_MM
+# Mid/fine residuals are bounded to RESIDUAL_BOUND_EDGES × the level's local
+# template edge length (tanh), so the free coarse level must carry the bulk
+# deformation and each finer level only adds detail at its own scale.  With
+# the old r_local-relative bounds (shear up to max(3 mm, 1.5 r)) the fine head
+# took the whole 8.8 mm sac inflation on p131 per vertex -- |ds| p50 4.6 mm,
+# tanh saturated, 41 % of the sac triangles flipped -- while the coarse level
+# stayed at |dx| 0.04 mm.  None restores the old heads.
+RESIDUAL_BOUND_EDGES = 2.0
+# Rim vertices keep their template position along the ostium-plane normal
+# (the displacement is projected, not the position): a template rim that sits
+# 0.7 mm off its fitted plane (p131) was snapped onto it even at identity.
+RIM_PROJECT_DISPLACEMENT = True
 
 # --- Optimisation ---
 LEARNING_RATE = 2e-4
@@ -218,6 +234,13 @@ LAMBDA_DISP = 0.15
 LAMBDA_LAP = 0.05
 LAMBDA_NORM = 0.02
 LAMBDA_RAD = 1.0
+# Mesh-quality terms on every level (losses.py): a hinge on adjacent faces
+# folded past 90 degrees, and log(1 + MIPS) conformal distortion against the
+# template, which lets a sac inflate isotropically but charges slivers.  The
+# failed run computed a template-relative fold and an SVD stretch but gave
+# both zero weight, so nothing in the objective saw a flipped triangle.
+LAMBDA_FOLD = 1.0
+LAMBDA_CONF = 0.05
 LAMBDA_CD_MID = 0.5
 LAMBDA_CD_COARSE = 0.05
 LAMBDA_RAD_MID = 0.5
@@ -251,6 +274,8 @@ DEFAULT_LOSS_WEIGHTS = {
     "lap": LAMBDA_LAP,
     "norm": LAMBDA_NORM,
     "rad": LAMBDA_RAD,
+    "fold": LAMBDA_FOLD,
+    "conf": LAMBDA_CONF,
 }
 
 # DataLoader node sets that do not match the fine-graph node count.

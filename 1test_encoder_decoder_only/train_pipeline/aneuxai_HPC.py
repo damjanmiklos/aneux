@@ -61,10 +61,15 @@ from hpc_runtime import (
 )
 from run_report import make_run_dir
 
-# Per-GPU batch 20. Global batch = 20 × n_gpu (80 on a full node). LR stays 2e-4.
+# Per-GPU batch 4. Global batch = 4 × n_gpu (16 on a full node). LR stays 2e-4.
+# The split has 493 training cases, so 25/GPU gave 5 optimiser steps an
+# epoch and ~2.5k steps in total, far too few for the decoder to converge;
+# 4/GPU gives ~31 steps an epoch (~15k over 500 epochs) at about the same
+# wall time: ~94% of a step is SplineConv, whose cost is per sample, so an
+# epoch costs the same whatever the batch (the old run: ~195 s an epoch).
 # DataLoader / cache workers follow SLURM_CPUS_PER_TASK (2× oversubscribe on
 # 16 cores/GPU). Override with ANEUX_NUM_WORKERS / ANEUX_CACHE_WORKERS.
-BATCH_SIZE = int(os.environ.get("ANEUX_BATCH_SIZE", "25"))
+BATCH_SIZE = int(os.environ.get("ANEUX_BATCH_SIZE", "4"))
 ACCUM_STEPS = int(os.environ.get("ANEUX_ACCUM_STEPS", "1"))
 EPOCHS = int(os.environ.get("ANEUX_EPOCHS", "500"))
 VAL_EVERY = int(os.environ.get("ANEUX_VAL_EVERY", "1"))
