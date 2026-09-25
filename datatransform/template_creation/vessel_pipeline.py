@@ -6617,8 +6617,11 @@ def clip_centerline_at_profiles(centerline, profiles, extension_length=DEFAULT_E
     heads = np.array([c[0] for c in cells if len(c)], dtype=np.float64).reshape(-1, 3)
     tails = np.array([c[-1] for c in cells if len(c)], dtype=np.float64).reshape(-1, 3)
 
+    # The two sides of a junction agree only to float32 noise (2.3e-4 mm on
+    # ANSYS_UNIGE_17_10, where an exact test called both free and emptied the
+    # 2.6 mm between them); samples are 0.1 mm apart, so 0.01 mm is still a join.
     def _meets(point, others):
-        return len(others) > 0 and float(np.min(np.linalg.norm(others - point, axis=1))) <= 1e-6
+        return len(others) > 0 and float(np.min(np.linalg.norm(others - point, axis=1))) <= 1e-2
 
     kept = []
     kept_cell_ids = []

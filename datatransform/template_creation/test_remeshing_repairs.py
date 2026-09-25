@@ -1229,3 +1229,25 @@ def test_a_branch_junction_is_never_trimmed_as_an_opening():
     # to within two points of its tail.
     assert on_b[:, 1].min() == pytest.approx(0.0, abs=1e-9)
     assert on_b[:, 1].max() == pytest.approx(8.0, abs=0.11)
+
+
+def test_a_junction_joined_only_to_float_noise_is_still_a_junction():
+    """ANSYS_UNIGE_17_10: the sides of a junction differed by 2.3e-4 mm."""
+    from vessel_pipeline import clip_centerline_at_profiles
+
+    def seg(p, q, n):
+        t = np.linspace(0.0, 1.0, n)[:, None]
+        pts = (1.0 - t) * np.asarray(p, float) + t * np.asarray(q, float)
+        return pts, np.full(n, 0.5)
+
+    trunk = seg((0, 0, 0), (5, 0, 0), 51)
+    to_b = seg((5, 2.3e-4, 0), (5, 13, 0), 131)
+    profiles = [
+        {"barycenter": np.array([5.0, 8.0, 0.0]), "normal": np.array([0.0, 1.0, 0.0]), "radius": 0.5},
+        {"barycenter": np.array([6.0, -1.0, 0.0]), "normal": np.array([0.0, 1.0, 0.0]), "radius": 0.5},
+    ]
+    out = clip_centerline_at_profiles(_centerline([trunk, to_b]), profiles, extension_length=5.0)
+    pts = np.array([out.GetPoint(i) for i in range(out.GetNumberOfPoints())])
+    on_b = pts[np.abs(pts[:, 0] - 5.0) < 1e-9]
+    assert on_b[:, 1].min() == pytest.approx(0.0, abs=1e-3)
+    assert on_b[:, 1].max() == pytest.approx(8.0, abs=0.11)
