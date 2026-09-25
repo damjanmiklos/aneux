@@ -6737,6 +6737,64 @@ RIM_OFF_PLANE_MIN_MM = 0.25
 WIDE_CUT_MARGIN = 1.15
 
 
+class _GtRims:
+    """How far a cut's rim lies from the GT's own rim at the same ostium.
+
+    The frame's cut, a wider one and the plane clip each leave a different rim;
+    the GT's rim is the one they all stand for. Its boundary is read on first
+    use, so an uncap whose cuts all stay in their planes pays nothing for it.
+    """
+
+    def __init__(self, reference_surface):
+        self._reference = reference_surface
+        self._rims = None
+
+    @staticmethod
+    def _nearest(rims, origin, reach_mm):
+        best = None
+        for rim in rims:
+            d = float(np.min(np.linalg.norm(rim - origin, axis=1)))
+            if d <= reach_mm and (best is None or d < best[0]):
+                best = (d, rim)
+        return None if best is None else best[1]
+
+    @staticmethod
+    def _rims_of(surface):
+        _poly, pts, faces = _triangle_points_faces(surface, clean=False)
+        return [pts[np.asarray(list(ids))] for ids in _free_edge_components(pts, faces)]
+
+    def mismatch(self, surface, origin, reach_mm):
+        """Mean distance, taken both ways, between the two rims nearest ``origin``.
+
+        ``inf`` when the cut left no rim there; None when the GT has none.
+        """
+        origin = np.asarray(origin, dtype=np.float64)
+        if self._rims is None:
+            self._rims = self._rims_of(self._reference)
+        gt = self._nearest(self._rims, origin, reach_mm)
+        if gt is None:
+            return None
+        from scipy.spatial import cKDTree
+
+        rim = self._nearest(self._rims_of(surface), origin, reach_mm)
+        if rim is None:
+            return float("inf")
+        there = cKDTree(gt).query(rim)[0]
+        back = cKDTree(rim).query(gt)[0]
+        return 0.5 * (float(there.mean()) + float(back.mean()))
+
+
+def _rim_reach(radius):
+    return max(3.0 * float(radius), 2.0)
+
+
+def _rim_left_its_plane(candidate, origin, outward, radius):
+    """How far the cut's rim strays from its plane, or None when it stays in it."""
+    tol = max(RIM_OFF_PLANE_MAX_R * float(radius), RIM_OFF_PLANE_MIN_MM)
+    off = _rim_off_plane_near(candidate, origin, outward, _rim_reach(radius))
+    return off if off > tol else None
+
+
 def _rim_off_plane_near(surface, origin, normal, reach_mm):
     """Largest distance from the plane of the boundary that comes nearest ``origin``."""
     _poly, pts, faces = _triangle_points_faces(surface, clean=False)
@@ -6786,9 +6844,9 @@ def _plane_section_extent(surface, origin, normal, reach_mm):
     return float(d.max())
 
 
-def _widen_a_slicing_cut(surface, candidate, origin, outward, radius, body_pt, ostia, i,
+def _widen_a_slicing_cut(surface, origin, outward, radius, body_pt, ostia, i, off,
                          extension_length=None, trimmed=False, fast=True, label=None):
-    """Cut again, wider, where the frame's cutter sliced the stub instead of taking it off.
+    """The cut again, wide enough to clear the stub the frame's cutter sliced.
 
     A GT frame carries the inscribed radius, and an oblique ostium is far wider
     than that: UPF_P0176's frame 1 is r=0.865 mm on a rim reaching 0.73-3.09 mm
@@ -6796,21 +6854,22 @@ def _widen_a_slicing_cut(surface, candidate, origin, outward, radius, body_pt, o
     cutter is then narrower than the stub it is meant to remove, runs along its
     wall 4.5 mm out, and leaves the rest standing 5 mm outside the GT. The
     stub's own cross-section in the cut plane is what the cutter has to clear.
-    A rescue: only a cut whose rim left its plane is tried again, the wider cut
-    answers to the same neighbour guard, and it is kept only if its rim is
-    flatter.
+
+    Returns None unless the wider cut's rim lies in the plane. A rim merely
+    less far off is not a cut stub but some other trouble -- on p402 a second
+    ostium 1.5 mm away, where a 1.27 -> 1.18 mm "improvement" left the tube
+    genus 2. A flat rim is still only a contestant: at a side branch the plane
+    section takes in the fat junction tube, and on UPF_P0277 the cut clearing
+    it opened a rim reaching 1.40 mm from a 0.70 mm GT rim, where the plane
+    clip lands on the GT's. The caller lets the GT's rim choose.
     """
-    tol = max(RIM_OFF_PLANE_MAX_R * float(radius), RIM_OFF_PLANE_MIN_MM)
-    reach = max(3.0 * float(radius), 2.0)
-    off = _rim_off_plane_near(candidate, origin, outward, reach)
-    if off <= tol:
-        return candidate
+    reach = _rim_reach(radius)
     extent = _plane_section_extent(surface, origin, outward, reach)
     if extent is None:
-        return candidate
+        return None
     wide_r = WIDE_CUT_MARGIN * extent / OPENING_CLIP_RADIUS_FACTOR
     if wide_r <= float(radius):
-        return candidate
+        return None
     limit = clip_radius_limit_for(
         origin, outward, wide_r, ostia, i,
         extension_length=extension_length, trimmed=trimmed,
@@ -6821,16 +6880,13 @@ def _widen_a_slicing_cut(surface, candidate, origin, outward, radius, body_pt, o
         clip_radius_limit=limit,
     )
     if not wide_ok:
-        return candidate
+        return None
     wide_off = _rim_off_plane_near(wide, origin, outward, reach)
-    if wide_off >= off:
+    if wide_off > max(RIM_OFF_PLANE_MAX_R * float(radius), RIM_OFF_PLANE_MIN_MM):
         print(f"  [Uncap] Profile {label} cut left its rim {off:.2f} mm off the "
-              f"plane; a cutter clearing the {extent:.2f} mm section is no "
-              f"flatter ({wide_off:.2f} mm)")
-        return candidate
-    print(f"  [Uncap] Profile {label} cut left its rim {off:.2f} mm off the plane "
-          f"(stub wider than the r={radius:.3f} mm frame); cut again clearing its "
-          f"{extent:.2f} mm section: {wide_off:.2f} mm")
+              f"plane; a cutter clearing the {extent:.2f} mm section does not "
+              f"bring it in ({wide_off:.2f} mm)")
+        return None
     return wide
 
 
@@ -6842,6 +6898,7 @@ def clip_flow_extensions_and_uncap(
     unextended_surface=None,
     fast_uncap=True,
     cut_frames=None,
+    reference_surface=None,
 ):
     """Pipe-section uncap at each ostium.
 
@@ -6849,8 +6906,17 @@ def clip_flow_extensions_and_uncap(
     (``origin``, unit ``normal``, ``radius``). When given, those planes are
     used instead of ``opening_clip_frames(centerline, profiles)``. Empty or
     ``None`` keeps the previous profile/centerline behaviour.
+
+    ``reference_surface``: the open GT the tube stands for. With frames, its
+    rims choose between the cuts tried where a frame's cut sliced its stub
+    (``_widen_a_slicing_cut``).
     """
     current = to_vtk_poly(base_surface)
+    gt_rims = (
+        _GtRims(reference_surface)
+        if cut_frames and reference_surface is not None
+        else None
+    )
     if cut_frames:
         work_profiles = _profiles_from_ostium_frames(cut_frames)
         frames = [
@@ -6919,21 +6985,55 @@ def clip_flow_extensions_and_uncap(
                 fast=fast_uncap,
                 clip_radius_limit=limit,
             )
-            if ok and cut_frames:
-                candidate = _widen_a_slicing_cut(
-                    current, candidate, origin, outward, radius, body_pt, ostia, i,
+            off = _rim_left_its_plane(candidate, origin, outward, radius) if ok and cut_frames else None
+            what = "pipe-section cut"
+            settled = off is not None
+            if settled:
+                # The cutter sliced the stub rather than taking it off. Try the
+                # cut wide enough to clear it and the plane clip beside it, and
+                # take whichever rim lies nearest the GT's.
+                options = [(what, candidate)]
+                wide = _widen_a_slicing_cut(
+                    current, origin, outward, radius, body_pt, ostia, i, off,
                     extension_length=extension_length, trimmed=trimmed,
                     fast=fast_uncap, label=profile["index"],
                 )
-            if ok:
-                ok = _accept(candidate, i, "pipe-section cut")
+                if wide is not None:
+                    options.append(("widened pipe-section cut", wide))
+                alternative, alt_ok = clip_one_profile(current, profile, body_pt, search_mm)
+                if alt_ok:
+                    options.append(("anatomical plane clip", alternative))
+                scores = ([gt_rims.mismatch(c, origin, _rim_reach(radius)) for _w, c in options]
+                          if gt_rims is not None else [None])
+                if None in scores:
+                    # No GT rim to ask: the flat rims first, the sliced one last.
+                    order = list(range(1, len(options))) + [0]
+                    scores = [float("nan")] * len(options)
+                else:
+                    order = [int(k) for k in np.argsort(scores, kind="stable")]
+                print(
+                    f"  [Uncap] Profile {profile['index']} cut left its rim {off:.2f} mm "
+                    f"off the plane of the r={radius:.3f} mm frame, so the stub was sliced; rim "
+                    "to GT rim: " + ", ".join(
+                        f"{w} {sc:.2f} mm" for (w, _c), sc in zip(options, scores))
+                )
+                ok = False
+                for k in order:
+                    if _accept(options[k][1], i, options[k][0]):
+                        what, candidate = options[k]
+                        ok = True
+                        break
+            elif ok:
+                ok = _accept(candidate, i, what)
             if ok:
                 current = candidate
                 print(
-                    f"  [Uncap] Profile {profile['index']} pipe-section cut "
+                    f"  [Uncap] Profile {profile['index']} {what} "
                     f"r={radius:.3f} mm at {np.round(origin, 2)}"
                 )
-        ragged = rim_circularity_at(current, where) if ok else 1.0
+        else:
+            settled = False
+        ragged = rim_circularity_at(current, where) if ok and not settled else 1.0
         if ragged < OSTIUM_ROUND_ENOUGH:
             # The cut was taken, but the hole it made is not an opening shape.
             # Try the plane clip from the surface as it stood and keep whichever
@@ -8950,6 +9050,7 @@ def _parent_tube_attempt(
             centerline=branched_centerline,
             fast_uncap=fast_uncap,
             cut_frames=uncap_cut_frames,
+            reference_surface=vessel_mesh if uncap_cut_frames else None,
         )
         print(f"  [t] uncap {time.perf_counter() - t_un:.2f}s")
         return opened

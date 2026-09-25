@@ -205,15 +205,21 @@ def resolve_log_dir(args, log_folder_name, default_output_dir=None):
     return os.path.join(output_dir, log_folder_name, f"run_{stamp}")
 
 
-def configure_batch_logging(args, log_folder_name, default_output_dir=None):
-    """Set ``args.log_dir`` and return (extra_cli_flags, on_worker_result)."""
+def configure_batch_logging(args, log_folder_name, default_output_dir=None,
+                            keep_all_transcripts=False):
+    """Set ``args.log_dir`` and return (extra_cli_flags, on_worker_result).
+
+    A worker's stdout is kept only when it fails, unless ``keep_all_transcripts``
+    asks for every case's -- which is the only record of the per-case
+    diagnostics a passing case prints.
+    """
     args.log_dir = resolve_log_dir(args, log_folder_name, default_output_dir)
     os.makedirs(args.log_dir, exist_ok=True)
     print(f"Run log directory: {args.log_dir}")
     extra = ["--log-dir", str(args.log_dir), "--skip-log-merge"]
 
     def on_worker_result(dataset_id, returncode, output):
-        if returncode != 0:
+        if returncode != 0 or keep_all_transcripts:
             write_worker_transcript(args.log_dir, dataset_id, returncode, output)
 
     return extra, on_worker_result

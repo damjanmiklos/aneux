@@ -14,9 +14,12 @@ import vtk
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from vessel_pipeline import (
+    _GtRims,
     _plane_section_extent,
+    _rim_left_its_plane,
     _rim_off_plane_near,
     _widen_a_slicing_cut,
+    clip_flow_extensions_and_uncap,
     clip_one_opening_pipe_section,
     count_boundary_regions,
     sanitize_vessel_for_vmtk,
@@ -1527,9 +1530,10 @@ def test_a_frame_cutter_narrower_than_its_stub_slices_it_and_the_wide_cut_does_n
     assert _plane_section_extent(tube, origin, outward, 2.0) == pytest.approx(1.3, abs=0.02)
     cut, ok = clip_one_opening_pipe_section(tube, origin, outward, r, body, extension_length=5.0)
     assert ok
-    assert _rim_off_plane_near(cut, origin, outward, 2.0) > 2.0
+    off = _rim_left_its_plane(cut, origin, outward, r)
+    assert off is not None and off > 2.0
     ostia = [(origin, max(1.0, 2.0 * r))]
-    wide = _widen_a_slicing_cut(tube, cut, origin, outward, r, body, ostia, 0, extension_length=5.0)
+    wide = _widen_a_slicing_cut(tube, origin, outward, r, body, ostia, 0, off, extension_length=5.0)
     assert _rim_off_plane_near(wide, origin, outward, 2.0) < 0.1
 
 
@@ -1539,5 +1543,41 @@ def test_a_clean_frame_cut_is_left_alone():
     body = np.array([0.0, 0.0, -4.0])
     cut, ok = clip_one_opening_pipe_section(tube, origin, outward, r, body, extension_length=5.0)
     assert ok and _rim_off_plane_near(cut, origin, outward, 3.0) < 0.1
-    ostia = [(origin, 2.0)]
-    assert _widen_a_slicing_cut(tube, cut, origin, outward, r, body, ostia, 0, extension_length=5.0) is cut
+    assert _rim_left_its_plane(cut, origin, outward, r) is None
+
+
+def _open_gt_tube_z(z1, radius=1.0, z0=-5.0):
+    """The GT the closed test tube stands for: the same tube, open at z0 and z1."""
+    import pyvista as pv
+
+    tube = pv.Cylinder(center=(0.0, 0.0, 0.5 * (z0 + z1)), direction=(0.0, 0.0, 1.0),
+                       radius=radius, height=z1 - z0, resolution=64, capping=False)
+    return tube.triangulate().subdivide_adaptive(max_edge_len=0.2).clean()
+
+
+def test_the_gt_rim_scores_the_cut_that_lands_on_it_best():
+    tube = _closed_tube_z()
+    origin, outward, r = np.array([0.3, 0.0, 2.0]), np.array([0.0, 0.0, 1.0]), 0.6
+    body = np.array([0.0, 0.0, -4.0])
+    sliced, _ok = clip_one_opening_pipe_section(tube, origin, outward, r, body, extension_length=5.0)
+    ostia = [(origin, max(1.0, 2.0 * r))]
+    wide = _widen_a_slicing_cut(tube, origin, outward, r, body, ostia, 0,
+                                _rim_left_its_plane(sliced, origin, outward, r), extension_length=5.0)
+    # The GT ends at the ostium plane: the wide cut lands on its rim.
+    at_plane = _GtRims(_open_gt_tube_z(2.0))
+    assert at_plane.mismatch(wide, origin, 2.0) < 0.1
+    assert at_plane.mismatch(sliced, origin, 2.0) > 0.5
+    # No cut rim near the ostium is worse than any; no GT rim there is no verdict.
+    assert at_plane.mismatch(tube, origin, 2.0) == float("inf")
+    assert _GtRims(_open_gt_tube_z(5.0)).mismatch(wide, np.array([0.0, 0.0, -20.0]), 2.0) is None
+
+
+def test_the_uncap_takes_the_cut_whose_rim_lies_on_the_gts(capsys):
+    tube = _closed_tube_z()
+    frame = {"origin": np.array([0.3, 0.0, 2.0]), "normal": np.array([0.0, 0.0, 1.0]), "radius": 0.6}
+    out, n_clipped = clip_flow_extensions_and_uncap(tube, [], extension_length=5.0, cut_frames=[frame],
+                                         reference_surface=_open_gt_tube_z(2.0))
+    log = capsys.readouterr().out
+    assert n_clipped == 1 and "rim to GT rim" in log
+    assert _GtRims(_open_gt_tube_z(2.0)).mismatch(out, frame["origin"], 2.0) < 0.1
+    assert _rim_off_plane_near(out, frame["origin"], frame["normal"], 2.0) < 0.1

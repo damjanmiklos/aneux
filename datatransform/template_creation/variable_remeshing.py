@@ -996,7 +996,7 @@ def main():
     # diagnostics are printed. Without it only a failing case leaves a trace
     # and the passing 700 cannot be audited at all.
     extra_log, on_worker_result = configure_batch_logging(
-        args, LOG_FOLDER, DEFAULT_OUTPUT_DIR
+        args, LOG_FOLDER, DEFAULT_OUTPUT_DIR, keep_all_transcripts=True
     )
     extra = [
         "--target-edge-length", str(args.target_edge_length),
