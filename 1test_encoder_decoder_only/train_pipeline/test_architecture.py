@@ -1605,29 +1605,91 @@ def test_resource_monitor_snapshots_on_this_os():
         shutil.rmtree(root, ignore_errors=True)
 
 
-def test_mirror_aug_requires_scaffold():
-    """GT-only mirrors must not flip the Chamfer target out from under the tube."""
-    from train import maybe_apply_cached_mirror
+def _mirror_pair_batch():
+    import copy
+    from torch_geometric.loader import DataLoader
+    from config import FOLLOW_BATCH
 
-    class Batch:
-        pass
+    d = make_synthetic_data()
+    d.theta = torch.remainder(d.theta + 1.3 + math.pi, 2 * math.pi) - math.pi  # no symmetric theta origin
+    b = next(iter(DataLoader([d, copy.deepcopy(d)], batch_size=2, follow_batch=FOLLOW_BATCH)))
+    return b
 
-    gt_only = Batch()
-    gt_only.x = torch.tensor([[1.0, 0.0, 0.0]])
-    gt_only.gt_points = torch.tensor([[1.0, 2.0, 3.0]])
-    gt_only.gt_points_mirror = torch.tensor([[-1.0, 2.0, 3.0]])
-    kept = maybe_apply_cached_mirror(gt_only, p=1.0)
-    _assert(torch.equal(kept.x, torch.tensor([[1.0, 0.0, 0.0]])), kept.x)
-    _assert(torch.equal(kept.gt_points, torch.tensor([[1.0, 2.0, 3.0]])), kept.gt_points)
 
-    full = Batch()
-    full.x = torch.tensor([[1.0, 0.0, 0.0]])
-    full.x_mirror = torch.tensor([[-1.0, 0.0, 0.0]])
-    full.gt_points = torch.tensor([[1.0, 2.0, 3.0]])
-    full.gt_points_mirror = torch.tensor([[-1.0, 2.0, 3.0]])
-    swapped = maybe_apply_cached_mirror(full, p=1.0)
-    _assert(torch.equal(swapped.x, torch.tensor([[-1.0, 0.0, 0.0]])), swapped.x)
-    _assert(torch.equal(swapped.gt_points, torch.tensor([[-1.0, 2.0, 3.0]])), swapped.gt_points)
+def _mirror_invariants(bt, g):
+    """Handedness-free facts of graph g: all must survive a reflection unchanged."""
+    from train import _wrap_pi
+
+    mv = bt.batch == g
+    x, n, t, bn, th = bt.x, bt.normal, bt.tangent, bt.binormal, bt.theta
+    f = bt.face[:, mv[bt.face[0]]]
+    fn = torch.cross(x[f[1]] - x[f[0]], x[f[2]] - x[f[0]], dim=-1)
+    outward = ((fn * (n[f[0]] + n[f[1]] + n[f[2]])).sum(-1) > 0).float().mean()
+    # +1 / -1: b = n x t (template path) or t x n (generated tubes); a mirror must keep it
+    hand = (torch.cross(n[mv], t[mv], dim=-1) * bn[mv]).sum(-1).sign().mean()
+    e = bt.edge_index[:, mv[bt.edge_index[0]]]
+    dth = _wrap_pi(th[e[1]] - th[e[0]])
+    ring = (dth.abs() > 1e-4) & (dth.abs() < 1.0) & ((bt.u[e[1]] - bt.u[e[0]]).abs() < 1e-5)
+    dp = x[e[1]] - x[e[0]]
+    # theta grows along t x n in either binormal convention
+    t_x_n = torch.cross(t[e[0][ring]], n[e[0][ring]], dim=-1)
+    theta_dir = (torch.sign(dth[ring]) == torch.sign((dp[ring] * t_x_n).sum(-1))).float().mean()
+    gm = bt.gt_points_batch == g
+    tpl2gt = torch.cdist(x[mv], bt.gt_points[gm]).min(dim=1).values.mean()
+    return dict(outward=float(outward), hand=float(hand), theta_dir=float(theta_dir),
+                n_ring=int(ring.sum()), tpl2gt=float(tpl2gt))
+
+
+def test_mirror_reflects_one_graph_consistently():
+    """A mirrored graph keeps outward winding, right-handed frames, theta direction and its GT fit."""
+    import copy
+    from train import apply_mirror
+
+    b0 = _mirror_pair_batch()
+    b = copy.deepcopy(b0)
+    _, flip = apply_mirror(b, flip=[True, False])
+    _assert(flip.tolist() == [True, False], flip)
+    before, after = _mirror_invariants(b0, 0), _mirror_invariants(b, 0)
+    _assert(before["n_ring"] > 100 and before["outward"] > 0.95 and abs(before["hand"]) == 1.0
+            and before["theta_dir"] > 0.95, before)
+    for k in ("outward", "hand", "theta_dir", "n_ring"):
+        _assert(before[k] == after[k], (k, before, after))
+    _assert(abs(before["tpl2gt"] - after["tpl2gt"]) < 1e-5, (before, after))
+
+    m0 = b0.batch == 0
+    _assert(torch.equal(b.x[m0], b0.x[m0] * torch.tensor([-1.0, 1.0, 1.0])), "x not reflected")
+    _assert(torch.equal(b.binormal[m0], b0.binormal[m0] * torch.tensor([1.0, -1.0, -1.0])), "binormal")
+    _assert(torch.equal(b.theta[m0], -b0.theta[m0]), "theta not negated")
+    lp = b0.latent_pos_batch == 0
+    _assert(torch.equal(b.latent_pos[lp, 0], -b0.latent_pos[lp, 0]), "latent_pos not reflected")
+    _assert(torch.equal(b.cl_dense[b0.cl_dense_batch == 0, 3], b0.cl_dense[b0.cl_dense_batch == 0, 3]),
+            "centerline radius must not change")
+    _assert(abs(float(torch.linalg.det(b.pose_R.reshape(2, 3, 3)[0])) + 1.0) < 1e-5, "pose_R lost M")
+
+    m1 = b0.batch == 1
+    for key in ("x", "normal", "binormal", "theta", "tangent"):
+        _assert(torch.equal(getattr(b, key)[m1], getattr(b0, key)[m1]), f"unflipped graph changed: {key}")
+
+
+def test_mirror_twice_is_identity():
+    import copy
+    from train import apply_mirror
+
+    b0 = _mirror_pair_batch()
+    b0.theta[0] = -math.pi  # the one angle that leaves [-pi, pi) when negated
+    b = copy.deepcopy(b0)
+    apply_mirror(b, flip=[True, True])
+    _assert(bool(b.theta[0] == b0.theta[0]), float(b.theta[0]))  # -pi maps to itself
+    apply_mirror(b, flip=[True, True])
+    for key, v in b0.items():
+        if torch.is_tensor(v):
+            _assert(torch.equal(v, b[key]), f"{key} not restored")
+    raised = False
+    try:
+        apply_mirror(b, flip=[True])
+    except ValueError:
+        raised = True
+    _assert(raised, "a flip mask of the wrong length must raise")
 
 
 def test_add_meter_accepts_fold_and_stretch():
@@ -2404,7 +2466,8 @@ def main():
         test_geco_beta_not_clipped_to_zero_at_epoch_one,
         test_scale_hpc_workers_follows_gpus,
         test_resource_monitor_snapshots_on_this_os,
-        test_mirror_aug_requires_scaffold,
+        test_mirror_reflects_one_graph_consistently,
+        test_mirror_twice_is_identity,
         test_add_meter_accepts_fold_and_stretch,
         test_chamfer_weight_cap,
         test_huber_and_radial_loss,

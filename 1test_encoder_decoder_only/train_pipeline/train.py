@@ -903,57 +903,119 @@ def resample_x_true(batch, n_true=None, generator=None):
     return _local_sample_x_true(batch, n_true=n_true, generator=generator)
 
 
-_MIRROR_PAIRS = (
-    ("gt_points", "gt_points_mirror"),
-    ("gt_normals", "gt_normals_mirror"),
-    ("gt_points_normal", "gt_points_normal_mirror"),
-    ("gt_cl_dist", "gt_cl_dist_mirror"),
-    ("x_true", "x_true_mirror"),
-    ("x_true_normal", "x_true_normal_mirror"),
-    ("x_true_cl_dist", "x_true_cl_dist_mirror"),
-    ("x", "x_mirror"),
-    ("pos_mid", "pos_mid_mirror"),
-    ("pos_coarse", "pos_coarse_mirror"),
-    ("normal", "normal_mirror"),
-    ("normal_mid", "normal_mid_mirror"),
-    ("normal_coarse", "normal_coarse_mirror"),
-    ("tangent", "tangent_mirror"),
-    ("binormal", "binormal_mirror"),
-    ("latent_pos", "latent_pos_mirror"),
-    ("cl_dense", "cl_dense_mirror"),
-    ("theta", "theta_mirror"),
-    ("theta_mid", "theta_mid_mirror"),
-    ("theta_coarse", "theta_coarse_mirror"),
+# L/R mirror, x -> -x in the posed frame (the plane the cached gt_*_mirror
+# used).  Reflected on the fly, per graph, so the scaffold, the frames and
+# the GT turn together; the cached gt_*_mirror fields are not read.
+#   positions and polar vectors (normals, tangents)  ->  M v
+#   binormals (b = ±n x t, an axial vector)           -> -M b, frame handedness kept
+#   theta, torsion (handedness-dependent scalars)     ->  negated
+#   triangles                                         ->  winding flipped, normals stay outward
+# Radii, distances, u, |dr/dtheta| and the upsample tables are unchanged;
+# pose_R (bookkeeping only) takes M on its rows.
+_MIRROR_POS_KEYS = (
+    "x", "pos_mid", "pos_coarse", "x_true", "gt_points", "latent_pos", "token_pos",
+    "boundary_plane_origin", "boundary_plane_origin_mid", "boundary_plane_origin_coarse",
 )
+_MIRROR_VEC_KEYS = (
+    "normal", "normal_mid", "normal_coarse",
+    "tangent", "tangent_mid", "tangent_coarse",
+    "x_true_normal", "gt_normals", "gt_points_normal",
+    "boundary_plane_normal", "boundary_plane_normal_mid", "boundary_plane_normal_coarse",
+)
+_MIRROR_AXIAL_KEYS = ("binormal", "binormal_mid", "binormal_coarse")
+_MIRROR_ODD_SCALARS = ("theta", "theta_mid", "theta_coarse", "torsion", "torsion_mid", "torsion_coarse")
+# face tensor -> the point set its indices address
+_MIRROR_FACES = (("face", "x"), ("face_mid", "pos_mid"), ("face_coarse", "pos_coarse"), ("gt_faces", "gt_points"))
 
 
-def maybe_apply_cached_mirror(batch, p=0.5, generator=None):
-    """Swap in a cached L/R mirror. No-op unless the tube scaffold is mirrored too.
+def _mirror_rows_graph(batch, key, n, n_graphs):
+    """Graph index of each row of ``batch.<key>``, or None if it cannot be told."""
+    if n_graphs == 1:
+        return torch.zeros(n, dtype=torch.long)
+    own = getattr(batch, f"{key}_batch", None)
+    if torch.is_tensor(own) and own.numel() == n:
+        return own
+    for suffix, ref in (("_mid", "pos_mid_batch"), ("_coarse", "pos_coarse_batch")):
+        if key.endswith(suffix):
+            b = getattr(batch, ref, None)
+            return b if torch.is_tensor(b) and b.numel() == n else None
+    for ref in ("batch", "x_true_batch", "gt_points_batch"):
+        b = getattr(batch, ref, None)
+        if torch.is_tensor(b) and b.numel() == n:
+            return b
+    if key == "token_pos" and n % n_graphs == 0:
+        return torch.arange(n) // (n // n_graphs)
+    return None
 
-    Current caches store ``gt_*_mirror`` only. ``resample_x_true`` then draws
-    the Chamfer target from that flipped cloud while ``x`` / ``theta`` stay in
-    the original frame, so train recon is computed against the reflected
-    aneurysm. Require ``x_mirror``, or a packed mirror that includes ``x``.
+
+def apply_mirror(batch, p=0.5, generator=None, flip=None):
+    """Reflect each graph of the batch with probability ``p`` (see the table above).
+
+    ``flip`` ([n_graphs] bool) overrides the draw.  Returns (batch, flip).
     """
-    packed = getattr(batch, "mirrored_sample", None)
-    packed_x = packed.get("x") if isinstance(packed, dict) else None
-    has_scaffold = _batch_tensor(batch, "x_mirror") is not None or (
-        torch.is_tensor(packed_x) and packed_x.numel() > 0
-    )
-    if not has_scaffold:
-        return batch
-    draw = torch.rand((), generator=generator)
-    if float(draw.item()) >= float(p):
-        return batch
-    if isinstance(packed, dict):
-        for key, value in packed.items():
-            setattr(batch, key, value)
-        return batch
-    for src, mirrored in _MIRROR_PAIRS:
-        mv = _batch_tensor(batch, mirrored)
-        if mv is not None:
-            setattr(batch, src, mv)
-    return batch
+    n_graphs = _num_graphs(batch)
+    if flip is None:
+        flip = torch.rand(n_graphs, generator=_cpu_generator(generator)) < float(p)
+    flip = torch.as_tensor(flip, dtype=torch.bool).reshape(-1).cpu()
+    if flip.numel() != n_graphs:
+        raise ValueError(f"apply_mirror: flip has {flip.numel()} entries for {n_graphs} graphs")
+    if not bool(flip.any()):
+        return batch, flip
+
+    def rows(key, n, device):
+        g = _mirror_rows_graph(batch, key, n, n_graphs)
+        if g is None:
+            raise ValueError(f"apply_mirror: cannot tell which graph each row of {key!r} belongs to")
+        return flip.to(device)[g.to(device)]
+
+    def reflect(key, sign_other=1.0, sign_x=-1.0):
+        v = _batch_tensor(batch, key)
+        if v is None or v.size(-1) < 3:
+            return
+        m = rows(key, v.size(0), v.device).unsqueeze(-1)
+        s = v.new_tensor([sign_x, sign_other, sign_other])
+        out = v.clone()
+        out[..., :3] = torch.where(m, v[..., :3] * s, v[..., :3])
+        setattr(batch, key, out)
+
+    for key in _MIRROR_POS_KEYS + _MIRROR_VEC_KEYS:
+        reflect(key)
+    for key in _MIRROR_AXIAL_KEYS:
+        reflect(key, sign_other=-1.0, sign_x=1.0)
+    cl = _batch_tensor(batch, "cl_dense")
+    if cl is not None:
+        reflect("cl_dense")
+    for key in _MIRROR_ODD_SCALARS:
+        v = _batch_tensor(batch, key)
+        if v is None:
+            continue
+        m = rows(key, v.reshape(-1).numel(), v.device).reshape(v.shape)
+        neg = -v
+        if key.startswith("theta"):
+            # theta lives in [-pi, pi); only -pi leaves it when negated.  Fixing that one
+            # value (instead of _wrap_pi) keeps every other angle bit-exact.
+            neg = torch.where(neg >= math.pi, neg - 2.0 * math.pi, neg)
+        setattr(batch, key, torch.where(m, neg, v))
+    for fkey, pkey in _MIRROR_FACES:
+        f = _batch_tensor(batch, fkey)
+        pts = _batch_tensor(batch, pkey)
+        if f is None or pts is None:
+            continue
+        g = _mirror_rows_graph(batch, pkey, pts.size(0), n_graphs)
+        if g is None:
+            raise ValueError(f"apply_mirror: cannot assign {fkey!r} to graphs")
+        m = flip.to(f.device)[g.to(f.device)[f[0]]]
+        out = f.clone()
+        out[1] = torch.where(m, f[2], f[1])
+        out[2] = torch.where(m, f[1], f[2])
+        setattr(batch, fkey, out)
+    # bookkeeping only (posed = pose_R @ world): fold M in so pose_R still maps to the posed frame
+    pose_R = getattr(batch, "pose_R", None)
+    if torch.is_tensor(pose_R) and pose_R.numel() == 9 * n_graphs:
+        R = pose_R.reshape(n_graphs, 3, 3).clone()
+        R[flip.to(R.device), 0, :] *= -1.0
+        batch.pose_R = R.reshape(pose_R.shape)
+    return batch, flip
 
 
 def apply_theta_phase(batch, generator=None):
@@ -1074,7 +1136,7 @@ def apply_pose_jitter(batch, max_deg=POSE_JITTER_DEG, generator=None):
 
 
 def apply_train_augmentations(batch, generator=None):
-    """§8 train-time augs: cached L/R mirror and ±5° pose jitter.
+    """§8 train-time augs: L/R mirror (per graph) and ±5° pose jitter.
 
     No θ-phase.  It rotated only the decoder's θ labels while the encoder saw
     the unrotated points and the scaffold kept its geometry, so the angular
@@ -1083,7 +1145,7 @@ def apply_train_augmentations(batch, generator=None):
     sits, and the decoder fell back to finding the sac from template density
     (z = 0 decoded the same mesh as μ on the failed run).
     """
-    maybe_apply_cached_mirror(batch, p=0.5, generator=generator)
+    apply_mirror(batch, p=0.5, generator=generator)
     apply_pose_jitter(batch, max_deg=POSE_JITTER_DEG, generator=generator)
     resample_x_true(batch, generator=generator)
     return batch
