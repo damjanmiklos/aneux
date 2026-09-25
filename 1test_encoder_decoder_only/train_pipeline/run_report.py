@@ -39,6 +39,10 @@ PLOT_SERIES = (
     ("val_recon_sample_gap", None, "recon(σ) − recon(μ)"),
 )
 
+# Early values sit decades above the settled curve, and every sample is > 0.
+# Signed gaps and series with a single near-zero startup sample stay linear.
+LOG_Y_TRAIN_KEYS = frozenset({"loss", "kl", "geco_beta", "lr"})
+
 
 def utc_stamp():
     return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -216,6 +220,18 @@ def capture_slurm_job_stats(job_id=None):
     return out
 
 
+def _move_checkpoint(src, dest):
+    """Move ``src`` onto ``dest``. ``os.replace`` overwrites ``dest``."""
+    if os.path.abspath(src) == os.path.abspath(dest):
+        return dest
+    try:
+        os.replace(src, dest)
+    except OSError:
+        shutil.copy2(src, dest)
+        os.remove(src)
+    return dest
+
+
 class TopKCheckpoints:
     """Keep the k lowest scores on disk as ``{prefix}_1.pt`` … ``{prefix}_k.pt``."""
 
@@ -240,7 +256,10 @@ class TopKCheckpoints:
         self.entries.sort(key=lambda row: (row[0], row[2]))
         dropped = self.entries[self.k :]
         self.entries = self.entries[: self.k]
+        kept_paths = {os.path.abspath(path) for _s, path, _e, _x in self.entries}
         for _s, path, _e, _x in dropped:
+            if os.path.abspath(path) in kept_paths:
+                continue
             try:
                 os.remove(path)
             except OSError:
@@ -249,18 +268,21 @@ class TopKCheckpoints:
         return True
 
     def _relabel(self):
+        # Park every live file before assigning rank slots. Renaming straight
+        # onto prefix_1.pt overwrites the previous rank-1 file while a later
+        # entry still points at that path, so the chain collapses onto
+        # prefix_k.pt and the earlier ranks disappear.
+        parked = []
+        for rank_i, (score, path, epoch, extra) in enumerate(self.entries, start=1):
+            hold = os.path.join(
+                self.directory,
+                f".{self.prefix}_hold_e{int(epoch)}_r{rank_i}_{os.getpid()}.tmp",
+            )
+            parked.append((score, _move_checkpoint(path, hold), int(epoch), extra))
+        self.entries = parked
         for rank_i, (score, path, epoch, extra) in enumerate(self.entries, start=1):
             dest = os.path.join(self.directory, f"{self.prefix}_{rank_i}.pt")
-            if os.path.abspath(path) != os.path.abspath(dest):
-                try:
-                    os.replace(path, dest)
-                except OSError:
-                    shutil.copy2(path, dest)
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-                self.entries[rank_i - 1] = (score, dest, epoch, extra)
+            self.entries[rank_i - 1] = (score, _move_checkpoint(path, dest), epoch, extra)
         self._write_index()
 
     def _write_index(self):
@@ -328,6 +350,20 @@ def _series(history, key):
     return xs, ys
 
 
+def _apply_log_y(ax, train_key, y_groups):
+    """Log y when this metric is positive and spans about a decade."""
+    if train_key not in LOG_Y_TRAIN_KEYS:
+        return False
+    flat = [value for group in y_groups for value in group]
+    if not flat or any(value <= 0.0 for value in flat):
+        return False
+    if max(flat) / min(flat) < 8.0:
+        return False
+    ax.set_yscale("log")
+    ax.grid(True, which="both", alpha=0.3)
+    return True
+
+
 def plot_training_history(history, run_dir):
     """Write a grid of curves plus one PNG per metric. No-op if matplotlib is missing."""
     if not history:
@@ -353,10 +389,13 @@ def plot_training_history(history, run_dir):
         tx, ty = _series(history, train_key)
         if tx:
             ax.plot(tx, ty, label=train_key)
+        vy = []
         if val_key:
             vx, vy = _series(history, val_key)
             if vx:
                 ax.plot(vx, vy, "o-", label=val_key)
+        if _apply_log_y(ax, train_key, (ty, vy)):
+            title = f"{title} (log)"
         ax.set_title(title)
         ax.set_xlabel("epoch")
         ax.grid(True, alpha=0.3)
@@ -380,6 +419,8 @@ def plot_training_history(history, run_dir):
             ax.plot(tx, ty, label=train_key)
         if vx:
             ax.plot(vx, vy, "o-", label=val_key)
+        if _apply_log_y(ax, train_key, (ty, vy)):
+            title = f"{title} (log)"
         ax.set_title(title)
         ax.set_xlabel("epoch")
         ax.grid(True, alpha=0.3)

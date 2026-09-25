@@ -686,6 +686,54 @@ def test_point_to_plane_chamfer():
     _assert(abs(float(plane_n) - expected_n) < 1e-3, f"normal offset {float(plane_n)} vs {expected_n}")
 
 
+def test_postprocess_checkpoint_and_split_summary():
+    parent = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    if parent not in sys.path:
+        sys.path.insert(0, parent)
+    import postprocess as pp
+
+    live = {"weight": torch.zeros(2)}
+    ema = {"weight": torch.ones(2)}
+    last = {"epoch": 4, "geco_beta": 0.8, "model": live, "ema": {"decay": 0.99, "shadow": ema, "n_updates": 3}}
+    state, source = pp.extract_state_dict(last, prefer_ema=True)
+    _assert(source == "ema.shadow", source)
+    _assert(torch.equal(state["weight"], torch.ones(2)), state["weight"])
+    state, source = pp.extract_state_dict(last, prefer_ema=False)
+    _assert(source == "model", source)
+    _assert(torch.equal(state["weight"], torch.zeros(2)), state["weight"])
+    best = {"epoch": 4, "score": 1.5, "model": ema}
+    state, source = pp.extract_state_dict(best, prefer_ema=True)
+    _assert(source == "model" and torch.equal(state["weight"], torch.ones(2)), source)
+    beta, beta_src = pp.beta_for_checkpoint(last, run_dir=None)
+    _assert(beta_src == "checkpoint" and abs(beta - 0.8) < 1e-9, (beta, beta_src))
+
+    groups = {"train": {"a"}, "val": {"b"}, "test": {"c"}}
+    _assert(pp.split_of("c", groups) == "test", pp.split_of("c", groups))
+    _assert(pp.split_of("z", groups) == "unassigned", "missing id")
+
+    rows = [
+        {"status": "ok", "split": "train", "total": 2.0, "recon": 1.0, "rad": 1.0, "kl": 1.0},
+        {"status": "ok", "split": "train", "total": 4.0, "recon": 3.0, "rad": 1.0, "kl": 1.0},
+        {"status": "ok", "split": "val", "total": 10.0, "recon": 8.0, "rad": 1.0, "kl": 1.0},
+        {"status": "error", "split": "test", "total": 99.0, "recon": 99.0, "error": "x"},
+    ]
+    summary = pp.summarize_splits(rows)
+    recon = {row["split"]: row for row in summary if row["metric"] == "recon"}
+    _assert(recon["train"]["n"] == 2 and abs(recon["train"]["mean"] - 2.0) < 1e-9, recon["train"])
+    _assert(recon["val"]["n"] == 1 and abs(recon["val"]["mean"] - 8.0) < 1e-9, recon["val"])
+    _assert("test" not in recon, recon)
+    _assert(recon["all"]["n"] == 3, recon["all"])
+
+    class Data:
+        pass
+
+    data = Data()
+    data.pose_R = torch.eye(3)
+    data.origin_shift = torch.tensor([10.0, 0.0, 0.0])
+    world = pp.canonical_to_world(torch.tensor([[1.0, 2.0, 3.0]]), data)
+    _assert(torch.allclose(world, torch.tensor([[11.0, 2.0, 3.0]])), world)
+
+
 def test_stretch_identity_on_skinny_triangle():
     """Skinny template faces must not blow up σ + 1/σ when pred == template."""
     from losses import triangle_stretch_loss
@@ -2153,6 +2201,43 @@ def test_null_code_decodes_to_template():
     )
 
 
+def test_topk_checkpoints_keep_distinct_files():
+    """A new best must not rename over the previous rank and erase it."""
+    from run_report import TopKCheckpoints
+
+    root = tempfile.mkdtemp(prefix="topk_")
+    try:
+        keeper = TopKCheckpoints(root, "best_val", k=3)
+        for epoch, score in ((1, 4.0), (2, 3.0), (3, 2.0), (4, 1.0)):
+            payload = {"epoch": epoch, "score": score, "model": {"w": torch.tensor([score])}}
+            _assert(keeper.consider(score, payload, epoch), epoch)
+        expect = [(1, 4, 1.0), (2, 3, 2.0), (3, 2, 3.0)]
+        for rank, epoch, score in expect:
+            path = os.path.join(root, f"best_val_{rank}.pt")
+            _assert(os.path.isfile(path), path)
+            ckpt = torch.load(path, map_location="cpu", weights_only=False)
+            _assert(int(ckpt["epoch"]) == epoch, (rank, ckpt.get("epoch"), epoch))
+            _assert(abs(float(ckpt["score"]) - score) < 1e-9, (rank, ckpt.get("score"), score))
+        mid = {"epoch": 5, "score": 1.5, "model": {"w": torch.tensor([1.5])}}
+        _assert(keeper.consider(1.5, mid, 5), "mid insert")
+        expect = [(1, 4, 1.0), (2, 5, 1.5), (3, 3, 2.0)]
+        for rank, epoch, score in expect:
+            ckpt = torch.load(
+                os.path.join(root, f"best_val_{rank}.pt"),
+                map_location="cpu",
+                weights_only=False,
+            )
+            _assert(int(ckpt["epoch"]) == epoch, (rank, ckpt.get("epoch")))
+            _assert(abs(float(ckpt["score"]) - score) < 1e-9, (rank, ckpt.get("score")))
+        _assert(not keeper.consider(9.0, {"epoch": 6, "score": 9.0}, 6), "worse score")
+        pts = sorted(name for name in os.listdir(root) if name.endswith(".pt"))
+        _assert(pts == ["best_val_1.pt", "best_val_2.pt", "best_val_3.pt"], pts)
+        temps = [name for name in os.listdir(root) if name.startswith(".")]
+        _assert(temps == [], temps)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     configure_stage2_precision()
     tests = [
@@ -2178,6 +2263,8 @@ def main():
         test_cross_attention_two_graph_isolation,
         test_knn_chamfer_matches_cdist,
         test_point_to_plane_chamfer,
+        test_postprocess_checkpoint_and_split_summary,
+        test_topk_checkpoints_keep_distinct_files,
         test_stretch_identity_on_skinny_triangle,
         test_mesh_losses_match_pytorch3d,
         test_spline_conv_backend,
