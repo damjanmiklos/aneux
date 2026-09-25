@@ -14,6 +14,13 @@ import vtk
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from vessel_pipeline import (
+    _plane_section_extent,
+    _rim_off_plane_near,
+    _widen_a_slicing_cut,
+    clip_one_opening_pipe_section,
+    count_boundary_regions,
+    sanitize_vessel_for_vmtk,
+    tessellation_looks_original,
     CLIP_MAX_AREA_LOSS_FRACTION,
     cap_surface,
     MAX_FLOW_EXTENSION_LAYERS,
@@ -1471,3 +1478,66 @@ def test_a_spliced_branch_is_one_tract_that_arrives():
         tract, [{"barycenter": np.array([10.0, 0.0, 0.0]), "radius": 0.3}]
     )
     assert bool(arrived.all())
+
+
+def _dense_tube_with_a_small_opening(opening_radius=0.12):
+    """A raw-STL-dense open tube with one tiny side opening, like a 0.12 mm ostium."""
+    import pyvista as pv
+
+    nt, nz = 200, 200
+    th = np.linspace(0.0, 2.0 * np.pi, nt, endpoint=False)
+    z = np.linspace(-5.0, 5.0, nz)
+    T, Z = np.meshgrid(th, z)
+    pts = np.c_[2.0 * np.cos(T).ravel(), 2.0 * np.sin(T).ravel(), Z.ravel()]
+    i, j = np.meshgrid(np.arange(nz - 1), np.arange(nt), indexing="ij")
+    i, j = i.ravel(), j.ravel()
+    a, b = i * nt + j, i * nt + (j + 1) % nt
+    c, d = b + nt, a + nt
+    faces = np.vstack([np.c_[a, b, c], np.c_[a, c, d]])
+    centroids = pts[faces].mean(axis=1)
+    keep = np.linalg.norm(centroids - [2.0, 0.0, 0.0], axis=1) > opening_radius
+    return pv.PolyData(pts, np.c_[np.full(keep.sum(), 3), faces[keep]].ravel()).clean()
+
+
+def test_the_template_working_copy_keeps_a_tiny_ostium_open():
+    tube = _dense_tube_with_a_small_opening()
+    assert tessellation_looks_original(tube)
+    assert count_boundary_regions(tube) == 3
+    # The size-cutoff fill cannot tell a 0.12 mm ostium from a pinhole.
+    assert count_boundary_regions(sanitize_vessel_for_vmtk(tube)) == 2
+    work = sanitize_vessel_for_vmtk(tube, keep_input_rims=True)
+    assert count_boundary_regions(work) == 3
+    assert work.GetNumberOfPoints() < 0.6 * tube.n_points
+
+
+def _closed_tube_z(radius=1.0, z0=-5.0, z1=5.0):
+    import pyvista as pv
+
+    tube = pv.Cylinder(center=(0.0, 0.0, 0.5 * (z0 + z1)), direction=(0.0, 0.0, 1.0),
+                       radius=radius, height=z1 - z0, resolution=64, capping=True)
+    return tube.triangulate().subdivide_adaptive(max_edge_len=0.2).clean()
+
+
+def test_a_frame_cutter_narrower_than_its_stub_slices_it_and_the_wide_cut_does_not():
+    # The frame's inscribed radius sits off-centre in a wider stub, as an oblique
+    # ostium's does: 1.5 R reaches the wall on one side only.
+    tube = _closed_tube_z()
+    origin, outward, r = np.array([0.3, 0.0, 2.0]), np.array([0.0, 0.0, 1.0]), 0.6
+    body = np.array([0.0, 0.0, -4.0])
+    assert _plane_section_extent(tube, origin, outward, 2.0) == pytest.approx(1.3, abs=0.02)
+    cut, ok = clip_one_opening_pipe_section(tube, origin, outward, r, body, extension_length=5.0)
+    assert ok
+    assert _rim_off_plane_near(cut, origin, outward, 2.0) > 2.0
+    ostia = [(origin, max(1.0, 2.0 * r))]
+    wide = _widen_a_slicing_cut(tube, cut, origin, outward, r, body, ostia, 0, extension_length=5.0)
+    assert _rim_off_plane_near(wide, origin, outward, 2.0) < 0.1
+
+
+def test_a_clean_frame_cut_is_left_alone():
+    tube = _closed_tube_z()
+    origin, outward, r = np.array([0.0, 0.0, 2.0]), np.array([0.0, 0.0, 1.0]), 1.0
+    body = np.array([0.0, 0.0, -4.0])
+    cut, ok = clip_one_opening_pipe_section(tube, origin, outward, r, body, extension_length=5.0)
+    assert ok and _rim_off_plane_near(cut, origin, outward, 3.0) < 0.1
+    ostia = [(origin, 2.0)]
+    assert _widen_a_slicing_cut(tube, cut, origin, outward, r, body, ostia, 0, extension_length=5.0) is cut

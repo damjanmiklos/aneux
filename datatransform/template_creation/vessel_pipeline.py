@@ -4841,6 +4841,7 @@ def sanitize_vessel_for_vmtk(
     surface,
     target_reduction=SANITIZE_INPUT_REDUCTION,
     min_points=SANITIZE_INPUT_MIN_POINTS,
+    keep_input_rims=False,
 ):
     """Working copy for centerlines/extensions. Originals stay as raycast GT.
 
@@ -4853,18 +4854,42 @@ def sanitize_vessel_for_vmtk(
     poly = drop_degenerate_triangles(poly)
     poly = drop_boundary_ear_triangles(poly)
     n_mid = poly.GetNumberOfPoints()
+    rims_in = None
     if target_reduction and tessellation_looks_original(poly):
+        if keep_input_rims:
+            rims_in = _rim_signatures(poly)
         poly = decimate_dense_mc(
             poly, target_reduction=target_reduction, min_points=min_points
         )
     if poly.GetNumberOfPoints() < n_mid:
-        # DecimatePro can punch sub-mm pinholes; fill those but not real ostia (~0.3 mm+).
-        poly = fill_pinholes(poly, hole_size=0.25)
+        if not keep_input_rims:
+            # DecimatePro can punch sub-mm pinholes; fill those but not real ostia (~0.3 mm+).
+            poly = fill_pinholes(poly, hole_size=0.25)
+        elif count_boundary_regions(poly) != len(rims_in):
+            # Close the pinholes DecimatePro punched, and only those. A size
+            # cutoff cannot tell them from a small ostium: vtkFillHolesFilter
+            # at 0.25 mm shut ANSYS_UNIGE_17_10's r=0.12 mm outlet on the
+            # float64 GT, leaving five rims for six frames, so the tube never
+            # traced a branch there and the uncap had nothing to open. Every
+            # rim the surface had before decimating is one the decimation did
+            # not make. Its rims survive it (boundary vertices are never
+            # deleted), so an unchanged count means nothing was punched.
+            poly, _n_fill = fan_fill_small_loops(poly, min_radius=0.25, profiles=rims_in)
         poly, _n_reg = drop_tiny_islands(poly)
     n1 = poly.GetNumberOfPoints()
     if n1 != n0:
         print(f"  Sanitized vessel for VMTK: {n0} -> {n1} points")
     return poly
+
+
+def _rim_signatures(surface):
+    """Every boundary loop as a profile-like dict, so later repairs leave it alone."""
+    _poly, pts, faces = _triangle_points_faces(surface)
+    out = []
+    for ids in _free_edge_components(pts, faces):
+        center, radius = _boundary_component_extent(pts, ids)[:2]
+        out.append({"barycenter": center, "radius": radius, "n_points": len(ids)})
+    return out
 
 
 def decimate_dense_mc(
@@ -6700,6 +6725,115 @@ def rim_circularity_at(surface, origin, reach_mm=6.0):
     return 1.0 if best is None else float(best[1])
 
 
+# How far a cut rim may stray from its ostium plane before the stub is taken to
+# have been sliced lengthwise rather than cut off. A clean pipe-section cut
+# leaves its rim within the cutter's 0.05 mm inward overlap (0.050-0.059 mm
+# measured); the sliced ones ran 2.0-4.2 mm up the cutter wall.
+RIM_OFF_PLANE_MAX_R = 0.5
+RIM_OFF_PLANE_MIN_MM = 0.25
+
+
+# How far past the tube's own cross-section a widened cutter reaches.
+WIDE_CUT_MARGIN = 1.15
+
+
+def _rim_off_plane_near(surface, origin, normal, reach_mm):
+    """Largest distance from the plane of the boundary that comes nearest ``origin``."""
+    _poly, pts, faces = _triangle_points_faces(surface, clean=False)
+    origin = np.asarray(origin, dtype=np.float64)
+    normal = _unit(normal)
+    best = None
+    for ids in _free_edge_components(pts, faces):
+        rim = pts[np.asarray(list(ids))]
+        d = float(np.min(np.linalg.norm(rim - origin, axis=1)))
+        if d <= reach_mm and (best is None or d < best[0]):
+            best = (d, float(np.max(np.abs((rim - origin) @ normal))))
+    return 0.0 if best is None else best[1]
+
+
+def _plane_section_extent(surface, origin, normal, reach_mm):
+    """How far from ``origin`` the surface's cross-section in this plane reaches.
+
+    The section is the piece of the plane cut that passes nearest the origin,
+    so a second vessel crossing the same plane further off does not count.
+    """
+    plane = vtk.vtkPlane()
+    _set_vec3(plane.SetOrigin, np.asarray(origin, dtype=np.float64))
+    _set_vec3(plane.SetNormal, _unit(normal))
+    cutter = vtk.vtkCutter()
+    cutter.SetInputData(to_vtk_poly(surface))
+    cutter.SetCutFunction(plane)
+    cutter.Update()
+    if cutter.GetOutput().GetNumberOfPoints() == 0:
+        return None
+    conn = vtk.vtkPolyDataConnectivityFilter()
+    conn.SetInputConnection(cutter.GetOutputPort())
+    conn.SetExtractionModeToClosestPointRegion()
+    _set_vec3(conn.SetClosestPoint, np.asarray(origin, dtype=np.float64))
+    clean = vtk.vtkCleanPolyData()
+    clean.SetInputConnection(conn.GetOutputPort())
+    clean.Update()
+    section = clean.GetOutput()
+    if section.GetNumberOfPoints() == 0:
+        return None
+    d = np.linalg.norm(
+        vtk_to_numpy(section.GetPoints().GetData()).astype(np.float64)
+        - np.asarray(origin, dtype=np.float64),
+        axis=1,
+    )
+    if float(d.min()) > reach_mm:
+        return None
+    return float(d.max())
+
+
+def _widen_a_slicing_cut(surface, candidate, origin, outward, radius, body_pt, ostia, i,
+                         extension_length=None, trimmed=False, fast=True, label=None):
+    """Cut again, wider, where the frame's cutter sliced the stub instead of taking it off.
+
+    A GT frame carries the inscribed radius, and an oblique ostium is far wider
+    than that: UPF_P0176's frame 1 is r=0.865 mm on a rim reaching 0.73-3.09 mm
+    from the origin, and the template stub there measures 1.37 mm. The 1.5 R
+    cutter is then narrower than the stub it is meant to remove, runs along its
+    wall 4.5 mm out, and leaves the rest standing 5 mm outside the GT. The
+    stub's own cross-section in the cut plane is what the cutter has to clear.
+    A rescue: only a cut whose rim left its plane is tried again, the wider cut
+    answers to the same neighbour guard, and it is kept only if its rim is
+    flatter.
+    """
+    tol = max(RIM_OFF_PLANE_MAX_R * float(radius), RIM_OFF_PLANE_MIN_MM)
+    reach = max(3.0 * float(radius), 2.0)
+    off = _rim_off_plane_near(candidate, origin, outward, reach)
+    if off <= tol:
+        return candidate
+    extent = _plane_section_extent(surface, origin, outward, reach)
+    if extent is None:
+        return candidate
+    wide_r = WIDE_CUT_MARGIN * extent / OPENING_CLIP_RADIUS_FACTOR
+    if wide_r <= float(radius):
+        return candidate
+    limit = clip_radius_limit_for(
+        origin, outward, wide_r, ostia, i,
+        extension_length=extension_length, trimmed=trimmed,
+    )
+    wide, wide_ok = clip_one_opening_pipe_section(
+        surface, origin, outward, wide_r, body_pt,
+        extension_length=extension_length, trimmed=trimmed, fast=fast,
+        clip_radius_limit=limit,
+    )
+    if not wide_ok:
+        return candidate
+    wide_off = _rim_off_plane_near(wide, origin, outward, reach)
+    if wide_off >= off:
+        print(f"  [Uncap] Profile {label} cut left its rim {off:.2f} mm off the "
+              f"plane; a cutter clearing the {extent:.2f} mm section is no "
+              f"flatter ({wide_off:.2f} mm)")
+        return candidate
+    print(f"  [Uncap] Profile {label} cut left its rim {off:.2f} mm off the plane "
+          f"(stub wider than the r={radius:.3f} mm frame); cut again clearing its "
+          f"{extent:.2f} mm section: {wide_off:.2f} mm")
+    return wide
+
+
 def clip_flow_extensions_and_uncap(
     base_surface,
     profiles,
@@ -6785,6 +6919,12 @@ def clip_flow_extensions_and_uncap(
                 fast=fast_uncap,
                 clip_radius_limit=limit,
             )
+            if ok and cut_frames:
+                candidate = _widen_a_slicing_cut(
+                    current, candidate, origin, outward, radius, body_pt, ostia, i,
+                    extension_length=extension_length, trimmed=trimmed,
+                    fast=fast_uncap, label=profile["index"],
+                )
             if ok:
                 ok = _accept(candidate, i, "pipe-section cut")
             if ok:
@@ -8715,6 +8855,7 @@ def _parent_tube_attempt(
     work_vessel = sanitize_vessel_for_vmtk(
         vessel_mesh,
         target_reduction=0.0 if keep_tessellation else SANITIZE_INPUT_REDUCTION,
+        keep_input_rims=True,
     )
     smoothed_vessel = apply_taubin_smoothing(work_vessel)
     if reopened:
