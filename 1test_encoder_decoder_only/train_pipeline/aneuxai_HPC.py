@@ -304,7 +304,8 @@ def main():
                 persist_if_remote(cache_dir, cache_src, "tube_cache -> project")
             except Exception as exc:
                 print(f"[hpc] tube_cache persist failed: {exc}", flush=True)
-        if run_dir and os.path.isdir(run_dir):
+        # without a scratch workspace the run already lives on project disk
+        if workspace and run_dir and os.path.isdir(run_dir):
             dest_root = os.path.join(os.path.abspath(output_persist), "runs")
             try:
                 dest = sync_run_back(run_dir, dest_root)
