@@ -184,6 +184,12 @@ RESIDUAL_BOUND_EDGES = 2.0
 # (the displacement is projected, not the position): a template rim that sits
 # 0.7 mm off its fitted plane (p131) was snapped onto it even at identity.
 RIM_PROJECT_DISPLACEMENT = True
+# The decoder's latent cross-attention also queries with each node's
+# world-frame template normal (the encoder's frame), not only (u, θ): θ's
+# zero is an arbitrary per-case Bishop direction, so without it a node could
+# not ask the latent "am I on the side with the bulge?".  False restores the
+# old layer shapes (for pre-v11 checkpoints).
+DECODER_QUERY_DIRECTION = True
 
 # --- Optimisation ---
 LEARNING_RATE = 2e-4

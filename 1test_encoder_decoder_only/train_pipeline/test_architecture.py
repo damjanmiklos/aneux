@@ -762,6 +762,36 @@ def test_stretch_identity_on_skinny_triangle():
     _assert(math.isfinite(bad) and bad < 2000.0, bad)
 
 
+def test_cross_attention_reads_world_direction():
+    """The query carries the node normal, and the FiLM starts at identity."""
+    from model import LatentCrossAttention
+
+    torch.manual_seed(0)
+    n, L, d = 12, 4, 8
+    layer = LatentCrossAttention(d, 16, 16, L, use_dir=True)
+    base = LatentCrossAttention(d, 16, 16, L, use_dir=False)
+    z = torch.randn(1, L, d)
+    u = torch.linspace(0.0, 1.0, n)
+    theta = torch.zeros(n)
+    tract = torch.zeros(n, dtype=torch.long)
+    token_u = torch.linspace(0.0, 1.0, L).unsqueeze(0)
+    attend = torch.ones(1, L, MAX_TRACTS, dtype=torch.bool)
+    batch = torch.zeros(n, dtype=torch.long)
+    nrm = torch.nn.functional.normalize(torch.randn(n, 3), dim=-1)
+    args = (z, u, theta, batch, tract, token_u, attend)
+    out_a = layer(*args, node_dir=nrm)
+    out_b = layer(*args, node_dir=-nrm)
+    _assert(out_a.shape == (n, 16), out_a.shape)
+    _assert(not torch.allclose(out_a, out_b), "flipping the normal did not change the output")
+    _assert(float(layer.dir_film.weight.abs().sum()) == 0.0, "dir FiLM must start at identity")
+    _assert(base(*args).shape == (n, 16), "use_dir=False must keep the (u, θ)-only layer")
+    try:
+        layer(*args)
+        raise AssertionError("use_dir=True without node_dir must raise")
+    except ValueError:
+        pass
+
+
 def test_mesh_terms_have_finite_gradients_at_identity():
     """At init the heads are zero, so pred == template exactly.
 
@@ -2498,6 +2528,7 @@ def main():
         test_mixer_before_sampling,
         test_null_code_decodes_to_template,
         test_mesh_terms_have_finite_gradients_at_identity,
+        test_cross_attention_reads_world_direction,
     ]
     failed = 0
     skipped = 0

@@ -777,18 +777,34 @@ def _decoder_token_allow(
 
 
 class LatentCrossAttention(nn.Module):
-    """Scaffold nodes query the tree latent via Fourier (u, θ) with a local token mask."""
+    """Scaffold nodes query the tree latent via Fourier (u, θ) with a local token mask.
 
-    def __init__(self, latent_dim: int, hidden_dim: int, attn_dim: int, latent_len: int):
+    With ``use_dir`` each node also brings its world-frame template normal.
+    The encoder sees world xyz and normals, so the latent says "bulge toward
+    +x"; θ is measured from a per-case Bishop frame whose zero is arbitrary,
+    so (u, θ) alone cannot tell a node which side of the vessel it is on.
+    The normal goes into the query and the output, and FiLMs the attended
+    value (zero-init, so the layer starts as the (u, θ)-only one) to give the
+    decoder the latent × direction product it needs to place a bulge.
+    """
+
+    def __init__(self, latent_dim: int, hidden_dim: int, attn_dim: int, latent_len: int,
+                 use_dir: bool = False):
         super().__init__()
         self.latent_len = int(latent_len)
         self.attn_dim = int(attn_dim)
         self.k_tokens = TOKEN_ATTEND_K
         self.ostium_mm = OSTIUM_NEIGHBOR_MM
-        self.w_q = nn.Linear(GAMMA_U_DIM + GAMMA_THETA_DIM, attn_dim)
+        self.use_dir = bool(use_dir)
+        d = 3 if self.use_dir else 0
+        self.w_q = nn.Linear(GAMMA_U_DIM + GAMMA_THETA_DIM + d, attn_dim)
         self.w_k = nn.Linear(latent_dim + GAMMA_U_DIM, attn_dim)
         self.w_v = nn.Linear(latent_dim, attn_dim)
-        self.out = nn.Linear(attn_dim + GAMMA_U_DIM + GAMMA_THETA_DIM, hidden_dim)
+        self.out = nn.Linear(attn_dim + GAMMA_U_DIM + GAMMA_THETA_DIM + d, hidden_dim)
+        if self.use_dir:
+            self.dir_film = nn.Linear(3, 2 * attn_dim)
+            nn.init.zeros_(self.dir_film.weight)
+            nn.init.zeros_(self.dir_film.bias)
 
     def forward(
         self,
@@ -803,10 +819,17 @@ class LatentCrossAttention(nn.Module):
         token_tract: Tensor | None = None,
         token_pos: Tensor | None = None,
         node_pos: Tensor | None = None,
+        node_dir: Tensor | None = None,
     ) -> Tensor:
         gamma_u = harmonic_encoding_u(u)
         gamma_th = harmonic_encoding_theta(theta)
-        q = self.w_q(torch.cat([gamma_u, gamma_th], dim=-1))
+        feats = [gamma_u, gamma_th]
+        if self.use_dir:
+            if node_dir is None or node_dir.shape != (u.size(0), 3):
+                raise ValueError("LatentCrossAttention(use_dir=True) needs a [N, 3] node_dir")
+            node_dir = F.normalize(node_dir.to(dtype=gamma_u.dtype, device=gamma_u.device), dim=-1, eps=1e-8)
+            feats.append(node_dir)
+        q = self.w_q(torch.cat(feats, dim=-1))
         n_graphs = z.size(0)
         gamma_uk = harmonic_encoding_u(token_u.reshape(-1)).reshape(n_graphs, self.latent_len, -1)
         k = self.w_k(torch.cat([z, gamma_uk], dim=-1))
@@ -848,13 +871,16 @@ class LatentCrossAttention(nn.Module):
         if n_graphs == 1:
             node_idx = torch.arange(q.size(0), device=q.device)
             a = _scores_and_weights(q, k[0], v[0], 0, node_idx)
-            return self.out(torch.cat([a, gamma_u, gamma_th], dim=-1))
-        a = q.new_empty(q.size(0), self.attn_dim)
-        for g in range(n_graphs):
-            mask = node_batch == g
-            node_idx = mask.nonzero(as_tuple=False).view(-1)
-            a[mask] = _scores_and_weights(q[mask], k[g], v[g], g, node_idx)
-        return self.out(torch.cat([a, gamma_u, gamma_th], dim=-1))
+        else:
+            a = q.new_empty(q.size(0), self.attn_dim)
+            for g in range(n_graphs):
+                mask = node_batch == g
+                node_idx = mask.nonzero(as_tuple=False).view(-1)
+                a[mask] = _scores_and_weights(q[mask], k[g], v[g], g, node_idx)
+        if self.use_dir:
+            gain, shift = self.dir_film(node_dir).chunk(2, dim=-1)
+            a = a * (1.0 + gain) + shift
+        return self.out(torch.cat([a] + feats, dim=-1))
 
 
 def _logit(p: float) -> float:
@@ -1294,9 +1320,10 @@ class ProgressiveSplineDecoder(nn.Module):
         self.r_margin = float(r_margin)
         self.gradient_checkpointing = normalize_gradient_checkpointing(gradient_checkpointing)
         n_conv = int(n_conv if n_conv is not None else _n_conv_per_level())
-        self.cross_coarse = LatentCrossAttention(latent_dim, hidden_dim, attn_dim, latent_len)
-        self.cross_mid = LatentCrossAttention(latent_dim, hidden_dim, attn_dim, latent_len)
-        self.cross_fine = LatentCrossAttention(latent_dim, hidden_dim, attn_dim, latent_len)
+        self.query_dir = bool(_cfg_get("DECODER_QUERY_DIRECTION", False))
+        self.cross_coarse = LatentCrossAttention(latent_dim, hidden_dim, attn_dim, latent_len, self.query_dir)
+        self.cross_mid = LatentCrossAttention(latent_dim, hidden_dim, attn_dim, latent_len, self.query_dir)
+        self.cross_fine = LatentCrossAttention(latent_dim, hidden_dim, attn_dim, latent_len, self.query_dir)
         self.geom_fuse_c = nn.Linear(hidden_dim + 4, hidden_dim)
         self.geom_fuse_m = nn.Linear(hidden_dim + 4, hidden_dim)
         self.geom_fuse_f = nn.Linear(hidden_dim + 4, hidden_dim)
@@ -1372,6 +1399,7 @@ class ProgressiveSplineDecoder(nn.Module):
         token_tract,
         token_pos,
         node_pos,
+        node_dir=None,
     ):
         return layer(
             z, u, theta, node_batch, tract, token_u, token_attend,
@@ -1379,6 +1407,7 @@ class ProgressiveSplineDecoder(nn.Module):
             token_tract=token_tract,
             token_pos=token_pos,
             node_pos=node_pos,
+            node_dir=node_dir if self.query_dir else None,
         )
 
     def _fuse_geom(self, h, fuse, data, n, level):
@@ -1410,7 +1439,7 @@ class ProgressiveSplineDecoder(nn.Module):
         h_c = self._cross(
             self.cross_coarse, z, data.u_coarse, data.theta_coarse, batch_c,
             data.tract_id_coarse, token_u, token_attend, latent_valid, token_tract,
-            token_pos, pos_c,
+            token_pos, pos_c, getattr(data, "normal_coarse", None),
         )
         h_c = self._fuse_geom(h_c, self.geom_fuse_c, data, pos_c.size(0), "coarse")
         h_c = self._run_attn(
@@ -1446,7 +1475,7 @@ class ProgressiveSplineDecoder(nn.Module):
         h_m = self._cross(
             self.cross_mid, z, data.u_mid, data.theta_mid, batch_m,
             data.tract_id_mid, token_u, token_attend, latent_valid, token_tract,
-            token_pos, pos_m,
+            token_pos, pos_m, getattr(data, "normal_mid", None),
         ) + self.mid_init(dx_m0) + torch.sigmoid(self.alpha_c_raw) * h_c_up
         h_m = self._fuse_geom(h_m, self.geom_fuse_m, data, pos_m.size(0), "mid")
         r_m = _level_r_local(data, pos_m.size(0), "mid", self.r_margin)
@@ -1483,7 +1512,7 @@ class ProgressiveSplineDecoder(nn.Module):
         h_f = self._cross(
             self.cross_fine, z, data.u, data.theta, batch_f,
             data.tract_id, token_u, token_attend, latent_valid, token_tract,
-            token_pos, pos_f,
+            token_pos, pos_f, getattr(data, "normal", None),
         ) + self.fine_init(dx_f0) + torch.sigmoid(self.alpha_m_raw) * h_m_up
         h_f = self._fuse_geom(h_f, self.geom_fuse_f, data, pos_f.size(0), "fine")
         r_f = _level_r_local(data, pos_f.size(0), "fine", self.r_margin)
