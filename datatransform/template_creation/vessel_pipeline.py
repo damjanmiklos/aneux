@@ -5806,7 +5806,18 @@ def _keep_region_with_point(surface, point):
 
 
 def _delete_outboard_leftover(surface, origin, outward, radius, outboard_mm=0.0, clean=True,
-                              clip_radius_limit=None):
+                              clip_radius_limit=None, height=None):
+    """Delete the cells the cutter left standing inside its own cylinder.
+
+    ``height`` bounds the cylinder the way ``_outboard_cap_implicit`` bounds
+    the cut. It was unbounded, which made this a half-infinite drill along the
+    branch axis: on C0049 the r=0.63 mm cutter of profile 6 took an r=1.73 mm
+    hole out of a different vessel 10 mm down its axis, and on p382 profile 1
+    took an r=2.49 mm one 25 mm away. The leftover fill then fanned each hole
+    shut, and the fan is the 0.9 / 0.7 mm pocket both GT surfaces shipped
+    with. Anything of the stub beyond the cutter is already severed by the
+    cut and goes with the fragments.
+    """
     poly, pts, faces = _triangle_points_faces(surface, clean=clean)
     if faces.size == 0:
         return poly
@@ -5817,6 +5828,8 @@ def _delete_outboard_leftover(surface, origin, outward, radius, outboard_mm=0.0,
     proj = rel @ outward
     radial = np.linalg.norm(rel - np.outer(proj, outward), axis=1)
     bad = (proj > outboard_mm) & (radial < _opening_clip_radius(radius, limit_mm=clip_radius_limit))
+    if height is not None:
+        bad &= proj < float(height)
     if not np.any(bad):
         return poly
     return _polydata_from_triangles(pts, faces[~bad])
@@ -5843,6 +5856,7 @@ def _clip_opening_cap_locally(
     return _delete_outboard_leftover(
         clipped, origin, outward, radius, clean=not fast,
         clip_radius_limit=clip_radius_limit,
+        height=_opening_clip_height(radius, extension_length=extension_length, trimmed=trimmed),
     )
 
 

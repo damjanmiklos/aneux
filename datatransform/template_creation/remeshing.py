@@ -63,6 +63,7 @@ from batch_run_log import (
     write_case_log,
     write_worker_transcript,  # re-exported for tests
 )
+from surface_polish import orient_outward, polish_surface
 from vessel_pipeline import (
     TemplateQualityError,
     add_flow_extensions,
@@ -531,6 +532,14 @@ def process_gt_remesh_dataset(
     folded = enforce_min_edge(final_surface, label="GT surface")
     if folded is not final_surface:
         final_surface = recompute_point_normals(folded, auto_orient=False)
+    # What the gates above never looked at, and a reviewer sees first: caps
+    # on the rims (4058 sub-degree triangles across the 742 installed
+    # surfaces), fins where a sac creases against its parent, and a winding
+    # that was inside out on 19 of them. Both steps leave a surface without
+    # those defects exactly as it is.
+    final_surface, _polish = polish_surface(final_surface, label="GT surface")
+    final_surface, _flipped = orient_outward(final_surface, label="GT surface")
+    final_surface = recompute_point_normals(final_surface, auto_orient=False)
     assert_gt_remesh_scale(final_surface, original, context=dataset_id)
     openings = assert_template_quality(final_surface, context=dataset_id)
     log_opening_planarity(final_surface, ostium_frames)

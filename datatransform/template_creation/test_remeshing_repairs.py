@@ -1581,3 +1581,89 @@ def test_the_uncap_takes_the_cut_whose_rim_lies_on_the_gts(capsys):
     assert n_clipped == 1 and "rim to GT rim" in log
     assert _GtRims(_open_gt_tube_z(2.0)).mismatch(out, frame["origin"], 2.0) < 0.1
     assert _rim_off_plane_near(out, frame["origin"], frame["normal"], 2.0) < 0.1
+
+
+# --------------------------------------------------------- surface polish ---
+
+from surface_polish import (  # noqa: E402
+    orient_outward,
+    polish_surface,
+    signed_volume,
+    surface_census,
+)
+
+
+def _tube_arrays(**kwargs):
+    _poly, pts, faces = _triangle_points_faces(open_tube(**kwargs), clean=False)
+    return np.asarray(pts, np.float64), np.asarray(faces, np.int64)
+
+
+def test_the_polish_leaves_a_clean_surface_alone():
+    tube = open_tube(radius=0.5, length=3.0)
+    out, report = polish_surface(tube)
+    assert out is tube and not report["changed"]
+
+
+def test_the_polish_drops_a_rim_ear_whose_apex_is_on_the_chord():
+    pts, faces = _tube_arrays(radius=0.5, length=3.0)
+    # A rim vertex just off the chord of rim edge 0-1, joined to it as an ear:
+    # the remesher leaves these wherever a straight rim was cut finely.
+    mid = 0.5 * (pts[0] + pts[1]) + np.array([0.0, 0.0, -2e-4])
+    pts = np.vstack([pts, mid])
+    faces = np.vstack([faces, [len(pts) - 1, 1, 0]])
+    ear = _polydata_from_triangles(pts, faces)
+    before = surface_census(pts, faces)
+    assert before["slivers"] == 1 and before["loops"] == 2
+    out, report = polish_surface(ear)
+    _q, p, f = _triangle_points_faces(out, clean=False)
+    after = surface_census(np.asarray(p), np.asarray(f))
+    assert report["changed"] and after["slivers"] == 0
+    assert after["loops"] == 2 and after["nonmanifold_edges"] == 0 and len(f) == len(faces) - 1
+
+
+def test_the_polish_takes_out_a_cap_apex_without_moving_the_wall():
+    pts, faces = _tube_arrays(radius=0.5, length=3.0)
+    t = len(faces) // 2
+    a, b, c = faces[t]
+    # A vertex 0.1 um off the edge a-b, inside the triangle: a cap at a-b.
+    m = 0.5 * (pts[a] + pts[b]) + 1e-4 * (pts[c] - 0.5 * (pts[a] + pts[b]))
+    pts = np.vstack([pts, m])
+    k = len(pts) - 1
+    faces = np.vstack([np.delete(faces, t, axis=0), [[a, b, k], [b, c, k], [c, a, k]]])
+    capped = _polydata_from_triangles(pts, faces)
+    assert surface_census(pts, faces)["slivers"] >= 1
+    out, report = polish_surface(capped)
+    _q, p, f = _triangle_points_faces(out, clean=False)
+    after = surface_census(np.asarray(p), np.asarray(f))
+    assert report["changed"] and after["slivers"] == 0 and after["genus"] == 0 and after["loops"] == 2
+    # flipped away or collapsed, no vertex has moved
+    from scipy.spatial import cKDTree
+    assert cKDTree(pts).query(np.asarray(p))[0].max() < 1e-12
+
+
+def test_the_polish_relaxes_a_fin_back_into_the_wall():
+    pts, faces = _tube_arrays(radius=0.5, length=3.0)
+    # Drag one wall vertex past its neighbour: its fan folds over itself.
+    v = 15 * 40 + 7
+    shifted = pts.copy()
+    shifted[v] = pts[v] + 1.6 * (pts[v + 1] - pts[v])
+    fin = _polydata_from_triangles(shifted, faces)
+    before = surface_census(shifted, faces)
+    assert before["folds"] > 0 or before["crossings"] > 0
+    out, report = polish_surface(fin)
+    _q, p, f = _triangle_points_faces(out, clean=False)
+    after = surface_census(np.asarray(p), np.asarray(f))
+    assert report["changed"] and after["folds"] == 0 and after["crossings"] == 0
+    assert after["loops"] == 2 and after["genus"] == 0
+
+
+def test_orient_outward_reverses_an_inside_out_surface_only():
+    pts, faces = _tube_arrays(radius=0.5, length=3.0)
+    outward = _polydata_from_triangles(pts, faces)
+    inward = _polydata_from_triangles(pts, faces[:, ::-1].copy())
+    assert signed_volume(pts, faces) > 0 > signed_volume(pts, faces[:, ::-1])
+    same, flipped = orient_outward(outward)
+    assert same is outward and not flipped
+    fixed, flipped = orient_outward(inward)
+    _q, p, f = _triangle_points_faces(fixed, clean=False)
+    assert flipped and signed_volume(np.asarray(p), np.asarray(f)) > 0

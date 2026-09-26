@@ -53,6 +53,7 @@ from batch_run_log import (
 )
 
 import vessel_pipeline
+from surface_polish import orient_outward, polish_surface
 from vessel_pipeline import (
     DEFAULT_EXTENSION_LENGTH,
     DEFAULT_GRID_SPACING,
@@ -870,6 +871,13 @@ def process_variable_dataset(
     folded = enforce_min_edge(final_surface, label="template")
     if folded is not final_surface:
         final_surface = recompute_point_normals(folded, auto_orient=False)
+    # Same polish and winding as the GT (see remeshing.py): 1476 sub-degree
+    # rim caps, 11 crossings and 16 inside-out windings were in the installed
+    # templates. Before the supervision transfer, so the arrays land on the
+    # vertices that ship.
+    final_surface, _polish = polish_surface(final_surface, label="template")
+    final_surface, _flipped = orient_outward(final_surface, label="template")
+    final_surface = recompute_point_normals(final_surface, auto_orient=False)
     final_surface = restore_template_supervision(final_surface, snap_pts, snap_arrays)
     t_xfer_s = time.perf_counter() - t_xfer
     print(
