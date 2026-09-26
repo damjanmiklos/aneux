@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import random
+import re
 import sys
 
 import numpy as np
@@ -303,21 +304,65 @@ def _split_counts(n, val_fraction, test_fraction):
     return n_test, n_val
 
 
+def patient_group(dataset_id):
+    """Patient an AneuX id belongs to: keep-one variants and sides of one scan share it.
+
+    p447_<hash>_1/_2/_3 and p461_<hash>_RICA/_LICA -> p447 / p461;
+    SNF00000049_01_1, SNF00000365_02 -> SNF00000049 / SNF00000365;
+    C0088a/b -> C0088; UPF_P0211.00_ID1/ID2 -> UPF_P0211;
+    ANSYS_UNIGE_17_10 -> ANSYS_UNIGE_17. Anything else is its own patient.
+    """
+    text = str(dataset_id).strip()
+    for pattern in (
+        r"^(p\d+)_",
+        r"^(SNF\d+)",
+        r"^(C\d+)[A-Za-z]?$",
+        r"^(UPF_P\d+)",
+        r"^(ANSYS_UNIGE_\d+)",
+    ):
+        m = re.match(pattern, text)
+        if m:
+            return m.group(1)
+    return text
+
+
 def _split_one_group(ids, val_fraction, test_fraction, seed):
-    unique = sorted(set(ids))
-    n = len(unique)
-    n_test, n_val = _split_counts(n, val_fraction, test_fraction)
+    """Split one hospital by patient: all cases of a patient land on one side.
+
+    Patients are drawn in seeded order and fill test, then val, up to the case
+    counts the fractions ask for; the rest is train.
+    """
+    by_patient = {}
+    for key in sorted(set(ids)):
+        by_patient.setdefault(patient_group(key), []).append(key)
+    patients = sorted(by_patient)
+    n_cases = sum(len(v) for v in by_patient.values())
+    if len(patients) < 3:
+        # too few patients for three sides: count patients, not cases
+        n_test, n_val = _split_counts(len(patients), val_fraction, test_fraction)
+        size = {p: 1 for p in patients}
+    else:
+        n_test, n_val = _split_counts(n_cases, val_fraction, test_fraction)
+        size = {p: len(by_patient[p]) for p in patients}
     rng = np.random.RandomState(int(seed))
-    perm = rng.permutation(n)
-    ordered = [unique[i] for i in perm]
-    test_ids = ordered[:n_test]
-    val_ids = ordered[n_test : n_test + n_val]
-    train_ids = ordered[n_test + n_val :]
+    perm = rng.permutation(len(patients))
+    train_ids, val_ids, test_ids = [], [], []
+    got_test = got_val = 0
+    for i in perm:
+        pat = patients[i]
+        if got_test < n_test:
+            test_ids.extend(by_patient[pat])
+            got_test += size[pat]
+        elif got_val < n_val:
+            val_ids.extend(by_patient[pat])
+            got_val += size[pat]
+        else:
+            train_ids.extend(by_patient[pat])
     return train_ids, val_ids, test_ids
 
 
 def split_ids(ids, val_fraction, test_fraction, seed):
-    """Disjoint train/val/test IDs, stratified by hospital prefix."""
+    """Disjoint train/val/test IDs, stratified by hospital, grouped by patient."""
     groups = {}
     for key in ids:
         groups.setdefault(hospital_group(key), []).append(key)
@@ -342,50 +387,69 @@ def train_val_test_indices(n, val_fraction, test_fraction, seed):
     return train_ids, val_ids, test_ids
 
 
+SPLIT_GROUPING = "patient"
+
+
 def make_split_payload(train_ids, val_ids, test_ids, seed, val_fraction, test_fraction):
     return {
         "seed": int(seed),
         "val_fraction": float(val_fraction),
         "test_fraction": float(test_fraction),
         "stratify": "hospital",
+        "group": SPLIT_GROUPING,
         "train": list(train_ids),
         "val": list(val_ids),
         "test": list(test_ids),
     }
 
 
-def _carve_ids(ids, n_take, seed):
-    ordered = sorted(ids)
-    if n_take <= 0 or not ordered:
-        return list(ordered), []
-    n_take = min(int(n_take), max(0, len(ordered) - 1))
-    rng = np.random.RandomState(int(seed))
-    perm = rng.permutation(len(ordered))
-    taken = [ordered[i] for i in perm[:n_take]]
-    rest = [ordered[i] for i in perm[n_take:]]
-    return rest, taken
+def reconcile_split_payload(payload, ids, val_fraction, test_fraction, seed):
+    """Bring a stored split up to date with the current case list.
 
-
-def ensure_three_way_payload(payload, val_fraction, test_fraction, seed):
-    """Keep a stored three-way split. Extend a two-way file by carving test from train."""
-    train_ids = list(payload.get("train") or [])
-    val_ids = list(payload.get("val") or [])
-    test_ids = list(payload.get("test") or [])
-    if test_ids:
-        return make_split_payload(
-            train_ids,
-            val_ids,
-            test_ids,
-            payload.get("seed", seed),
-            payload.get("val_fraction", val_fraction),
-            payload.get("test_fraction", test_fraction),
-        )
-    n = len(train_ids) + len(val_ids)
-    n_test, _n_val = _split_counts(n, val_fraction, test_fraction)
-    new_train, new_test = _carve_ids(train_ids, n_test, seed)
-    return make_split_payload(
-        new_train, val_ids, new_test, seed, val_fraction, test_fraction
+    Cases no longer present are dropped. A new case whose patient is already
+    in the split joins that patient's side; new patients are split among
+    themselves with the same stratified, grouped rule. Stored assignments
+    never move, so the test set stays fixed across cleandata updates.
+    """
+    current = list(dict.fromkeys(str(i) for i in ids))
+    present = set(current)
+    stored = [str(i) for k in ("train", "val", "test") for i in (payload.get(k) or [])]
+    sides = {
+        k: [str(i) for i in (payload.get(k) or []) if str(i) in present]
+        for k in ("train", "val", "test")
+    }
+    side_of_patient = {}
+    for k in ("test", "val", "train"):
+        for i in sides[k]:
+            side_of_patient.setdefault(patient_group(i), k)
+    placed = set(sides["train"]) | set(sides["val"]) | set(sides["test"])
+    joined, fresh = [], []
+    for i in current:
+        if i in placed:
+            continue
+        k = side_of_patient.get(patient_group(i))
+        if k is None:
+            fresh.append(i)
+        else:
+            sides[k].append(i)
+            joined.append(i)
+    if fresh:
+        tr, va, te = split_ids(fresh, val_fraction, test_fraction, seed)
+        sides["train"] += tr
+        sides["val"] += va
+        sides["test"] += te
+    out = make_split_payload(
+        sides["train"], sides["val"], sides["test"],
+        payload.get("seed", seed),
+        payload.get("val_fraction", val_fraction),
+        payload.get("test_fraction", test_fraction),
     )
+    changes = {
+        "added_to_patient": joined,
+        "added_new_patients": fresh,
+        "dropped": sorted(set(stored) - present),
+    }
+    return out, changes
 
 
 def subsets_from_ids(dataset, train_ids, val_ids, test_ids):
@@ -485,42 +549,67 @@ def train_val_test_split(dataset, val_fraction, test_fraction, seed):
     return subsets_from_ids(dataset, train_ids, val_ids, test_ids)
 
 
+def _write_json_atomic(path, payload):
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(payload, f, indent=4)
+    os.replace(tmp, path)
+
+
 def load_or_create_fixed_split(
     dataset, split_path, val_fraction, test_fraction, seed, write=True
 ):
-    """Load a stored hospital-stratified split, or create one and write it.
+    """Load the stored patient-grouped split, bring it up to date, or create one.
 
-    An existing file is reused only if it already has ``stratify: hospital``.
-    Older random two-way/three-way files are rebuilt.
+    A stored file is kept only if it is hospital-stratified and patient-grouped;
+    older files (grouped by case, which put keep-one variants of one scan on
+    both sides) are rebuilt. A kept file is reconciled with the current cases,
+    so every case is in exactly one side. The write is atomic: the R* sweep
+    starts four runs on one output folder at once.
     Rank-0 should pass ``write=True``; other DDP ranks wait on the barrier
     and load with ``write=False``.
     """
     parent = os.path.dirname(split_path)
     if parent:
         os.makedirs(parent, exist_ok=True)
+    ids = [str(dataset.samples[i]["dataset_id"]) for i in range(len(dataset))]
     payload = None
     if os.path.isfile(split_path):
         with open(split_path, "r") as f:
             stored = json.load(f)
-        if stored.get("stratify") == "hospital" and stored.get("test"):
-            payload = ensure_three_way_payload(
-                stored, val_fraction, test_fraction, seed
+        if stored.get("stratify") == "hospital" and stored.get("group") == SPLIT_GROUPING:
+            payload, changes = reconcile_split_payload(
+                stored, ids, val_fraction, test_fraction, seed
             )
+            n_join = len(changes["added_to_patient"])
+            n_fresh = len(changes["added_new_patients"])
+            if write and (n_join or n_fresh or changes["dropped"]):
+                print(
+                    f"Split updated: {n_join} new cases joined their patient's side, "
+                    f"{n_fresh} new-patient cases split, "
+                    f"{len(changes['dropped'])} missing cases dropped"
+                )
+        elif write:
+            print(f"Rebuilding {split_path}: not a patient-grouped split")
     if payload is None:
         if not write:
             raise FileNotFoundError(
                 f"Split file missing at {split_path}; rank 0 must write it first"
             )
-        ids = [dataset.samples[i]["dataset_id"] for i in range(len(dataset))]
         train_ids, val_ids, test_ids = split_ids(
             ids, val_fraction, test_fraction, seed
         )
         payload = make_split_payload(
             train_ids, val_ids, test_ids, seed, val_fraction, test_fraction
         )
+    placed = [i for k in ("train", "val", "test") for i in payload[k]]
+    if len(placed) != len(set(placed)) or set(placed) != set(ids):
+        raise RuntimeError(
+            f"split does not cover the dataset exactly once: {len(set(placed))} placed, "
+            f"{len(placed) - len(set(placed))} duplicates, {len(set(ids))} cases"
+        )
     if write:
-        with open(split_path, "w") as f:
-            json.dump(payload, f, indent=4)
+        _write_json_atomic(split_path, payload)
     train_ds, val_ds, test_ds = subsets_from_ids(
         dataset, payload["train"], payload["val"], payload["test"]
     )

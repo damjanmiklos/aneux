@@ -1470,6 +1470,64 @@ def test_train_val_split_covers_all():
         _assert(n_te >= 1, f"{prefix} missing from test")
 
 
+def test_split_groups_patients_and_reconciles():
+    import json
+    import tempfile
+    from aneuxai import load_or_create_fixed_split, patient_group, reconcile_split_payload, split_ids
+
+    for key, want in (
+        ("p447_GBQfAx_1", "p447"), ("p461_HwYbBA_RICA", "p461"), ("p420_Bg4cPh", "p420"),
+        ("SNF00000049_01_3", "SNF00000049"), ("SNF00000365_02", "SNF00000365"), ("SNF00000074", "SNF00000074"),
+        ("C0088b", "C0088"), ("C0002", "C0002"), ("UPF_P0211.00_ID2", "UPF_P0211"),
+        ("ANSYS_UNIGE_17_10", "ANSYS_UNIGE_17"), ("ANSYS_UNIGE_16", "ANSYS_UNIGE_16"), ("USFD_0032", "USFD_0032"),
+    ):
+        _assert(patient_group(key) == want, f"{key} -> {patient_group(key)}, want {want}")
+
+    ids = []
+    for i in range(30):  # every third SNF patient has three keep-one variants
+        ids += [f"SNF{i:08d}_01_{k}" for k in (1, 2, 3)] if i % 3 == 0 else [f"SNF{i:08d}_01"]
+    ids += [f"C{i:04d}{s}" for i in range(20) for s in ("a", "b")]
+    tr, va, te = split_ids(ids, 0.15, 0.15, 31)
+    side = {i: k for k, v in (("train", tr), ("val", va), ("test", te)) for i in v}
+    _assert(sorted(side) == sorted(ids), "every case in exactly one side")
+    by_pat = {}
+    for i, k in side.items():
+        by_pat.setdefault(patient_group(i), set()).add(k)
+    _assert(all(len(v) == 1 for v in by_pat.values()), "a patient on two sides")
+    _assert(len(va) >= 1 and len(te) >= 1, (len(va), len(te)))
+
+    stored = {"train": tr, "val": va, "test": te, "seed": 31, "stratify": "hospital", "group": "patient"}
+    sibling = te[0].rsplit("_", 1)[0] + "_9" if te[0].count("_") == 2 else te[0][:-1] + "z"
+    now = [i for i in ids if i != tr[0]] + [sibling, "SNF99999999_01"]
+    out, ch = reconcile_split_payload(stored, now, 0.15, 0.15, 31)
+    _assert(sibling in out["test"], f"new case {sibling} should join its patient's test side")
+    _assert(tr[0] not in sum((out[k] for k in ("train", "val", "test")), []), "missing case dropped")
+    _assert(ch["dropped"] == [tr[0]] and ch["added_new_patients"] == ["SNF99999999_01"], ch)
+    for k in ("train", "val", "test"):
+        _assert(set(stored[k]) - {tr[0]} <= set(out[k]), f"stored {k} assignments moved")
+
+    class Dummy:
+        def __init__(self, keys):
+            self.samples = [{"dataset_id": k} for k in keys]
+
+        def __len__(self):
+            return len(self.samples)
+
+    root = tempfile.mkdtemp()
+    try:
+        path = os.path.join(root, "split.json")
+        with open(path, "w") as f:  # an old case-level split is rebuilt, not reused
+            json.dump({"train": ids[:-1], "val": ids[-1:], "test": ids[:1], "stratify": "hospital"}, f)
+        *_, p1 = load_or_create_fixed_split(Dummy(ids), path, 0.15, 0.15, 31)
+        _assert(p1.get("group") == "patient", p1.keys())
+        *_, p2 = load_or_create_fixed_split(Dummy(now), path, 0.15, 0.15, 31)
+        placed = p2["train"] + p2["val"] + p2["test"]
+        _assert(sorted(placed) == sorted(now), "reconciled split covers the current cases")
+        _assert([n for n in os.listdir(root) if n.endswith(".tmp")] == [], "atomic write leaves no temp file")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_filter_split_payload_skips_failed_cache_ids():
     from aneuxai import filter_split_payload, subsets_from_ids
 
@@ -2526,6 +2584,7 @@ def main():
         test_batch_inc,
         test_scaffold_decode_without_vessel,
         test_train_val_split_covers_all,
+        test_split_groups_patients_and_reconciles,
         test_filter_split_payload_skips_failed_cache_ids,
         test_skipped_samples_report_is_loud,
         test_warmup_result_skips_unless_strict,
