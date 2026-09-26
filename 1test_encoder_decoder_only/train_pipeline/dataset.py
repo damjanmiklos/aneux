@@ -11,6 +11,7 @@ from torch_geometric.data import Data
 from torch.utils.data import Dataset
 
 import config as _config
+from murray import attach_murray_fields
 from config import (
     CACHE_VERSION,
     DENSE_CL_SPACING_MM,
@@ -167,6 +168,9 @@ def _finalize_item(data):
         data = _as_aneurysm_data(data)
     data = _ensure_fp32_data(data)
     data = _refresh_r_star_smoothness(data)
+    # junction windows for the Murray term: derived from cached fields, so no
+    # cache bump; fixed per case (pose jitter and mirroring leave radii alone)
+    data = attach_murray_fields(data)
     data.has_true_normal = torch.tensor(
         1 if _infer_has_true_normal(data) else 0, dtype=torch.uint8
     )

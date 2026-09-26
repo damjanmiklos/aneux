@@ -21,6 +21,7 @@ from config import (
     SMOOTH_W_AMBIGUOUS,
     TUBE_RADIUS_MM,
 )
+from murray import murray_errors, murray_loss
 from ops import composed_radius
 
 
@@ -938,6 +939,9 @@ def compute_losses(
     face_coarse=None,
     edge_index_mid=None,
     edge_index_coarse=None,
+    murray_win=None,
+    murray_rel=None,
+    murray_rel_batch=None,
 ):
     """Return a dict of unweighted loss terms."""
     x_pred = x_pred.float()
@@ -1165,10 +1169,26 @@ def compute_losses(
         loss_conf = loss_conf + conformal_distortion_loss(xp, pos_l, f_l, batch=b_l, num_graphs=num_graphs)
 
     loss_rad = x_pred.new_zeros(())
+    loss_murray = x_pred.new_zeros(())
+    murray_err = x_pred.new_zeros(())
     if r_star is not None and normal is not None:
         r_rad = r_local if r_local is not None else r_scalar
         r_pred = composed_radius(x_pred, x_tube, normal, r_rad)
         loss_rad = radial_huber_loss(r_pred, r_star, r_star_valid, delta=radial_huber_delta)
+        if murray_win is not None and murray_rel is not None and murray_rel.numel():
+            v_batch = batch_tube if batch_tube is not None else torch.zeros_like(murray_win)
+            r_batch = murray_rel_batch if murray_rel_batch is not None else torch.zeros_like(murray_rel[:, 0])
+            e_pred, e_gt = murray_errors(
+                r_pred, r_star, murray_win, v_batch, murray_rel, r_batch,
+                float(getattr(_config, "MURRAY_EXPONENT", 2.0)),
+            )
+            loss_murray = murray_loss(
+                e_pred, e_gt,
+                tolerance=float(getattr(_config, "MURRAY_TOLERANCE", 0.15)),
+                huber_delta=float(getattr(_config, "MURRAY_HUBER_DELTA", 0.1)),
+            )
+            if e_pred.numel():
+                murray_err = e_pred.detach().abs().mean()
         if (
             x_pred_mid is not None
             and r_star_mid is not None
@@ -1192,4 +1212,6 @@ def compute_losses(
         "conf": loss_conf,
         "fold_tpl": loss_fold_tpl,
         "stretch": loss_stretch,
+        "murray": loss_murray,
+        "murray_err": murray_err,
     }

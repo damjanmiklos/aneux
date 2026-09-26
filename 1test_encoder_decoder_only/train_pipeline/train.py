@@ -257,7 +257,7 @@ def weighted_total(terms, weights):
     )
     if "rad" in terms:
         total = total + float(weights.get("rad", 0.0)) * terms["rad"]
-    for extra in ("fold", "conf", "stretch"):
+    for extra in ("fold", "conf", "stretch", "murray"):
         if extra in terms and extra in weights:
             total = total + float(weights[extra]) * terms[extra]
     return total
@@ -510,6 +510,10 @@ def losses_from_output(out, batch, kl_beta=None):
     # else: compute_losses has no kl_beta — GECO cannot scale the KL tensor.
     if _fn_has_param(compute_losses, "latent_valid"):
         extra["latent_valid"] = getattr(batch, "latent_valid", None)
+    if _fn_has_param(compute_losses, "murray_rel"):
+        extra["murray_win"] = getattr(batch, "murray_win", None)
+        extra["murray_rel"] = getattr(batch, "murray_rel", None)
+        extra["murray_rel_batch"] = getattr(batch, "murray_rel_batch", None)
     terms = compute_losses(
         out.x_pred,
         batch.x_true,
@@ -672,7 +676,16 @@ def _zero_meters():
         "conf": 0.0,
         "fold_tpl": 0.0,
         "stretch": 0.0,
+        "murray": 0.0,
+        "murray_err": 0.0,
     }
+
+
+# per-epoch averages of these terms go to the log and epoch_metrics.csv
+_METER_KEYS = (
+    "recon", "kl", "disp", "lap", "norm", "rad", "kl_mean_raw", "rate_gap",
+    "fold", "conf", "fold_tpl", "stretch", "murray", "murray_err",
+)
 
 
 def _add_meter(acc, key, value, scale):
@@ -1255,7 +1268,7 @@ def train_epoch(
 
         scale = float(window_len * batch_size)
         _add_meter(totals, "loss", loss, scale)
-        for key in ("recon", "kl", "disp", "lap", "norm", "rad", "kl_mean_raw", "rate_gap", "fold", "conf", "fold_tpl", "stretch"):
+        for key in _METER_KEYS:
             if key in terms:
                 val = terms[key]
                 if not torch.is_tensor(val):
@@ -1293,7 +1306,7 @@ def evaluate_epoch(model, dataloader, weights, device, sample=False, kl_beta=Non
             terms = losses_from_output(out, batch, kl_beta=kl_beta)
             loss = _weighted_total(terms, weights)
             _add_meter(totals, "loss", loss, float(batch_size))
-            for key in ("recon", "kl", "disp", "lap", "norm", "rad", "kl_mean_raw", "rate_gap", "fold", "conf", "fold_tpl", "stretch"):
+            for key in _METER_KEYS:
                 if key in terms:
                     val = terms[key]
                     if not torch.is_tensor(val):
@@ -1320,6 +1333,7 @@ def _format_metrics(metrics, weights, tag, epoch, epochs):
         f"Fold: {metrics.get('fold', 0.0):.4f} | "
         f"Conf: {metrics.get('conf', 0.0):.4f} | "
         f"FoldTpl: {metrics.get('fold_tpl', 0.0):.4f} | "
+        f"Murray: {metrics.get('murray', 0.0):.4f} (|e| {metrics.get('murray_err', 0.0):.3f}) | "
         f"w_recon: {metrics['recon'] * weights['recon']:.4f} | "
         f"w_rad: {w_rad:.4f} | "
         f"w_kl: {metrics['kl'] * weights['kl']:.4f} | "
