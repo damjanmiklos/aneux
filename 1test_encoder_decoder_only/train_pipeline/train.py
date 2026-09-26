@@ -903,9 +903,9 @@ def resample_x_true(batch, n_true=None, generator=None):
     return _local_sample_x_true(batch, n_true=n_true, generator=generator)
 
 
-# L/R mirror, x -> -x in the posed frame (the plane the cached gt_*_mirror
-# used).  Reflected on the fly, per graph, so the scaffold, the frames and
-# the GT turn together; the cached gt_*_mirror fields are not read.
+# L/R mirror, x -> -x in the posed frame.  Reflected on the fly, per graph,
+# so the scaffold, the frames and the GT turn together (cache v12 no longer
+# stores mirrored copies of the GT).
 #   positions and polar vectors (normals, tangents)  ->  M v
 #   binormals (b = ±n x t, an axial vector)           -> -M b, frame handedness kept
 #   theta, torsion (handedness-dependent scalars)     ->  negated
@@ -1059,7 +1059,6 @@ _POS_KEYS = (
     "latent_pos",
     "token_pos",
     "gt_points",
-    "gt_points_mirror",
     "boundary_plane_origin",
     "boundary_plane_origin_mid",
     "boundary_plane_origin_coarse",
@@ -1076,9 +1075,7 @@ _VEC_KEYS = (
     "binormal_coarse",
     "x_true_normal",
     "gt_normals",
-    "gt_normals_mirror",
     "gt_points_normal",
-    "gt_points_normal_mirror",
     "boundary_plane_normal",
     "boundary_plane_normal_mid",
     "boundary_plane_normal_coarse",
@@ -1106,11 +1103,6 @@ def apply_pose_jitter(batch, max_deg=POSE_JITTER_DEG, generator=None):
         out = cl.clone()
         out[..., :3] = cl[..., :3].to(dtype=R.dtype) @ rt
         batch.cl_dense = out
-    clm = _batch_tensor(batch, "cl_dense_mirror")
-    if clm is not None and clm.size(-1) >= 3:
-        out = clm.clone()
-        out[..., :3] = clm[..., :3].to(dtype=R.dtype) @ rt
-        batch.cl_dense_mirror = out
     for key in _VEC_KEYS:
         vec = _batch_tensor(batch, key)
         if vec is None or vec.size(-1) < 3:

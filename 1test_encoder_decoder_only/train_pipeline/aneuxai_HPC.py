@@ -38,8 +38,10 @@ if _REPO not in sys.path:
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+import aneuxai as _aneuxai
 import config as _config
-from aneuxai import run_stage2_training
+import latent_metrics as _latent_metrics
+from aneuxai import build_tube_cache_only, run_stage2_training
 from aneux_paths import CLEANDATA, EXPERIMENT_CACHE, EXPERIMENT_OUTPUT, REPO_ROOT
 from dist_utils import (
     barrier,
@@ -62,6 +64,8 @@ from hpc_runtime import (
 from run_report import make_run_dir
 
 # Per-GPU batch 4. Global batch = 4 × n_gpu (16 on a full node). LR stays 2e-4.
+# The R* sweep (hpc/sweep_rate_target.sbatch) runs one GPU at batch 16: the
+# same global batch, so what it picks carries over to this production setup.
 # The split has 493 training cases, so 25/GPU gave 5 optimiser steps an
 # epoch and ~2.5k steps in total, far too few for the decoder to converge;
 # 4/GPU gives ~31 steps an epoch (~15k over 500 epochs) at about the same
@@ -74,8 +78,15 @@ ACCUM_STEPS = int(os.environ.get("ANEUX_ACCUM_STEPS", "1"))
 EPOCHS = int(os.environ.get("ANEUX_EPOCHS", "500"))
 VAL_EVERY = int(os.environ.get("ANEUX_VAL_EVERY", "1"))
 LEARNING_RATE = float(os.environ.get("ANEUX_LR", "2e-4"))
-WEIGHT_DECAY = 1e-4
-EMA_DECAY = 0.993
+# 0.01: the 2026-09-22 run (1e-4) memorised -- val recon peaked at epoch 110
+# while train KL kept climbing.  EMA 0.996 averages ~250 steps (~8 epochs at
+# 31 steps an epoch); 0.999 would lag the val curve by ~30 epochs.
+WEIGHT_DECAY = float(os.environ.get("ANEUX_WEIGHT_DECAY", "0.01"))
+EMA_DECAY = float(os.environ.get("ANEUX_EMA_DECAY", "0.996"))
+# R* (nats per valid token) for the GECO hinge; unset keeps config.py's value.
+RATE_TARGET = os.environ.get("ANEUX_RATE_TARGET", "").strip()
+# a short name for this run, appended to the run folder (e.g. rstar0.5)
+RUN_TAG = os.environ.get("ANEUX_RUN_TAG", "").strip()
 LR_WARMUP_STEPS = 300
 TORCH_THREADS = 1
 PIN_MEMORY = True
@@ -111,6 +122,35 @@ def _activate_python_env_hints():
 
 def _install_geco_eta(eta):
     _config.GECO_ETA = float(eta)
+
+
+def _install_rate_target(value):
+    """Set R* everywhere it is read: losses read config live, the other two copied it."""
+    if not value:
+        return float(_config.RATE_TARGET_NATS)
+    r = float(value)
+    if not r > 0.0:
+        raise ValueError(f"ANEUX_RATE_TARGET must be > 0, got {value!r}")
+    _config.RATE_TARGET_NATS = r
+    _latent_metrics.RATE_TARGET_NATS = r
+    _aneuxai.RATE_TARGET_NATS = r
+    return r
+
+
+def _cache_only_main():
+    """ANEUX_CACHE_ONLY=1: fill ANEUX_CACHE in place from ANEUX_CLEANDATA, then exit."""
+    scaled = _resolve_worker_counts(n_gpu=1)
+    cache_dir = os.environ.get("ANEUX_CACHE", EXPERIMENT_CACHE)
+    cleandata = os.environ.get("ANEUX_CLEANDATA", CLEANDATA)
+    print(f"[hpc] cache-only: {cleandata} -> {cache_dir}  workers={scaled['cache_build_workers']}", flush=True)
+    errors = build_tube_cache_only(
+        cache_dir=cache_dir,
+        cleandata_root=cleandata,
+        cache_build_workers=scaled["cache_build_workers"],
+    )
+    # a handful of unbuildable cases is what training skips anyway; more means broken inputs
+    if len(errors) > 10:
+        raise SystemExit(f"[hpc] {len(errors)} cases failed to build; check cleandata")
 
 
 def _maybe_reexec_torchrun():
@@ -150,6 +190,10 @@ def main():
     os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     os.environ.setdefault("ANEUX_MONITOR_SEC", "15")
+
+    if os.environ.get("ANEUX_CACHE_ONLY", "").strip() in ("1", "true", "yes"):
+        _cache_only_main()
+        return
 
     _maybe_reexec_torchrun()
     init_distributed()
@@ -224,7 +268,10 @@ def main():
             cache_dir = cache_src
             output_dir = output_persist
         os.makedirs(output_dir, exist_ok=True)
-        run_dir = make_run_dir(output_dir, job_id=os.environ.get("SLURM_JOB_ID"))
+        job_tag = os.environ.get("SLURM_JOB_ID") or ""
+        if RUN_TAG:
+            job_tag = f"{job_tag}_{RUN_TAG}" if job_tag else RUN_TAG
+        run_dir = make_run_dir(output_dir, job_id=job_tag or None)
         print(f"[hpc] run_dir={run_dir}")
     else:
         cleandata_root = cleandata_src
@@ -238,6 +285,13 @@ def main():
     barrier()
 
     _install_geco_eta(GECO_ETA)
+    rate_target = _install_rate_target(RATE_TARGET)
+    if main_rank:
+        print(
+            f"[hpc] R*={rate_target:g} nats/token  weight_decay={WEIGHT_DECAY:g}  "
+            f"ema_decay={EMA_DECAY:g}  epochs={EPOCHS}  tag={RUN_TAG or '-'}",
+            flush=True,
+        )
 
     copy_back_done = {"yes": False}
 
@@ -274,6 +328,10 @@ def main():
         "CACHE_BUILD_WORKERS": cache_build_workers,
         "n_cpu": scaled["n_cpu"],
         "GECO_ETA": GECO_ETA,
+        "RATE_TARGET_NATS": rate_target,
+        "RUN_TAG": RUN_TAG,
+        "SLURM_ARRAY_JOB_ID": os.environ.get("SLURM_ARRAY_JOB_ID"),
+        "SLURM_ARRAY_TASK_ID": os.environ.get("SLURM_ARRAY_TASK_ID"),
     }
 
     try:

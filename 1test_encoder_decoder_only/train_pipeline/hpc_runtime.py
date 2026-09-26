@@ -15,6 +15,7 @@ large `.vtp` / `.pt` working set.
 """
 from __future__ import annotations
 
+import fnmatch
 import os
 import shutil
 import stat
@@ -163,8 +164,12 @@ def _which(name):
     return shutil.which(name)
 
 
-def copy_tree(src, dst, description="tree"):
-    """Copy `src` → `dst`. Prefer rsync on Linux; shutil elsewhere."""
+def copy_tree(src, dst, description="tree", only=None):
+    """Copy `src` → `dst`. Prefer rsync on Linux; shutil elsewhere.
+
+    ``only`` (a glob such as ``*_v12_*``) limits a flat directory copy to the
+    matching files; everything else in ``src`` is left behind.
+    """
     src = os.path.abspath(src)
     dst = os.path.abspath(dst)
     if not os.path.exists(src):
@@ -179,6 +184,7 @@ def copy_tree(src, dst, description="tree"):
             "-a",
             "--human-readable",
             "--info=stats2",
+            *(["--include", only, "--exclude", "*"] if only else []),
             src.rstrip("/") + "/",
             dst.rstrip("/") + "/",
         ]
@@ -187,7 +193,10 @@ def copy_tree(src, dst, description="tree"):
     else:
         print(f"[hpc] copy {description}: {src} -> {dst}", flush=True)
         if os.path.isdir(src):
-            shutil.copytree(src, dst, dirs_exist_ok=True)
+            ignore = None
+            if only:
+                ignore = lambda _d, names: [n for n in names if not fnmatch.fnmatch(n, only)]
+            shutil.copytree(src, dst, dirs_exist_ok=True, ignore=ignore)
         else:
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             shutil.copy2(src, dst)
@@ -218,7 +227,7 @@ def _dir_has_vtp(path):
     return False
 
 
-def persist_if_remote(src, dest, description="tree"):
+def persist_if_remote(src, dest, description="tree", only=None):
     """Copy ``src`` → ``dest`` when they are different existing/creatable paths."""
     if not src or not dest:
         return None
@@ -226,7 +235,14 @@ def persist_if_remote(src, dest, description="tree"):
     dest = os.path.abspath(dest)
     if src == dest or not os.path.isdir(src):
         return dest if src == dest else None
-    return copy_tree(src, dest, description)
+    return copy_tree(src, dest, description, only=only)
+
+
+def tube_cache_glob():
+    """Files of the current cache version; older versions stay on project disk."""
+    from config import CACHE_VERSION
+
+    return f"*_v{int(CACHE_VERSION)}_*"
 
 
 def stage_training_inputs(
@@ -257,7 +273,7 @@ def stage_training_inputs(
         )
     if copy_cache and cache_src and os.path.isdir(cache_src):
         dest = os.path.join(workspace, "tube_cache")
-        copy_tree(cache_src, dest, "tube_cache")
+        copy_tree(cache_src, dest, "tube_cache", only=tube_cache_glob())
         staged["cache"] = dest
     else:
         dest = os.path.join(workspace, "tube_cache")

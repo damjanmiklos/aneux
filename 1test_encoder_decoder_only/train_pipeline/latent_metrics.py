@@ -1112,6 +1112,43 @@ class LatentMetricAccumulator:
         )
 
 
+@torch.no_grad()
+def compute_latent_epoch_metrics(
+    *,
+    model: Any,
+    dataloader: Any,
+    device: Any,
+    beta: float | None = None,
+    max_batches: int | None = None,
+) -> dict[str, Any]:
+    """The per-epoch latent row `train.py` logs: raw KL, bits/case, active units.
+
+    Runs the encoder and the tract mixer only (the posterior the KL term sees),
+    never the decoder, so it costs a small part of a validation pass.  R* is
+    read from `config` at call time so a runtime override is reported.
+    """
+    try:
+        import config as _config
+
+        rate_target = float(getattr(_config, "RATE_TARGET_NATS", RATE_TARGET_NATS))
+    except ImportError:
+        rate_target = float(RATE_TARGET_NATS)
+    was_training = bool(model.training)
+    model.eval()
+    acc = LatentMetricAccumulator()
+    try:
+        for i, batch in enumerate(dataloader):
+            if max_batches is not None and i >= int(max_batches):
+                break
+            batch = batch.to(device)
+            mu_raw, logvar_raw = model.encode(batch)
+            mu, logvar = model.mix_posterior(mu_raw, logvar_raw, batch)
+            acc.update(mu.float(), logvar.float(), valid=getattr(batch, "latent_valid", None))
+    finally:
+        model.train(was_training)
+    return acc.compute(beta=beta, rate_target=rate_target)
+
+
 def rate_distortion_sweep(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
     """50-case D × R* grid of §5.3.7 — not run from this module.
 

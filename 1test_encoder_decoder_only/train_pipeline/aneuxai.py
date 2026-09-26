@@ -438,6 +438,39 @@ def persist_tube_cache(cache_dir):
     return persist_if_remote(cache_dir, dest, "tube_cache persist")
 
 
+def build_tube_cache_only(*, cache_dir=None, cleandata_root=None, cache_build_workers=None):
+    """Build every missing tube cache with the training run's dataset settings, then stop.
+
+    Lets one job fill the cache that several training jobs then only stage.
+    Returns the ``(dataset_id, error)`` list of cases that failed to build.
+    """
+    from coarsen import build_core
+    from config import CACHE_VERSION
+
+    cache_dir = os.path.abspath(cache_dir or CACHE_DIR)
+    cleandata_root = os.path.abspath(cleandata_root or CLEANDATA_ROOT)
+    workers = CACHE_BUILD_WORKERS if cache_build_workers is None else int(cache_build_workers)
+    os.makedirs(cache_dir, exist_ok=True)
+    print(f"coarsen C++ core: {'compiled' if build_core() else 'UNAVAILABLE -- slow Python collapse'}")
+    dataset = AneurysmDataset(
+        tube_radius=TUBE_RADIUS,
+        n_length=N_LENGTH,
+        n_radial=N_RADIAL,
+        cache_dir=cache_dir,
+        n_true=N_TRUE,
+        cleandata_root=cleandata_root,
+        require_templates=True,
+        ensure_derived=ENSURE_DERIVED,
+    )
+    print(f"{len(dataset)} samples; cache {cache_dir} (v{CACHE_VERSION}); {workers} workers")
+    errors = dataset.warmup_cache(num_workers=workers)
+    n_ready = sum(1 for i in range(len(dataset)) if dataset._cache_file_ready(i))
+    print(f"Tube cache ready for {n_ready}/{len(dataset)} samples; {len(errors)} failed")
+    for did, err in errors:
+        print(f"  FAILED {did}: {err}")
+    return errors
+
+
 def _first_cache_ready_index(dataset):
     for i in range(len(dataset)):
         if dataset._cache_file_ready(i):

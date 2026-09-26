@@ -124,6 +124,8 @@ def assert_optimized_cuda_kernels(device):
         raise RuntimeError("SplineConv is not using pyg-lib CUDA spline ops.")
     if not WITH_RADIUS:
         raise RuntimeError("radius / ball_query are not using pyg-lib CUDA radius ops.")
+    if dev.index is None:
+        dev = torch.device("cuda", torch.cuda.current_device())
     torch.cuda.set_device(dev)
     pts = torch.randn(128, 3, device=dev)
     fps = fps_indices(pts, 16)

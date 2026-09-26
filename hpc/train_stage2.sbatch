@@ -169,14 +169,15 @@ if [[ -z "$STATS_DIR" || ! -d "$STATS_DIR" ]]; then
   STATS_DIR="${ANEUX_OUTPUT}/runs"
   mkdir -p "$STATS_DIR"
 fi
-{
-  echo "=== seff ${SLURM_JOB_ID} $(date -Is) ==="
-  seff "${SLURM_JOB_ID}" || true
-} > "${STATS_DIR}/seff.txt" 2>&1 || true
-{
-  echo "=== jobstats ${SLURM_JOB_ID} $(date -Is) ==="
-  jobstats "${SLURM_JOB_ID}" || true
-} > "${STATS_DIR}/jobstats.txt" 2>&1 || true
+# seff and jobstats are not on the compute nodes' PATH (the 2026-09-22 job
+# logged "command not found"); leave the login-node command instead.
+for _tool in seff jobstats; do
+  if command -v "$_tool" >/dev/null 2>&1; then
+    { echo "=== $_tool ${SLURM_JOB_ID} $(date -Is) ==="; "$_tool" "${SLURM_JOB_ID}" || true; }       > "${STATS_DIR}/${_tool}.txt" 2>&1 || true
+  else
+    echo "$_tool is not on the compute node; on the login node run: $_tool ${SLURM_JOB_ID}"       > "${STATS_DIR}/${_tool}.txt"
+  fi
+done
 {
   echo "=== sacct ${SLURM_JOB_ID} $(date -Is) ==="
   sacct -j "${SLURM_JOB_ID}" -o JobID,State,ExitCode,Elapsed,MaxRSS,ReqMem,AllocTRES,TotalCPU,MaxDiskRead,MaxDiskWrite --parsable2 || true

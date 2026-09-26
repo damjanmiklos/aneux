@@ -199,13 +199,8 @@ _GT_FOLLOW_ATTRS = (
     "gt_points",
     "gt_normals",
     "gt_points_normal",
-    "gt_points_mirror",
-    "gt_normals_mirror",
-    "gt_points_normal_mirror",
     "gt_cl_dist",
-    "gt_cl_dist_mirror",
     "gt_template_sdf",
-    "gt_template_sdf_mirror",
 )
 _GT_FOLLOW_BATCH_KEYS = frozenset(f"{name}_batch" for name in _GT_FOLLOW_ATTRS)
 
@@ -224,7 +219,7 @@ class AneurysmData(Data):
             return int(self.pos_coarse.size(0))
         if key == "upsample_idx_fine":
             return int(self.pos_mid.size(0))
-        if key in ("gt_faces", "gt_faces_mirror"):
+        if key == "gt_faces":
             n_gt = getattr(self, "gt_points", None)
             return int(n_gt.size(0)) if n_gt is not None else 0
         if key in _GT_FOLLOW_BATCH_KEYS:
@@ -240,7 +235,6 @@ class AneurysmData(Data):
             "face_mid",
             "face_coarse",
             "gt_faces",
-            "gt_faces_mirror",
         ):
             return -1
         if key in ("pose_R", "origin_shift"):
@@ -2204,25 +2198,16 @@ class AneurysmDataset(Dataset):
             gt_faces = None
             if gt_mesh is not None:
                 _, gt_faces = self._polydata_triangles(gt_mesh)
-            flip = np.array([-1.0, 1.0, 1.0], dtype=np.float64)
-            gt_pts_m = gt_pts * flip
-            nrm_m = nrm * flip
-            nrm_m = self._orient_normals_outward(nrm_m, gt_pts_m, cl_xyz * flip)
             gt_extra = {
                 "gt_points": _torch_f32(gt_pts),
                 "gt_normals": _torch_f32(nrm),
                 "gt_points_normal": _torch_f32(nrm),
-                "gt_points_mirror": _torch_f32(gt_pts_m),
-                "gt_normals_mirror": _torch_f32(nrm_m),
-                "gt_points_normal_mirror": _torch_f32(nrm_m),
             }
             cl_dist = point_to_polyline_dist(gt_pts.astype(np.float32), cl_xyz).astype(np.float64)
             gt_extra["gt_cl_dist"] = _torch_f32(cl_dist)
-            gt_extra["gt_cl_dist_mirror"] = _torch_f32(cl_dist)
             if gt_faces is not None and len(gt_faces) > 0:
                 face_t = torch.from_numpy(np.ascontiguousarray(np.asarray(gt_faces, dtype=np.int64).T)).long()
                 gt_extra["gt_faces"] = face_t
-                gt_extra["gt_faces_mirror"] = face_t.clone()
             x_true, x_true_cl_dist, x_true_normal = sample_x_true(
                 gt_pts, nrm, cl_xyz, n_true=self.n_true, tube_radius=self.tube_radius
             )
@@ -2337,7 +2322,6 @@ class AneurysmDataset(Dataset):
             if gt_pts.shape[0] > 0:
                 sdf = signed_distance_to_oriented_surface(gt_pts, tpl_pos, tpl_nrm)
                 extra["gt_template_sdf"] = _torch_f32(sdf)
-                extra["gt_template_sdf_mirror"] = _torch_f32(sdf)
         if x_true is not None and torch.is_tensor(x_true) and x_true.numel() > 0:
             extra["x_true_template_sdf"] = _torch_f32(
                 signed_distance_to_oriented_surface(x_true.detach().cpu().numpy(), tpl_pos, tpl_nrm)

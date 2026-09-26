@@ -60,7 +60,10 @@ N_TRUE_FAR_FRAC = 0.25
 FAR_CL_MARGIN_MM = 1.0
 # Cache contents change with this bump: full GT, latent_valid, r*, 2 mm tokens.
 # 11: mid/coarse by sizing-field collapse + barycentric prolongation tables.
-CACHE_VERSION = 11
+# 12: rebuilt on the 2026-09-25/26 cleandata (stage-4 centerlines, var67
+#     templates) -- the key has no source hash, so v11 silently kept the old
+#     inputs; also drops the unread gt_*_mirror copies (train.apply_mirror).
+CACHE_VERSION = 12
 
 # (n_length, n_radial) per hierarchy level
 LEVEL_COARSE = (40, 6)
