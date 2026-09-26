@@ -31,6 +31,7 @@ PLOT_SERIES = (
     ("fold", "val_fold", "Fold penalty (dihedral, all levels)"),
     ("conf", "val_conf", "Conformal distortion log(1+MIPS)"),
     ("fold_tpl", "val_fold_tpl", "Faces turned >90° from template"),
+    ("rim_normal", "val_rim_normal", "Rim-normal slide removed (mm²)"),
     ("geco_beta", None, "GECO β"),
     ("rate_gap", "val_rate_gap", "Rate gap KL̄−R*"),
     ("lr", None, "Learning rate"),

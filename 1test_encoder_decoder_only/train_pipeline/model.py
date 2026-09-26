@@ -1457,7 +1457,8 @@ class ProgressiveSplineDecoder(nn.Module):
             self.gradient_checkpointing == "all",
         )
         dx_c = self.coarse_head(h_c)
-        x_c = self._rim(pos_c + dx_c, data, "_coarse", pos_c)
+        x_c_raw = pos_c + dx_c
+        x_c = self._rim(x_c_raw, data, "_coarse", pos_c)
         dx_c = x_c - pos_c
 
         dx_m0 = _upsample_level(
@@ -1494,7 +1495,8 @@ class ProgressiveSplineDecoder(nn.Module):
         dx_m = dx_m0 + decoupled_displacement(
             dr_m, ds_m, data.normal_mid, data.tangent_mid, data.binormal_mid
         )
-        x_m = self._rim(pos_m + dx_m, data, "_mid", pos_m)
+        x_m_raw = pos_m + dx_m
+        x_m = self._rim(x_m_raw, data, "_mid", pos_m)
         dx_m = x_m - pos_m
 
         dx_f0 = _upsample_level(
@@ -1531,9 +1533,14 @@ class ProgressiveSplineDecoder(nn.Module):
             delta_r, delta_s, data.normal, data.tangent, data.binormal
         )
         delta_x = dx_f0 + dx_decoupled
-        x_pred = self._rim(pos_f + delta_x, data, "", pos_f)
+        x_raw = pos_f + delta_x
+        x_pred = self._rim(x_raw, data, "", pos_f)
         delta_x = x_pred - pos_f
-        return x_pred, delta_x, x_c, x_m, delta_r, delta_s, dx_c
+        # What the rim projection threw away, per level (zero off the rim).
+        # The projection keeps the output exact; a small loss on this keeps the
+        # heads from emitting a normal slide that is silently discarded.
+        rim_removed = (x_c_raw - x_c, x_m_raw - x_m, x_raw - x_pred)
+        return x_pred, delta_x, x_c, x_m, delta_r, delta_s, dx_c, rim_removed
 
 
 @dataclass
@@ -1551,6 +1558,8 @@ class VAEOutput:
     logvar_raw: Tensor | None = None
     sampled: bool = False
     delta_x_coarse: Tensor | None = None
+    # (coarse, mid, fine) displacement removed by the rim-plane projection
+    rim_removed: tuple | None = None
 
 
 class GraphVAE(nn.Module):
@@ -1628,6 +1637,7 @@ class GraphVAE(nn.Module):
         unpacked = self.decoder(z, data)
         x_pred, delta_x, x_coarse, x_mid, delta_r, delta_s = unpacked[:6]
         dx_c = unpacked[6] if len(unpacked) > 6 else None
+        rim_removed = unpacked[7] if len(unpacked) > 7 else None
         return VAEOutput(
             x_pred=x_pred,
             mu=mu,
@@ -1642,4 +1652,5 @@ class GraphVAE(nn.Module):
             logvar_raw=logvar_raw,
             sampled=bool(sample),
             delta_x_coarse=dx_c,
+            rim_removed=rim_removed,
         )

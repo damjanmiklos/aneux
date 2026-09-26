@@ -2438,6 +2438,45 @@ def test_topk_checkpoints_keep_distinct_files():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_rim_normal_term_sees_only_the_projected_slide():
+    import train as T
+    from losses import rim_normal_residual_loss
+    data = make_synthetic_data(latent_len=8)
+    batch = next(iter(DataLoader([data], batch_size=1, follow_batch=FOLLOW_BATCH)))
+    torch.manual_seed(0)
+    model = _tiny_model()
+    with torch.no_grad():  # the heads start at zero (identity decode); move them off it
+        for prm in model.decoder.parameters():
+            prm.add_(0.05 * torch.randn_like(prm))
+    out = T._forward_model(model, batch, sample=False)
+    _assert(out.rim_removed is not None and len(out.rim_removed) == 3, "decoder returns 3 removed levels")
+    any_live = False
+    for rem, sfx in zip(out.rim_removed, ("_coarse", "_mid", "")):
+        m = getattr(batch, f"boundary_mask{sfx}")
+        nrm = torch.nn.functional.normalize(getattr(batch, f"boundary_plane_normal{sfx}"), dim=-1)
+        _assert(float(rem.detach()[~m].abs().max()) == 0.0, f"level {sfx or '_fine'}: nothing removed off the rim")
+        r = rem[m].detach()
+        tang = r - nrm[m] * (r * nrm[m]).sum(-1, keepdim=True)
+        _assert(float(tang.abs().max()) < 1e-5, f"level {sfx or '_fine'}: removed part is along the plane normal")
+        any_live |= float(r.abs().max()) > 1e-6
+    _assert(any_live, "a perturbed decoder slides some rim vertex off its plane")
+    terms = T.losses_from_output(out, batch)
+    _assert("rim_normal" in terms and float(terms["rim_normal"]) > 0, f"term present: {terms.get('rim_normal')}")
+    # nothing else in the objective pulls on this direction; this term must
+    model.zero_grad()
+    terms["rim_normal"].backward()
+    g = sum(float(p.grad.abs().sum()) for p in model.decoder.parameters() if p.grad is not None)
+    _assert(g > 0, "the term trains the decoder")
+    # value: mean |removed|^2 over each level's rim, summed over levels
+    rem = (torch.zeros(4, 3), torch.tensor([[0.0, 0.0, 2.0], [0.0, 0.0, 0.0], [5.0, 5.0, 5.0]]))
+    masks = (torch.zeros(4, dtype=torch.bool), torch.tensor([True, True, False]))
+    _assert(abs(float(rim_normal_residual_loss(rem, masks)) - 2.0) < 1e-6, "mean over rim only, empty level adds 0")
+    w = dict(T.DEFAULT_LOSS_WEIGHTS)
+    base = {k: torch.zeros(()) for k in ("recon", "kl", "disp", "lap", "norm")}
+    _assert(abs(float(T.weighted_total({**base, "rim_normal": torch.tensor(3.0)}, w)) - 3.0 * w["rim_normal"]) < 1e-6,
+            "weighted_total includes rim_normal")
+
+
 def main():
     configure_stage2_precision()
     tests = [
@@ -2529,6 +2568,7 @@ def main():
         test_null_code_decodes_to_template,
         test_mesh_terms_have_finite_gradients_at_identity,
         test_cross_attention_reads_world_direction,
+        test_rim_normal_term_sees_only_the_projected_slide,
     ]
     failed = 0
     skipped = 0

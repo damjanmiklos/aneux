@@ -253,6 +253,13 @@ LAMBDA_CONF = 0.05
 LAMBDA_CD_MID = 0.5
 LAMBDA_CD_COARSE = 0.05
 LAMBDA_RAD_MID = 0.5
+# The rim projection (RIM_PROJECT_DISPLACEMENT) stays the hard constraint; this
+# only charges the ostium-normal displacement it removes (mm^2, mean over rim
+# vertices, summed over levels), so the heads' raw output matches what is
+# applied. Nothing else pulls on that direction, so a small weight suffices:
+# after 2 smoke epochs the removed slide is 0.005-0.05 mm RMS (term ~0.003
+# against a total ~1), identity decode removes nothing.
+LAMBDA_RIM_NORMAL = 0.1
 
 CHAMFER_WEIGHT_CAP = 4.0
 RADIAL_HUBER_DELTA_MM = 1.0
@@ -285,6 +292,7 @@ DEFAULT_LOSS_WEIGHTS = {
     "rad": LAMBDA_RAD,
     "fold": LAMBDA_FOLD,
     "conf": LAMBDA_CONF,
+    "rim_normal": LAMBDA_RIM_NORMAL,
 }
 
 # DataLoader node sets that do not match the fine-graph node count.

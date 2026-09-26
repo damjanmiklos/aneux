@@ -876,6 +876,26 @@ def _resolve_true_cloud(
     return true_pts, true_batch, true_cl, n_true
 
 
+def rim_normal_residual_loss(removed, masks):
+    """Mean squared displacement (mm^2) the rim projection removed, per level.
+
+    `removed` holds (coarse, mid, fine) [N_l, 3] tensors that are zero off the
+    rim; `masks` the matching boundary masks. Levels are averaged over their
+    own rim vertices and summed; a level without rim vertices adds zero.
+    """
+    total = None
+    for r, m in zip(removed, masks):
+        if r is None or m is None:
+            continue
+        m = m.reshape(-1).to(device=r.device, dtype=torch.bool)
+        if m.numel() != r.size(0):
+            continue
+        sq = r.float()[m].pow(2).sum(dim=-1)
+        term = sq.mean() if sq.numel() else r.float().sum() * 0.0
+        total = term if total is None else total + term
+    return total
+
+
 def compute_losses(
     x_pred,
     x_true,
@@ -938,6 +958,8 @@ def compute_losses(
     face_coarse=None,
     edge_index_mid=None,
     edge_index_coarse=None,
+    rim_removed=None,
+    rim_masks=None,
 ):
     """Return a dict of unweighted loss terms."""
     x_pred = x_pred.float()
@@ -1181,6 +1203,12 @@ def compute_losses(
                 r_pred_m, r_star_mid, r_star_valid_mid, delta=radial_huber_delta
             )
 
+    loss_rim = x_pred.new_zeros(())
+    if rim_removed is not None and rim_masks is not None:
+        rim = rim_normal_residual_loss(rim_removed, rim_masks)
+        if rim is not None:
+            loss_rim = rim
+
     return {
         "recon": loss_recon,
         "kl": loss_kl,
@@ -1192,4 +1220,5 @@ def compute_losses(
         "conf": loss_conf,
         "fold_tpl": loss_fold_tpl,
         "stretch": loss_stretch,
+        "rim_normal": loss_rim,
     }
