@@ -253,17 +253,6 @@ LAMBDA_CONF = 0.05
 LAMBDA_CD_MID = 0.5
 LAMBDA_CD_COARSE = 0.05
 LAMBDA_RAD_MID = 0.5
-# Murray's law prior at junctions (murray.py): r_p^k ~ sum r_c^k, read in
-# windows set back from each split, compared in log-radius units
-# e = log(sum r_c^k / r_p^k) / k, hinged beyond max(tolerance, |e_GT|).
-# Exponent: on 637 GT relations (v11 cache, 300 cases) k = 2 centres the error
-# (median e -0.008) and k = 3 does not (median -0.105, children ~10 % thinner
-# than Murray-3 predicts); |e_GT| at k = 2 has median 0.11, 80th pct 0.24.
-# Low weight: the law is a noisy prior and `rad` already fits the GT radius.
-LAMBDA_MURRAY = 0.1
-MURRAY_EXPONENT = 2.0
-MURRAY_TOLERANCE = 0.15
-MURRAY_HUBER_DELTA = 0.1
 
 CHAMFER_WEIGHT_CAP = 4.0
 RADIAL_HUBER_DELTA_MM = 1.0
@@ -296,7 +285,6 @@ DEFAULT_LOSS_WEIGHTS = {
     "rad": LAMBDA_RAD,
     "fold": LAMBDA_FOLD,
     "conf": LAMBDA_CONF,
-    "murray": LAMBDA_MURRAY,
 }
 
 # DataLoader node sets that do not match the fine-graph node count.
@@ -320,5 +308,4 @@ FOLLOW_BATCH = [
     "latent_pos",
     "latent_valid",
     "token_attend",
-    "murray_rel",
 ]
