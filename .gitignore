@@ -54,6 +54,9 @@ cleandata/**
 !cleandata/**/
 !cleandata/**/.gitkeep
 
+# Backups of replaced cleandata/cleaned_data sets
+cleandata_backups/
+
 # Local agent troubleshooting (never commit)
 scratch/
 
