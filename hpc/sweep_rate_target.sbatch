@@ -102,6 +102,10 @@ for i in "${!pids[@]}"; do
 done
 
 aneux_write_job_stats "${ANEUX_OUTPUT}/runs/rsweep_job${SLURM_JOB_ID}_stats"
-rm -rf "${WS}"
+# rsync -a copied the project disk's read-only directory modes, so rm -rf alone
+# failed 1485 times on job 14451411 and set -e turned that into exit 1 after
+# four clean runs. Make it writable first, and never let cleanup decide the exit code.
+chmod -R u+w "${WS}" 2>/dev/null || true
+rm -rf "${WS}" || echo "warning: could not remove ${WS}; delete it by hand"
 echo "=== finished $(date -Is) rc=${rc} ==="
 exit "$rc"
