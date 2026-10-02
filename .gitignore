@@ -67,9 +67,11 @@ datatransform/hemoMesh/
 aneux_s2_*.out
 aneux_s2_*.err
 
-# Compiled variable-remesh raycast helper (built in hemomesh against local VTK)
+# Compiled template-creation helpers (built against the local VTK)
 datatransform/template_creation/stretch_raycast*.pyd
 datatransform/template_creation/stretch_raycast*.so
+datatransform/template_creation/vtk_double_points*.pyd
+datatransform/template_creation/vtk_double_points*.so
 datatransform/template_creation/build/
 
 # Parent tubes kept between variable_remeshing.py runs
