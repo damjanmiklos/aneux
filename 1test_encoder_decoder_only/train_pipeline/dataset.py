@@ -1336,6 +1336,7 @@ class AneurysmDataset(Dataset):
         alloc = allocate_ring_counts(n_length, arc_lengths)
         node_chunks = []
         u_local_chunks = []
+        s_chunks = []
         theta_chunks = []
         n_chunks, t_chunks, b_chunks = [], [], []
         eval_chunks, u_cl_chunks = [], []
@@ -1348,6 +1349,7 @@ class AneurysmDataset(Dataset):
             tube = self._tube_from_dense(dense, n_len, n_radial)
             node_chunks.append(tube["nodes"])
             u_local_chunks.append(tube["u_local"])
+            s_chunks.append(tube["u_local"] * float(arc_b))
             theta_chunks.append(tube["theta"])
             n_chunks.append(tube["n_v"])
             t_chunks.append(tube["t_v"])
@@ -1365,6 +1367,7 @@ class AneurysmDataset(Dataset):
 
         pos = _torch_f32(np.concatenate(node_chunks, axis=0))
         u_local = _torch_f32(np.concatenate(u_local_chunks))
+        s_mm = _torch_f32(np.concatenate(s_chunks))
         theta = _torch_f32(np.concatenate(theta_chunks))
         n_v = _torch_f32(np.concatenate(n_chunks, axis=0))
         t_v = _torch_f32(np.concatenate(t_chunks, axis=0))
@@ -1404,6 +1407,7 @@ class AneurysmDataset(Dataset):
         return {
             "pos": pos,
             "u": u_local,
+            "s_mm": s_mm,
             "theta": theta,
             "normal": n_v,
             "tangent": t_v,
@@ -1483,10 +1487,15 @@ class AneurysmDataset(Dataset):
             n_tok = max(1, n_tok)
             slots = []
             for k in range(n_tok):
-                s_mm = k * spacing
-                u = 0.0 if arc <= 1e-12 else float(min(s_mm / arc, 1.0))
+                s_raw = k * spacing
+                if arc <= 1e-12:
+                    u = 0.0
+                    s_abs = 0.0
+                else:
+                    s_abs = float(min(s_raw, arc))
+                    u = s_abs / arc
                 xyz = self._interp_by_u(dense["u"], dense["xyz"], np.asarray([u], dtype=np.float64))
-                slots.append((k, u, xyz[0], tid))
+                slots.append((k, u, s_abs, xyz[0], tid))
             per_tract.append(slots)
 
         # Fill k=0 of every tract first so a short LATENT_LEN still covers the tree.
@@ -1498,6 +1507,7 @@ class AneurysmDataset(Dataset):
                     ordered.append(slots[k])
 
         token_u = np.zeros(pad, dtype=np.float64)
+        token_s = np.zeros(pad, dtype=np.float64)
         token_tract = np.zeros(pad, dtype=np.int64)
         token_is_junc = np.zeros(pad, dtype=np.int64)
         token_pos = np.zeros((pad, 3), dtype=np.float64)
@@ -1505,8 +1515,9 @@ class AneurysmDataset(Dataset):
         valid = np.zeros(pad, dtype=bool)
         n_keep = min(len(ordered), pad)
         for slot in range(n_keep):
-            _k, u, xyz, tid = ordered[slot]
+            _k, u, s_abs, xyz, tid = ordered[slot]
             token_u[slot] = u
+            token_s[slot] = s_abs
             token_tract[slot] = int(tid)
             token_pos[slot] = xyz
             if 0 <= int(tid) < MAX_TRACTS:
@@ -1514,11 +1525,13 @@ class AneurysmDataset(Dataset):
             valid[slot] = True
 
         latent_u = _torch_f32(token_u)
+        latent_s = _torch_f32(token_s)
         latent_pos = _torch_f32(token_pos)
         latent_tract = _torch_long(token_tract)
         latent_valid = torch.from_numpy(valid.copy()).bool()
         return {
             "latent_u": latent_u,
+            "latent_s_mm": latent_s,
             "latent_tract_id": latent_tract,
             "latent_is_junction": _torch_long(token_is_junc),
             "latent_pos": latent_pos,
@@ -1672,8 +1685,19 @@ class AneurysmDataset(Dataset):
         x_nb = np.einsum("ij,ij->i", rel, n_i)
         y_nb = np.einsum("ij,ij->i", rel, b_i)
         theta = np.arctan2(y_nb, x_nb)
+        arc = np.concatenate(
+            [
+                np.full(
+                    len(d["xyz"]),
+                    float(d["arc"]) if float(d.get("arc", 0.0) or 0.0) > 1e-12 else _arc_len(d["xyz"]),
+                    dtype=np.float64,
+                )
+                for d in dense_tracts
+            ]
+        )
         return {
             "u": u[idx],
+            "s_mm": u[idx] * arc[idx],
             "theta": theta,
             "tract_id": tract_id[idx],
             "t": t_i,
@@ -2141,6 +2165,7 @@ class AneurysmDataset(Dataset):
         return {
             "pos": _torch_f32(pts),
             "u": _torch_f32(proj["u"]),
+            "s_mm": _torch_f32(proj["s_mm"]),
             "theta": _torch_f32(proj["theta"]),
             "normal": _torch_f32(n_v),
             "tangent": _torch_f32(t_v),
@@ -2242,6 +2267,7 @@ class AneurysmDataset(Dataset):
             edge_index=fine["edge_index"],
             face=fine["face"],
             u=fine["u"],
+            s_mm=fine["s_mm"],
             theta=fine["theta"],
             normal=fine["normal"],
             tangent=fine["tangent"],
@@ -2252,6 +2278,7 @@ class AneurysmDataset(Dataset):
             edge_index_mid=mid["edge_index"],
             face_mid=mid["face"],
             u_mid=mid["u"],
+            s_mm_mid=mid["s_mm"],
             theta_mid=mid["theta"],
             normal_mid=mid["normal"],
             tangent_mid=mid["tangent"],
@@ -2262,6 +2289,7 @@ class AneurysmDataset(Dataset):
             edge_index_coarse=coarse["edge_index"],
             face_coarse=coarse["face"],
             u_coarse=coarse["u"],
+            s_mm_coarse=coarse["s_mm"],
             theta_coarse=coarse["theta"],
             normal_coarse=coarse["normal"],
             tangent_coarse=coarse["tangent"],

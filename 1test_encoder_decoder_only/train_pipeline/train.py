@@ -1797,6 +1797,14 @@ def train_model(
             if metrics.get("rate_gap") is not None:
                 extra += f" | rate_gap: {metrics['rate_gap']:.4f}"
         extra += f" | {metrics['samples_per_sec']:.2f} samples/s"
+        sigmas = raw_model.decoder.attention_sigmas()
+        metrics.update(sigmas)
+        extra += (
+            " | sigma_attn c/m/f: "
+            f"{sigmas['attn_sigma_coarse']:.3f}/"
+            f"{sigmas['attn_sigma_mid']:.3f}/"
+            f"{sigmas['attn_sigma_fine']:.3f} mm"
+        )
         _log(_format_metrics(metrics, epoch_weights, "TRAIN", epoch, epochs) + extra)
         if os.environ.get("ANEUX_VRAM_PROBE_ONLY", "").strip().lower() in ("1", "true", "yes"):
             history.append(metrics)

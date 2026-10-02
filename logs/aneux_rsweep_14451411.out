@@ -1,0 +1,23 @@
+=== aneux R* sweep 2026-09-27T02:40:05+02:00 job=14451411 node=x1001c7s1b0n0 ===
+repo=/project/nr_hemo_ai1/nr_hemd/aneuxai/aneux
+env=aneuxai_env
+python 3.11.7 exe /home/nr_hemd/aneuxai_env/bin/python
+torch 2.11.0+cu130 cuda True ngpu 4
+--- cache build 2026-09-27T02:40:56+02:00
+[hpc] cache-only: /project/nr_hemo_ai1/nr_hemd/aneuxai/aneux/cleandata -> /project/nr_hemo_ai1/nr_hemd/aneuxai/aneux/1test_encoder_decoder_only/tube_cache  workers=48
+coarsen C++ core: compiled
+AneurysmDataset: cleandata (uniformly_remeshed=742, template_mesh=742, original_centerline=742); 742 samples
+742 samples; cache /project/nr_hemo_ai1/nr_hemd/aneuxai/aneux/1test_encoder_decoder_only/tube_cache (v12); 48 workers
+Tube cache: 0 ready, 742 to build, 48 process(es)
+Tube cache ready for 742/742 samples; 0 failed
+--- staging to /scratch/nr_hemo_ai1/nr_hemd/aneux/14451411 2026-09-27T02:46:07+02:00
+staged 742 v12 cache files 2026-09-27T02:47:25+02:00
+--- run R*=0.25 on GPU 0 -> /project/nr_hemo_ai1/nr_hemd/aneuxai/aneux/aneux_rsweep_14451411_rstar0.25.log
+--- run R*=0.5 on GPU 1 -> /project/nr_hemo_ai1/nr_hemd/aneuxai/aneux/aneux_rsweep_14451411_rstar0.5.log
+--- run R*=1 on GPU 2 -> /project/nr_hemo_ai1/nr_hemd/aneuxai/aneux/aneux_rsweep_14451411_rstar1.log
+--- run R*=2 on GPU 3 -> /project/nr_hemo_ai1/nr_hemd/aneuxai/aneux/aneux_rsweep_14451411_rstar2.log
+run R*=0.25 exited 0 2026-09-29T04:43:09+02:00
+run R*=0.5 exited 0 2026-09-29T04:43:09+02:00
+run R*=1 exited 0 2026-09-29T04:43:09+02:00
+run R*=2 exited 0 2026-09-29T04:43:09+02:00
+Stats written under /project/nr_hemo_ai1/nr_hemd/aneuxai/aneux/1test_encoder_decoder_only/output/runs/rsweep_job14451411_stats

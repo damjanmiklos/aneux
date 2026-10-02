@@ -23,8 +23,9 @@ from config import (
     FOLLOW_BATCH,
     GAMMA_THETA_DIM,
     GAMMA_U_DIM,
-    K_THETA,
-    K_U,
+    THETA_HARMONICS,
+    U_NORM_HARMONICS,
+    U_WAVELENGTHS_MM,
     LAMBDA_CD_COARSE,
     LATENT_DIM,
     LATENT_LEN,
@@ -278,22 +279,40 @@ def test_config_contracts():
 
 
 def test_fourier_shapes():
+    _assert(tuple(U_WAVELENGTHS_MM) == (128.0, 64.0, 32.0, 16.0, 8.0, 4.0), U_WAVELENGTHS_MM)
+    _assert(tuple(U_NORM_HARMONICS) == (1.0, 2.0), U_NORM_HARMONICS)
+    _assert(tuple(THETA_HARMONICS) == (1, 2, 3, 4), THETA_HARMONICS)
+    _assert(GAMMA_U_DIM == 16 and GAMMA_THETA_DIM == 8, (GAMMA_U_DIM, GAMMA_THETA_DIM))
     u = torch.linspace(0, 1, 11)
+    s = u * 100.0
     th = torch.linspace(-math.pi, math.pi, 13)[:-1]
-    gu = harmonic_encoding_u(u)
+    gu = harmonic_encoding_u(s, u)
     gt = harmonic_encoding_theta(th)
     _assert(gu.dtype == torch.float32 and gt.dtype == torch.float32, "Fourier dtype")
     _assert(gu.shape == (11, GAMMA_U_DIM), f"γ(u) shape {gu.shape}")
     _assert(gt.shape == (12, GAMMA_THETA_DIM), f"γ(θ) shape {gt.shape}")
     _assert(torch.isfinite(gu).all() and torch.isfinite(gt).all(), "non-finite Fourier")
-    u_hi = torch.tensor([0.0, 0.5, 1.0], dtype=torch.float32)
+    u_ends = torch.tensor([0.0, 1.0], dtype=torch.float32)
+    s_ends = torch.tensor([0.0, 100.0], dtype=torch.float32)
+    g_ends = harmonic_encoding_u(s_ends, u_ends)
+    # [sin λ (6), cos λ (6), sin(kπu) (2), cos(kπu) (2)]; cos(πu) is index 14.
+    _assert(float(g_ends[0, :6].abs().max()) < 1e-5, "s=0 absolute sines")
+    _assert(float((g_ends[0, 6:12] - 1).abs().max()) < 1e-5, "s=0 absolute cosines")
+    _assert(abs(float(g_ends[0, 14]) - 1.0) < 1e-5, "cos(πu) at u=0")
+    _assert(abs(float(g_ends[1, 14]) + 1.0) < 1e-5, "cos(πu) at u=1")
+    # Shortest band is λ=4 mm: sin(2π s / 4) at s=1 mm is 1.
+    g_mm = harmonic_encoding_u(torch.tensor([1.0]), torch.tensor([0.0]))
+    _assert(abs(float(g_mm[0, 5]) - 1.0) < 1e-5, f"4 mm sine {float(g_mm[0, 5])}")
+    same_u = harmonic_encoding_u(torch.tensor([20.0, 50.0]), torch.tensor([0.5, 0.5]))
+    _assert(not torch.allclose(same_u[0], same_u[1]), "absolute bands must see millimetres")
     th_hi = torch.tensor([-math.pi, 0.0, math.pi], dtype=torch.float32)
-    _assert(torch.isfinite(harmonic_encoding_u(u_hi)).all(), "γ(u) max-band")
     _assert(torch.isfinite(harmonic_encoding_theta(th_hi)).all(), "γ(θ) max-band")
     th0 = torch.tensor([-math.pi, math.pi - 1e-6])
     gt0 = harmonic_encoding_theta(th0)
     _assert((gt0[0] - gt0[1]).abs().max() < 1e-3, "θ encoding should be nearly 2π-periodic")
-    _assert(K_U == 8 and K_THETA == 6, "frequency band counts")
+    # k = 3 is the triangular harmonic: sin(3·π/2) = -1, stored at index 2.
+    gt3 = harmonic_encoding_theta(torch.tensor([0.5 * math.pi]))
+    _assert(abs(float(gt3[0, 2]) + 1.0) < 1e-5, f"sin(3θ) {float(gt3[0, 2])}")
 
 
 def test_kl_and_anneal():
@@ -542,14 +561,16 @@ def test_orphan_attention_uniform():
     n = 3
     z = torch.randn(1, latent_len, latent_dim)
     u = torch.full((n,), 0.4)
+    s = u * 80.0
     theta = torch.zeros(n)
     node_batch = torch.zeros(n, dtype=torch.long)
     node_tract = torch.zeros(n, dtype=torch.long)
     token_u = torch.linspace(0, 1, latent_len).unsqueeze(0)
+    token_s = token_u * 80.0
     token_attend = torch.zeros(1, latent_len, MAX_TRACTS, dtype=torch.bool)
     with torch.no_grad():
-        out = layer(z, u, theta, node_batch, node_tract, token_u, token_attend)
-        gamma_u = harmonic_encoding_u(u)
+        out = layer(z, s, u, theta, node_batch, node_tract, token_s, token_u, token_attend)
+        gamma_u = harmonic_encoding_u(s, u)
         gamma_th = harmonic_encoding_theta(theta)
         v = layer.w_v(z)[0]
         a = v.mean(dim=0, keepdim=True).expand(n, -1)
@@ -557,13 +578,15 @@ def test_orphan_attention_uniform():
     _assert(torch.allclose(out, expected, atol=1e-5), "orphan queries must attend uniformly")
 
 
-def _broadcast_latent_cross_attn(layer, z, u, theta, node_batch, node_tract, token_u, token_attend):
+def _broadcast_latent_cross_attn(layer, z, s, u, theta, node_batch, node_tract, token_s, token_u, token_attend):
     """Old [N, L, D] broadcast formula; reference only (tiny N)."""
-    gamma_u = harmonic_encoding_u(u)
+    gamma_u = harmonic_encoding_u(s, u)
     gamma_th = harmonic_encoding_theta(theta)
     q = layer.w_q(torch.cat([gamma_u, gamma_th], dim=-1))
     n_graphs = z.size(0)
-    gamma_uk = harmonic_encoding_u(token_u.reshape(-1)).reshape(n_graphs, layer.latent_len, -1)
+    gamma_uk = harmonic_encoding_u(token_s.reshape(-1), token_u.reshape(-1)).reshape(
+        n_graphs, layer.latent_len, -1
+    )
     k = layer.w_k(torch.cat([z, gamma_uk], dim=-1))
     v = layer.w_v(z)
     k_n = k[node_batch]
@@ -592,19 +615,21 @@ def test_cross_attention_gemm_matches_broadcast():
     n = n0 + n1
     z = torch.randn(2, latent_len, latent_dim)
     u = torch.rand(n)
+    s = u * 80.0
     theta = torch.rand(n) * 2 * math.pi - math.pi
     node_batch = torch.cat([torch.zeros(n0), torch.ones(n1)]).long()
     node_tract = torch.randint(0, 3, (n,))
     token_u = torch.rand(2, latent_len)
+    token_s = token_u * 80.0
     token_attend = torch.zeros(2, latent_len, MAX_TRACTS, dtype=torch.bool)
     token_attend[0, :, 0] = True
     token_attend[0, :3, 1] = True
     token_attend[1, :, 1] = True
     token_attend[1, 2:, 2] = True
     with torch.no_grad():
-        got = layer(z, u, theta, node_batch, node_tract, token_u, token_attend)
+        got = layer(z, s, u, theta, node_batch, node_tract, token_s, token_u, token_attend)
         ref = _broadcast_latent_cross_attn(
-            layer, z, u, theta, node_batch, node_tract, token_u, token_attend
+            layer, z, s, u, theta, node_batch, node_tract, token_s, token_u, token_attend
         )
     _assert(got.shape == ref.shape, f"shape {got.shape} vs {ref.shape}")
     _assert(torch.allclose(got, ref, atol=1e-5, rtol=1e-5), "GEMM path must match broadcast scores")
@@ -618,24 +643,26 @@ def test_cross_attention_two_graph_isolation():
     n0, n1 = 18, 14
     z = torch.randn(2, latent_len, latent_dim)
     u = torch.rand(n0 + n1)
+    s = u * 80.0
     theta = torch.rand(n0 + n1) * 2 * math.pi - math.pi
     node_batch = torch.cat([torch.zeros(n0), torch.ones(n1)]).long()
     node_tract = torch.cat([torch.zeros(n0), torch.ones(n1)]).long()
     token_u = torch.rand(2, latent_len)
+    token_s = token_u * 80.0
     token_attend = torch.zeros(2, latent_len, MAX_TRACTS, dtype=torch.bool)
     token_attend[0, :, 0] = True
     token_attend[1, :, 1] = True
     with torch.no_grad():
-        batched = layer(z, u, theta, node_batch, node_tract, token_u, token_attend)
+        batched = layer(z, s, u, theta, node_batch, node_tract, token_s, token_u, token_attend)
         out0 = layer(
-            z[0:1], u[:n0], theta[:n0],
+            z[0:1], s[:n0], u[:n0], theta[:n0],
             torch.zeros(n0, dtype=torch.long), node_tract[:n0],
-            token_u[0:1], token_attend[0:1],
+            token_s[0:1], token_u[0:1], token_attend[0:1],
         )
         out1 = layer(
-            z[1:2], u[n0:], theta[n0:],
+            z[1:2], s[n0:], u[n0:], theta[n0:],
             torch.zeros(n1, dtype=torch.long), node_tract[n0:],
-            token_u[1:2], token_attend[1:2],
+            token_s[1:2], token_u[1:2], token_attend[1:2],
         )
     _assert(torch.allclose(batched[:n0], out0, atol=1e-5, rtol=1e-5), "graph 0 mixed with graph 1")
     _assert(torch.allclose(batched[n0:], out1, atol=1e-5, rtol=1e-5), "graph 1 mixed with graph 0")
@@ -772,13 +799,15 @@ def test_cross_attention_reads_world_direction():
     base = LatentCrossAttention(d, 16, 16, L, use_dir=False)
     z = torch.randn(1, L, d)
     u = torch.linspace(0.0, 1.0, n)
+    s = u * 80.0
     theta = torch.zeros(n)
     tract = torch.zeros(n, dtype=torch.long)
     token_u = torch.linspace(0.0, 1.0, L).unsqueeze(0)
+    token_s = token_u * 80.0
     attend = torch.ones(1, L, MAX_TRACTS, dtype=torch.bool)
     batch = torch.zeros(n, dtype=torch.long)
     nrm = torch.nn.functional.normalize(torch.randn(n, 3), dim=-1)
-    args = (z, u, theta, batch, tract, token_u, attend)
+    args = (z, s, u, theta, batch, tract, token_s, token_u, attend)
     out_a = layer(*args, node_dir=nrm)
     out_b = layer(*args, node_dir=-nrm)
     _assert(out_a.shape == (n, 16), out_a.shape)
@@ -790,6 +819,136 @@ def test_cross_attention_reads_world_direction():
         raise AssertionError("use_dir=True without node_dir must raise")
     except ValueError:
         pass
+
+
+def _content_free_cross_attention(layer):
+    """Zero q and k so the logits are only the distance bias, and return the weights."""
+    dim = layer.attn_dim
+    with torch.no_grad():
+        for lin in (layer.w_q, layer.w_k):
+            lin.weight.zero_()
+            lin.bias.zero_()
+        layer.w_v.weight.copy_(torch.eye(dim))
+        layer.w_v.bias.zero_()
+        layer.out.weight.zero_()
+        layer.out.bias.zero_()
+        layer.out.weight[:, :dim].copy_(torch.eye(dim))
+
+
+def _distance_softmax(layer, node_pos, token_pos, allow):
+    dist2 = torch.cdist(node_pos, token_pos).square()
+    sigma = float(layer.sigma().detach())
+    scores = -dist2 / (2.0 * sigma * sigma)
+    scores = scores.masked_fill(~allow, -1.0e4)
+    orphan = ~allow.any(dim=-1)
+    scores = torch.where(orphan.unsqueeze(-1), torch.zeros_like(scores), scores)
+    return torch.softmax(scores, dim=-1)
+
+
+def test_cross_attention_gaussian_distance_bias():
+    """Logits gain −d²/(2σ²). The (tract, u) mask, including ostium tokens, stays."""
+    from config import ATTN_SIGMA_INIT_MM, ATTN_SIGMA_MAX_MM, ATTN_SIGMA_MIN_MM
+    from model import LatentCrossAttention, ProgressiveSplineDecoder, _decoder_token_allow
+
+    _assert(ATTN_SIGMA_INIT_MM == 2.0 and ATTN_SIGMA_MIN_MM == 1.0 and ATTN_SIGMA_MAX_MM == 2.5, "sigma bounds")
+    dim = 6
+    layer = LatentCrossAttention(dim, dim, dim, dim)
+    _assert(abs(float(layer.log_sigma) - math.log(2.0)) < 1e-6, float(layer.log_sigma))
+    _assert(abs(float(layer.sigma()) - 2.0) < 1e-5, float(layer.sigma()))
+    with torch.no_grad():
+        layer.log_sigma.fill_(math.log(0.25))
+    _assert(abs(float(layer.sigma()) - 1.0) < 1e-5, "sigma must clamp at 1 mm")
+    with torch.no_grad():
+        layer.log_sigma.fill_(math.log(8.0))
+    _assert(abs(float(layer.sigma()) - 2.5) < 1e-5, "sigma must clamp at 2.5 mm")
+    with torch.no_grad():
+        layer.log_sigma.fill_(math.log(2.0))
+    _content_free_cross_attention(layer)
+
+    # Six same-tract tokens. The last is closest in xyz and farthest in u, so the
+    # 5-nearest-(tract, u) mask drops it. Distance may reweight the five, not recruit it.
+    token_u = torch.tensor([[0.50, 0.51, 0.52, 0.53, 0.54, 0.80]])
+    token_tract = torch.zeros(1, 6, dtype=torch.long)
+    token_pos = torch.tensor(
+        [[[3.0, 0.0, 0.0], [6.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]]]
+    )
+    node_pos = torch.zeros(1, 3)
+    node_u = torch.tensor([0.50])
+    node_tract = torch.zeros(1, dtype=torch.long)
+    attend = torch.ones(1, 6, MAX_TRACTS, dtype=torch.bool)
+    valid = torch.ones(1, 6, dtype=torch.bool)
+    allow = _decoder_token_allow(
+        attend[0], node_tract, token_u[0], valid[0], token_tract[0], node_u, token_pos[0], node_pos, 5, 4.0
+    )
+    _assert(bool(allow[0, :5].all()) and not bool(allow[0, 5]), f"mask changed: {allow[0].tolist()}")
+    z = torch.eye(6).unsqueeze(0)
+    token_s = token_u * 40.0
+    out = layer(
+        z, node_u * 40.0, node_u, torch.zeros(1), torch.zeros(1, dtype=torch.long), node_tract,
+        token_s, token_u, attend, latent_valid=valid, token_tract=token_tract,
+        token_pos=token_pos, node_pos=node_pos,
+    )
+    weights = _distance_softmax(layer, node_pos, token_pos[0], allow)
+    _assert(torch.allclose(out, weights, atol=1e-5), f"weights {out} vs {weights}")
+    _assert(float(out[0, 5]) < 1e-5, "3D-closest token outside the u-mask must stay out")
+    ratio = float(out[0, 0] / out[0, 1])
+    expect_ratio = math.exp((36.0 - 9.0) / (2.0 * 4.0))
+    _assert(abs(ratio - expect_ratio) < 1e-3, f"closer/farther {ratio} vs {expect_ratio}")
+    out.sum().backward()
+    _assert(layer.log_sigma.grad is not None and float(layer.log_sigma.grad.abs()) > 0.0, "log_sigma grad")
+
+    # Cross-branch ostium token is inside the 4 mm mask and still takes the distance bias.
+    dim = 8
+    ost = LatentCrossAttention(dim, dim, dim, dim)
+    _content_free_cross_attention(ost)
+    token_u = torch.tensor([[0.50, 0.51, 0.52, 0.53, 0.54, 0.80, 0.00, 0.00]])
+    token_tract = torch.tensor([[0, 0, 0, 0, 0, 0, 1, 0]])
+    base_pos = torch.tensor(
+        [[
+            [10.0, 0.0, 0.0], [11.0, 0.0, 0.0], [12.0, 0.0, 0.0], [13.0, 0.0, 0.0],
+            [14.0, 0.0, 0.0], [100.0, 0.0, 0.0], [1.5, 0.0, 0.0], [1.8, 0.0, 0.0],
+        ]]
+    )
+    node_pos = torch.zeros(1, 3)
+    node_u = torch.tensor([0.50])
+    node_tract = torch.zeros(1, dtype=torch.long)
+    attend = torch.ones(1, 8, MAX_TRACTS, dtype=torch.bool)
+    valid = torch.ones(1, 8, dtype=torch.bool)
+    z = torch.eye(8).unsqueeze(0)
+    token_s = token_u * 40.0
+
+    def _run(pos):
+        allow_b = _decoder_token_allow(
+            attend[0], node_tract, token_u[0], valid[0], token_tract[0], node_u, pos[0], node_pos, 5, 4.0
+        )
+        got = ost(
+            z, node_u * 40.0, node_u, torch.zeros(1), torch.zeros(1, dtype=torch.long), node_tract,
+            token_s, token_u, attend, latent_valid=valid, token_tract=token_tract,
+            token_pos=pos, node_pos=node_pos,
+        )
+        ref = _distance_softmax(ost, node_pos, pos[0], allow_b)
+        return allow_b, got, ref
+
+    allow_near, got_near, ref_near = _run(base_pos)
+    _assert(bool(allow_near[0, 6]) and not bool(allow_near[0, 5]), f"ostium mask {allow_near[0].tolist()}")
+    _assert(torch.allclose(got_near, ref_near, atol=1e-5), "ostium token must use the distance logit")
+    far_pos = base_pos.clone()
+    far_pos[0, 6, 0] = 3.2
+    allow_far, got_far, ref_far = _run(far_pos)
+    _assert(bool(allow_far[0, 6]), "moving the ostium token within 4 mm must keep it in the mask")
+    _assert(torch.allclose(got_far, ref_far, atol=1e-5), "farther ostium token logit")
+    _assert(float(got_far[0, 6]) < float(got_near[0, 6]), "greater distance must lower the ostium weight")
+
+    dec = ProgressiveSplineDecoder(latent_dim=4, latent_len=4, hidden_dim=8, attn_dim=8)
+    sig = dec.attention_sigmas()
+    _assert(set(sig) == {"attn_sigma_coarse", "attn_sigma_mid", "attn_sigma_fine"}, sig)
+    _assert(all(abs(v - 2.0) < 1e-5 for v in sig.values()), sig)
+    ids = {id(dec.cross_coarse.log_sigma), id(dec.cross_mid.log_sigma), id(dec.cross_fine.log_sigma)}
+    _assert(len(ids) == 3, "levels must not share log_sigma")
+    with torch.no_grad():
+        dec.cross_mid.log_sigma.fill_(math.log(2.5))
+    sig = dec.attention_sigmas()
+    _assert(abs(sig["attn_sigma_mid"] - 2.5) < 1e-5 and abs(sig["attn_sigma_coarse"] - 2.0) < 1e-5, sig)
 
 
 def test_mesh_terms_have_finite_gradients_at_identity():
@@ -1409,6 +1568,10 @@ def test_synthetic_data_fp32():
         "pos_mid",
         "pos_coarse",
         "u",
+        "s_mm",
+        "s_mm_mid",
+        "s_mm_coarse",
+        "latent_s_mm",
         "theta",
         "normal",
         "pose_R",
@@ -1430,6 +1593,10 @@ def test_synthetic_data_fp32():
     _assert(data.token_attend.dtype == torch.bool, data.token_attend.dtype)
     _assert(data.latent_valid.dtype == torch.bool, data.latent_valid.dtype)
     _assert(data.latent_valid.shape[0] == data.latent_u.shape[0], "latent_valid length")
+    _assert(data.s_mm.shape[0] == data.u.shape[0], "s_mm must match fine nodes")
+    _assert(data.s_mm_mid.shape[0] == data.u_mid.shape[0], "s_mm_mid must match mid nodes")
+    _assert(data.s_mm_coarse.shape[0] == data.u_coarse.shape[0], "s_mm_coarse must match coarse nodes")
+    _assert(data.latent_s_mm.shape[0] == data.latent_u.shape[0], "latent_s_mm length")
     _assert(data.x_true_normal.shape == data.x_true.shape, "x_true_normal shape")
     _assert(not hasattr(data, "cl_pos") or getattr(data, "cl_pos") is None, "cl_pos should be gone")
 
@@ -1968,13 +2135,14 @@ def test_coarse_attn_per_graph_and_finite():
     n0, n1 = 12, 10
     h = torch.randn(n0 + n1, hidden)
     u = torch.rand(n0 + n1)
+    s = u * 80.0
     th = (torch.rand(n0 + n1) * 2 * math.pi) - math.pi
     tract = torch.cat([torch.zeros(n0), torch.ones(n1)]).long()
     batch = torch.cat([torch.zeros(n0), torch.ones(n1)]).long()
     with torch.no_grad():
-        out = attn(h, u, th, tract, batch)
-        out0 = attn(h[:n0], u[:n0], th[:n0], tract[:n0], torch.zeros(n0, dtype=torch.long))
-        out1 = attn(h[n0:], u[n0:], th[n0:], tract[n0:], torch.zeros(n1, dtype=torch.long))
+        out = attn(h, s, u, th, tract, batch)
+        out0 = attn(h[:n0], s[:n0], u[:n0], th[:n0], tract[:n0], torch.zeros(n0, dtype=torch.long))
+        out1 = attn(h[n0:], s[n0:], u[n0:], th[n0:], tract[n0:], torch.zeros(n1, dtype=torch.long))
     _assert(torch.isfinite(out).all(), "coarse attn non-finite")
     _assert(torch.allclose(out[:n0], out0, atol=1e-5, rtol=1e-5), "graph 0 mixed")
     _assert(torch.allclose(out[n0:], out1, atol=1e-5, rtol=1e-5), "graph 1 mixed")
@@ -1989,6 +2157,7 @@ def _token_pack(u, tract, is_junc):
                 attend[g, i, int(tid)] = True
     pack = type("Tok", (), {})()
     pack.latent_u = u
+    pack.latent_s_mm = u * 80.0
     pack.latent_tract_id = tract
     pack.latent_is_junction = is_junc
     pack.token_attend = attend
@@ -2305,9 +2474,14 @@ def test_token_spacing_independent_of_length():
         n_tok = int(valid.sum())
         expect = int(np.floor(float(dense["arc"]) / TOKEN_SPACING_MM) + 1)
         _assert(n_tok == expect, f"L={length}: n_tok {n_tok} vs floor(L/2)+1={expect}")
+        s_tok = tok["latent_s_mm"].numpy()[valid]
+        u_tok = tok["latent_u"].numpy()[valid]
+        arc = float(dense["arc"])
+        _assert(np.allclose(s_tok, u_tok * arc, atol=1e-3), f"L={length} latent_s_mm")
         if n_tok > 1:
             ds = np.linalg.norm(np.diff(pos, axis=0), axis=1)
             _assert(abs(float(np.median(ds)) - TOKEN_SPACING_MM) < 0.15, f"L={length} spacing {float(np.median(ds))}")
+            _assert(abs(float(s_tok[1] - s_tok[0]) - TOKEN_SPACING_MM) < 1e-3, f"L={length} s step")
         _assert(not bool(tok["token_attend"][~tok["latent_valid"]].any()), f"L={length} pad attend")
         _assert(n_tok != 96, "must not spread a fixed 96-slot budget")
 
@@ -2627,6 +2801,7 @@ def main():
         test_null_code_decodes_to_template,
         test_mesh_terms_have_finite_gradients_at_identity,
         test_cross_attention_reads_world_direction,
+        test_cross_attention_gaussian_distance_bias,
         test_rim_normal_term_sees_only_the_projected_slide,
     ]
     failed = 0

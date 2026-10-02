@@ -9,24 +9,43 @@ import torch
 from scipy.spatial import cKDTree
 from torch import Tensor
 
-from config import K_THETA, K_U
+from config import THETA_HARMONICS, U_NORM_HARMONICS, U_WAVELENGTHS_MM
 from ops import fps_indices
 
 
-def harmonic_encoding_u(u: Tensor, k_u: int = K_U) -> Tensor:
-    """γ(u) = [sin(2^i π u), cos(2^i π u)]_{i=0}^{K_u-1} ∈ R^{2 K_u}."""
-    u = u.to(dtype=torch.float32).reshape(-1, 1)
-    freqs = (2.0 ** torch.arange(k_u, device=u.device, dtype=torch.float32)) * math.pi
-    ang = u * freqs.unsqueeze(0)
-    return torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)
+def harmonic_encoding_u(s_mm: Tensor, u: Tensor) -> Tensor:
+    """Hybrid γ(u): absolute millimetre bands, then two tract-relative bands.
+
+    ``s_mm`` is arc length along the tract in millimetres. ``u`` is the fraction
+    of that tract's length in ``[0, 1]``. Absolute bands are
+    ``sin/cos(2π s / λ)`` for ``λ`` in ``U_WAVELENGTHS_MM``. Tract-relative
+    bands are ``sin/cos(k π u)`` for ``k`` in ``U_NORM_HARMONICS``.
+    Layout is ``[sin λ, cos λ, sin k, cos k]``, shape ``[N, GAMMA_U_DIM]``.
+    """
+    s = s_mm.to(dtype=torch.float32).reshape(-1, 1)
+    u = u.to(dtype=torch.float32, device=s.device).reshape(-1, 1)
+    if u.shape[0] != s.shape[0]:
+        raise ValueError(
+            "arc length and normalized u must have the same length, "
+            f"got {s.shape[0]} and {u.shape[0]}"
+        )
+    wl = s.new_tensor(tuple(float(v) for v in U_WAVELENGTHS_MM)).view(1, -1)
+    ang_s = (2.0 * math.pi) * s / wl
+    k_u = s.new_tensor(tuple(float(v) for v in U_NORM_HARMONICS)).view(1, -1)
+    ang_u = math.pi * u * k_u
+    return torch.cat([ang_s.sin(), ang_s.cos(), ang_u.sin(), ang_u.cos()], dim=-1)
 
 
-def harmonic_encoding_theta(theta: Tensor, k_theta: int = K_THETA) -> Tensor:
-    """γ(θ) = [sin(2^i θ), cos(2^i θ)]_{i=0}^{K_θ-1} ∈ R^{2 K_θ}."""
+def harmonic_encoding_theta(theta: Tensor) -> Tensor:
+    """γ(θ) = [sin(k θ), cos(k θ)] for integer harmonics k = 1..4.
+
+    ``theta`` is in radians. Layout is all sines, then all cosines,
+    shape ``[N, GAMMA_THETA_DIM]``.
+    """
     theta = theta.to(dtype=torch.float32).reshape(-1, 1)
-    freqs = 2.0 ** torch.arange(k_theta, device=theta.device, dtype=torch.float32)
-    ang = theta * freqs.unsqueeze(0)
-    return torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)
+    k = theta.new_tensor(tuple(float(v) for v in THETA_HARMONICS)).view(1, -1)
+    ang = theta * k
+    return torch.cat([ang.sin(), ang.cos()], dim=-1)
 
 
 def wrap_pi(delta: Tensor) -> Tensor:

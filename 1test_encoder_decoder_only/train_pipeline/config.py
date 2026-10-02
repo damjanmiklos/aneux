@@ -63,7 +63,9 @@ FAR_CL_MARGIN_MM = 1.0
 # 12: rebuilt on the 2026-09-25/26 cleandata (stage-4 centerlines, var67
 #     templates) -- the key has no source hash, so v11 silently kept the old
 #     inputs; also drops the unread gt_*_mirror copies (train.apply_mirror).
-CACHE_VERSION = 12
+# 13: absolute arc length (s_mm, s_mm_mid, s_mm_coarse, latent_s_mm) for the
+#     hybrid Fourier encoding of u.
+CACHE_VERSION = 13
 
 # (n_length, n_radial) per hierarchy level
 LEVEL_COARSE = (40, 6)
@@ -92,10 +94,17 @@ DENSE_CL_SPACING_MM = 0.2
 GROUPID_ENDPOINT_SNAP_MM = 1.0
 
 # --- Intrinsic Fourier encodings ---
-K_U = 8
-K_THETA = 6
-GAMMA_U_DIM = 2 * K_U  # 16
-GAMMA_THETA_DIM = 2 * K_THETA  # 12
+# u is a hybrid. Absolute wavelengths are millimetres along the tract and stay
+# at or above 2× the 2 mm token spacing, so a query does not oscillate between
+# neighbouring tokens. The two normalized bands are one half-cycle and one full
+# cycle of tract-relative u (sin/cos(k π u)), which mark position along a branch
+# of any length. θ uses every integer harmonic through 4: offset, ellipse, and
+# the triangular section at an ostium. Higher octaves alias on the coarse rings.
+U_WAVELENGTHS_MM = (128.0, 64.0, 32.0, 16.0, 8.0, 4.0)
+U_NORM_HARMONICS = (1.0, 2.0)
+THETA_HARMONICS = (1, 2, 3, 4)
+GAMMA_U_DIM = 2 * (len(U_WAVELENGTHS_MM) + len(U_NORM_HARMONICS))  # 16
+GAMMA_THETA_DIM = 2 * len(THETA_HARMONICS)  # 8
 
 # --- Latent trajectory (tree-valued; 1 mm / 2 mm contract, §5.4) ---
 # Shared with Stage 1. Distinct from DENSE_CL_SPACING_MM (cache-time samples).
@@ -122,6 +131,13 @@ LOGVAR_CLAMP = (LOGVAR_MIN, LOGVAR_MAX)
 # branch, plus neighbouring-branch tokens within OSTIUM_NEIGHBOR_MM of an ostium.
 TOKEN_ATTEND_K = 5
 OSTIUM_NEIGHBOR_MM = 4.0
+# Gaussian bias on those same logits (mask unchanged):
+#   score = q·k / sqrt(d) − ||x_vertex − p_token||² / (2 σ²), distances in mm.
+# One learnable log σ per decoder level (the cross-attention is a single head).
+# σ = exp(log_sigma), clamped to [ATTN_SIGMA_MIN_MM, ATTN_SIGMA_MAX_MM].
+ATTN_SIGMA_INIT_MM = 2.0
+ATTN_SIGMA_MIN_MM = 1.0
+ATTN_SIGMA_MAX_MM = 2.5
 # Active-unit test for post-training standardisation (§5.3.6 item 7, §5.3.7).
 ACTIVE_UNIT_KL_THRESH = 0.01
 Z_ATTN_HEADS = 4
@@ -311,6 +327,7 @@ FOLLOW_BATCH = [
     "r_star_valid_mid",
     "r_star_ambiguous_mid",
     "latent_u",
+    "latent_s_mm",
     "latent_tract_id",
     "latent_is_junction",
     "latent_pos",

@@ -16,11 +16,11 @@ import pyvista as pv
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
-from aneux_paths import VESSELS_ORIGINAL, HASCAPOREXTENSION_CSV
+from aneux_paths import DATATRANSFORM, LABEL_DIR
 
 # --- CONFIGURATION ---
-FOLDER_PATH = VESSELS_ORIGINAL
-OUTPUT_CSV_PATH = HASCAPOREXTENSION_CSV
+FOLDER_PATH = os.path.join(DATATRANSFORM, "hemoMesh", "keep_one", "surfaces")
+OUTPUT_CSV_PATH = os.path.join(LABEL_DIR, "keep_one_surfaces.csv")
 
 SUPPORTED_EXTENSIONS = ('.vtp', '.stl')
 LOAD_WORKERS = min(8, os.cpu_count() or 4)
