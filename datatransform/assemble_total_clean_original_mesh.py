@@ -61,6 +61,14 @@ MANIFEST_PATH = Path(__file__).resolve().parents[1] / "scratch" / "total_clean_o
 # measured 41.7%. Anything under this is not the aneurysm we think it is.
 SAME_PATIENT_MIN_OVERLAP = 0.80
 
+# Vessels left out of the set whatever source holds them. SNF00000049 carries
+# four aneurysms packed into one sharp bend, too close together for any of them
+# to be removed cleanly, so no keep-one version of it is usable; _01, _02 and
+# _03 are the same mesh, one per labelled aneurysm. All three were deleted
+# from every working folder on 2026-10-02; without this it would come straight
+# back from the read-only rawdata as an un-split mesh.
+EXCLUDED_VESSELS = {"SNF00000049_01", "SNF00000049_02", "SNF00000049_03"}
+
 
 def list_meshes(folder: Path) -> dict[str, Path]:
     if not folder.is_dir():
@@ -227,8 +235,15 @@ def main(dry_run: bool = False) -> None:
     cleaned = list_meshes(Path(CLEANED_VESSELS))
     uncapped = list_meshes(Path(UNCAPPED_VESSELS))
     keep_one = list_meshes(KEEP_ONE_SURFACES)
+    for excluded in sorted(EXCLUDED_VESSELS):
+        for source in (original, cleaned, uncapped):
+            source.pop(excluded, None)
+        print(f"excluded: {excluded}")
 
     slots = keep_one_slots(PICKED_POINTS, keep_one)
+    stray = sorted(EXCLUDED_VESSELS & set(slots))
+    if stray:
+        raise SystemExit("Excluded vessel(s) still have keep-one outputs: " + ", ".join(stray))
     print(f"original stems: {len(original)}")
     print(f"keep_one files: {len(keep_one)} across {len(slots)} vessels")
     print(f"cleaned files: {len(cleaned)}")
