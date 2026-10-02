@@ -91,6 +91,8 @@ DEFAULT_MAX_GRID_SIZE = 320
 # Thinnest tube the template carries. Ostia narrower than this on the ground
 # truth are still opened, on a tube of this radius.
 R_FLOOR_MM = 0.35
+# Each stub ends flat this many voxels past its ostium plane.
+STUB_STRAIGHT_VOXELS = 3.0
 # Every sphere overlaps the parent or a connected sphere by at least this.
 CONNECT_OVERLAP_MM = 0.3
 # Smooth-union width between the sac spheres and the parent (and each other).
@@ -684,6 +686,26 @@ def _stamp(field, origin, g, centers, radii, reach_extra):
         np.minimum(sl, val, out=sl)
 
 
+def _stamp_capped_cylinder(field, origin, g, o, n, r, s0, s1):
+    """field = min(field, flat-ended cylinder along n from o + s0 n to o + s1 n)."""
+    nz, ny, nx = field.shape
+    ends = np.stack((o + s0 * n, o + s1 * n))
+    i0 = np.maximum(np.floor((ends.min(axis=0) - r - 2 * g - origin) / g).astype(int), 0)
+    i1 = np.minimum(np.ceil((ends.max(axis=0) + r + 2 * g - origin) / g).astype(int) + 1,
+                    np.array([nx, ny, nz]))
+    if np.any(i1 <= i0):
+        return
+    xs = origin[0] + np.arange(i0[0], i1[0]) * g - o[0]
+    ys = origin[1] + np.arange(i0[1], i1[1]) * g - o[1]
+    zs = origin[2] + np.arange(i0[2], i1[2]) * g - o[2]
+    Z, Y, X = np.meshgrid(zs, ys, xs, indexing="ij")
+    sv = X * n[0] + Y * n[1] + Z * n[2]
+    lat = np.sqrt(np.maximum(X * X + Y * Y + Z * Z - sv * sv, 0.0))
+    val = np.maximum(np.maximum(lat - r, sv - s1), s0 - sv).astype(np.float32)
+    sl = field[i0[2]:i1[2], i0[1]:i1[1], i0[0]:i1[0]]
+    np.minimum(sl, val, out=sl)
+
+
 def _sample_segments(p0, p1, r0, r1, step):
     """Balls every ``step`` along segments (p0 -> p1) with linear radii."""
     seg = p1 - p0
@@ -745,22 +767,24 @@ class CaseModel:
         kept_ids = np.flatnonzero(keep)
         tree = cKDTree(up[kept_ids])
         self.ostia = []
-        stub_c, stub_r = [], []
         for o, n, r_gt in frames:
             _d, j = tree.query(o)
             node = int(kept_ids[j])
             # Tube radius at the plane: the parent's, never wider than the rim.
             r_t = float(max(min(rp[node], max(r_gt, R_FLOOR_MM)), R_FLOOR_MM))
-            back = max(1.0 * r_t, 0.6)
-            out_len = max(1.0 * r_t, 0.6) + 2.0 * grid_spacing
-            a = o - back * n
-            b = o + out_len * n
-            stub_c.append(np.stack((up[node], a)))
+            self.ostia.append({"origin": o, "normal": n, "r": r_t, "gt_radius": r_gt,
+                               "node": node, "back": max(r_t, 0.6),
+                               "out_len": STUB_STRAIGHT_VOXELS * float(grid_spacing)})
+        # Each stub: the tube tapers from the centerline node to the ostium
+        # radius behind the plane (balls), then a flat-ended cylinder runs from
+        # there to a few voxels past the plane -- all the clip needs. A
+        # ball-swept end would stick out a whole radius and, at crowded
+        # outlets, run into the next vessel beyond the plane.
+        stub_c, stub_r = [], []
+        for op in self.ostia:
+            o, n, r_t, node = op["origin"], op["normal"], op["r"], op["node"]
+            stub_c.append(np.stack((up[node], o - op["back"] * n)))
             stub_r.append(np.array([rp[node], r_t]))
-            stub_c.append(np.stack((a, b)))
-            stub_r.append(np.array([r_t, r_t]))
-            self.ostia.append({"origin": o, "normal": n, "r": r_t, "out_len": out_len,
-                               "gt_radius": r_gt})
         r_min = min(op["r"] for op in self.ostia)
         self.edge = float(np.clip(EDGE_OVER_RIM_RADIUS * r_min, MIN_EDGE_MM, target_edge_length))
 
@@ -790,10 +814,53 @@ class CaseModel:
         self.shape = (int(dims[2]), int(dims[1]), int(dims[0]))
         field = np.full(self.shape, 1.0e3, dtype=np.float32)
         _stamp(field, lo, g, c, r, reach_extra=self.blend + 2.0 * g)
+        for op in self.ostia:
+            _stamp_capped_cylinder(field, lo, g, op["origin"], op["normal"], op["r"],
+                                   -op["back"], op["out_len"])
+        self.clearance = self._stub_clearance(lo, g, field.shape)
+        field.ravel()[self.clearance] = np.maximum(field.ravel()[self.clearance], np.float32(g))
         self.parent_field = field
         seed = kept_ids[int(np.argmax(rp[kept_ids]))]
         self.parent_seed = tuple(int(v) for v in np.round((up[seed] - lo) / g)[::-1])
         self.seconds_parent = time.perf_counter() - t0
+
+    def _stub_clearance(self, lo, g, shape):
+        """Voxels of a thin empty shell around each stub, beyond its plane.
+
+        Where another vessel passes within a voxel or two of an outlet, the
+        surface would join the two and the piece cut away at the outlet would
+        take part of the neighbour with it, off the plane. Keeping this shell
+        outside separates them; the neighbour loses at most a sub-millimetre
+        dent, the stub and its rim are untouched.
+        """
+        nz, ny, nx = shape
+        out = []
+        for op in self.ostia:
+            o, n, r = op["origin"], op["normal"], op["r"]
+            r_out = r + 3.5 * g
+            far = op["out_len"] + 3.5 * g
+            ends = np.stack((o, o + far * n))
+            bmin = ends.min(axis=0) - r_out
+            bmax = ends.max(axis=0) + r_out
+            i0 = np.maximum(np.floor((bmin - lo) / g).astype(int), 0)
+            i1 = np.minimum(np.ceil((bmax - lo) / g).astype(int) + 1, np.array([nx, ny, nz]))
+            if np.any(i1 <= i0):
+                continue
+            xs = lo[0] + np.arange(i0[0], i1[0]) * g
+            ys = lo[1] + np.arange(i0[1], i1[1]) * g
+            zs = lo[2] + np.arange(i0[2], i1[2]) * g
+            Z, Y, X = np.meshgrid(zs, ys, xs, indexing="ij")
+            rel = np.stack((X - o[0], Y - o[1], Z - o[2]), axis=-1)
+            sv = rel @ n
+            lat = np.linalg.norm(rel - sv[..., None] * n, axis=-1)
+            # Distance to the stub's own surface (side, flat end, its edge).
+            d_stub = np.where(sv <= op["out_len"], lat - r,
+                              np.where(lat <= r, sv - op["out_len"],
+                                       np.hypot(lat - r, sv - op["out_len"])))
+            sel = (sv > 0.5 * g) & (sv < far) & (lat < r_out) & (d_stub > 1.5 * g)
+            k, j, i = np.nonzero(sel)
+            out.append(((k + i0[2]) * ny + (j + i0[1])) * nx + (i + i0[0]))
+        return np.unique(np.concatenate(out)) if out else np.zeros(0, dtype=np.int64)
 
     # -- field ---------------------------------------------------------------
     def field_with_spheres(self, centers, radii):
@@ -817,6 +884,8 @@ class CaseModel:
                 idx[ax] = end
                 border = field[tuple(idx)]
                 np.maximum(border, np.float32(self.g), out=border)
+        flat = field.ravel()
+        flat[self.clearance] = np.maximum(flat[self.clearance], np.float32(self.g))
         return field
 
     def _image(self, field):
@@ -948,7 +1017,9 @@ class CaseModel:
             o, n, r = op["origin"], op["normal"], op["r"]
             s = (pts - o) @ n
             lat = np.linalg.norm((pts - o) - s[:, None] * n, axis=1)
-            cand = (s > 0.0) & (s < op["out_len"] + r + 3.0 * self.g) & (lat < 3.0 * r + 1.0)
+            # The stub wall sits at lateral ~r; a band of a few voxels covers
+            # marching-cubes and smoothing error without reaching a neighbour.
+            cand = (s > 0.0) & (s < op["out_len"] + r + 3.0 * self.g) & (lat < 1.3 * r + 3.0 * self.g)
             if not cand.any():
                 raise TemplateQualityError("an ostium stub is missing from the surface")
             ids = np.flatnonzero(cand)
