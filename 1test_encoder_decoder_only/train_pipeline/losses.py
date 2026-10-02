@@ -79,18 +79,21 @@ def _token_valid_weight(mu, latent_valid):
 
 
 def apply_token_kl_floor(kl_per_token, latent_valid=None, lambda_tok=None):
-    """Masked mean of ``max(λ_tok, Σ_j KL_j)``.
+    """Masked mean of ``relu(λ_tok − KL)`` over valid tokens.
 
-    Apply this to the *accumulated* token batch (``bs × accum``), not to each
-    micro-step, so λ_tok ≈ 0.5 nats is warm-up insurance rather than per-step
-    free bits (§5.3.6 item 3).
+    A minimum rate: each valid token pays until its KL reaches λ_tok nats, and
+    pays nothing above that. Warm-up uses this so the encoder cannot switch a
+    token off while the R* hinge is still off. It is not free bits. Clamping
+    the rate *up* to λ (``max(KL, λ)`` inside the hinge) would make the first
+    λ nats free on every token, which is where a constant offset hides, so the
+    training loss does not do that.
     """
     kl_per_token = kl_per_token.float()
     if lambda_tok is None:
         lambda_tok = _cfg("TOKEN_KL_FLOOR_NATS", 0.5)
-    floored = torch.clamp(kl_per_token, min=float(lambda_tok))
-    w = _token_valid_weight(floored.unsqueeze(-1), latent_valid)
-    return (floored * w).sum() / w.sum().clamp_min(1e-8)
+    short = (float(lambda_tok) - kl_per_token).clamp_min(0.0)
+    w = _token_valid_weight(short.unsqueeze(-1), latent_valid)
+    return (short * w).sum() / w.sum().clamp_min(1e-8)
 
 
 def geco_beta_max_for_epoch(
@@ -100,10 +103,12 @@ def geco_beta_max_for_epoch(
     beta_min=None,
     beta_start=None,
 ):
-    """Ramp the GECO ceiling from ``beta_start`` at epoch 1 to ``beta_max``.
+    """Ceiling on the hinge weight β.
 
-    Must never return 0: clipping β to a zero ceiling kills the KL term after
-    the first optimiser step (epoch-1 logs then show β=0 and val KL=0).
+    During the warm-up the hinge is not applied, and the ceiling stays at the
+    start value so a step cannot jump. Afterwards the ceiling is ``beta_max``.
+    The return is never 0: a zero ceiling used to wipe the KL term and make
+    the logged β and the raw KL both read as 0.
     """
     if beta_max is None:
         beta_max = _cfg("GECO_BETA_MAX", 10.0)
@@ -112,15 +117,14 @@ def geco_beta_max_for_epoch(
     if beta_min is None:
         beta_min = _cfg("GECO_BETA_MIN", 1e-4)
     if beta_start is None:
-        beta_start = _cfg("GECO_BETA_INIT", 1.0)
+        beta_start = _cfg("GECO_BETA_INIT", 0.02)
     beta_max = float(beta_max)
     beta_min = float(beta_min)
     start = max(float(beta_start), beta_min)
     warmup_epochs = int(warmup_epochs)
-    if warmup_epochs <= 1:
+    if warmup_epochs <= 1 or int(epoch) > warmup_epochs:
         return max(beta_max, beta_min)
-    t = min(1.0, max(0.0, (int(epoch) - 1) / float(warmup_epochs - 1)))
-    return max(beta_min, start + t * (beta_max - start))
+    return start
 
 
 def update_geco_beta(
@@ -135,12 +139,18 @@ def update_geco_beta(
 ):
     """One optimiser-step dual update: ``β ← clip(β · exp(η · (KL̄_raw − R*)))``.
 
-    Constraint is on the mean raw KL over valid tokens. Pass ``epoch`` so the
-    20-epoch warm-up ramps β_max rather than a fixed λ. The floor ``β_min``
-    always holds; the ceiling is never dropped below it.
+    Constraint is the mean raw KL over valid tokens, and only from above: β
+    grows while that mean exceeds R* and shrinks while it is under. During
+    ``warmup_epochs`` the hinge is off, so this returns ``beta`` unchanged.
+    ``β_min`` is the dual floor. The small always-on KL weight is a separate
+    term and does not decay with β.
     """
+    if epoch is not None and warmup_epochs is not None and int(epoch) <= int(warmup_epochs):
+        if torch.is_tensor(beta):
+            return beta.detach()
+        return float(beta)
     if rate_target is None:
-        rate_target = _cfg("RATE_TARGET_NATS", 12.0)
+        rate_target = _cfg("RATE_TARGET_NATS", 3.0)
     if eta is None:
         eta = _cfg("GECO_ETA", 1e-3)
     if beta_min is None:
@@ -150,10 +160,7 @@ def update_geco_beta(
     kl = float(kl_mean_raw.detach().cpu()) if torch.is_tensor(kl_mean_raw) else float(kl_mean_raw)
     b = float(beta.detach().cpu()) if torch.is_tensor(beta) else float(beta)
     new_b = b * math.exp(float(eta) * (kl - float(rate_target)))
-    # Stay at least at the init weight. Decaying to β_min while KL < R*
-    # (the usual early state) removed the rate cap for the rest of the run.
-    init = float(_cfg("GECO_BETA_INIT", 1.0))
-    lo = max(float(beta_min), init)
+    lo = float(beta_min)
     hi = float(beta_max)
     if epoch is not None:
         hi = geco_beta_max_for_epoch(
@@ -172,21 +179,29 @@ def vae_kl_loss(
     latent_valid=None,
     beta=None,
     token_floor=None,
+    always_weight=None,
     use_lambda_kl=False,
 ):
     """Per-token KL of a diagonal Gaussian against N(0, I), masked by ``latent_valid``.
 
     mu, logvar: ``[B, L, D]`` or ``[B, D]``. logvar is log(σ²), not a lognormal.
     The mean is over *valid* tokens so β and R* mean the same on short and long
-    trees. Raw per-token KL is unclamped and reported before β.
+    trees. Raw per-token KL is unclamped and reported before any weight.
 
-    Returns ``(loss, info_dict)``. ``loss`` is ``β · relu(mean_valid(KL) − R*)``
-    when ``beta`` is set (no penalty while the rate is under target);
-    otherwise the unweighted valid-token mean (unit-test fallback).
+    Returns ``(loss, info_dict)``. With no ``beta``, ``token_floor``, or
+    ``always_weight``, ``loss`` is the unweighted valid-token mean (unit-test
+    fallback). Otherwise it is the sum of whichever of these are set:
+
+    * ``token_floor``: mean of ``relu(λ − KL_i)`` over valid tokens. Warm-up
+      only. This is a minimum per token, not a free band under the hinge.
+    * ``beta``: ``β · relu(mean(KL) − R*)``. Excess over R* only, on the raw
+      mean. The floor is not folded into this mean: doing so would make the
+      first λ nats of every token free.
+    * ``always_weight``: ``w · mean(KL)`` on the raw mean, including the first
+      fraction of a nat. Used after warm-up, with ``w`` below the β cap.
+
     ``LAMBDA_KL`` is not the primary weight; pass ``use_lambda_kl=True`` only
     for callers that still multiply by the old fixed λ inside this function.
-    Optional ``token_floor`` applies ``max(λ_tok, Σ_j KL_j)`` to this call's
-    tokens — prefer :func:`apply_token_kl_floor` on the accumulated batch.
     """
     mu = mu.float()
     logvar = logvar.float()
@@ -195,26 +210,36 @@ def vae_kl_loss(
     w = _token_valid_weight(mu, latent_valid)
     w_sum = w.sum().clamp_min(1e-8)
     kl_mean_raw = (kl_token * w).sum() / w_sum
-    if token_floor is not None:
-        kl_for_loss = (torch.clamp(kl_token, min=float(token_floor)) * w).sum() / w_sum
-    else:
-        kl_for_loss = kl_mean_raw
     if beta is None and use_lambda_kl:
         beta = _cfg("LAMBDA_KL", 5e-4)
-    if beta is None:
-        loss = kl_for_loss
-        beta_used = kl_for_loss.new_zeros(())
-    else:
+    rate_target = float(_cfg("RATE_TARGET_NATS", 3.0))
+    floor_loss = None
+    if token_floor is not None:
+        floor_loss = apply_token_kl_floor(kl_token, latent_valid, lambda_tok=token_floor)
+    hinge = None
+    beta_used = kl_mean_raw.new_zeros(())
+    if beta is not None:
         if torch.is_tensor(beta):
-            b = beta.to(dtype=kl_for_loss.dtype, device=kl_for_loss.device)
+            b = beta.to(dtype=kl_mean_raw.dtype, device=kl_mean_raw.device)
         else:
-            b = kl_for_loss.new_tensor(float(beta))
-        # Upper rate constraint only. β · KL with β ≈ 1 and KL ≈ 9 nats
-        # dominated chamfer (~1) from epoch 1 and collapsed μ before the
-        # decoder could use the latent. Excess over R* is what the dual prices.
-        rate = kl_for_loss.new_tensor(float(_cfg("RATE_TARGET_NATS", 12.0)))
-        loss = b * (kl_for_loss - rate).clamp_min(0.0)
-        beta_used = b.detach() if torch.is_tensor(b) else kl_for_loss.new_tensor(float(b))
+            b = kl_mean_raw.new_tensor(float(beta))
+        # Upper rate constraint only, on the raw mean. β · KL with β ≈ 1
+        # dominated chamfer from epoch 1. Excess over R* is what the dual prices.
+        hinge = b * (kl_mean_raw - rate_target).clamp_min(0.0)
+        beta_used = b.detach() if torch.is_tensor(b) else kl_mean_raw.new_tensor(float(b))
+    always = None
+    if always_weight is not None and float(always_weight) != 0.0:
+        always = kl_mean_raw.new_tensor(float(always_weight)) * kl_mean_raw
+    if floor_loss is None and hinge is None and always is None:
+        loss = kl_mean_raw
+    else:
+        loss = kl_mean_raw.new_zeros(())
+        if floor_loss is not None:
+            loss = loss + floor_loss
+        if hinge is not None:
+            loss = loss + hinge
+        if always is not None:
+            loss = loss + always
     n_valid = w_sum.detach()
     ln2 = math.log(2.0)
     token_view = (kl_token * w).reshape(mu.size(0), -1)
@@ -224,8 +249,8 @@ def vae_kl_loss(
         "kl_mean_raw": kl_mean_raw.detach(),
         "n_valid": n_valid,
         "beta": beta_used,
-        "rate_target": float(_cfg("RATE_TARGET_NATS", 12.0)),
-        "rate_gap": (kl_mean_raw.detach() - float(_cfg("RATE_TARGET_NATS", 12.0))),
+        "rate_target": rate_target,
+        "rate_gap": (kl_mean_raw.detach() - rate_target),
         "bits_per_case": bits_per_case,
     }
     return KlLossResult(loss, info)
@@ -946,6 +971,7 @@ def compute_losses(
     latent_valid=None,
     kl_beta=None,
     kl_token_floor=None,
+    kl_always_weight=None,
     gt_points=None,
     gt_normals=None,
     gt_batch=None,
@@ -1117,7 +1143,12 @@ def compute_losses(
         )
 
     loss_kl, _kl_info = vae_kl_loss(
-        mu, logvar, latent_valid=latent_valid, beta=kl_beta, token_floor=kl_token_floor
+        mu,
+        logvar,
+        latent_valid=latent_valid,
+        beta=kl_beta,
+        token_floor=kl_token_floor,
+        always_weight=kl_always_weight,
     )
     disp_w = None
     if r_star is not None and r_star_valid is not None and r_dth is not None:

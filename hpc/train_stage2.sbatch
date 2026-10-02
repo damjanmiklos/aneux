@@ -35,12 +35,15 @@
 #SBATCH --cpus-per-task=64
 #SBATCH --gres=gpu:4
 #SBATCH --exclusive
-#SBATCH --time=1-16:00:00
+# 2 days 4 hours. The previous 1 day 16 hour cap finished with about a
+# 2 hour margin; this leaves more than that, including the z=0 validation
+# decode. Validation itself runs every 5 epochs (ANEUX_VAL_EVERY).
+#SBATCH --time=2-04:00:00
 #SBATCH --mem=0
 #SBATCH --no-requeue
-# One epoch is several minutes. 600s lets the handler finish that epoch,
+# 30 min: a validation epoch (μ, σ, and the z=0 decode) has to finish,
 # write last.pt, and copy the run off scratch before Slurm SIGKILLs.
-#SBATCH --signal=TERM@600
+#SBATCH --signal=TERM@1800
 #SBATCH --output=aneux_s2_%j.out
 #SBATCH --error=aneux_s2_%j.err
 #SBATCH --mail-type=END,FAIL

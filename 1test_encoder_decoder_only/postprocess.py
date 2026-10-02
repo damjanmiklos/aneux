@@ -44,6 +44,7 @@ from config import (
     FOLLOW_BATCH,
     GECO_BETA_INIT,
     HIERARCHY_LEVELS,
+    KL_WARMUP_EPOCHS,
     LATENT_DIM,
     LATENT_LEN,
     N_TRUE,
@@ -52,7 +53,7 @@ from config import (
 )
 from dataset import AneurysmDataset, _finalize_item, _load_cached_graph
 from model import GraphVAE
-from train import _keep_meta_on_cpu, losses_from_output, weighted_total
+from train import _keep_meta_on_cpu, kl_objective_for_epoch, losses_from_output, weighted_total
 
 LOSS_KEYS = (
     "recon",
@@ -399,6 +400,10 @@ def reconstruct_all(
     kl_beta, beta_source = beta_for_checkpoint(ckpt, run_dir)
     weights = dict(DEFAULT_LOSS_WEIGHTS)
     weights["kl"] = 1.0
+    saved_epoch = int(ckpt.get("epoch") or KL_WARMUP_EPOCHS + 1)
+    kl_kwargs, _in_warmup = kl_objective_for_epoch(
+        saved_epoch, KL_WARMUP_EPOCHS, kl_beta, True
+    )
 
     model = build_model(device)
     model.load_state_dict(state, strict=True)
@@ -486,7 +491,7 @@ def reconstruct_all(
             batch = _keep_meta_on_cpu(next(iter(loader)).to(device))
             with torch.no_grad():
                 out = model(batch, sample=False)
-                terms = losses_from_output(out, batch, kl_beta=kl_beta)
+                terms = losses_from_output(out, batch, **kl_kwargs)
             losses = loss_row(terms, weights, kl_beta)
             faces = _faces_np(data)
             mesh_path = os.path.join(out_dir, "meshes", split, f"{case_id}.vtp")

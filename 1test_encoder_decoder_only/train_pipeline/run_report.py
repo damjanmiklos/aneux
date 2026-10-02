@@ -40,6 +40,9 @@ PLOT_SERIES = (
     ("epoch_seconds", None, "Wall seconds / epoch"),
     ("peak_vram_gib", None, "Peak allocated VRAM (GiB)"),
     ("val_recon_sample_gap", None, "recon(σ) − recon(μ)"),
+    ("val_z0_gain_mm", None, "Encoded vs z=0, mean per token (mm)"),
+    ("val_z0_gain_sac_mm", None, "Encoded vs z=0 on sac-like tokens (mm)"),
+    ("val_z0_gain_other_mm", None, "Encoded vs z=0 on other tokens (mm)"),
 )
 
 # Early values sit decades above the settled curve, and every sample is > 0.

@@ -65,7 +65,9 @@ FAR_CL_MARGIN_MM = 1.0
 #     inputs; also drops the unread gt_*_mirror copies (train.apply_mirror).
 # 13: absolute arc length (s_mm, s_mm_mid, s_mm_coarse, latent_s_mm) for the
 #     hybrid Fourier encoding of u.
-CACHE_VERSION = 13
+# 14: force a tube-cache rebuild for the next training job. v13 files are
+#     not reused.
+CACHE_VERSION = 14
 
 # (n_length, n_radial) per hierarchy level
 LEVEL_COARSE = (40, 6)
@@ -240,20 +242,30 @@ def normalize_gradient_checkpointing(value=None):
     )
 
 LAMBDA_RECON = 1.0
-# Fixed λ kept for DEFAULT_LOSS_WEIGHTS until item 19 wires GECO.
+# Fixed λ kept for the non-GECO fallback (annealed inside train.py).
 LAMBDA_KL = 5e-4
 # Rate-controlled KL, GECO-style (Rezende & Viola 2018; §5.3.6 item 3).
-# β ← clip(β · exp(η · (KL̄_raw − R*)), β_min, β_max), once per optimiser step.
-# Constraint is on the mean over valid tokens, so healthy tokens may spend ≈ 0
-# and sac tokens more. KL_WARMUP_EPOCHS ramps the β_max ceiling from
-# GECO_BETA_INIT to GECO_BETA_MAX (never below GECO_BETA_MIN). R* is a starting
-# midpoint of the 8–16 nats/token band at D = 16; set finally by the §5.3.7 sweep.
-RATE_TARGET_NATS = 12.0
-GECO_BETA_INIT = 1.0  # standard-VAE weight; the dual then adapts
-GECO_BETA_MIN = 1e-4  # floor so the rate term never vanishes
+# For the first KL_WARMUP_EPOCHS the hinge is off, so the decoder can learn to
+# read z before the latent is squeezed. In that window each valid token is held
+# to at least TOKEN_KL_FLOOR_NATS (a minimum, not free bits). After the window
+# the floor is dropped — a permanent floor makes the first 0.5 nats of every
+# token free, which is where the constant-offset waste sat — and replaced by
+# KL_ALWAYS_WEIGHT * mean(KL), plus the one-sided hinge
+#   β · relu(mean_valid(KL) − R*)
+# that tightens the mean down toward R* and never pushes it up. β starts at
+# GECO_BETA_INIT and the dual raises it only while the mean is above R*, up to
+# GECO_BETA_MAX. R* = 3 nats/token leaves room for the few sac tokens once
+# healthy tokens are allowed to sit near zero.
+RATE_TARGET_NATS = 3.0
+KL_ALWAYS_WEIGHT = 0.02  # post-warmup raw-KL weight; must stay below GECO_BETA_MAX
+GECO_BETA_INIT = 0.02  # hinge starts here; same scale as KL_ALWAYS_WEIGHT, not β = 1
+GECO_BETA_MIN = 1e-4  # dual floor; the always-on weight is separate and does not decay
 GECO_BETA_MAX = 10.0  # cap so reconstruction is not starved if the dual overshoots
 GECO_ETA = 1e-3  # log-space step per nat of (KL̄_raw − R*) per optimiser step
-TOKEN_KL_FLOOR_NATS = 0.5  # per-token warm-up insurance only, §5.3.6 item 3
+TOKEN_KL_FLOOR_NATS = 0.5  # per-token minimum during KL_WARMUP_EPOCHS only
+# How many of the most sac-like tokens (largest template-to-GT gap) are
+# averaged when logging the encoded-vs-z=0 gain. A case has about this many.
+Z0_SAC_TOKENS = 5
 
 LAMBDA_DISP = 0.15
 LAMBDA_LAP = 0.05

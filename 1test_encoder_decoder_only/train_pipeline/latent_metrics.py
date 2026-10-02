@@ -34,7 +34,7 @@ try:
     from config import ACTIVE_UNIT_KL_THRESH, RATE_TARGET_NATS, TOKEN_SPACING_MM
 except ImportError:  # scratch tests that only add this file to path
     ACTIVE_UNIT_KL_THRESH = 0.01
-    RATE_TARGET_NATS = 12.0
+    RATE_TARGET_NATS = 3.0
     TOKEN_SPACING_MM = 2.0
 
 LN2 = math.log(2.0)
@@ -1147,6 +1147,154 @@ def compute_latent_epoch_metrics(
     finally:
         model.train(was_training)
     return acc.compute(beta=beta, rate_target=rate_target)
+
+
+# Tokens per case whose template sits farthest from the GT surface. That
+# gap is the sac: a healthy station's template already lies on the wall.
+SAC_LIKE_TOKENS_PER_CASE = 5
+
+
+def _nn_euclidean(src: Tensor, dst: Tensor) -> Tensor:
+    """Distance in mm from each `src` point to the nearest `dst` point."""
+    src = src.float()
+    dst = dst.float()
+    if src.size(0) == 0:
+        return src.new_zeros(0)
+    if dst.size(0) == 0:
+        return src.new_full((src.size(0),), float("inf"))
+    if src.size(0) * dst.size(0) <= 2_000_000:
+        return torch.cdist(src, dst).min(dim=1).values
+    from pytorch3d.ops import knn_points
+
+    d2 = knn_points(src.unsqueeze(0), dst.unsqueeze(0), K=1, return_nn=False).dists.reshape(-1)
+    return d2.clamp_min(0).sqrt()
+
+
+def _mean_or_none(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return float(sum(values) / len(values))
+
+
+@torch.no_grad()
+def token_zero_decode_gain(
+    x_encoded: Tensor,
+    x_zero: Tensor,
+    template: Tensor,
+    vert_batch: Tensor,
+    vert_tract: Tensor,
+    vert_s: Tensor,
+    gt: Tensor,
+    gt_batch: Tensor | None,
+    token_s: Tensor,
+    token_tract: Tensor,
+    token_valid: Tensor,
+    n_graphs: int,
+    n_sac: int | None = None,
+    min_verts: int = 8,
+) -> dict[str, Any]:
+    """Per-token millimetres by which the encoded surface beats a z=0 decode.
+
+    Each fine vertex is charged to the nearest valid token on its own tract
+    (absolute arc length). The token's error is the mean distance of those
+    vertices to the GT cloud. Gain = error(z=0) − error(encoded); positive
+    means the latent moved the surface toward the GT.
+
+    Sac-like tokens are the ``n_sac`` eligible tokens whose template vertices
+    sit farthest from the GT (the bulge; about five per case). Val recon is
+    dominated by the healthy wall, so this split is the number that says
+    whether the latent is doing anything at the sac.
+
+    ``token_*`` are ``[B, L]``. Returns case-averaged scalars plus the
+    per-token gains of the last graph (tests). ``n_cases`` is 0 when nothing
+    was eligible.
+    """
+    n_graphs = int(n_graphs)
+    if n_sac is None:
+        try:
+            import config as _config
+
+            n_sac = int(getattr(_config, "Z0_SAC_TOKENS", SAC_LIKE_TOKENS_PER_CASE))
+        except ImportError:
+            n_sac = SAC_LIKE_TOKENS_PER_CASE
+    n_sac = max(1, int(n_sac))
+    min_verts = max(1, int(min_verts))
+    case_gain: list[float] = []
+    case_sac: list[float] = []
+    case_other: list[float] = []
+    case_enc: list[float] = []
+    case_zero: list[float] = []
+    case_n_sac: list[float] = []
+    last_gains: list[float] = []
+    last_sac_index: list[int] = []
+
+    for g in range(n_graphs):
+        vm = vert_batch.reshape(-1) == g
+        if gt_batch is None:
+            if n_graphs != 1:
+                raise ValueError("token_zero_decode_gain requires gt_batch when n_graphs > 1")
+            gt_g = gt
+        else:
+            gt_g = gt[gt_batch.reshape(-1) == g]
+        if int(vm.sum()) == 0 or gt_g.numel() == 0:
+            continue
+        s_tok = token_s[g].reshape(-1).float()
+        tr_tok = token_tract[g].reshape(-1)
+        valid = token_valid[g].reshape(-1).bool()
+        s_v = vert_s[vm].reshape(-1).float()
+        tr_v = vert_tract[vm].reshape(-1)
+        ds = (s_v.unsqueeze(1) - s_tok.unsqueeze(0)).abs()
+        ok = (tr_v.unsqueeze(1) == tr_tok.unsqueeze(0)) & valid.unsqueeze(0)
+        ds = ds.masked_fill(~ok, float("inf"))
+        nearest = ds.argmin(dim=1)
+        has = torch.isfinite(ds.min(dim=1).values)
+        err_e = _nn_euclidean(x_encoded[vm], gt_g)
+        err_z = _nn_euclidean(x_zero[vm], gt_g)
+        err_t = _nn_euclidean(template[vm], gt_g)
+        gains: list[float] = []
+        gaps: list[float] = []
+        encs: list[float] = []
+        zeros: list[float] = []
+        for t in range(int(s_tok.numel())):
+            if not bool(valid[t]):
+                continue
+            sel = has & (nearest == t)
+            n = int(sel.sum())
+            if n < min_verts:
+                continue
+            e = float(err_e[sel].mean())
+            z = float(err_z[sel].mean())
+            gains.append(z - e)
+            gaps.append(float(err_t[sel].mean()))
+            encs.append(e)
+            zeros.append(z)
+        if not gains:
+            continue
+        order = sorted(range(len(gains)), key=lambda i: gaps[i], reverse=True)
+        k = min(n_sac, len(order))
+        sac_idx = order[:k]
+        other_idx = order[k:]
+        case_gain.append(float(sum(gains) / len(gains)))
+        case_sac.append(float(sum(gains[i] for i in sac_idx) / k))
+        if other_idx:
+            case_other.append(float(sum(gains[i] for i in other_idx) / len(other_idx)))
+        case_enc.append(float(sum(encs) / len(encs)))
+        case_zero.append(float(sum(zeros) / len(zeros)))
+        case_n_sac.append(float(k))
+        last_gains = gains
+        last_sac_index = sac_idx
+
+    return {
+        "n_cases": len(case_gain),
+        "z0_gain_mm": _mean_or_none(case_gain),
+        "z0_gain_sac_mm": _mean_or_none(case_sac),
+        "z0_gain_other_mm": _mean_or_none(case_other),
+        "z0_err_encoded_mm": _mean_or_none(case_enc),
+        "z0_err_zero_mm": _mean_or_none(case_zero),
+        "z0_n_sac_tokens": _mean_or_none(case_n_sac),
+        "per_token_gain": last_gains,
+        "sac_token_index": last_sac_index,
+    }
 
 
 def rate_distortion_sweep(*_args: Any, **_kwargs: Any) -> dict[str, Any]:

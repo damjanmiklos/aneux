@@ -42,12 +42,16 @@ from resource_monitor import ResourceMonitor
 from config import (
     DEFAULT_LOSS_WEIGHTS,
     FOLLOW_BATCH,
+    GECO_BETA_MAX,
     GRAD_CLIP,
+    KL_ALWAYS_WEIGHT,
     KL_WARMUP_EPOCHS,
     LAMBDA_KL,
     LEARNING_RATE,
     N_TRUE,
     N_TRUE_FAR_FRAC,
+    RATE_TARGET_NATS,
+    TOKEN_KL_FLOOR_NATS,
     TUBE_RADIUS_MM,
     WEIGHT_DECAY,
     configure_stage2_precision,
@@ -77,6 +81,10 @@ try:
     from latent_metrics import compute_latent_epoch_metrics as _compute_latent_epoch_metrics
 except ImportError:
     _compute_latent_epoch_metrics = None
+try:
+    from latent_metrics import token_zero_decode_gain as _token_zero_decode_gain
+except ImportError:
+    _token_zero_decode_gain = None
 
 
 def _device_type(device):
@@ -180,8 +188,8 @@ def _face_from_batch(batch):
 def kl_anneal_weight(epoch, max_weight=LAMBDA_KL, warmup_epochs=KL_WARMUP_EPOCHS):
     """Linear KL anneal: 0 at epoch 1, `max_weight` from epoch `warmup_epochs` onward.
 
-    Used only when GECO is unavailable. With GECO, β is the KL weight and the
-    ceiling β_max ramps from GECO_BETA_INIT to GECO_BETA_MAX (never 0).
+    Used only when GECO is unavailable. With GECO the hinge is off for
+    ``warmup_epochs`` and β is the hinge weight afterwards.
     """
     if warmup_epochs <= 1:
         return float(max_weight)
@@ -500,7 +508,29 @@ def resolve_resume_path(resume, ckpt_dir):
     return None
 
 
-def losses_from_output(out, batch, kl_beta=None):
+def kl_objective_for_epoch(epoch, warmup_epochs, geco_beta, use_geco):
+    """Which KL terms are live this epoch.
+
+    Warm-up: per-token floor only, hinge off, so a token cannot sit at the
+    prior while the decoder is still learning to read z. After warm-up: the
+    one-sided R* hinge plus a small raw-KL weight, and no floor.
+    """
+    if not use_geco:
+        return {"kl_beta": None, "kl_token_floor": None, "kl_always_weight": None}, False
+    if int(epoch) <= int(warmup_epochs):
+        return {
+            "kl_beta": None,
+            "kl_token_floor": float(TOKEN_KL_FLOOR_NATS),
+            "kl_always_weight": None,
+        }, True
+    return {
+        "kl_beta": geco_beta,
+        "kl_token_floor": None,
+        "kl_always_weight": float(KL_ALWAYS_WEIGHT),
+    }, False
+
+
+def losses_from_output(out, batch, kl_beta=None, kl_token_floor=None, kl_always_weight=None):
     batch_mid = getattr(batch, "pos_mid_batch", None)
     batch_coarse = getattr(batch, "pos_coarse_batch", None)
     cl_batch = getattr(batch, "cl_dense_batch", None)
@@ -508,6 +538,10 @@ def losses_from_output(out, batch, kl_beta=None):
     if _fn_has_param(compute_losses, "kl_beta"):
         extra["kl_beta"] = kl_beta
     # else: compute_losses has no kl_beta — GECO cannot scale the KL tensor.
+    if _fn_has_param(compute_losses, "kl_token_floor"):
+        extra["kl_token_floor"] = kl_token_floor
+    if _fn_has_param(compute_losses, "kl_always_weight"):
+        extra["kl_always_weight"] = kl_always_weight
     if _fn_has_param(compute_losses, "latent_valid"):
         extra["latent_valid"] = getattr(batch, "latent_valid", None)
     if _fn_has_param(compute_losses, "rim_removed") and getattr(out, "rim_removed", None) is not None:
@@ -1184,6 +1218,9 @@ def train_epoch(
     window_kl_sum = 0.0
     window_kl_n = 0
     use_geco = geco_beta is not None and geco_is_available()
+    kl_kwargs, kl_warmup = kl_objective_for_epoch(
+        epoch, kl_warmup_epochs, geco_beta, use_geco
+    )
     if vram_probe and use_cuda:
         torch.cuda.reset_peak_memory_stats(_cuda_index(device))
 
@@ -1197,7 +1234,7 @@ def train_epoch(
         window_len = _accum_window_len(step, n_batches, accum_steps)
 
         out = _forward_model(model, batch, sample=True)
-        terms = losses_from_output(out, batch, kl_beta=geco_beta if use_geco else None)
+        terms = losses_from_output(out, batch, **kl_kwargs)
         loss = _weighted_total(terms, weights) / window_len
 
         is_update = (step + 1) % accum_steps == 0 or (step + 1) == n_batches
@@ -1230,7 +1267,7 @@ def train_epoch(
                 window_kl_sum, window_kl_n = all_reduce_sum_pair(
                     window_kl_sum, window_kl_n, device=device if use_cuda else None
                 )
-            if use_geco and window_kl_n > 0:
+            if use_geco and window_kl_n > 0 and not kl_warmup:
                 geco_beta = step_geco_beta(
                     geco_beta,
                     window_kl_sum / float(window_kl_n),
@@ -1284,14 +1321,83 @@ def train_epoch(
     if geco_beta is not None:
         metrics["geco_beta"] = float(geco_beta)
         metrics["beta"] = float(geco_beta)
+    metrics["kl_warmup"] = 1.0 if kl_warmup else 0.0
     return metrics, global_step, geco_beta
 
 
-def evaluate_epoch(model, dataloader, weights, device, sample=False, kl_beta=None):
-    """Validation recon. `sample=False` is the μ path (σ=0, used for best.pt)."""
+_Z0_GAIN_KEYS = (
+    "z0_gain_mm",
+    "z0_gain_sac_mm",
+    "z0_gain_other_mm",
+    "z0_err_encoded_mm",
+    "z0_err_zero_mm",
+    "z0_n_sac_tokens",
+)
+
+
+def _score_zero_decode(model, batch, out):
+    """Per-token mm by which ``out`` (encoded μ) beats a z=0 decode of ``batch``."""
+    if _token_zero_decode_gain is None or getattr(out, "mu", None) is None:
+        return None
+    if getattr(batch, "s_mm", None) is None or getattr(batch, "tract_id", None) is None:
+        return None
+    core = unwrap_model(model)
+    from model import _token_s_table, _token_tables
+
+    n_g = _num_graphs(batch)
+    _token_u, token_tract, _attend, _junc, token_valid = _token_tables(
+        batch, n_g, int(core.latent_len)
+    )
+    token_s = _token_s_table(batch, n_g, int(core.latent_len))
+    gt = getattr(batch, "gt_points", None)
+    gt_batch = getattr(batch, "gt_points_batch", None)
+    if gt is None or not torch.is_tensor(gt) or gt.numel() == 0:
+        gt = getattr(batch, "x_true", None)
+        gt_batch = getattr(batch, "x_true_batch", None)
+    if gt is None or not torch.is_tensor(gt) or gt.numel() == 0:
+        return None
+    x_zero = core.decode(torch.zeros_like(out.mu), batch)
+    vert_batch = getattr(batch, "batch", None)
+    if vert_batch is None:
+        vert_batch = torch.zeros(out.x_pred.size(0), dtype=torch.long, device=out.x_pred.device)
+    return _token_zero_decode_gain(
+        out.x_pred,
+        x_zero,
+        batch.x,
+        vert_batch,
+        batch.tract_id,
+        batch.s_mm,
+        gt,
+        gt_batch,
+        token_s,
+        token_tract,
+        token_valid,
+        n_graphs=n_g,
+    )
+
+
+def evaluate_epoch(
+    model,
+    dataloader,
+    weights,
+    device,
+    sample=False,
+    kl_beta=None,
+    kl_token_floor=None,
+    kl_always_weight=None,
+    zero_decode=False,
+):
+    """Validation recon. `sample=False` is the μ path (σ=0, used for best.pt).
+
+    ``zero_decode`` also decodes z=0 and records, per token, how many
+    millimetres the encoded surface beats it. The sac-like slice of that
+    gain is the number val recon itself does not show.
+    """
     model.eval()
     totals = _zero_tensor_meters()
     total_samples = 0
+    gain_acc = {key: 0.0 for key in _Z0_GAIN_KEYS}
+    gain_n = {key: 0 for key in _Z0_GAIN_KEYS}
 
     with torch.no_grad():
         for batch in tqdm(
@@ -1303,7 +1409,13 @@ def evaluate_epoch(model, dataloader, weights, device, sample=False, kl_beta=Non
             batch_size = int(batch.num_graphs)
             total_samples += batch_size
             out = _forward_model(model, batch, sample=bool(sample))
-            terms = losses_from_output(out, batch, kl_beta=kl_beta)
+            terms = losses_from_output(
+                out,
+                batch,
+                kl_beta=kl_beta,
+                kl_token_floor=kl_token_floor,
+                kl_always_weight=kl_always_weight,
+            )
             loss = _weighted_total(terms, weights)
             _add_meter(totals, "loss", loss, float(batch_size))
             for key in _METER_KEYS:
@@ -1313,9 +1425,31 @@ def evaluate_epoch(model, dataloader, weights, device, sample=False, kl_beta=Non
                         val = _tensor_scalar(val)
                     if val is not None:
                         _add_meter(totals, key, val, float(batch_size))
+            if zero_decode and not sample:
+                gain = _score_zero_decode(model, batch, out)
+                n_cases = 0 if gain is None else int(gain.get("n_cases") or 0)
+                if n_cases > 0:
+                    for key in _Z0_GAIN_KEYS:
+                        val = gain.get(key)
+                        if val is None:
+                            continue
+                        gain_acc[key] += float(val) * n_cases
+                        gain_n[key] = gain_n.get(key, 0) + n_cases
             del out, terms, loss, batch
 
-    return _flush_meters(totals, total_samples)
+    metrics = _flush_meters(totals, total_samples)
+    if zero_decode:
+        # Every rank reports the same keys so the DDP mean stays aligned.
+        fallback = 0.0
+        if gain_n.get("z0_gain_mm", 0) > 0:
+            fallback = gain_acc["z0_gain_mm"] / float(gain_n["z0_gain_mm"])
+        for key in _Z0_GAIN_KEYS:
+            n = gain_n.get(key, 0)
+            if n > 0:
+                metrics[key] = gain_acc[key] / float(n)
+            else:
+                metrics[key] = fallback
+    return metrics
 
 
 def _format_metrics(metrics, weights, tag, epoch, epochs):
@@ -1603,14 +1737,15 @@ def train_model(
         num_workers=num_workers,
         **loader_kwargs,
     )
+    # Validation used to load on the main process (num_workers=0) and took
+    # about 30% of each epoch. Same worker setup as training.
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
         sampler=val_sampler,
-        num_workers=0,
-        follow_batch=FOLLOW_BATCH,
-        pin_memory=bool(pin_memory) and use_cuda,
+        num_workers=num_workers,
+        **loader_kwargs,
     )
     latent_loader = val_loader
     if main and val_sampler is not None:
@@ -1618,8 +1753,8 @@ def train_model(
             val_dataset,
             batch_size=batch_size,
             shuffle=False,
-            num_workers=0,
-            follow_batch=FOLLOW_BATCH,
+            num_workers=num_workers,
+            **loader_kwargs,
         )
 
     model = model.to(device)
@@ -1656,8 +1791,11 @@ def train_model(
     geco_beta = init_geco_beta() if use_geco else None
     if use_geco:
         _log(
-            f"GECO dual: β_init={geco_beta:.6g}  "
-            f"(KL weight=1; {kl_warmup_epochs}-epoch ramp of β_max)"
+            f"KL schedule: R*={RATE_TARGET_NATS:g} nats/token, "
+            f"hinge off for {int(kl_warmup_epochs)} epochs "
+            f"(per-token floor {TOKEN_KL_FLOOR_NATS:g}), then "
+            f"β from {geco_beta:.4g} plus always-on weight {KL_ALWAYS_WEIGHT:g} "
+            f"(cap {GECO_BETA_MAX:g})"
         )
     else:
         _log("GECO unavailable; using annealed LAMBDA_KL")
@@ -1756,6 +1894,9 @@ def train_model(
         if val_sampler is not None:
             val_sampler.set_epoch(epoch)
         epoch_weights = dict(weights)
+        kl_kwargs, in_kl_warmup = kl_objective_for_epoch(
+            epoch, kl_warmup_epochs, geco_beta, use_geco
+        )
         if use_geco:
             epoch_weights["kl"] = 1.0
         else:
@@ -1792,8 +1933,14 @@ def train_model(
         last_lr = scheduler.get_last_lr()[0] if scheduler is not None else lr
         ema_d = ema_warmup_decay(ema.decay, max(0, ema.n_updates - 1)) if ema is not None else 0.0
         extra = f" | kl_lambda: {epoch_weights['kl']:.6f} | lr: {last_lr:.2e} | ema_d: {ema_d:.4f}"
+        if metrics.get("kl_mean_raw") is not None:
+            extra += f" | KL_raw: {float(metrics['kl_mean_raw']):.3f}"
         if geco_beta is not None:
             extra += f" | β: {float(geco_beta):.6g}"
+            if in_kl_warmup:
+                extra += f" | floor {TOKEN_KL_FLOOR_NATS:g} (hinge off)"
+            else:
+                extra += f" | always {KL_ALWAYS_WEIGHT:g}"
             if metrics.get("rate_gap") is not None:
                 extra += f" | rate_gap: {metrics['rate_gap']:.4f}"
         extra += f" | {metrics['samples_per_sec']:.2f} samples/s"
@@ -1821,28 +1968,32 @@ def train_model(
             if bmax is not None:
                 metrics["geco_beta_max"] = bmax
 
-        if main:
-            latent_row = _call_maybe(
-                _compute_latent_epoch_metrics,
-                model=raw_model,
-                dataloader=latent_loader if len(val_dataset) else train_loader,
-                device=device,
-                epoch=epoch,
-                beta=geco_beta if geco_beta is not None else epoch_weights["kl"],
-                r_star=None,
-                weights=epoch_weights,
-                kl_lambda=epoch_weights["kl"],
-                kl_mean_raw=metrics.get("kl_mean_raw"),
-                rate_gap=metrics.get("rate_gap"),
-            )
-            if isinstance(latent_row, dict):
-                metrics.update(_flatten_metrics(latent_row, prefix="latent"))
-
         do_val = epoch % val_every == 0 or epoch == epochs or stop["flag"]
         if do_val:
+            if main:
+                latent_row = _call_maybe(
+                    _compute_latent_epoch_metrics,
+                    model=raw_model,
+                    dataloader=latent_loader if len(val_dataset) else train_loader,
+                    device=device,
+                    epoch=epoch,
+                    beta=geco_beta if geco_beta is not None else epoch_weights["kl"],
+                    r_star=None,
+                    weights=epoch_weights,
+                    kl_lambda=epoch_weights["kl"],
+                    kl_mean_raw=metrics.get("kl_mean_raw"),
+                    rate_gap=metrics.get("rate_gap"),
+                )
+                if isinstance(latent_row, dict):
+                    metrics.update(_flatten_metrics(latent_row, prefix="latent"))
             if ema is not None:
                 live_mu = evaluate_epoch(
-                    model, val_loader, epoch_weights, device, sample=False, kl_beta=geco_beta
+                    model,
+                    val_loader,
+                    epoch_weights,
+                    device,
+                    sample=False,
+                    **kl_kwargs,
                 )
                 live_mu = reduce_mean_dict(live_mu, device=device if use_cuda else None)
                 _log(_format_metrics(live_mu, epoch_weights, "VAL live μ", epoch, epochs))
@@ -1851,10 +2002,21 @@ def train_model(
                 ema.store(raw_model)
                 ema.copy_to(raw_model)
             val_metrics = evaluate_epoch(
-                model, val_loader, epoch_weights, device, sample=False, kl_beta=geco_beta
+                model,
+                val_loader,
+                epoch_weights,
+                device,
+                sample=False,
+                zero_decode=True,
+                **kl_kwargs,
             )
             val_sampled = evaluate_epoch(
-                model, val_loader, epoch_weights, device, sample=True, kl_beta=geco_beta
+                model,
+                val_loader,
+                epoch_weights,
+                device,
+                sample=True,
+                **kl_kwargs,
             )
             val_metrics = reduce_mean_dict(val_metrics, device=device if use_cuda else None)
             val_sampled = reduce_mean_dict(val_sampled, device=device if use_cuda else None)
@@ -1864,6 +2026,14 @@ def train_model(
             _log(_format_metrics(val_sampled, epoch_weights, "VAL σ  ", epoch, epochs))
             gap = float(val_sampled["recon"] - val_metrics["recon"])
             _log(f"  recon(σ) − recon(μ) = {gap:.4f}")
+            if "z0_gain_sac_mm" in val_metrics:
+                _log(
+                    "  z=0: encoded beats it by "
+                    f"{float(val_metrics['z0_gain_mm']):.3f} mm/token"
+                    f" (sac-like {float(val_metrics['z0_gain_sac_mm']):.3f} mm"
+                    f" on ~{float(val_metrics.get('z0_n_sac_tokens', 0)):.0f} tokens,"
+                    f" other {float(val_metrics['z0_gain_other_mm']):.3f} mm)"
+                )
             for key, value in val_metrics.items():
                 metrics[f"val_{key}"] = value
             for key, value in val_sampled.items():

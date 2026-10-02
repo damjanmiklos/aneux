@@ -1810,18 +1810,50 @@ def test_persist_if_remote_skips_same_path():
 
 
 def test_geco_beta_not_clipped_to_zero_at_epoch_one():
+    """Warm-up freezes β (hinge off). After it, the dual moves and never hits 0."""
     import config as cfg
-    from losses import geco_beta_max_for_epoch, update_geco_beta
+    from losses import geco_beta_max_for_epoch, update_geco_beta, vae_kl_loss
+
+    _assert(abs(cfg.RATE_TARGET_NATS - 3.0) < 1e-9, cfg.RATE_TARGET_NATS)
+    _assert(10 <= int(cfg.KL_WARMUP_EPOCHS) <= 20, cfg.KL_WARMUP_EPOCHS)
+    _assert(0.0 < float(cfg.KL_ALWAYS_WEIGHT) < float(cfg.GECO_BETA_MAX), cfg.KL_ALWAYS_WEIGHT)
+    _assert(abs(float(cfg.TOKEN_KL_FLOOR_NATS) - 0.5) < 1e-9, cfg.TOKEN_KL_FLOOR_NATS)
 
     hi1 = geco_beta_max_for_epoch(1, beta_max=10.0, warmup_epochs=20)
-    _assert(hi1 >= cfg.GECO_BETA_MIN, hi1)
+    _assert(hi1 > 0.0, hi1)
     _assert(abs(hi1 - cfg.GECO_BETA_INIT) < 1e-9, hi1)
-    hi20 = geco_beta_max_for_epoch(20, beta_max=10.0, warmup_epochs=20)
-    _assert(abs(hi20 - 10.0) < 1e-9, hi20)
-    # KL below R* shrinks β slightly; a zero ceiling used to force β=0.
-    b = update_geco_beta(1.0, kl_mean_raw=5.45, epoch=1, warmup_epochs=20)
-    _assert(float(b) >= cfg.GECO_BETA_MIN, b)
-    _assert(0.5 < float(b) <= hi1 + 1e-12, (b, hi1))
+    hi_warm = geco_beta_max_for_epoch(20, beta_max=10.0, warmup_epochs=20)
+    _assert(abs(hi_warm - cfg.GECO_BETA_INIT) < 1e-9, hi_warm)
+    hi_after = geco_beta_max_for_epoch(21, beta_max=10.0, warmup_epochs=20)
+    _assert(abs(hi_after - 10.0) < 1e-9, hi_after)
+
+    frozen = update_geco_beta(0.02, kl_mean_raw=9.0, epoch=1, warmup_epochs=20)
+    _assert(abs(float(frozen) - 0.02) < 1e-12, frozen)
+    # Above R* the dual tightens from above; below R* it eases off, but not to 0.
+    up = update_geco_beta(0.02, kl_mean_raw=9.0, epoch=21, warmup_epochs=20, rate_target=3.0)
+    _assert(float(up) > 0.02, up)
+    down = update_geco_beta(0.02, kl_mean_raw=1.0, epoch=21, warmup_epochs=20, rate_target=3.0)
+    _assert(cfg.GECO_BETA_MIN <= float(down) < 0.02, down)
+
+    mu0 = torch.zeros(1, 3, 4)
+    lv0 = torch.zeros(1, 3, 4)
+    warm, info = vae_kl_loss(mu0, lv0, token_floor=0.5)
+    _assert(abs(float(warm) - 0.5) < 1e-5, float(warm))
+    _assert(abs(float(info["kl_mean_raw"])) < 1e-5, info["kl_mean_raw"])
+    # A live neighbour must not cover a token that is off: the floor is per token.
+    mu_mix = torch.zeros(1, 2, 4)
+    mu_mix[0, 0] = 3.0
+    mixed, _ = vae_kl_loss(mu_mix, torch.zeros(1, 2, 4), token_floor=0.5)
+    _assert(float(mixed) > 0.2, float(mixed))
+    # Above the floor the warm-up term is zero, and it does not enter the hinge.
+    mu_on = torch.full((1, 3, 4), 1.0)  # 2 nats/token, under R*=3
+    warm_on, info_on = vae_kl_loss(mu_on, lv0, token_floor=0.5)
+    _assert(float(warm_on) < 1e-5, float(warm_on))
+    charged, info_c = vae_kl_loss(mu_on, lv0, beta=0.02, always_weight=0.02)
+    raw = float(info_c["kl_mean_raw"])
+    _assert(raw < 3.0, raw)
+    _assert(abs(float(charged) - 0.02 * raw) < 1e-4, (float(charged), raw))
+    _assert(float(info_on["kl_mean_raw"]) > 0.5, info_on["kl_mean_raw"])
 
 
 def test_scale_hpc_workers_follows_gpus():
@@ -2017,15 +2049,77 @@ def test_mesh_r_star_stats_stay_in_millimetres():
     _assert(float(w[0]) > 0.7, f"0.4 mm step must stay coupled, got {float(w[0])}")
 
 
+def test_token_zero_decode_gain_is_per_token():
+    """The sac-like token is the one whose template misses the GT, not the mean mesh."""
+    from latent_metrics import token_zero_decode_gain
+
+    template = torch.tensor(
+        [
+            [0.0, 0.0, 0.0],
+            [0.2, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+            [4.2, 0.0, 0.0],
+        ]
+    )
+    gt = template.clone()
+    gt[:2, 1] = 2.0
+    encoded = gt.clone()
+    zero = template.clone()
+    vert_batch = torch.zeros(4, dtype=torch.long)
+    vert_tract = torch.zeros(4, dtype=torch.long)
+    vert_s = torch.tensor([0.0, 0.2, 4.0, 4.2])
+    token_s = torch.tensor([[0.0, 4.0]])
+    token_tract = torch.zeros(1, 2, dtype=torch.long)
+    token_valid = torch.ones(1, 2, dtype=torch.bool)
+    out = token_zero_decode_gain(
+        encoded,
+        zero,
+        template,
+        vert_batch,
+        vert_tract,
+        vert_s,
+        gt,
+        None,
+        token_s,
+        token_tract,
+        token_valid,
+        n_graphs=1,
+        n_sac=1,
+        min_verts=1,
+    )
+    _assert(out["n_cases"] == 1, out)
+    _assert(out["sac_token_index"] == [0], out["sac_token_index"])
+    _assert(out["z0_gain_sac_mm"] > 1.5, out)
+    _assert(abs(out["per_token_gain"][1]) < 0.05, out["per_token_gain"])
+    _assert(out["z0_gain_sac_mm"] > out["z0_gain_mm"], out)
+
+
+def test_kl_objective_uses_floor_only_during_warmup():
+    from train import kl_objective_for_epoch
+
+    warm, is_warm = kl_objective_for_epoch(3, 20, 0.02, True)
+    _assert(is_warm, warm)
+    _assert(warm["kl_beta"] is None, warm)
+    _assert(abs(warm["kl_token_floor"] - 0.5) < 1e-9, warm)
+    _assert(warm["kl_always_weight"] is None, warm)
+    after, is_after = kl_objective_for_epoch(21, 20, 0.02, True)
+    _assert(not is_after, after)
+    _assert(after["kl_token_floor"] is None, after)
+    _assert(abs(after["kl_beta"] - 0.02) < 1e-9, after)
+    _assert(abs(after["kl_always_weight"] - 0.02) < 1e-9, after)
+
+
 def test_kl_penalty_is_excess_over_target():
     mu = torch.zeros(1, 2, 4)
     logvar = torch.zeros(1, 2, 4)
     under, info = vae_kl_loss(mu, logvar, beta=1.0)
-    _assert(float(info["kl_mean_raw"]) < 12.0, info["kl_mean_raw"])
+    target = float(info["rate_target"])
+    _assert(abs(target - 3.0) < 1e-9, target)
+    _assert(float(info["kl_mean_raw"]) < target, info["kl_mean_raw"])
     _assert(float(under) == 0.0, f"under-target KL must not be penalised, got {float(under)}")
     mu_hi = torch.full((1, 2, 4), 3.0)
     over, info_hi = vae_kl_loss(mu_hi, logvar, beta=1.0)
-    _assert(float(info_hi["kl_mean_raw"]) > 12.0, info_hi["kl_mean_raw"])
+    _assert(float(info_hi["kl_mean_raw"]) > target, info_hi["kl_mean_raw"])
     _assert(float(over) > 0.0, over)
 
 
@@ -2766,6 +2860,8 @@ def main():
         test_destroy_distributed_without_process_group,
         test_persist_if_remote_skips_same_path,
         test_geco_beta_not_clipped_to_zero_at_epoch_one,
+        test_token_zero_decode_gain_is_per_token,
+        test_kl_objective_uses_floor_only_during_warmup,
         test_scale_hpc_workers_follows_gpus,
         test_resource_monitor_snapshots_on_this_os,
         test_mirror_reflects_one_graph_consistently,

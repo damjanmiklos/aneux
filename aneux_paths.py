@@ -46,6 +46,8 @@ TEMPLATE_DIR = os.path.join(DATATRANSFORM, "template_creation")
 TEMPLATE_OUTPUT = os.path.join(TEMPLATE_DIR, "output")
 TEMPLATE_OUTPUT_REMESHED = os.path.join(TEMPLATE_DIR, "output_remeshed")
 TEMPLATE_OUTPUT_VARIABLE = os.path.join(TEMPLATE_DIR, "output_variable_remeshed")
+# Parent tube plus four aneurysm spheres, uniform and heavily smoothed.
+TEMPLATE_OUTPUT_VESSEL_ANEURYSM = os.path.join(TEMPLATE_DIR, "output_vessel_aneurysm")
 
 EXPERIMENT_DIR = os.path.join(REPO_ROOT, "1test_encoder_decoder_only")
 EXPERIMENT_OUTPUT = os.path.join(EXPERIMENT_DIR, "output")

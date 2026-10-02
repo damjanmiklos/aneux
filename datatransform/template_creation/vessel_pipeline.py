@@ -5903,12 +5903,14 @@ def clip_one_opening_pipe_section(
         )
         if fast:
             n_cand = clipped.GetNumberOfPoints()
-            if n_cand < 50 or n_cand < 0.45 * n_prev or n_cand >= n_prev:
-                why = (
-                    f"the cut left {n_cand}/{n_prev} points"
-                    if n_cand < n_prev
-                    else "the cutter removed nothing"
-                )
+            # A long stub loses points when it is cut off. A flush outlet does
+            # the opposite: the cap is a few triangles, the new rim adds
+            # vertices, and the count rises. Rejecting that as "removed
+            # nothing" left the ostium shut. A real miss has no new rim, which
+            # the boundary test below still rejects. A cut that blows the mesh
+            # up is not an ostium either.
+            if n_cand < 50 or n_cand < 0.45 * n_prev or n_cand > 1.15 * n_prev:
+                why = f"the cut left {n_cand}/{n_prev} points"
                 inset += OPENING_CLIP_INSET_STEP_MM
                 continue
         clipped = (
@@ -5931,9 +5933,9 @@ def clip_one_opening_pipe_section(
         if fast:
             _pc, pts_c, faces_c = _triangle_points_faces(clipped, clean=False)
             n_local = _n_boundary_points_near(pts_c, faces_c, origin_i, radius)
-            opened = n_local >= MIN_OPENING_LOOP_POINTS and n_cand < n_prev
-            if n_local_before >= MIN_OPENING_LOOP_POINTS:
-                opened = opened and n_local > n_local_before
+            # The rim has to be new. A point-count drop is not required: the
+            # flush-outlet cut adds the rim and still opens the hole.
+            opened = n_local >= MIN_OPENING_LOOP_POINTS and n_local > n_local_before
         else:
             loops_after = _n_boundary_loops(clipped)
             near = any(
@@ -6913,6 +6915,7 @@ def clip_flow_extensions_and_uncap(
     fast_uncap=True,
     cut_frames=None,
     reference_surface=None,
+    collar_only=False,
 ):
     """Pipe-section uncap at each ostium.
 
@@ -6943,6 +6946,11 @@ def clip_flow_extensions_and_uncap(
     trimmed = False
     if unextended_surface is not None and frames is not None:
         current, _n_trimmed = trim_extension_patches(current, unextended_surface, frames)
+        trimmed = True
+    # A tube that only carries a short stub past the ostium cannot use the
+    # flow-extension cutter: that cylinder is about 7R long and, on a fork,
+    # reaches the branch that was just opened. The trimmed collar is 2R.
+    if collar_only:
         trimmed = True
     body_pt = mesh_body_point(current)
     n_clipped = 0
@@ -7039,6 +7047,27 @@ def clip_flow_extensions_and_uncap(
                         break
             elif ok:
                 ok = _accept(candidate, i, what)
+            # The full cutter can be wider than the stub and still reach the
+            # trunk that carries the outlet beside it. A narrower punch opens
+            # this end and leaves that trunk standing. Only the short-stub
+            # tubes take this retry; a long flow extension wants the wide cut.
+            if collar_only and frames is not None and not ok:
+                saved_near = near_before
+                for factor in (0.72, 0.50):
+                    narrow_r = max(float(radius) * factor, 0.22)
+                    narrow, narrow_ok = clip_one_opening_pipe_section(
+                        before, origin, outward, narrow_r, body_pt,
+                        extension_length=extension_length, trimmed=True,
+                        fast=fast_uncap,
+                    )
+                    if not narrow_ok:
+                        continue
+                    near_before = saved_near
+                    if _accept(narrow, i, "narrow pipe-section cut"):
+                        candidate, ok, what = narrow, True, "narrow pipe-section cut"
+                        break
+                if not ok:
+                    near_before = saved_near
             if ok:
                 current = candidate
                 print(
@@ -8341,6 +8370,22 @@ def remesh_surface_verified(
                     + " and ".join(torn)
                     + "; trying the next rung for a clean one"
                 )
+                # Every later rung reproduces a lone microscopic edge, and the
+                # fold after remesh is what removes it. Stopping here keeps the
+                # collapse-off surface, which has no bowtie, instead of falling
+                # back to the first rung that did.
+                if (
+                    n_nm == 0
+                    and n_bow == 0
+                    and min_edge < MIN_EDGE_LENGTH_MM
+                    and collapse == REMESH_COLLAPSE_ANGLE_OFF
+                    and fraction == 0.0
+                ):
+                    print(
+                        f"  NOTE: the only defect left is an edge of {min_edge:.2e} mm; "
+                        "the edge fold after remesh takes it"
+                    )
+                    return out
                 continue
         if held:
             if fraction > 0 or iters != n_iter or collapse != REMESH_COLLAPSE_ANGLE:

@@ -4,7 +4,7 @@
 Hardware: `gpu` node — 64-core EPYC 7763, 256 GB, 4× A100 40 GB (16 cores/GPU).
 Workers and DDP ranks follow the GPUs/CPUs Slurm actually gave this job.
 
-Production (4 GPU, 1 day 16 hours)::
+Production (4 GPU, 2 days 4 hours)::
 
     sbatch --account=<account> --mail-user=YOU@email hpc/train_stage2.sbatch
 
@@ -76,7 +76,9 @@ from run_report import make_run_dir
 BATCH_SIZE = int(os.environ.get("ANEUX_BATCH_SIZE", "4"))
 ACCUM_STEPS = int(os.environ.get("ANEUX_ACCUM_STEPS", "1"))
 EPOCHS = int(os.environ.get("ANEUX_EPOCHS", "500"))
-VAL_EVERY = int(os.environ.get("ANEUX_VAL_EVERY", "1"))
+# Every 5th epoch. Validating every epoch (three decoder passes, workers off)
+# was about 30% of the previous job. z=0 is scored on the same passes.
+VAL_EVERY = int(os.environ.get("ANEUX_VAL_EVERY", "5"))
 LEARNING_RATE = float(os.environ.get("ANEUX_LR", "2e-4"))
 # 0.01: the 2026-09-22 run (1e-4) memorised -- val recon peaked at epoch 110
 # while train KL kept climbing.  EMA 0.996 averages ~250 steps (~8 epochs at
@@ -330,6 +332,10 @@ def main():
         "n_cpu": scaled["n_cpu"],
         "GECO_ETA": GECO_ETA,
         "RATE_TARGET_NATS": rate_target,
+        "KL_WARMUP_EPOCHS": _config.KL_WARMUP_EPOCHS,
+        "TOKEN_KL_FLOOR_NATS": _config.TOKEN_KL_FLOOR_NATS,
+        "KL_ALWAYS_WEIGHT": _config.KL_ALWAYS_WEIGHT,
+        "VAL_EVERY": VAL_EVERY,
         "RUN_TAG": RUN_TAG,
         "SLURM_ARRAY_JOB_ID": os.environ.get("SLURM_ARRAY_JOB_ID"),
         "SLURM_ARRAY_TASK_ID": os.environ.get("SLURM_ARRAY_TASK_ID"),
