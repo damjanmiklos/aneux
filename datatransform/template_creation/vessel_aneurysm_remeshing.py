@@ -93,6 +93,9 @@ DEFAULT_MAX_GRID_SIZE = 320
 R_FLOOR_MM = 0.35
 # Each stub ends flat this many voxels past its ostium plane.
 STUB_STRAIGHT_VOXELS = 3.0
+# Fallback only: radius around each stub (beyond r) that is flattened to just
+# behind the ostium plane when the normal build fails its gates.
+FLUSH_FALLBACK_MM = 1.5
 # Every sphere overlaps the parent or a connected sphere by at least this.
 CONNECT_OVERLAP_MM = 0.3
 # Smooth-union width between the sac spheres and the parent (and each other).
@@ -817,6 +820,7 @@ class CaseModel:
         for op in self.ostia:
             _stamp_capped_cylinder(field, lo, g, op["origin"], op["normal"], op["r"],
                                    -op["back"], op["out_len"])
+        self.flush = []
         self.clearance = self._stub_clearance(lo, g, field.shape)
         field.ravel()[self.clearance] = np.maximum(field.ravel()[self.clearance], np.float32(g))
         self.parent_field = field
@@ -885,8 +889,47 @@ class CaseModel:
                 border = field[tuple(idx)]
                 np.maximum(border, np.float32(self.g), out=border)
         flat = field.ravel()
+        if self.flush:
+            for idx, val in self.flush:
+                flat[idx] = np.maximum(flat[idx], val)
+            for op in self.ostia:
+                _stamp_capped_cylinder(field, self.origin, self.g, op["origin"], op["normal"],
+                                       op["r"], -op["back"], op["out_len"])
         flat[self.clearance] = np.maximum(flat[self.clearance], np.float32(self.g))
         return field
+
+    def set_flush(self, flush_mm):
+        """Fallback for an ostium whose plane is flush with another wall.
+
+        Within ``flush_mm`` of each stub, everything but the stub is pushed to
+        two voxels behind the ostium plane, so the plane meets the stub alone
+        and the cut is bounded by it. Neighbouring wall there gets a shallow
+        flat dent. Off (empty) unless the normal build failed its gates.
+        """
+        self.flush = []
+        if flush_mm <= 0:
+            return
+        g, lo = self.g, self.origin
+        nz, ny, nx = self.shape
+        for op in self.ostia:
+            o, n, r = op["origin"], op["normal"], op["r"]
+            rad = r + flush_mm
+            ends = np.stack((o - 3.0 * g * n, o + (op["out_len"] + flush_mm) * n))
+            i0 = np.maximum(np.floor((ends.min(axis=0) - rad - lo) / g).astype(int), 0)
+            i1 = np.minimum(np.ceil((ends.max(axis=0) + rad - lo) / g).astype(int) + 1,
+                            np.array([nx, ny, nz]))
+            if np.any(i1 <= i0):
+                continue
+            xs = lo[0] + np.arange(i0[0], i1[0]) * g - o[0]
+            ys = lo[1] + np.arange(i0[1], i1[1]) * g - o[1]
+            zs = lo[2] + np.arange(i0[2], i1[2]) * g - o[2]
+            Z, Y, X = np.meshgrid(zs, ys, xs, indexing="ij")
+            sv = X * n[0] + Y * n[1] + Z * n[2]
+            lat = np.sqrt(np.maximum(X * X + Y * Y + Z * Z - sv * sv, 0.0))
+            sel = (sv > -3.0 * g) & (sv < op["out_len"] + flush_mm) & (lat < rad)
+            k, j, i = np.nonzero(sel)
+            idx = ((k + i0[2]) * ny + (j + i0[1])) * nx + (i + i0[0])
+            self.flush.append((idx, (sv[sel] + 2.0 * g).astype(np.float32)))
 
     def _image(self, field):
         img = vtk.vtkImageData()
@@ -1017,16 +1060,30 @@ class CaseModel:
             o, n, r = op["origin"], op["normal"], op["r"]
             s = (pts - o) @ n
             lat = np.linalg.norm((pts - o) - s[:, None] * n, axis=1)
-            # The stub wall sits at lateral ~r; a band of a few voxels covers
-            # marching-cubes and smoothing error without reaching a neighbour.
-            cand = (s > 0.0) & (s < op["out_len"] + r + 3.0 * self.g) & (lat < 1.3 * r + 3.0 * self.g)
-            if not cand.any():
-                raise TemplateQualityError("an ostium stub is missing from the surface")
-            ids = np.flatnonzero(cand)
-            tip = o + op["out_len"] * n
-            seed = int(ids[np.argmin(np.linalg.norm(pts[ids] - tip, axis=1))])
+            # The piece to delete must be bounded by the plane alone. Start with
+            # a band hugging the stub (the wall sits at lateral ~r) and widen it
+            # only while the piece still runs into the band's edge.
             edges, _inv, _cnt = _edge_table(faces)
-            comp = _component_with_seed(cand, _adjacency(len(pts), edges), seed)
+            adj = _adjacency(len(pts), edges)
+            comp = None
+            for widen in (0.0, 1.0, 2.5):
+                cand = ((s > 0.0) & (s < op["out_len"] + (1.0 + widen) * r + 3.0 * self.g)
+                        & (lat < (1.3 + widen) * r + (3.0 + 2.0 * widen) * self.g))
+                if not cand.any():
+                    continue
+                ids = np.flatnonzero(cand)
+                tip = o + op["out_len"] * n
+                seed = int(ids[np.argmin(np.linalg.norm(pts[ids] - tip, axis=1))])
+                trial = _component_with_seed(cand, adj, seed)
+                ea, eb = edges[:, 0], edges[:, 1]
+                leak = np.any((trial[ea] & ~trial[eb] & (s[eb] > 0.0))
+                              | (trial[eb] & ~trial[ea] & (s[ea] > 0.0)))
+                if comp is None or not leak:
+                    comp = trial
+                if not leak:
+                    break
+            if comp is None:
+                raise TemplateQualityError("an ostium stub is missing from the surface")
             value = np.where(comp | (s <= 0.0), s, -1.0e3)
             poly = _poly_from_arrays(pts, faces)
             arr = numpy_to_vtk(np.ascontiguousarray(value), deep=True)
@@ -1185,11 +1242,6 @@ def remesh_surface_isotropically(surface, target_edge_length, n_iter=REMESH_ITER
     return to_vtk_poly(remesher.Surface)
 
 
-def _same_rim_edge(a, b, uq, cn):
-    k = np.flatnonzero((uq[:, 0] == min(a, b)) & (uq[:, 1] == max(a, b)))
-    return bool(len(k) and cn[k[0]] == 1)
-
-
 def _weld(pts, faces):
     """Merge coincident points (the clip emits one new point per cut edge and cell)."""
     key, inv = np.unique(np.round(pts, 9), axis=0, return_inverse=True)
@@ -1202,30 +1254,51 @@ def _weld(pts, faces):
 
 
 def _collapse_short(pts, faces, tol):
-    """Weld vertex pairs closer than ``tol`` along an edge (clip leftovers)."""
+    """Weld vertex pairs closer than ``tol`` along an edge (clip leftovers).
+
+    Each collapse keeps the rim vertex (so rims stay on their planes) and is
+    taken only when it is topologically safe: the two ends share exactly the
+    vertices opposite the edge (the link condition), a chord between two rim
+    vertices is never collapsed, and collapses in one round touch disjoint
+    one-rings so each check stays valid.
+    """
     for _ in range(3):
-        uniq, _inv, _cnt = _edge_table(faces)
+        uniq, _inv, cnt = _edge_table(faces)
         d = np.linalg.norm(pts[uniq[:, 0]] - pts[uniq[:, 1]], axis=1)
-        short = uniq[d < tol]
-        if len(short) == 0:
+        order = np.argsort(d)
+        order = order[d[order] < tol]
+        if len(order) == 0:
             break
-        # Greedy independent set of short edges.
-        used = np.zeros(len(pts), dtype=bool)
-        target = np.arange(len(pts))
-        rim = np.zeros(len(pts), dtype=bool)
-        uq, _i, cn = _edge_table(faces)
-        rim[uq[cn == 1].ravel()] = True
-        for a, b in short:
-            if used[a] or used[b] or (rim[a] and rim[b] and not _same_rim_edge(a, b, uq, cn)):
+        n = len(pts)
+        adj = _adjacency(n, uniq).tocsr()
+        rim = np.zeros(n, dtype=bool)
+        rim[uniq[cnt == 1].ravel()] = True
+        # Vertices opposite each edge, from the faces holding it.
+        e3 = np.stack((faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]), axis=1)
+        opp = np.stack((faces[:, 2], faces[:, 0], faces[:, 1]), axis=1).ravel()
+        _u, inv = np.unique(np.sort(e3.reshape(-1, 2), axis=1), axis=0, return_inverse=True)
+        inv = inv.reshape(-1)
+        used = np.zeros(n, dtype=bool)
+        target = np.arange(n)
+        for k in order:
+            a, b = int(uniq[k, 0]), int(uniq[k, 1])
+            if used[a] or used[b]:
                 continue
-            used[a] = used[b] = True
+            if rim[a] and rim[b] and cnt[k] != 1:
+                continue
+            na = adj.indices[adj.indptr[a]:adj.indptr[a + 1]]
+            nb = adj.indices[adj.indptr[b]:adj.indptr[b + 1]]
+            common = np.intersect1d(na, nb)
+            if not np.array_equal(common, np.unique(opp[inv == k])):
+                continue
             if rim[b] and not rim[a]:
                 a, b = b, a
             target[b] = a
+            used[na] = used[nb] = True
+            used[a] = used[b] = True
         faces = target[faces]
         good = (faces[:, 0] != faces[:, 1]) & (faces[:, 1] != faces[:, 2]) & (faces[:, 0] != faces[:, 2])
-        faces = faces[good]
-        pts, faces = _compact(pts, faces)
+        pts, faces = _compact(pts, faces[good])
     return pts, faces
 
 
@@ -1293,7 +1366,13 @@ def process_vessel_aneurysm_dataset(
         f"  Parent field {model.shape[::-1]} at {model.g:.3f} mm, {len(model.ostia)} ostia, "
         f"edge {model.edge:.3f} mm ({model.seconds_parent:.2f}s)"
     )
-    pts, faces, rep = model.manifold(centers, radii)
+    try:
+        pts, faces, rep = model.manifold(centers, radii)
+    except TemplateQualityError as exc:
+        # One fallback: flatten whatever sits on or just past an ostium plane.
+        print(f"  {exc}; retrying with walls flattened behind the ostium planes")
+        model.set_flush(FLUSH_FALLBACK_MM)
+        pts, faces, rep = model.manifold(centers, radii)
     tm = rep["timing"]
     print(
         "  Surface: " + ", ".join(f"{k} {v:.2f}s" for k, v in tm.items())
