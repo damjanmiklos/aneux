@@ -694,3 +694,140 @@ def compute_level_r_star(
         "du": du,
         "ring_med": ring_med,
     }
+
+
+def _triangle_polydata(pts, faces):
+    import vtk
+    from vtk.util.numpy_support import numpy_to_vtk
+
+    poly = vtk.vtkPolyData()
+    vpts = vtk.vtkPoints()
+    vpts.SetDataTypeToDouble()
+    vpts.SetData(numpy_to_vtk(np.ascontiguousarray(pts, dtype=np.float64), deep=True))
+    poly.SetPoints(vpts)
+    faces = np.ascontiguousarray(faces, dtype=np.int64)
+    cells = vtk.vtkCellArray()
+    offs = numpy_to_vtk(
+        np.arange(0, 3 * len(faces) + 1, 3, dtype=np.int64),
+        deep=True,
+        array_type=vtk.VTK_ID_TYPE,
+    )
+    conn = numpy_to_vtk(faces.ravel(), deep=True, array_type=vtk.VTK_ID_TYPE)
+    cells.SetData(offs, conn)
+    poly.SetPolys(cells)
+    return poly
+
+
+def _barycentric_on_triangle(tri, point):
+    v0 = tri[1] - tri[0]
+    v1 = tri[2] - tri[0]
+    v2 = point - tri[0]
+    d00 = float(np.dot(v0, v0))
+    d01 = float(np.dot(v0, v1))
+    d11 = float(np.dot(v1, v1))
+    d20 = float(np.dot(v2, v0))
+    d21 = float(np.dot(v2, v1))
+    den = d00 * d11 - d01 * d01
+    if abs(den) < 1e-18:
+        return np.full(3, 1.0 / 3.0)
+    vv = (d11 * d20 - d01 * d21) / den
+    ww = (d00 * d21 - d01 * d20) / den
+    bary = np.array([1.0 - vv - ww, vv, ww], dtype=np.float64)
+    bary = np.clip(bary, 0.0, None)
+    total = float(bary.sum())
+    if total < 1e-12:
+        return np.full(3, 1.0 / 3.0)
+    return bary / total
+
+
+def ray_sac_membership(
+    pos,
+    normal,
+    gt_pts,
+    gt_faces,
+    gt_m,
+    t_max=R_STAR_T_MAX_MM,
+    t_inward=R_STAR_INWARD_MM,
+    t_eps=R_STAR_T_EPS_MM,
+    hit_tol=R_STAR_HIT_TOL,
+    normal_dot_min=R_STAR_NORMAL_DOT,
+):
+    """Copy GT membership onto template vertices along their outward rays.
+
+    The hit is the nearest outward face the normal meets, including a double
+    wall: the first surface is the one this vertex is responsible for. A miss
+    stays 0. The label does not depend on where the network later moves the
+    vertex; callers store it once.
+    """
+    pos = np.asarray(pos, dtype=np.float64).reshape(-1, 3)
+    normal = np.asarray(normal, dtype=np.float64).reshape(-1, 3)
+    gt_pts = np.asarray(gt_pts, dtype=np.float64).reshape(-1, 3)
+    gt_faces = np.asarray(gt_faces, dtype=np.int64).reshape(-1, 3)
+    gt_m = np.asarray(gt_m, dtype=np.float64).reshape(-1)
+    n = int(pos.shape[0])
+    out = np.zeros(n, dtype=np.float64)
+    if (
+        n == 0
+        or gt_pts.shape[0] == 0
+        or gt_faces.shape[0] == 0
+        or gt_m.shape[0] != gt_pts.shape[0]
+        or normal.shape[0] != n
+    ):
+        return out
+    nn = np.linalg.norm(normal, axis=1, keepdims=True)
+    normal = normal / np.clip(nn, 1e-12, None)
+    fn = np.cross(
+        gt_pts[gt_faces[:, 1]] - gt_pts[gt_faces[:, 0]],
+        gt_pts[gt_faces[:, 2]] - gt_pts[gt_faces[:, 0]],
+    )
+    fn = fn / np.clip(np.linalg.norm(fn, axis=1, keepdims=True), 1e-12, None)
+
+    import vtk
+
+    poly = _triangle_polydata(gt_pts, gt_faces)
+    tree = vtk.vtkModifiedBSPTree()
+    tree.SetDataSet(poly)
+    tree.BuildLocator()
+    tree._keep_alive = poly
+    hit_points = vtk.vtkPoints()
+    hit_cells = vtk.vtkIdList()
+    t_max = float(t_max)
+    t_inward = float(t_inward)
+    t_eps = float(t_eps)
+    lo = float(normal_dot_min)
+    n_faces = int(gt_faces.shape[0])
+    for i in range(n):
+        n_v = normal[i]
+        origin = pos[i]
+        raw = _collect_hits(
+            tree,
+            origin - t_inward * n_v,
+            origin + t_max * n_v,
+            hit_tol,
+            hit_points,
+            hit_cells,
+        )
+        best = None
+        best_key = None
+        for xyz, cid in raw:
+            if cid < 0 or cid >= n_faces:
+                continue
+            t = float(np.dot(xyz - origin, n_v))
+            if t < -t_inward - 1e-6 or t > t_max + 1e-6:
+                continue
+            nd = abs(float(np.dot(n_v, fn[cid])))
+            if nd < lo:
+                continue
+            # Nearest outward hit. Inward-only rays take the one closest to
+            # the vertex (largest t, since those t are negative).
+            outward = t >= t_eps
+            key = (0, t) if outward else (1, -t)
+            if best_key is None or key < best_key:
+                best_key = key
+                best = (xyz, cid)
+        if best is None:
+            continue
+        xyz, cid = best
+        bary = _barycentric_on_triangle(gt_pts[gt_faces[cid]], xyz)
+        out[i] = float(np.dot(bary, gt_m[gt_faces[cid]]))
+    return out

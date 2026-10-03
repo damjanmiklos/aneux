@@ -2025,6 +2025,80 @@ def test_huber_and_radial_loss():
     _assert(float(loss0) == 0.0, "all-invalid radial must be 0")
 
 
+def test_sac_membership_is_one_on_the_lip_and_cosines_off_it():
+    from sac_membership import membership_from_mask
+
+    pts = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]], dtype=np.float64)
+    faces = np.array([[0, 1, 2]], dtype=np.int64)
+    mask = np.array([True, False, False])
+    m = membership_from_mask(pts, faces, mask, decay_mm=2.0)
+    _assert(abs(m[0] - 1.0) < 1e-8, m)
+    _assert(abs(m[1] - 0.5) < 1e-6, m)
+    _assert(abs(m[2]) < 1e-6, m)
+    # A longer parent does not change the sac vertex's share of the balanced mean.
+    from losses import _chamfer_pair, region_balanced_mean
+
+    err = torch.tensor([0.0, 0.0, 0.0, 0.0, 10.0])
+    mem = torch.tensor([0.0, 0.0, 0.0, 0.0, 1.0])
+    got = region_balanced_mean(err, torch.ones(5), mem, sac_share=0.4)
+    _assert(abs(float(got) - 4.0) < 1e-5, got)
+    err_more = torch.cat([torch.zeros(20), err])
+    mem_more = torch.cat([torch.zeros(20), mem])
+    got_more = region_balanced_mean(err_more, torch.ones_like(err_more), mem_more, sac_share=0.4)
+    _assert(abs(float(got_more) - 4.0) < 1e-5, got_more)
+
+    pred = torch.tensor([[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]])
+    true = torch.tensor([[0.0, 0.0, 0.0], [3.0, 0.0, 1.0]])
+    ones = torch.ones(2)
+    m2 = torch.tensor([0.0, 1.0])
+    plain = _chamfer_pair(pred, true, ones, ones)
+    split = _chamfer_pair(pred, true, ones, ones, m_pred=m2, m_true=m2, sac_share=0.4)
+    _assert(abs(float(plain) - 0.5) < 1e-5, plain)
+    _assert(abs(float(split) - 0.4) < 1e-5, split)
+
+    r_pred = torch.tensor([0.0, 0.0, 2.0])
+    r_star = torch.zeros(3)
+    valid = torch.ones(3, dtype=torch.bool)
+    rad = radial_huber_loss(r_pred, r_star, valid, delta=1.0, membership=torch.tensor([0.0, 0.0, 1.0]), sac_share=0.4)
+    _assert(abs(float(rad) - 0.6) < 1e-5, rad)
+
+
+def test_ray_copies_sac_membership_from_the_hit_face():
+    from raycast import ray_sac_membership
+
+    gt_pts = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64)
+    gt_faces = np.array([[0, 1, 2]], dtype=np.int64)
+    gt_m = np.array([1.0, 0.0, 0.0])
+    pos = np.array([[1.0 / 3.0, 1.0 / 3.0, -1.0], [1.0 / 3.0, 1.0 / 3.0, 3.0]], dtype=np.float64)
+    normal = np.array([[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+    got = ray_sac_membership(pos, normal, gt_pts, gt_faces, gt_m)
+    _assert(abs(got[0] - 1.0 / 3.0) < 1e-3, got)
+    _assert(abs(got[1]) < 1e-6, got)
+
+
+def test_failed_detection_leaves_membership_absent():
+    """A wall with no sac, and a missing radius, stay unweighted. Import stays numpy-only."""
+    import warnings
+
+    from sac_membership import wall_sac_membership
+
+    pts = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    faces = np.array([[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]], dtype=np.int64)
+    cl = np.array([[0.0, 0.0, -2.0], [0.0, 0.0, -1.0], [0.0, 0.0, 0.0]], dtype=np.float64)
+    rad = np.ones(3, dtype=np.float64)
+    lines = np.array([3, 0, 1, 2], dtype=np.int64)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        missed = wall_sac_membership(pts, faces, cl, rad, lines)
+    _assert(missed is None, missed)
+    _assert(any("aneurysm membership skipped" in str(w.message) for w in caught), caught)
+    quiet = wall_sac_membership(pts, faces, cl, None, lines)
+    _assert(quiet is None, quiet)
+
+
 def test_mesh_r_star_stats_stay_in_millimetres():
     """A short sac edge with a small |Δr*| must not look like a steep neck."""
     pos = np.array([[0.0, 0.0, 0.0], [0.2, 0.0, 0.0]], dtype=np.float64)
@@ -2869,6 +2943,9 @@ def main():
         test_add_meter_accepts_fold_and_stretch,
         test_chamfer_weight_cap,
         test_huber_and_radial_loss,
+        test_sac_membership_is_one_on_the_lip_and_cosines_off_it,
+        test_ray_copies_sac_membership_from_the_hit_face,
+        test_failed_detection_leaves_membership_absent,
         test_mesh_r_star_stats_stay_in_millimetres,
         test_kl_penalty_is_excess_over_target,
         test_smoothness_edge_weights,

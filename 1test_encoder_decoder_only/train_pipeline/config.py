@@ -67,7 +67,9 @@ FAR_CL_MARGIN_MM = 1.0
 #     hybrid Fourier encoding of u.
 # 14: force a tube-cache rebuild for the next training job. v13 files are
 #     not reused.
-CACHE_VERSION = 14
+# 15: aneurysm membership (gt_sac_m, sac_m, sac_m_mid, sac_m_coarse) for the
+#     40/60 reconstruction and radial split. v14 files are not reused.
+CACHE_VERSION = 15
 
 # (n_length, n_radial) per hierarchy level
 LEVEL_COARSE = (40, 6)
@@ -290,6 +292,10 @@ LAMBDA_RAD_MID = 0.5
 LAMBDA_RIM_NORMAL = 0.1
 
 CHAMFER_WEIGHT_CAP = 4.0
+# Share of each case's reconstruction mean, and of its radial mean, that the
+# aneurysm carries (dome, neck lip, and the cosine tail past the lip). The
+# parent carries the rest. A large sac does not take more than this share.
+SAC_LOSS_SHARE = 0.4
 RADIAL_HUBER_DELTA_MM = 1.0
 PLANE_HUBER_DELTA_MM = 1.0
 PLANE_L2_MIX = 0.2

@@ -313,14 +313,86 @@ def huber(diff, delta=RADIAL_HUBER_DELTA_MM):
     return torch.where(abs_d <= delta, quad, lin)
 
 
-def radial_huber_loss(r_pred, r_star, valid, delta=RADIAL_HUBER_DELTA_MM):
+def region_balanced_mean(err, weight, membership=None, sac_share=None):
+    """Weighted mean, or ``(1 − s) * parent + s * sac`` when membership is set.
+
+    ``membership`` is in [0, 1]. A point splits its weight between the two
+    means, so the sac side is ``s`` of this value on every case that has both
+    sides, whatever its area. Missing membership keeps the single weighted mean.
+    """
+    e = err.reshape(-1).float()
+    if e.numel() == 0:
+        return err.reshape(-1).new_zeros(()) if torch.is_tensor(err) else err.new_zeros(())
+    w = weight.reshape(-1).to(dtype=e.dtype)
+    if w.numel() == 1 and e.numel() != 1:
+        w = w.expand(e.numel())
+    if (
+        membership is None
+        or not torch.is_tensor(membership)
+        or membership.reshape(-1).numel() != e.numel()
+    ):
+        return (w * e).sum() / w.sum().clamp_min(1e-8)
+    if sac_share is None:
+        sac_share = _cfg("SAC_LOSS_SHARE", 0.4)
+    m = membership.reshape(-1).to(dtype=e.dtype).clamp(0, 1)
+    share = e.new_tensor(float(sac_share))
+    w_s = w * m
+    w_p = w * (1.0 - m)
+    ds = w_s.sum()
+    dp = w_p.sum()
+    tiny = e.new_tensor(1e-8)
+    sac = (w_s * e).sum() / ds.clamp_min(1e-8)
+    parent = (w_p * e).sum() / dp.clamp_min(1e-8)
+    has_s = ds > tiny
+    has_p = dp > tiny
+    return torch.where(
+        has_s & has_p,
+        (1.0 - share) * parent + share * sac,
+        torch.where(has_s, sac, parent),
+    )
+
+
+def radial_huber_loss(
+    r_pred,
+    r_star,
+    valid,
+    delta=RADIAL_HUBER_DELTA_MM,
+    membership=None,
+    batch=None,
+    num_graphs=None,
+    sac_share=None,
+):
     if r_pred is None or r_star is None or valid is None:
         return r_pred.new_zeros(()) if r_pred is not None else torch.zeros(())
     if r_pred.size(0) == 0:
         return r_pred.new_zeros(())
     w = valid.to(dtype=r_pred.dtype).reshape(-1)
     diff = huber(r_pred.reshape(-1) - r_star.float().reshape(-1), delta=delta)
-    return (diff * w).sum() / w.sum().clamp_min(1e-8)
+    # No label, or a label that never leaves the parent: keep the single
+    # mean over the batch. A live label is applied per case, then cases are
+    # averaged, so each aneurysm is `sac_share` of its own case.
+    plain = (diff * w).sum() / w.sum().clamp_min(1e-8)
+    if membership is None or not torch.is_tensor(membership):
+        return plain
+    m_all = membership.reshape(-1)
+    if m_all.numel() != diff.numel() or not bool((m_all > 0).any()):
+        return plain
+    if batch is None:
+        return region_balanced_mean(diff, w, membership, sac_share)
+    n_g = int(num_graphs) if num_graphs is not None else int(batch.reshape(-1).max().item()) + 1
+    acc = diff.new_zeros(())
+    n_ok = 0
+    b = batch.reshape(-1)
+    m = membership.reshape(-1)
+    for i in range(n_g):
+        sel = b == i
+        if int(sel.sum()) == 0:
+            continue
+        acc = acc + region_balanced_mean(diff[sel], w[sel], m[sel], sac_share)
+        n_ok += 1
+    if n_ok == 0:
+        return diff.new_zeros(())
+    return acc / n_ok
 
 
 def smoothness_edge_weights(
@@ -431,7 +503,19 @@ def _cl_radius(points, cl_xyz):
     return _knn_min_sq(points, cl_xyz[:, :3]).sqrt()
 
 
-def _chamfer_pair(pred, true, w_pred, w_true, n_true=None, pred_v=None, w_v=None):
+def _chamfer_pair(
+    pred,
+    true,
+    w_pred,
+    w_true,
+    n_true=None,
+    pred_v=None,
+    w_v=None,
+    m_pred=None,
+    m_true=None,
+    m_v=None,
+    sac_share=None,
+):
     """Two-sided Chamfer.  `pred_v` / `w_v`: the mesh vertices themselves.
 
     Area samples alone left most vertices without a gradient in any given
@@ -456,22 +540,46 @@ def _chamfer_pair(pred, true, w_pred, w_true, n_true=None, pred_v=None, w_v=None
             return _plane_l2_pair(src, true, n_true, n_is_at_dst=True)
         return _knn_min_sq(src, true)
 
-    loss_p = (w_pred * to_true(pred)).sum() / w_pred.sum().clamp_min(1e-8)
+    loss_p = region_balanced_mean(to_true(pred), w_pred, m_pred, sac_share)
     if has_v:
-        loss_v = (w_v * to_true(pred_v)).sum() / w_v.sum().clamp_min(1e-8)
+        loss_v = region_balanced_mean(to_true(pred_v), w_v, m_v, sac_share)
         loss_p = 0.5 * (loss_p + loss_v)
     if use_plane:
         min_pred = _plane_l2_pair(true, pred_all, n_true, n_is_at_dst=False)
     else:
         min_pred = _knn_min_sq(true, pred_all)
-    loss_t = (w_true * min_pred).sum() / w_true.sum().clamp_min(1e-8)
+    loss_t = region_balanced_mean(min_pred, w_true, m_true, sac_share)
     return 0.5 * (loss_p + loss_t)
 
 
-def _weighted_chamfer(pred, pred_batch, true, true_batch, w_pred, w_true, num_graphs, n_true=None,
-                      pred_v=None, pred_v_batch=None, w_v=None):
+def _slice_m(membership, mask):
+    if membership is None:
+        return None
+    return membership.reshape(-1)[mask]
+
+
+def _weighted_chamfer(
+    pred,
+    pred_batch,
+    true,
+    true_batch,
+    w_pred,
+    w_true,
+    num_graphs,
+    n_true=None,
+    pred_v=None,
+    pred_v_batch=None,
+    w_v=None,
+    m_pred=None,
+    m_true=None,
+    m_v=None,
+    sac_share=None,
+):
     if int(num_graphs) == 1:
-        return _chamfer_pair(pred, true, w_pred, w_true, n_true=n_true, pred_v=pred_v, w_v=w_v)
+        return _chamfer_pair(
+            pred, true, w_pred, w_true, n_true=n_true, pred_v=pred_v, w_v=w_v,
+            m_pred=m_pred, m_true=m_true, m_v=m_v, sac_share=sac_share,
+        )
     loss = pred.new_zeros(())
     n_ok = 0
     for i in range(num_graphs):
@@ -480,12 +588,18 @@ def _weighted_chamfer(pred, pred_batch, true, true_batch, w_pred, w_true, num_gr
         if p.size(0) == 0 or t.size(0) == 0:
             continue
         n_t = n_true[true_batch == i] if n_true is not None else None
-        pv = wv = None
+        pv = wv = mv = None
         if pred_v is not None and pred_v_batch is not None and w_v is not None:
-            mv = pred_v_batch == i
-            pv, wv = pred_v[mv], w_v[mv]
+            sel_v = pred_v_batch == i
+            pv, wv = pred_v[sel_v], w_v[sel_v]
+            mv = _slice_m(m_v, sel_v)
         loss = loss + _chamfer_pair(
-            p, t, w_pred[pred_batch == i], w_true[true_batch == i], n_true=n_t, pred_v=pv, w_v=wv
+            p, t, w_pred[pred_batch == i], w_true[true_batch == i], n_true=n_t,
+            pred_v=pv, w_v=wv,
+            m_pred=_slice_m(m_pred, pred_batch == i),
+            m_true=_slice_m(m_true, true_batch == i),
+            m_v=mv,
+            sac_share=sac_share,
         )
         n_ok += 1
     if n_ok > 0:
@@ -986,8 +1100,18 @@ def compute_losses(
     edge_index_coarse=None,
     rim_removed=None,
     rim_masks=None,
+    sac_m=None,
+    sac_m_mid=None,
+    sac_m_coarse=None,
+    gt_sac_m=None,
+    sac_loss_share=None,
 ):
-    """Return a dict of unweighted loss terms."""
+    """Return a dict of unweighted loss terms.
+
+    When aneurysm membership is present, reconstruction and radial are each
+    ``(1 − s) * parent mean + s * sac mean`` inside every case. Smoothness,
+    mesh quality, the rim term, and KL are unchanged.
+    """
     x_pred = x_pred.float()
     x_true = x_true.float()
     x_tube = x_tube.float()
@@ -1088,9 +1212,27 @@ def compute_losses(
             w[pm] = chamfer_distance_weights(rad, r_g, cap=cap)
         return w
 
-    def face_sampled_pred(verts, v_batch, faces, nrm, tube, rloc):
+    def _align_m(m, n, ref):
+        if m is None or not torch.is_tensor(m):
+            return None
+        m = m.detach().to(device=ref.device, dtype=torch.float32).reshape(-1)
+        if int(m.numel()) != int(n):
+            return None
+        return m.clamp(0, 1)
+
+    share = float(sac_loss_share) if sac_loss_share is not None else float(_cfg("SAC_LOSS_SHARE", 0.4))
+    m_fine = _align_m(sac_m, x_pred.size(0), x_pred)
+    m_mid = _align_m(sac_m_mid, x_pred_mid.size(0), x_pred_mid) if x_pred_mid is not None else None
+    m_coarse = (
+        _align_m(sac_m_coarse, x_pred_coarse.size(0), x_pred_coarse)
+        if x_pred_coarse is not None
+        else None
+    )
+    m_true = _align_m(gt_sac_m, true_pts.size(0), true_pts)
+
+    def face_sampled_pred(verts, v_batch, faces, nrm, tube, rloc, vert_m):
         if faces is None or n_samp <= 0:
-            return verts, v_batch, nrm, tube, rloc
+            return verts, v_batch, nrm, tube, rloc, vert_m
         pts, s_batch, bary, fidx = sample_mesh_surface(
             verts,
             faces,
@@ -1100,16 +1242,17 @@ def compute_losses(
             area_weighted=area_weighted,
         )
         if pts.size(0) == 0:
-            return verts, v_batch, nrm, tube, rloc
+            return verts, v_batch, nrm, tube, rloc, vert_m
         nrm_s = _barycentric_interpolate(nrm, faces, fidx, bary)
         if nrm_s is not None:
             nrm_s = F.normalize(nrm_s, dim=-1, eps=1e-8)
         tube_s = _barycentric_interpolate(tube, faces, fidx, bary)
         rloc_s = _barycentric_interpolate(rloc, faces, fidx, bary)
-        return pts, s_batch, nrm_s, tube_s, rloc_s
+        m_s = _barycentric_interpolate(vert_m, faces, fidx, bary)
+        return pts, s_batch, nrm_s, tube_s, rloc_s, m_s
 
-    pred_cd, batch_cd, nrm_cd, tube_cd, rloc_cd = face_sampled_pred(
-        x_pred, batch_tube, face, normal, x_tube, r_local
+    pred_cd, batch_cd, nrm_cd, tube_cd, rloc_cd, m_cd = face_sampled_pred(
+        x_pred, batch_tube, face, normal, x_tube, r_local, m_fine
     )
     w_pred = pred_weights(pred_cd, batch_cd, tube=tube_cd, nrm=nrm_cd, rloc=rloc_cd)
     w_vert = None
@@ -1120,6 +1263,7 @@ def compute_losses(
     loss_recon = _weighted_chamfer(
         pred_cd, batch_cd, true_pts, true_batch, w_pred, w_true, num_graphs, n_true=n_true,
         pred_v=x_pred if w_vert is not None else None, pred_v_batch=batch_tube, w_v=w_vert,
+        m_pred=m_cd, m_true=m_true, m_v=m_fine if w_vert is not None else None, sac_share=share,
     )
     # Mid and coarse Chamfer run on the vertices, so weight each by its area:
     # the sac is 3-5x denser than the parent on every level now.
@@ -1130,7 +1274,8 @@ def compute_losses(
         if face_mid is not None:
             w_mid = w_mid * vertex_areas(x_pred_mid, face_mid)
         loss_recon = loss_recon + lambda_cd_mid * _weighted_chamfer(
-            x_pred_mid, batch_mid, true_pts, true_batch, w_mid, w_true, num_graphs, n_true=n_true
+            x_pred_mid, batch_mid, true_pts, true_batch, w_mid, w_true, num_graphs, n_true=n_true,
+            m_pred=m_mid, m_true=m_true, sac_share=share,
         )
     if x_pred_coarse is not None and batch_coarse is not None:
         w_c = pred_weights(
@@ -1139,7 +1284,8 @@ def compute_losses(
         if face_coarse is not None:
             w_c = w_c * vertex_areas(x_pred_coarse, face_coarse)
         loss_recon = loss_recon + lambda_cd_coarse * _weighted_chamfer(
-            x_pred_coarse, batch_coarse, true_pts, true_batch, w_c, w_true, num_graphs, n_true=n_true
+            x_pred_coarse, batch_coarse, true_pts, true_batch, w_c, w_true, num_graphs, n_true=n_true,
+            m_pred=m_coarse, m_true=m_true, sac_share=share,
         )
 
     loss_kl, _kl_info = vae_kl_loss(
@@ -1221,7 +1367,10 @@ def compute_losses(
     if r_star is not None and normal is not None:
         r_rad = r_local if r_local is not None else r_scalar
         r_pred = composed_radius(x_pred, x_tube, normal, r_rad)
-        loss_rad = radial_huber_loss(r_pred, r_star, r_star_valid, delta=radial_huber_delta)
+        loss_rad = radial_huber_loss(
+            r_pred, r_star, r_star_valid, delta=radial_huber_delta,
+            membership=m_fine, batch=batch_tube, num_graphs=num_graphs, sac_share=share,
+        )
         if (
             x_pred_mid is not None
             and r_star_mid is not None
@@ -1231,7 +1380,8 @@ def compute_losses(
             r_rad_m = r_local_mid if r_local_mid is not None else r_scalar
             r_pred_m = composed_radius(x_pred_mid, pos_mid, normal_mid, r_rad_m)
             loss_rad = loss_rad + float(lambda_rad_mid) * radial_huber_loss(
-                r_pred_m, r_star_mid, r_star_valid_mid, delta=radial_huber_delta
+                r_pred_m, r_star_mid, r_star_valid_mid, delta=radial_huber_delta,
+                membership=m_mid, batch=batch_mid, num_graphs=num_graphs, sac_share=share,
             )
 
     loss_rim = x_pred.new_zeros(())

@@ -48,11 +48,13 @@ from raycast import (
     compute_level_r_star,
     empty_r_star,
     mesh_r_star_edge_stats,
+    ray_sac_membership,
     signed_distance_to_oriented_surface,
     stretch_distance_r_star,
     template_ray_r_star,
     transform_vessel_mesh,
 )
+from sac_membership import wall_sac_membership
 
 # Config agent lands LATENT_DIM=16 / LATENT_LEN=128 / TOKEN_SPACING_MM=2.0.
 # getattr keeps this file working if an older config is still imported.
@@ -2356,6 +2358,49 @@ class AneurysmDataset(Dataset):
             )
         return extra
 
+    def _faces_fx3(self, gt_faces):
+        if gt_faces is None:
+            return None
+        f = gt_faces.detach().cpu().numpy() if torch.is_tensor(gt_faces) else np.asarray(gt_faces)
+        if f.ndim != 2 or f.size == 0:
+            return None
+        # Cached gt_faces is [3, F].
+        if f.shape[0] == 3:
+            f = f.T
+        if f.shape[-1] != 3:
+            return None
+        return np.ascontiguousarray(f, dtype=np.int64)
+
+    def _sac_membership_extra(self, centerline_mesh, origin, R, gt_pts, gt_faces, fine, mid, coarse):
+        """Cache GT membership and copy it onto each template level along the ray."""
+        if centerline_mesh is None or gt_pts is None:
+            return {}
+        gt_pts = np.asarray(gt_pts, dtype=np.float64).reshape(-1, 3)
+        faces = self._faces_fx3(gt_faces)
+        if faces is None or gt_pts.shape[0] == 0:
+            return {}
+        rad = _point_data_array(centerline_mesh, "MaximumInscribedSphereRadius")
+        if rad is None:
+            return {}
+        try:
+            lines = np.asarray(centerline_mesh.lines).reshape(-1)
+        except Exception:
+            return {}
+        origin = np.asarray(origin, dtype=np.float64).reshape(1, 3)
+        rot = np.asarray(R, dtype=np.float64).reshape(3, 3)
+        cl_pts = (_as_f64(centerline_mesh.points) - origin) @ rot
+        m_gt = wall_sac_membership(gt_pts, faces, cl_pts, rad, lines)
+        if m_gt is None or m_gt.shape[0] != gt_pts.shape[0]:
+            return {}
+        out = {"gt_sac_m": _torch_f32(m_gt)}
+        for key, level in (("sac_m", fine), ("sac_m_mid", mid), ("sac_m_coarse", coarse)):
+            if level is None or "pos" not in level or "normal" not in level:
+                continue
+            pos = level["pos"].numpy() if torch.is_tensor(level["pos"]) else np.asarray(level["pos"])
+            nrm = level["normal"].numpy() if torch.is_tensor(level["normal"]) else np.asarray(level["normal"])
+            out[key] = _torch_f32(ray_sac_membership(pos, nrm, gt_pts, faces, m_gt))
+        return out
+
     def _build_template_scaffold(
         self,
         centerline_mesh,
@@ -2425,6 +2470,9 @@ class AneurysmDataset(Dataset):
         extra["r_dth_mid"] = r_mid["dth"]
         extra["r_du_mid"] = r_mid["du"]
         extra["r_ring_med_mid"] = r_mid["ring_med"]
+        extra.update(self._sac_membership_extra(
+            centerline_mesh, origin, R, gt_pts, extra.get("gt_faces"), fine, mid, coarse,
+        ))
         return self._assemble_scaffold_data(
             fine, mid, coarse, tokens, cl_pack, x_true, x_true_cl_dist, x_true_normal,
             r_fine, r_mid, origin, R, extra=extra,
@@ -2502,6 +2550,10 @@ class AneurysmDataset(Dataset):
             ostium_frames_posed=self._pose_ostium_frames(ostium_frames, origin, R),
             gt_pts=extra["gt_points"].numpy() if "gt_points" in extra else None,
         )
+        tube_gt = extra["gt_points"].numpy() if "gt_points" in extra else None
+        extra.update(self._sac_membership_extra(
+            centerline_mesh, origin, R, tube_gt, extra.get("gt_faces"), fine, mid, coarse,
+        ))
         return self._assemble_scaffold_data(
             fine, mid, coarse, tokens, cl_pack, x_true, x_true_cl_dist, x_true_normal,
             r_fine, r_mid, origin, R, extra=extra,
