@@ -119,10 +119,18 @@ RADIUS_KNOT_MM = 5.0
 NECK_TARGET_MM = 0.6
 NECK_DEPTH_MM = 0.3
 NECK_HALF_R = 1.0
+NECK_OPEN_CAP = 0.5
 NECK_PEN_R = 0.5
 NECK_BUFFER_MM = 0.5
 NECK_BUFFER_R = 1.0
 CARVE_GAP_MM = 0.5
+# Sac selection among the excess peaks (see _select_sac).
+LOBE_MED_MM = 1.5
+LOBE_TOUCH_MM = 0.4
+RIM_EXCLUDE_R = 1.5
+SAC_REL_CAP = 2.5
+SAC_CAP_SCALE = 2.0
+SAC_SWITCH_MARGIN = 1.5
 # Windowed-sinc smoothing of the marching-cubes surface.
 SMOOTH_PASSBAND = 0.03
 SMOOTH_ITERS = 25
@@ -515,25 +523,61 @@ def _dilate(seed, allowed, adj, hops):
     return out
 
 
-def detect_aneurysm(pts, faces, up, r_parent):
-    """Sac plus a short neck lip, and almost none of the parent wall.
+def ball_excess(pts, up, r_parent, k=48, tree=None, refine_above=0.3):
+    """Signed distance to the union of the parent's inscribed balls, and its node.
 
-    ``excess`` is how far a wall vertex stands off the parent tube. The dome
-    is its maximum. The sac is the dome's connected level set at the level
-    whose set is compact and high (the step before it spills along the
-    parent); a geodesic lip of about half a parent radius picks up the neck.
+    min_j |p - c_j| - r_j, not the nearest node's |p - c| - r: where a small
+    branch leaves a large vessel the branch's centerline is nearest to the large
+    vessel's wall, and that measure reads the wall as a bulge of the large
+    radius. The min only lowers the nearest-node value, so it is refined only
+    where that value could matter (above ``refine_above``): first over the 12
+    nearest nodes, then over ``k`` for the points where a node beyond the 12th
+    could still be lower (its distance less the largest radius is below the
+    current minimum).
     """
-    t0 = time.perf_counter()
-    dist, nearest = cKDTree(up).query(pts, k=1, workers=1)
-    nearest = np.asarray(nearest, dtype=np.int64)
-    excess = dist - r_parent[nearest]
-    mesh_edges, _inv, _cnt = _edge_table(faces)
-    adj = _adjacency(len(pts), mesh_edges)
-    elen = np.linalg.norm(pts[mesh_edges[:, 0]] - pts[mesh_edges[:, 1]], axis=1)
-    median_edge = float(np.median(elen))
-    dome = int(np.argmax(excess))
+    tree = cKDTree(up) if tree is None else tree
+    d, j = tree.query(pts, k=1, workers=1)
+    j = np.asarray(j, dtype=np.int64)
+    ex = d - r_parent[j]
+    sel = np.flatnonzero(ex > refine_above)
+    r_max = float(np.max(r_parent)) if len(up) else 0.0
+    for kk in (12, k):
+        kk = min(kk, len(up))
+        if len(sel) == 0 or kk < 2:
+            break
+        dk, jk = tree.query(pts[sel], k=kk, workers=1)
+        v = dk - r_parent[jk]
+        a = np.argmin(v, axis=1)
+        rows = np.arange(len(sel))
+        lower = v[rows, a] < ex[sel]
+        ex[sel[lower]] = v[rows, a][lower]
+        j[sel[lower]] = jk[rows, a][lower]
+        sel = sel[dk[:, -1] - r_max < ex[sel]]
+    return ex, j
+
+
+def _peak_candidates(pts, excess, n_max=4, sep_mm=4.0, floor_mm=0.6):
+    """Highest excess first, then the next highest at least ``sep_mm`` from those taken."""
+    order = np.argsort(-excess)
+    out = [int(order[0])]
+    taken = pts[order[0]][None]
+    for i in order[1:]:
+        if excess[i] < floor_mm or len(out) >= n_max:
+            break
+        if np.min(np.linalg.norm(taken - pts[i], axis=1)) >= sep_mm:
+            out.append(int(i))
+            taken = np.vstack((taken, pts[i]))
+    return out
+
+
+def _sac_core(pts, excess, adj, dome, r_dome):
+    """The dome's connected excess level set that is compact and high.
+
+    Scanned from high to low; the chosen level is the last before the set
+    spills along the parent.
+    """
     peak = float(excess[dome])
-    r_dome = float(max(r_parent[nearest[dome]], 0.45))
+    r_dome = max(r_dome, 0.45)
     char = float(np.clip(1.15 * peak + 2.0 * r_dome, 4.0, 16.0))
     d_cap = float(np.clip(1.55 * char, 8.0, 22.0))
     levels = np.linspace(max(0.55, min(0.72 * peak, peak - 0.15)), 0.28, 8)
@@ -554,6 +598,112 @@ def detect_aneurysm(pts, faces, up, r_parent):
             best, core = score, comp
     if core is None:
         core = _component_with_seed(excess >= max(0.4, 0.35 * peak), adj, dome)
+    return core
+
+
+def _candidate_features(pts, excess, core, dome, r_dome, vert_area, rim_tree):
+    chunk = pts[core] if core.any() else pts[[dome]]
+    cen = chunk.mean(axis=0)
+    peak = float(excess[dome])
+    rim = float(rim_tree.query(pts[dome], k=1)[0]) if rim_tree is not None else np.inf
+    return {
+        "dome": int(dome), "core": core, "peak": peak, "r_parent": r_dome,
+        "rel": peak / max(r_dome, 0.2),
+        "diam": 2.0 * float(np.linalg.norm(chunk - cen, axis=1).max()),
+        "n": int(core.sum()),
+        "area": float(vert_area[core].sum()),
+        "med": float(np.median(excess[core])) if core.any() else 0.0,
+        "rim_mm": rim,
+    }
+
+
+def _select_sac(pts, cands):
+    """Group the candidates that are lobes of one sac, then pick the best group.
+
+    Two candidates are lobes of one sac when their cores touch and both stand
+    well off the parent (median excess >= LOBE_MED_MM); a giant sac otherwise
+    splits into a small high lobe and the bulk. A group scores its volume off
+    the parent (area * median excess) times its height relative to the parent
+    radius (saturating at SAC_REL_CAP), divided by a penalty for a patch broad
+    against its height (a bend of the parent, not a sac). A candidate whose
+    dome lies within RIM_EXCLUDE_R parent radii of an open end is a cut-end
+    artefact and scores zero. The group with the highest peak wins unless
+    another scores SAC_SWITCH_MARGIN times more.
+    """
+    n = len(cands)
+    root = list(range(n))
+
+    def find(i):
+        while root[i] != i:
+            i = root[i]
+        return i
+
+    trees = [cKDTree(pts[c["core"]]) if c["n"] else None for c in cands]
+    for i in range(n):
+        for j in range(i + 1, n):
+            if trees[i] is None or trees[j] is None:
+                continue
+            if min(cands[i]["med"], cands[j]["med"]) < LOBE_MED_MM:
+                continue
+            if trees[i].query(pts[cands[j]["core"]], k=1, distance_upper_bound=LOBE_TOUCH_MM)[0].min() <= LOBE_TOUCH_MM:
+                root[find(j)] = find(i)
+    groups = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+    best, best_score = None, -1.0
+    for members in groups.values():
+        live = [i for i in members if cands[i]["rim_mm"] >= RIM_EXCLUDE_R * cands[i]["r_parent"]]
+        area = sum(cands[i]["area"] for i in live)
+        if area <= 0.0:
+            score = 0.0
+        else:
+            med = sum(cands[i]["area"] * cands[i]["med"] for i in live) / area
+            peak = max(cands[i]["peak"] for i in live)
+            rel = max(cands[i]["rel"] for i in live)
+            cap = area / (2.0 * np.pi * peak * peak)
+            score = area * med * min(rel, SAC_REL_CAP) / (1.0 + (cap / SAC_CAP_SCALE) ** 2)
+        if 0 in members:
+            score *= SAC_SWITCH_MARGIN
+        for i in members:
+            cands[i]["score"] = score
+        if score > best_score:
+            best, best_score = members, score
+    return best
+
+
+def detect_aneurysm(pts, faces, up, r_parent):
+    """Sac plus a short neck lip, and almost none of the parent wall.
+
+    ``excess`` is how far a wall vertex stands off the parent tube. The dome
+    is its maximum. The sac is the dome's connected level set at the level
+    whose set is compact and high (the step before it spills along the
+    parent); a geodesic lip of about half a parent radius picks up the neck.
+    """
+    t0 = time.perf_counter()
+    excess, nearest = ball_excess(pts, up, r_parent)
+    mesh_edges, _inv, use = _edge_table(faces)
+    adj = _adjacency(len(pts), mesh_edges)
+    elen = np.linalg.norm(pts[mesh_edges[:, 0]] - pts[mesh_edges[:, 1]], axis=1)
+    median_edge = float(np.median(elen))
+    vert_area = np.zeros(len(pts))
+    a = pts[faces[:, 1]] - pts[faces[:, 0]]
+    b = pts[faces[:, 2]] - pts[faces[:, 0]]
+    np.add.at(vert_area, faces.ravel(), np.repeat(np.linalg.norm(np.cross(a, b), axis=1) / 6.0, 3))
+    rim_v = np.unique(mesh_edges[use == 1])
+    rim_tree = cKDTree(pts[rim_v]) if len(rim_v) else None
+    cands = []
+    for dome in _peak_candidates(pts, excess, n_max=8):
+        if any(c["core"][dome] for c in cands):
+            continue  # another high point of a sac already taken
+        if len(cands) >= 4:
+            break
+        r_dome = float(r_parent[nearest[dome]])
+        core = _sac_core(pts, excess, adj, dome, r_dome)
+        cands.append(_candidate_features(pts, excess, core, dome, r_dome, vert_area, rim_tree))
+    members = _select_sac(pts, cands)
+    core = np.logical_or.reduce([cands[i]["core"] for i in members])
+    top = max(members, key=lambda i: cands[i]["peak"])
+    dome, peak = cands[top]["dome"], cands[top]["peak"]
     if int(core.sum()) < 30:
         raise TemplateQualityError(f"no aneurysm found (peak excess {peak:.2f} mm)")
     chunk = pts[core]
@@ -571,6 +721,8 @@ def detect_aneurysm(pts, faces, up, r_parent):
         "diameter_mm": core_diam,
         "neck_frac": float((mask & ~core).sum() / max(int(mask.sum()), 1)),
         "core": core,
+        "candidates": [{k: v for k, v in c.items() if k != "core"} for c in cands],
+        "chosen": members,
         "nearest": nearest,
         "adj": adj,
         "seconds": time.perf_counter() - t0,
@@ -587,11 +739,12 @@ def classify_parent(pts, normals, mask, det, up, r_parent, cl_edges):
     the wall all the way; where the sac merely rests on a stretch of vessel
     (a loop of the same artery, a neighbour) every such path runs through or
     along the walls. The window is centred on the node with the most open
-    path and spans NECK_HALF_R radii either way along the centerline, however
-    long the true neck is: the template's sac joins its parent there only.
-    The NECK_BUFFER after it is plain union; everything farther is foreign.
-    Centerline that runs into the sac itself (nearest wall is sac) is never
-    foreign. With no opening found, everything is neck.
+    path and spans NECK_HALF_R radii either way along the centerline,
+    and further along the run of open nodes through it, up to NECK_OPEN_CAP
+    of the sac's diameter: the template's sac joins its parent there only.
+    The NECK_BUFFER after it is plain union; everything farther is foreign,
+    except centerline that opens into the sac elsewhere or runs inside it
+    (nearest wall is sac). With no opening found, everything is neck.
     """
     n = len(up)
     cat = np.zeros(n, dtype=np.int8)
@@ -623,14 +776,27 @@ def classify_parent(pts, normals, mask, det, up, r_parent, cl_edges):
     if openness.max() < NECK_DEPTH_MM:
         return cat
     centre = int(cand[np.argmax(openness)])
+    is_open = np.zeros(n, dtype=bool)
+    is_open[cand[openness >= NECK_DEPTH_MM]] = True
     length = np.maximum(np.linalg.norm(up[cl_edges[:, 0]] - up[cl_edges[:, 1]], axis=1), 1e-6)
     graph = csr_matrix((length, (cl_edges[:, 0], cl_edges[:, 1])), shape=(n, n))
     half = max(NECK_HALF_R * float(r_parent[centre]), 0.75)
-    reach = half + NECK_BUFFER_MM + NECK_BUFFER_R * float(np.max(r_parent)) + 1.0
-    dist = dijkstra(graph, directed=False, indices=centre, limit=reach)
+    # The window grows along the run of open nodes through the centre (the
+    # parent's true opening), never past half the sac's diameter.
+    cap = max(half, NECK_OPEN_CAP * float(det["diameter_mm"]))
+    dist = dijkstra(graph, directed=False, indices=centre, limit=cap)
+    run = is_open | (dist <= half)
+    keep = run[cl_edges[:, 0]] & run[cl_edges[:, 1]]
+    sub = csr_matrix((length[keep], (cl_edges[keep, 0], cl_edges[keep, 1])), shape=(n, n))
+    neck = dijkstra(sub, directed=False, indices=centre, limit=cap) <= cap
+    reach = NECK_BUFFER_MM + NECK_BUFFER_R * float(np.max(r_parent)) + 1.0
+    d_neck = dijkstra(graph, directed=False, indices=np.flatnonzero(neck), min_only=True, limit=reach)
     cat[:] = 2
-    cat[dist <= half + NECK_BUFFER_MM + NECK_BUFFER_R * r_parent] = 1
-    cat[dist <= half] = 0
+    cat[d_neck <= NECK_BUFFER_MM + NECK_BUFFER_R * r_parent] = 1
+    cat[neck] = 0
+    # Centerline that opens straight into the sac elsewhere (a branch leaving
+    # it, a vessel running through it) is joined to it in the lumen too.
+    cat[(cat != 0) & is_open] = 3
     _d, near = wtree.query(up, k=1, workers=1)
     cat[(cat == 2) & mask[near]] = 3
     return cat
