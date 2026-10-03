@@ -1628,25 +1628,30 @@ def prepare_case(dataset_id, v_file, centerline_path, grid_spacing=DEFAULT_GRID_
 
 
 def build_surface(model, centers, radii):
-    """``model.manifold`` with its fallbacks, each tried at most once."""
-    flushed = False
-    while True:
+    """``model.manifold`` under each fallback in turn until one passes its gates.
+
+    Flattening the walls behind the ostium planes fixes a plane flush with
+    another wall; dropping the foreign-vessel carve fixes a sac the carve cut
+    off, or creased into a thin sheet. A detached sac goes straight to the
+    builds without the carve.
+    """
+    plans = [(True, False), (True, True), (False, False), (False, True)]
+    if not len(model.foreign_balls[0]):
+        plans = plans[:2]
+    exc = None
+    for carve, flush in plans:
+        if exc is not None:
+            if isinstance(exc, SacDetachedError) and carve:
+                continue
+            print(f"  {exc}; retrying {'with' if carve else 'without'} the foreign-vessel carve, "
+                  f"{'with' if flush else 'without'} walls flattened behind the ostium planes")
+        model.carve = carve
+        model.set_flush(FLUSH_FALLBACK_MM if flush else 0.0)
         try:
             return model.manifold(centers, radii)
-        except TemplateQualityError as exc:
-            # Fallbacks, each at most once: a sac the carve cut off keeps its
-            # foreign-vessel contact instead; anything else flattens whatever
-            # sits on or just past an ostium plane.
-            if isinstance(exc, SacDetachedError) and model.carve:
-                model.carve = False
-                how = "without the foreign-vessel carve"
-            elif not flushed:
-                flushed = True
-                model.set_flush(FLUSH_FALLBACK_MM)
-                how = "with walls flattened behind the ostium planes"
-            else:
-                raise
-            print(f"  {exc}; retrying {how}")
+        except TemplateQualityError as e:
+            exc = e
+    raise exc
 
 
 @with_dataset_id
