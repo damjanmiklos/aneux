@@ -179,9 +179,20 @@ def _compact(pts, faces):
 
 
 def _edge_table(faces):
+    """Unique edges (sorted pairs, lexicographic), per-half-edge index, use counts.
+
+    Half-edges are faces' (0,1), (1,2), (2,0) blocks, in that order. Edges are
+    keyed as one int64 each, which sorts like the pairs and is several times
+    faster than a row-wise unique.
+    """
+    faces = np.asarray(faces, dtype=np.int64)
     e = np.concatenate((faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]))
     e.sort(axis=1)
-    uniq, inv, cnt = np.unique(e, axis=0, return_inverse=True, return_counts=True)
+    if len(e) == 0:
+        return np.zeros((0, 2), np.int64), np.zeros(0, np.int64), np.zeros(0, np.int64)
+    n = int(e[:, 1].max()) + 1
+    key, inv, cnt = np.unique(e[:, 0] * n + e[:, 1], return_inverse=True, return_counts=True)
+    uniq = np.stack((key // n, key % n), axis=1)
     return uniq, inv.reshape(-1), cnt
 
 
@@ -190,9 +201,9 @@ def _vertex_components(n, edges):
     return connected_components(g, directed=False)
 
 
-def _boundary_loops(pts, faces):
+def _boundary_loops(pts, faces, table=None):
     """Boundary loops as lists of vertex rings (assumes a manifold rim)."""
-    uniq, _inv, cnt = _edge_table(faces)
+    uniq, _inv, cnt = _edge_table(faces) if table is None else table
     rim = uniq[cnt == 1]
     if len(rim) == 0:
         return []
@@ -205,10 +216,10 @@ def _boundary_loops(pts, faces):
     return loops
 
 
-def _bowtie_count(faces, n):
+def _bowtie_count(faces, n, table=None):
     """Vertices whose incident faces form more than one fan."""
     # Faces around a vertex are connected through edges that contain the vertex.
-    uniq, inv, _cnt = _edge_table(faces)
+    uniq, inv, _cnt = _edge_table(faces) if table is None else table
     nf = len(faces)
     fid = np.tile(np.arange(nf), 3)
     # For each (vertex, edge) incidence link faces sharing that edge.
@@ -237,19 +248,25 @@ def _bowtie_count(faces, n):
     dst = np.concatenate((b0, b1))
     m = len(nodes_v)
     g = csr_matrix((np.ones(len(src)), (src, dst)), shape=(m, m))
-    _nc, lab = connected_components(g, directed=False)
-    fans = np.unique(np.stack((nodes_v, lab), axis=1), axis=0)
-    per_v = np.bincount(fans[:, 0], minlength=n)
+    nc, lab = connected_components(g, directed=False)
+    fans = np.unique(nodes_v.astype(np.int64) * max(nc, 1) + lab)
+    per_v = np.bincount(fans // max(nc, 1), minlength=n)
     return int(np.sum(per_v > 1))
 
 
 def surface_report(pts, faces):
-    """Topology and quality numbers for a triangle surface."""
-    uniq, _inv, cnt = _edge_table(faces)
+    """Topology and quality numbers for a triangle surface.
+
+    Genus comes from the counts (V - E + F = 2C - 2g - b), which only means
+    something on a manifold; so the same report also counts non-manifold
+    edges, bowtie vertices, components and rim loops, all from one edge table.
+    """
+    table = _edge_table(faces)
+    uniq, inv, cnt = table
     n_used = len(np.unique(faces))
     ncomp, _lab = _vertex_components(len(pts), uniq)
     ncomp -= len(pts) - n_used
-    loops = _boundary_loops(pts, faces)
+    loops = _boundary_loops(pts, faces, table)
     euler = n_used - len(uniq) + len(faces)
     genus = (2 * ncomp - len(loops) - euler) / 2.0
     e = pts[uniq[:, 0]] - pts[uniq[:, 1]]
@@ -257,7 +274,8 @@ def surface_report(pts, faces):
     a = pts[faces[:, 1]] - pts[faces[:, 0]]
     b = pts[faces[:, 2]] - pts[faces[:, 0]]
     area2 = np.linalg.norm(np.cross(a, b), axis=1)
-    l2 = (elen[_inv_face_edges(faces, uniq)] ** 2).sum(axis=1)
+    # Half-edge blocks are each face's edges (0,1), (1,2), (2,0).
+    l2 = (elen[inv.reshape(3, -1).T] ** 2).sum(axis=1)
     # 1 for an equilateral triangle, 0 for a degenerate one.
     q = 2.0 * np.sqrt(3.0) * area2 / np.maximum(l2, 1e-30)
     return {
@@ -267,7 +285,7 @@ def surface_report(pts, faces):
         "loops": loops,
         "n_loops": len(loops),
         "nonmanifold_edges": int(np.sum(cnt > 2)),
-        "bowties": _bowtie_count(faces, len(pts)),
+        "bowties": _bowtie_count(faces, len(pts), table),
         "genus": float(genus),
         "edge_mean": float(elen.mean()),
         "edge_cv": float(elen.std() / max(elen.mean(), 1e-12)),
@@ -277,14 +295,6 @@ def surface_report(pts, faces):
         "q_p01": float(np.percentile(q, 1)),
         "area": float(0.5 * area2.sum()),
     }
-
-
-def _inv_face_edges(faces, uniq):
-    e = np.stack((faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]), axis=1)
-    e = np.sort(e, axis=2).reshape(-1, 2)
-    key_u = uniq[:, 0] * (uniq.max() + 1) + uniq[:, 1]
-    key_e = e[:, 0] * (uniq.max() + 1) + e[:, 1]
-    return np.searchsorted(key_u, key_e).reshape(-1, 3)
 
 
 # ---------------------------------------------------------------------------
@@ -1518,10 +1528,11 @@ def _collapse_short(pts, faces, tol):
     taken only when it is topologically safe: the two ends share exactly the
     vertices opposite the edge (the link condition), a chord between two rim
     vertices is never collapsed, and collapses in one round touch disjoint
-    one-rings so each check stays valid.
+    one-rings so each check stays valid. The round is a sequential greedy
+    pass (shortest first), with every per-edge lookup precomputed.
     """
     for _ in range(3):
-        uniq, _inv, cnt = _edge_table(faces)
+        uniq, inv, cnt = _edge_table(faces)
         d = np.linalg.norm(pts[uniq[:, 0]] - pts[uniq[:, 1]], axis=1)
         order = np.argsort(d)
         order = order[d[order] < tol]
@@ -1529,25 +1540,28 @@ def _collapse_short(pts, faces, tol):
             break
         n = len(pts)
         adj = _adjacency(n, uniq).tocsr()
+        adj.sort_indices()
         rim = np.zeros(n, dtype=bool)
         rim[uniq[cnt == 1].ravel()] = True
-        # Vertices opposite each edge, from the faces holding it.
-        e3 = np.stack((faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]), axis=1)
-        opp = np.stack((faces[:, 2], faces[:, 0], faces[:, 1]), axis=1).ravel()
-        _u, inv = np.unique(np.sort(e3.reshape(-1, 2), axis=1), axis=0, return_inverse=True)
-        inv = inv.reshape(-1)
+        # Vertices opposite each edge, grouped per edge (half-edge blocks are
+        # each face's (0,1), (1,2), (2,0), opposite 2, 0, 1).
+        opp = np.concatenate((faces[:, 2], faces[:, 0], faces[:, 1]))
+        by_edge = np.lexsort((opp, inv))
+        opp_s = opp[by_edge]
+        start = np.searchsorted(inv[by_edge], np.arange(len(uniq) + 1))
         used = np.zeros(n, dtype=bool)
         target = np.arange(n)
-        for k in order:
+        ip, ix = adj.indptr, adj.indices
+        for k in order.tolist():
             a, b = int(uniq[k, 0]), int(uniq[k, 1])
             if used[a] or used[b]:
                 continue
             if rim[a] and rim[b] and cnt[k] != 1:
                 continue
-            na = adj.indices[adj.indptr[a]:adj.indptr[a + 1]]
-            nb = adj.indices[adj.indptr[b]:adj.indptr[b + 1]]
-            common = np.intersect1d(na, nb)
-            if not np.array_equal(common, np.unique(opp[inv == k])):
+            na = ix[ip[a]:ip[a + 1]]
+            nb = ix[ip[b]:ip[b + 1]]
+            common = np.intersect1d(na, nb, assume_unique=True)
+            if not np.array_equal(common, np.unique(opp_s[start[k]:start[k + 1]])):
                 continue
             if rim[b] and not rim[a]:
                 a, b = b, a
@@ -1649,7 +1663,8 @@ def process_vessel_aneurysm_dataset(
         f"q_min {rep['q_min']:.2f}, {rep['n_loops']} openings on their planes "
         f"(remesh drift {rep['rim_drift_mm']:.3f} mm, snapped), genus {rep['genus']:g}"
     )
-    gt_area = float(surface_report(case["pts"], case["faces"])["area"])
+    gp, gf = case["pts"], case["faces"]
+    gt_area = 0.5 * float(np.linalg.norm(np.cross(gp[gf[:, 1]] - gp[gf[:, 0]], gp[gf[:, 2]] - gp[gf[:, 0]]), axis=1).sum())
     ratio = rep["area"] / max(gt_area, 1e-9)
     if not 0.5 <= ratio <= 1.5:
         raise TemplateQualityError(f"template area is {ratio:.2f}x the vessel")
