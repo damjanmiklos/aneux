@@ -1,17 +1,23 @@
-"""Uniform parent-vessel template with the aneurysm rebuilt from four spheres.
+"""Uniform parent-vessel template with the aneurysm rebuilt from three spheres.
 
 Per case:
 
 1. Detection. The parent artery is the centerline tube whose inscribed radius
    has had the sac spike opened out along the graph. The sac and its neck are
    the compact patch of wall that stands off that tube, grown from the dome.
-2. Four spheres. Seeded at the deepest medial balls of the sac and refined
-   jointly (L-BFGS) so that the blended model -- parent tube smooth-union the
-   four spheres -- passes through the sac wall without crossing it.
+   The neck is the part of the parent the sac wall actually runs on into;
+   any other stretch of vessel the sac merely presses against is "foreign".
+2. Three spheres. Seeded at the deepest medial balls of the sac and refined
+   jointly (L-BFGS) so that the blended model passes through the sac wall
+   without crossing it.
 3. One implicit field. Parent tube (balls swept along the centerline, plus a
-   short stub through each ostium plane) smooth-union the four spheres,
-   sampled on a voxel grid. The smooth union is the "high smoothing" at the
-   neck; a windowed-sinc pass removes the voxel staircase.
+   short stub through each ostium plane) union the spheres, sampled on a
+   voxel grid. The template is deliberately coarse: the tube radius is kept
+   only at knots every few millimetres of centerline and interpolated in
+   between. The spheres are smooth-unioned with the neck stretch only (the
+   "high smoothing" at the neck) and kept a small gap away from foreign
+   vessel, so the sac joins its parent at the neck and nowhere else. A
+   windowed-sinc pass removes the voxel staircase.
 4. One marching-cubes surface, closed. Each ostium is opened with one planar
    cut limited to a short cylinder around its stub, so the rim is exactly the
    ground-truth ostium plane.
@@ -27,7 +33,7 @@ with new spheres without repeating detection or the parent field.
 Inputs are ``cleandata/uniformly_remeshed`` (mesh + ``.ostium_frames.npz``) and
 ``cleandata/original_centerline``. Meshes land in
 ``datatransform/template_creation/output_vessel_aneurysm`` next to a
-``{id}.spheres.npz`` holding the four spheres and the sac vertex ids.
+``{id}.spheres.npz`` holding the spheres and the sac vertex ids.
 """
 import os
 import sys
@@ -48,7 +54,7 @@ import vtk
 from scipy import ndimage
 from scipy.optimize import minimize
 from scipy.sparse import csr_matrix
-from scipy.sparse.csgraph import connected_components
+from scipy.sparse.csgraph import connected_components, dijkstra
 from scipy.spatial import cKDTree
 from vtk.util.numpy_support import numpy_to_vtk, vtk_to_numpy
 
@@ -81,7 +87,7 @@ from vessel_pipeline import (
 )
 
 LOG_FOLDER = "vessel_aneurysm_logs"
-N_SPHERES = 4
+N_SPHERES = 3
 
 # Voxel of the implicit field. The surface is smoothed and remeshed at
 # >= 0.3 mm afterwards, so 0.2 mm resolves the thinnest kept tube (0.35 mm
@@ -98,8 +104,26 @@ STUB_STRAIGHT_VOXELS = 3.0
 FLUSH_FALLBACK_MM = 1.5
 # Every sphere overlaps the parent or a connected sphere by at least this.
 CONNECT_OVERLAP_MM = 0.3
-# Smooth-union width between the sac spheres and the parent (and each other).
+# Smooth-union width between the sac spheres and the neck (and each other).
 BLEND_MM = 0.9
+# The template's parent radius is the (opened) inscribed radius sampled only
+# at knots this far apart along the centerline, linear in between: the vessel
+# calibre is followed coarsely, its local bumps are left to the network.
+RADIUS_KNOT_MM = 5.0
+# Neck vs. foreign vessel (see classify_parent). The neck window is
+# NECK_HALF_R parent radii either side of where the lumen opens most into the
+# sac (a path to a point NECK_TARGET_MM inside the dome wall staying
+# NECK_DEPTH_MM inside the lumen). Spheres may sink at most NECK_PEN_R parent
+# radii into the window's tube and not at all into the buffer after it
+# (NECK_BUFFER_MM + NECK_BUFFER_R * r); beyond that the vessel is foreign and
+# the sac stays CARVE_GAP_MM (at least 2.5 voxels) clear of it.
+NECK_TARGET_MM = 0.6
+NECK_DEPTH_MM = 0.3
+NECK_HALF_R = 1.0
+NECK_PEN_R = 0.5
+NECK_BUFFER_MM = 0.5
+NECK_BUFFER_R = 1.0
+CARVE_GAP_MM = 0.5
 # Windowed-sinc smoothing of the marching-cubes surface.
 SMOOTH_PASSBAND = 0.03
 SMOOTH_ITERS = 25
@@ -328,6 +352,67 @@ def parent_radius(up, ur, edges, window_mm=3.5):
     return np.maximum(opened, 0.2)
 
 
+def _branches(n, edges):
+    """Centerline split into paths between nodes of degree != 2 (cycles too)."""
+    nbrs = [[] for _ in range(n)]
+    for a, b in edges.tolist():
+        nbrs[a].append(b)
+        nbrs[b].append(a)
+    deg = np.array([len(v) for v in nbrs])
+    seen = set()
+    paths = []
+
+    def walk(a, b):
+        path = [a, b]
+        seen.add((a, b))
+        seen.add((b, a))
+        while deg[path[-1]] == 2:
+            u, v = path[-1], path[-2]
+            w = nbrs[u][0] if nbrs[u][0] != v else nbrs[u][1]
+            if (u, w) in seen:
+                break
+            seen.add((u, w))
+            seen.add((w, u))
+            path.append(w)
+        return path
+
+    for a in np.flatnonzero(deg != 2).tolist():
+        for b in nbrs[a]:
+            if (a, b) not in seen:
+                paths.append(walk(a, b))
+    for a, b in edges.tolist():  # loops made of degree-2 nodes only
+        if (a, b) not in seen:
+            paths.append(walk(a, b))
+    return paths
+
+
+def sparse_radius(up, r_parent, edges, spacing=RADIUS_KNOT_MM):
+    """Parent radius kept only at knots ``spacing`` mm apart, linear in between.
+
+    Knots split every branch evenly; each takes the median radius within half
+    a spacing of it along the branch. A junction takes the largest of its
+    branches' end values, so a daughter tapers out of its parent.
+    """
+    out = np.asarray(r_parent, dtype=np.float64).copy()
+    if len(edges) == 0 or spacing <= 0:
+        return out
+    ends = {}
+    for path in _branches(len(up), edges):
+        path = np.asarray(path)
+        s = np.concatenate(([0.0], np.cumsum(np.linalg.norm(np.diff(up[path], axis=0), axis=1))))
+        m = max(1, int(round(s[-1] / spacing)))
+        knots = np.linspace(0.0, s[-1], m + 1)
+        vals = np.array([np.median(r_parent[path[np.abs(s - sk) <= 0.5 * spacing + 1e-9]])
+                         for sk in knots])
+        r = np.interp(s, knots, vals)
+        out[path[1:-1]] = r[1:-1]
+        for node, val in ((path[0], r[0]), (path[-1], r[-1])):
+            ends[int(node)] = max(ends.get(int(node), 0.0), float(val))
+    for node, val in ends.items():
+        out[node] = val
+    return out
+
+
 def load_case(v_file, centerline_path, dataset_id=None):
     mesh = read_polydata(v_file)
     if not os.path.isfile(centerline_path):
@@ -469,13 +554,73 @@ def detect_aneurysm(pts, faces, up, r_parent):
         "diameter_mm": core_diam,
         "neck_frac": float((mask & ~core).sum() / max(int(mask.sum()), 1)),
         "core": core,
+        "nearest": nearest,
+        "adj": adj,
         "seconds": time.perf_counter() - t0,
     }
     return mask, excess, info
 
 
+def classify_parent(pts, normals, mask, det, up, r_parent, cl_edges):
+    """Per centerline node: 0 neck, 1 near the neck, 2 foreign, 3 inside the sac.
+
+    The neck is a short window of centerline where the parent lumen opens
+    into the sac. A node opens into the sac when a straight path from it to
+    a point just inside the dome side of the sac stays NECK_DEPTH_MM inside
+    the wall all the way; where the sac merely rests on a stretch of vessel
+    (a loop of the same artery, a neighbour) every such path runs through or
+    along the walls. The window is centred on the node with the most open
+    path and spans NECK_HALF_R radii either way along the centerline, however
+    long the true neck is: the template's sac joins its parent there only.
+    The NECK_BUFFER after it is plain union; everything farther is foreign.
+    Centerline that runs into the sac itself (nearest wall is sac) is never
+    foreign. With no opening found, everything is neck.
+    """
+    n = len(up)
+    cat = np.zeros(n, dtype=np.int8)
+    if len(cl_edges) == 0:
+        return cat
+    wtree = cKDTree(pts)
+
+    def depth(q):  # distance inside the wall (negative outside)
+        d, j = wtree.query(q, k=1, workers=1)
+        side = np.einsum("ij,ij->i", q - pts[j], normals[j])
+        return np.where(side > 0.0, -d, d)
+
+    core = np.flatnonzero(det["core"])
+    core = core[:: max(1, len(core) // 600)]
+    tgt = pts[core] - NECK_TARGET_MM * normals[core]
+    tgt = tgt[depth(tgt) > NECK_DEPTH_MM]
+    if len(tgt) == 0:
+        return cat
+    d_sac, _j = cKDTree(pts[mask]).query(up, k=1, workers=1)
+    cand = np.flatnonzero(d_sac <= r_parent + 2.0)
+    if len(cand) == 0:
+        return cat
+    kt = min(12, len(tgt))
+    _d, tj = cKDTree(tgt).query(up[cand], k=kt, workers=1)
+    tj = tj.reshape(len(cand), kt)
+    t = np.linspace(0.0, 1.0, 24)
+    seg = up[cand][:, None, None, :] + t[None, None, :, None] * (tgt[tj][:, :, None, :] - up[cand][:, None, None, :])
+    openness = depth(seg.reshape(-1, 3)).reshape(len(cand), kt, len(t)).min(axis=2).max(axis=1)
+    if openness.max() < NECK_DEPTH_MM:
+        return cat
+    centre = int(cand[np.argmax(openness)])
+    length = np.maximum(np.linalg.norm(up[cl_edges[:, 0]] - up[cl_edges[:, 1]], axis=1), 1e-6)
+    graph = csr_matrix((length, (cl_edges[:, 0], cl_edges[:, 1])), shape=(n, n))
+    half = max(NECK_HALF_R * float(r_parent[centre]), 0.75)
+    reach = half + NECK_BUFFER_MM + NECK_BUFFER_R * float(np.max(r_parent)) + 1.0
+    dist = dijkstra(graph, directed=False, indices=centre, limit=reach)
+    cat[:] = 2
+    cat[dist <= half + NECK_BUFFER_MM + NECK_BUFFER_R * r_parent] = 1
+    cat[dist <= half] = 0
+    _d, near = wtree.query(up, k=1, workers=1)
+    cat[(cat == 2) & mask[near]] = 3
+    return cat
+
+
 # ---------------------------------------------------------------------------
-# 2. Four spheres
+# 2. Sac spheres
 # ---------------------------------------------------------------------------
 
 def smin(a, b, k):
@@ -497,23 +642,53 @@ def _fib_sphere(n):
     return np.stack((np.cos(th) * np.sin(phi), np.sin(th) * np.sin(phi), np.cos(phi)), axis=1)
 
 
-def fit_aneurysm_spheres(pts, normals, mask, up, r_parent, blend=BLEND_MM, n_spheres=N_SPHERES):
-    """Four spheres whose blended union with the parent tracks the sac wall.
+def _subset_value(q, up, r_parent, ids, kn=8):
+    """Parent-tube distance using only the nodes ``ids`` (far when there are none)."""
+    if len(ids) == 0:
+        return np.full(len(q), 1.0e3)
+    return _parent_value(q, up[ids], r_parent[ids], cKDTree(up[ids]), kn)
+
+
+def sac_model(C, R, P, fp_all, fp_neck, fp_foreign, blend, gap):
+    """The template's implicit model at points P (same CSG as the voxel field).
+
+    Spheres smooth-unioned with each other and with the neck; that sac part is
+    carved ``gap`` clear of foreign vessel; then hard union with the parent.
+    """
+    S = None
+    for c, r in zip(C, R):
+        d = np.linalg.norm(P - c, axis=1) - r
+        S = d if S is None else smin(S, d, blend)
+    f = smin(fp_neck, S, blend)
+    if fp_foreign is not None:
+        f = np.maximum(f, gap - fp_foreign)
+    return np.minimum(fp_all, f)
+
+
+def fit_aneurysm_spheres(pts, normals, mask, up, r_parent, cat=None, blend=BLEND_MM,
+                         gap=CARVE_GAP_MM, n_spheres=N_SPHERES):
+    """Spheres whose blended union with the parent tracks the sac wall.
 
     Objective, over the sac wall samples s and samples q on each sphere:
     mean F(s)^2 (the model surface passes through the wall) plus
     mean max(0, sd_wall(q))^2 on the exposed part of each sphere (the model
-    does not cross the wall), where F is the same smooth union the surface is
-    built from. Seeded from the deepest medial balls of the sac (greedy cover),
-    refined jointly with L-BFGS on the 16 parameters. Cheap, not exhaustive.
+    does not cross the wall), where F is ``sac_model``, the same CSG the
+    surface is built from. Seeded from the deepest medial balls of the sac
+    (greedy cover), refined jointly with L-BFGS on the 4 parameters per
+    sphere. Cheap, not exhaustive. ``cat`` is ``classify_parent``'s labels.
     """
     t0 = time.perf_counter()
+    cat = np.zeros(len(up), dtype=np.int8) if cat is None else cat
+    neck_ids = np.flatnonzero(cat == 0)
+    foreign_ids = np.flatnonzero(cat == 2)
     sac_idx = np.flatnonzero(mask)
     sac = pts[sac_idx]
     step = max(1, len(sac) // 1500)
     S = np.ascontiguousarray(sac[::step])
     ptree = cKDTree(up)
     fp_S = _parent_value(S, up, r_parent, ptree)
+    fn_S = _subset_value(S, up, r_parent, neck_ids)
+    ff_S = _subset_value(S, up, r_parent, foreign_ids) if len(foreign_ids) else None
 
     # Signed distance to the wall (positive outside) on a grid around the sac.
     lo = sac.min(axis=0) - 2.5
@@ -547,29 +722,25 @@ def fit_aneurysm_spheres(pts, normals, mask, up, r_parent, blend=BLEND_MM, n_sph
     order = np.argsort(cand_r)[::-1][:200]
     cand_c, cand_r = cand_c[order], cand_r[order]
 
-    def union(C, R, P, fp):
-        f = fp
-        for c, r in zip(C, R):
-            f = smin(f, np.linalg.norm(P - c, axis=1) - r, blend)
-        return f
+    def union(C, R):
+        return sac_model(C, R, S, fp_S, fn_S, ff_S, blend, gap)
 
     # Greedy cover of the sac wall, gain measured with the blended model.
     chosen = []
-    base = fp_S.copy()
+    cur = float(np.mean(fp_S ** 2))
     for _ in range(n_spheres):
-        best_gain, best_i = 0.0, None
-        cur = np.mean(base ** 2)
+        best_gain, best_i, best_cost = 0.0, None, cur
         for i in range(len(cand_c)):
             if i in chosen:
                 continue
-            f = smin(base, np.linalg.norm(S - cand_c[i], axis=1) - cand_r[i], blend)
-            gain = cur - np.mean(f ** 2)
-            if gain > best_gain:
-                best_gain, best_i = gain, i
+            ids = chosen + [i]
+            c = float(np.mean(union(cand_c[ids], cand_r[ids]) ** 2))
+            if cur - c > best_gain:
+                best_gain, best_i, best_cost = cur - c, i, c
         if best_i is None:
             break
         chosen.append(best_i)
-        base = smin(base, np.linalg.norm(S - cand_c[best_i], axis=1) - cand_r[best_i], blend)
+        cur = best_cost
     C0 = [cand_c[i] for i in chosen]
     R0 = [cand_r[i] for i in chosen]
     while len(C0) < n_spheres:
@@ -582,12 +753,22 @@ def fit_aneurysm_spheres(pts, normals, mask, up, r_parent, blend=BLEND_MM, n_sph
     R0 = np.asarray(R0, dtype=np.float64)
 
     U = _fib_sphere(40)
+    # How deep a sphere may sink into each nearby node's tube: a little into
+    # the neck window, not into the buffer, and stay a gap off foreign vessel.
+    lo_s, hi_s = sac.min(axis=0), sac.max(axis=0)
+    span = float(np.max(hi_s - lo_s))
+    near = np.flatnonzero(np.linalg.norm(up - 0.5 * (lo_s + hi_s), axis=1) <= span + 2.0 * float(r_parent.max()) + 2.0)
+    allow = np.select([cat[near] == 0, cat[near] == 1, cat[near] == 2],
+                      [NECK_PEN_R * r_parent[near], np.zeros(len(near)), np.full(len(near), -gap)],
+                      default=np.inf)
+    pen_on = np.isfinite(allow)
+    near, allow = near[pen_on], allow[pen_on]
     r_min = 0.3
 
     def cost(x):
         C = x[: 3 * n_spheres].reshape(n_spheres, 3)
         R = x[3 * n_spheres:]
-        f = union(C, R, S, fp_S)
+        f = union(C, R)
         fit = np.mean(f * f)
         Q = (C[:, None, :] + R[:, None, None] * U[None]).reshape(-1, 3)
         out = np.maximum(sd_at(Q), 0.0)
@@ -598,7 +779,11 @@ def fit_aneurysm_spheres(pts, normals, mask, up, r_parent, blend=BLEND_MM, n_sph
         exposed = (dQ.min(axis=1) > 0.0) & (fp_Q_cache(Q) > 0.0)
         cross = np.mean((out * exposed) ** 2)
         small = np.sum(np.maximum(r_min - R, 0.0) ** 2)
-        return fit + 2.0 * cross + 10.0 * small
+        sink = 0.0
+        if len(near):
+            pen = R[:, None] + r_parent[near][None] - np.linalg.norm(C[:, None, :] - up[near][None], axis=2)
+            sink = np.sum(np.max(np.maximum(pen - allow[None], 0.0), axis=1) ** 2)
+        return fit + 2.0 * cross + 10.0 * small + 10.0 * sink
 
     def fp_Q_cache(Q):
         return _parent_value(Q, up, r_parent, ptree, kn=4)
@@ -608,9 +793,9 @@ def fit_aneurysm_spheres(pts, normals, mask, up, r_parent, blend=BLEND_MM, n_sph
     x = res.x if np.isfinite(res.fun) and res.fun <= cost(x0) else x0
     C = x[: 3 * n_spheres].reshape(n_spheres, 3)
     R = np.maximum(x[3 * n_spheres:], r_min)
-    C, n_moved = connect_spheres(C, R, up, r_parent, ptree)
+    C, R, n_moved = place_spheres(C, R, up, r_parent, neck_ids, foreign_ids, gap)
     f_par = fp_S
-    f_fin = union(C, R, S, fp_S)
+    f_fin = union(C, R)
     info = {
         "parent_rmse_mm": float(np.sqrt(np.mean(np.maximum(f_par, 0.0) ** 2))),
         "union_rmse_mm": float(np.sqrt(np.mean(f_fin ** 2))),
@@ -629,7 +814,7 @@ def connect_spheres(C, R, up, r_parent, ptree=None, overlap=CONNECT_OVERLAP_MM):
     sphere) by ``overlap``. One that is not is moved straight toward whichever
     connected body is nearest until it overlaps it; nearest spheres go first.
     The fit nearly always satisfies this already; it is the guarantee that the
-    four spheres never come out as an island the surface would drop.
+    spheres never come out as an island the surface would drop.
     """
     ptree = ptree if ptree is not None else cKDTree(up)
     C = np.array(C, dtype=np.float64)
@@ -661,6 +846,47 @@ def connect_spheres(C, R, up, r_parent, ptree=None, overlap=CONNECT_OVERLAP_MM):
             n_moved += 1
         connected[i] = True
     return C, n_moved
+
+
+def place_spheres(C, R, up, r_parent, neck_ids, foreign_ids, gap, r_min=0.3):
+    """Connect the spheres through the neck and keep them off foreign vessel.
+
+    Spheres are pulled in toward the neck nodes only (``connect_spheres``),
+    never toward a stretch they would merely be carved against. A sphere
+    reaching within ``gap`` of a foreign tube is shrunk until it does not,
+    or, when that would take more than 40% of it, moved straight away from
+    that tube; anything left over is what the field's carve removes. A few
+    rounds, since a connecting move can undo a clearing one.
+    """
+    C = np.array(C, dtype=np.float64)
+    R = np.array(R, dtype=np.float64)
+    neck_ids = neck_ids if len(neck_ids) else np.arange(len(up))
+    tree_n = cKDTree(up[neck_ids])
+    moved = 0
+    for _ in range(3):
+        C, m = connect_spheres(C, R, up[neck_ids], r_parent[neck_ids], tree_n)
+        moved += m
+        if len(foreign_ids) == 0:
+            break
+        cleared = True
+        for i in range(len(C)):
+            d = np.linalg.norm(up[foreign_ids] - C[i], axis=1) - r_parent[foreign_ids]
+            k = int(np.argmin(d))
+            if d[k] - R[i] >= gap - 1e-6:
+                continue
+            cleared = False
+            moved += 1
+            if d[k] - gap >= max(r_min, 0.6 * R[i]):
+                R[i] = d[k] - gap
+            else:
+                j = foreign_ids[k]
+                v = C[i] - up[j]
+                dist = float(np.linalg.norm(v))
+                C[i] = up[j] + (v / dist if dist > 1e-9 else np.array([1.0, 0, 0])) \
+                    * (r_parent[j] + gap + R[i])
+        if cleared:
+            break
+    return C, R, moved
 
 
 # ---------------------------------------------------------------------------
@@ -728,11 +954,12 @@ class CaseModel:
     field, blends the spheres in, and builds the final uniform surface.
     """
 
-    def __init__(self, up, r_parent, cl_edges, frames, bounds,
+    def __init__(self, up, r_parent, cl_edges, frames, bounds, node_cat=None,
                  grid_spacing=DEFAULT_GRID_SPACING, max_grid_size=DEFAULT_MAX_GRID_SIZE,
                  target_edge_length=DEFAULT_TARGET_EDGE_LENGTH, blend=BLEND_MM):
         t0 = time.perf_counter()
         self.blend = float(blend)
+        node_cat = np.zeros(len(up), dtype=np.int8) if node_cat is None else np.asarray(node_cat)
         rp = np.maximum(r_parent, R_FLOOR_MM)
         up = np.asarray(up, dtype=np.float64)
         frames = [
@@ -794,16 +1021,23 @@ class CaseModel:
         step0 = max(0.5 * float(grid_spacing), 0.08)
         if len(e):
             c, r = _sample_segments(up[e[:, 0]], up[e[:, 1]], rp[e[:, 0]], rp[e[:, 1]], step0)
+            # A ball is neck (foreign) when both ends of its edge are.
+            ca, cb = node_cat[e[:, 0]], node_cat[e[:, 1]]
+            ce = np.where((ca == 0) & (cb == 0), 0, np.where((ca == 2) & (cb == 2), 2, 1)).astype(float)
+            _c, lab = _sample_segments(up[e[:, 0]], up[e[:, 1]], ce, ce, step0)
         else:
-            c, r = up[kept_ids], rp[kept_ids]
+            c, r, lab = up[kept_ids], rp[kept_ids], node_cat[kept_ids].astype(float)
         for sc, sr in zip(stub_c, stub_r):
             c2, r2 = _sample_segments(sc[:1], sc[1:], sr[:1], sr[1:], step0)
             c = np.vstack((c, c2))
             r = np.concatenate((r, r2))
+            lab = np.concatenate((lab, np.ones(len(r2))))
         # Balls closer than a quarter step to a kept one add nothing.
         key = np.round(c / (0.25 * step0)).astype(np.int64)
         _u, first = np.unique(key, axis=0, return_index=True)
-        c, r = c[first], r[first]
+        c, r, lab = c[first], r[first], np.round(lab[first]).astype(np.int8)
+        self.neck_balls = (c[lab == 0], r[lab == 0])
+        self.foreign_balls = (c[lab == 2], r[lab == 2])
 
         pad = self.blend + 1.0
         lo = np.minimum(np.asarray(bounds[0::2], dtype=np.float64), (c - r[:, None]).min(axis=0)) - pad
@@ -812,6 +1046,7 @@ class CaseModel:
         if np.max(hi - lo) / g + 1 > max_grid_size:
             g = float(np.max(hi - lo)) / (max_grid_size - 1)
         self.g = g
+        self.gap = max(CARVE_GAP_MM, 2.5 * g)
         dims = np.ceil((hi - lo) / g).astype(np.int64) + 1
         self.origin = lo
         self.shape = (int(dims[2]), int(dims[1]), int(dims[0]))
@@ -868,20 +1103,43 @@ class CaseModel:
 
     # -- field ---------------------------------------------------------------
     def field_with_spheres(self, centers, radii):
+        """Parent field union ``sac_model``'s sac part, evaluated around the spheres.
+
+        Outside the spheres' reach the sac part equals the neck tube, which
+        the parent field already holds, so only that box is touched.
+        """
         field = self.parent_field.copy()
-        g, lo, k = self.g, self.origin, self.blend
-        for c, r in zip(np.asarray(centers, float), np.asarray(radii, float)):
-            reach = r + k + 2.0 * g
-            i0 = np.maximum(((c - reach - lo) / g).astype(int), 0)
-            i1 = np.minimum(((c + reach - lo) / g).astype(int) + 2, np.array(self.shape[::-1]))
-            if np.any(i1 <= i0):
-                continue
-            xs = lo[0] + np.arange(i0[0], i1[0], dtype=np.float32) * g - c[0]
-            ys = lo[1] + np.arange(i0[1], i1[1], dtype=np.float32) * g - c[1]
-            zs = lo[2] + np.arange(i0[2], i1[2], dtype=np.float32) * g - c[2]
-            d = np.sqrt(zs[:, None, None] ** 2 + ys[None, :, None] ** 2 + xs[None, None, :] ** 2) - np.float32(r)
+        g, lo, k, gap = self.g, self.origin, np.float32(self.blend), np.float32(self.gap)
+        C = np.asarray(centers, float).reshape(-1, 3)
+        R = np.asarray(radii, float).reshape(-1)
+        reach = (R + float(k) + float(gap) + 2.0 * g)[:, None]
+        i0 = np.maximum(np.floor(((C - reach).min(axis=0) - lo) / g).astype(int), 0)
+        i1 = np.minimum(np.ceil(((C + reach).max(axis=0) - lo) / g).astype(int) + 1,
+                        np.array(self.shape[::-1]))
+        if np.all(i1 > i0):
+            sub_lo = lo + i0 * g
+            xs = sub_lo[0] + np.arange(i1[0] - i0[0], dtype=np.float32) * g
+            ys = sub_lo[1] + np.arange(i1[1] - i0[1], dtype=np.float32) * g
+            zs = sub_lo[2] + np.arange(i1[2] - i0[2], dtype=np.float32) * g
+            S = None
+            for c, r in zip(C, R):
+                d = np.sqrt((zs[:, None, None] - c[2]) ** 2 + (ys[None, :, None] - c[1]) ** 2
+                            + (xs[None, None, :] - c[0]) ** 2) - np.float32(r)
+                S = d if S is None else smin(S, d, k)
+            box_lo, box_hi = sub_lo, lo + (i1 - 1) * g
+
+            def local(balls, extra):
+                bc, br = balls
+                out = np.full(S.shape, 1.0e3, dtype=np.float32)
+                hit = np.all((bc + (br + extra)[:, None] >= box_lo) & (bc - (br + extra)[:, None] <= box_hi), axis=1)
+                _stamp(out, sub_lo, g, bc[hit], br[hit], reach_extra=extra)
+                return out
+
+            sac = smin(local(self.neck_balls, float(k) + 2.0 * g), S, k)
+            if len(self.foreign_balls[0]):
+                np.maximum(sac, gap - local(self.foreign_balls, float(gap) + 2.0 * g), out=sac)
             sl = field[i0[2]:i1[2], i0[1]:i1[1], i0[0]:i1[0]]
-            sl[...] = smin(sl, d, np.float32(k))
+            np.minimum(sl, sac.astype(np.float32), out=sl)
         for ax in range(3):
             idx = [slice(None)] * 3
             for end in (0, -1):
@@ -1322,17 +1580,25 @@ def to_vtk_surface(pts, faces):
 
 
 def prepare_case(dataset_id, v_file, centerline_path, grid_spacing=DEFAULT_GRID_SPACING,
-                 max_grid_size=DEFAULT_MAX_GRID_SIZE, target_edge_length=DEFAULT_TARGET_EDGE_LENGTH):
+                 max_grid_size=DEFAULT_MAX_GRID_SIZE, target_edge_length=DEFAULT_TARGET_EDGE_LENGTH,
+                 radius_knot_mm=RADIUS_KNOT_MM):
     """Detection, sphere fit and the parent field: everything before the surface."""
     case = load_case(v_file, centerline_path, dataset_id)
     pts, faces, up = case["pts"], case["faces"], case["up"]
     r_par = parent_radius(up, case["ur"], case["cl_edges"])
     mask, excess, det = detect_aneurysm(pts, faces, up, r_par)
     normals = wall_normals(pts, faces, up)
-    centers, radii, fit = fit_aneurysm_spheres(pts, normals, mask, up, r_par)
-    model = CaseModel(up, r_par, case["cl_edges"], case["frames"], case["mesh"].bounds,
-                      grid_spacing=grid_spacing, max_grid_size=max_grid_size,
+    cat = classify_parent(pts, normals, mask, det, up, r_par, case["cl_edges"])
+    det["n_neck_nodes"] = int((cat == 0).sum())
+    det["n_foreign_nodes"] = int((cat == 2).sum())
+    # Detection measures the sac against the dense radius; the template (and
+    # so the fit, which models it) uses the coarse one.
+    r_tmpl = sparse_radius(up, r_par, case["cl_edges"], radius_knot_mm)
+    model = CaseModel(up, r_tmpl, case["cl_edges"], case["frames"], case["mesh"].bounds,
+                      node_cat=cat, grid_spacing=grid_spacing, max_grid_size=max_grid_size,
                       target_edge_length=target_edge_length)
+    centers, radii, fit = fit_aneurysm_spheres(pts, normals, mask, up, r_tmpl, cat=cat,
+                                               gap=model.gap)
     return case, mask, det, centers, radii, fit, model
 
 
@@ -1345,16 +1611,19 @@ def process_vessel_aneurysm_dataset(
     target_edge_length=DEFAULT_TARGET_EDGE_LENGTH,
     grid_spacing=DEFAULT_GRID_SPACING,
     max_grid_size=DEFAULT_MAX_GRID_SIZE,
+    radius_knot_mm=RADIUS_KNOT_MM,
 ):
-    """Detect the sac, fit four spheres, and write one uniform manifold."""
+    """Detect the sac, fit the spheres, and write one uniform manifold."""
     t_all = time.perf_counter()
     print(f"\n=========================================\nVessel+aneurysm template: {dataset_id}")
     case, mask, det, centers, radii, fit, model = prepare_case(
-        dataset_id, v_file, centerline_path, grid_spacing, max_grid_size, target_edge_length
+        dataset_id, v_file, centerline_path, grid_spacing, max_grid_size, target_edge_length,
+        radius_knot_mm,
     )
     print(
         f"  Sac: {100 * det['frac']:.1f}% of vertices, diameter {det['diameter_mm']:.1f} mm, "
-        f"peak {det['peak_mm']:.2f} mm, neck lip {100 * det['neck_frac']:.0f}% "
+        f"peak {det['peak_mm']:.2f} mm, neck lip {100 * det['neck_frac']:.0f}%, "
+        f"{det['n_neck_nodes']} neck / {det['n_foreign_nodes']} foreign centerline nodes "
         f"({det['seconds']:.2f}s)"
     )
     print(
@@ -1409,6 +1678,7 @@ def _process_one(dataset_id, v_file, args):
             target_edge_length=args.target_edge_length,
             grid_spacing=args.grid_spacing,
             max_grid_size=args.max_grid_size,
+            radius_knot_mm=args.radius_knot_mm,
         )
 
     return run_logged_case(
@@ -1419,12 +1689,15 @@ def _process_one(dataset_id, v_file, args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Uniform template of the parent vessel with the aneurysm as four spheres"
+        description="Uniform template of the parent vessel with the aneurysm as three spheres"
     )
     add_shared_cli_args(parser, DEFAULT_OUTPUT_DIR, default_workers=os.cpu_count() or 4,
                         include_remesh_grid=True)
     parser.add_argument("--centerline-dir", type=str, default=CLEANDATA_ORIGINAL_CENTERLINE,
                         help="Directory of original_centerline {id}.vtp files")
+    parser.add_argument("--radius-knot-mm", type=float, default=RADIUS_KNOT_MM,
+                        help="Spacing of the parent-radius knots along the centerline "
+                             "(larger = coarser vessel; 0 keeps the dense radius)")
     add_run_log_args(parser, LOG_FOLDER)
     parser.set_defaults(
         from_folder=True,
@@ -1442,6 +1715,7 @@ def main():
         "--grid-spacing", str(args.grid_spacing),
         "--max-grid-size", str(args.max_grid_size),
         "--centerline-dir", args.centerline_dir,
+        "--radius-knot-mm", str(args.radius_knot_mm),
         "--from-folder",
     ] + extra_log
     try:
