@@ -1795,7 +1795,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Uniform template of the parent vessel with the aneurysm as three spheres"
     )
-    add_shared_cli_args(parser, DEFAULT_OUTPUT_DIR, default_workers=os.cpu_count() or 4,
+    add_shared_cli_args(parser, DEFAULT_OUTPUT_DIR, 10,
                         include_remesh_grid=True)
     parser.add_argument("--centerline-dir", type=str, default=CLEANDATA_ORIGINAL_CENTERLINE,
                         help="Directory of original_centerline {id}.vtp files")

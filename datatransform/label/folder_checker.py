@@ -15,11 +15,11 @@ import pyvista as pv
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
-from aneux_paths import CLEANED_VESSELS, VESSELS_ORIGINAL
+from aneux_paths import CLEANDATA_UNIFORM, TEMPLATE_OUTPUT_VESSEL_ANEURYSM
 
 # --- CONFIGURATION ---
-FOLDER_1 = CLEANED_VESSELS
-FOLDER_2 = VESSELS_ORIGINAL
+FOLDER_1 = CLEANDATA_UNIFORM
+FOLDER_2 = TEMPLATE_OUTPUT_VESSEL_ANEURYSM
 
 SUPPORTED_EXTENSIONS = ('.vtp', '.stl', '.vtk')
 LOAD_WORKERS = min(8, os.cpu_count() or 4)
@@ -136,10 +136,10 @@ def _frame_current(first=False):
 def _overlay_text(index, name1, name2):
     progress = f"[{index + 1}/{len(state['files'])}]"
     left = (
-        f"FOLDER 1 (Unextended)\n{progress} {name1}\n"
+        f"FOLDER 1 (Uniformly remeshed)\n{progress} {name1}\n"
         "< Left Arrow (Back) | Right Arrow (Next) >"
     )
-    right = f"FOLDER 2 (Original)\n{progress} {name2}"
+    right = f"FOLDER 2 (Vessel aneurysm)\n{progress} {name2}"
     return left, right
 
 
