@@ -74,7 +74,6 @@ from batch_run_log import (
 from surface_polish import self_intersections, signed_volume
 from variable_remeshing import resolve_cut_frames
 from vessel_pipeline import (
-    DEFAULT_TARGET_EDGE_LENGTH,
     TemplateQualityError,
     _grow_solid_ball,
     add_shared_cli_args,
@@ -127,9 +126,17 @@ CARVE_GAP_MM = 0.5
 # Windowed-sinc smoothing of the marching-cubes surface.
 SMOOTH_PASSBAND = 0.03
 SMOOTH_ITERS = 25
-# Uniform edge: 0.6 of the narrowest rim radius, clamped to this range.
+# Vessel edge: 0.6 of the narrowest rim radius, clamped to [MIN_EDGE_MM,
+# target]. VMTK's edges come out ~0.82x its target (0.3 -> ~0.25 mm).
 MIN_EDGE_MM = 0.3
+TARGET_EDGE_MM = 0.3
 EDGE_OVER_RIM_RADIUS = 0.6
+# The sac is remeshed finer: this target within SAC_BAND_MM of the spheres
+# (the smooth-union fillets sit up to ~blend/4 outside them), ramping linearly
+# to the vessel target over SAC_RAMP_MM.
+SAC_EDGE_MM = 0.15
+SAC_BAND_MM = 0.3
+SAC_RAMP_MM = 1.0
 REMESH_ITERS = 2
 # Rims must sit on the ground-truth ostium planes. The clip puts them there;
 # the remesher slides rim vertices along the rim, so anything it leaves off
@@ -976,7 +983,7 @@ class CaseModel:
 
     def __init__(self, up, r_parent, cl_edges, frames, bounds, node_cat=None,
                  grid_spacing=DEFAULT_GRID_SPACING, max_grid_size=DEFAULT_MAX_GRID_SIZE,
-                 target_edge_length=DEFAULT_TARGET_EDGE_LENGTH, blend=BLEND_MM):
+                 target_edge_length=TARGET_EDGE_MM, blend=BLEND_MM, sac_edge=SAC_EDGE_MM):
         t0 = time.perf_counter()
         self.blend = float(blend)
         node_cat = np.zeros(len(up), dtype=np.int8) if node_cat is None else np.asarray(node_cat)
@@ -1037,6 +1044,8 @@ class CaseModel:
             stub_r.append(np.array([rp[node], r_t]))
         r_min = min(op["r"] for op in self.ostia)
         self.edge = float(np.clip(EDGE_OVER_RIM_RADIUS * r_min, MIN_EDGE_MM, target_edge_length))
+        self.sac_edge = float(min(sac_edge, self.edge)) if sac_edge > 0 else self.edge
+        self.spheres = (np.zeros((0, 3)), np.zeros(0))
 
         step0 = max(0.5 * float(grid_spacing), 0.08)
         if len(e):
@@ -1301,16 +1310,35 @@ class CaseModel:
         sm.Update()
         return vtk_to_numpy(sm.GetOutput().GetPoints().GetData()).astype(np.float64)
 
+    def sizing(self, pts):
+        """Target edge length at each point: ``sac_edge`` on the sac, ``edge`` elsewhere.
+
+        Distance to the nearest sphere surface decides: within SAC_BAND_MM the
+        sac target, then a linear ramp over SAC_RAMP_MM (a size gradient of
+        (edge - sac_edge) / SAC_RAMP_MM, gentle enough for the remesher).
+        """
+        C, R = self.spheres
+        h = np.full(len(pts), self.edge, dtype=np.float32)
+        if len(R) == 0 or self.sac_edge >= self.edge:
+            return h
+        d = np.full(len(pts), np.inf)
+        for c, r in zip(C, R):
+            np.minimum(d, np.linalg.norm(pts - c, axis=1) - r, out=d)
+        t = np.clip((d - SAC_BAND_MM) / SAC_RAMP_MM, 0.0, 1.0)
+        return (self.sac_edge + (self.edge - self.sac_edge) * t).astype(np.float32)
+
     def decimate(self, pts, faces):
         """Thin the marching-cubes mesh to about twice the final face count.
 
         VMTK's remesher costs time per input triangle, and the 0.2 mm voxel
-        surface has ~10x more than the template needs.
+        surface has ~10x more than the template needs. The budget follows
+        ``sizing``, so the sac keeps its share for the finer target.
         """
         a = pts[faces[:, 1]] - pts[faces[:, 0]]
         b = pts[faces[:, 2]] - pts[faces[:, 0]]
-        area = 0.5 * float(np.linalg.norm(np.cross(a, b), axis=1).sum())
-        target = 2.0 * area / (0.433 * self.edge ** 2)
+        area = 0.5 * np.linalg.norm(np.cross(a, b), axis=1)
+        h = self.sizing(pts).astype(np.float64)[faces].mean(axis=1)
+        target = 2.0 * float((area / (0.433 * h ** 2)).sum())
         if target >= 0.8 * len(faces):
             return pts, faces
         dec = vtk.vtkQuadricDecimation()
@@ -1385,12 +1413,13 @@ class CaseModel:
         p, f = _compact(*_poly_arrays(conn.GetOutput()))
         # Clip vertices that landed a hair from old ones make slivers; weld
         # them, keeping the rim vertex so the rim stays on its plane.
-        return _collapse_short(p, f, 0.15 * self.edge)
+        return _collapse_short(p, f, 0.15 * self.sac_edge)
 
     def remesh(self, pts, faces):
         out = remesh_surface_isotropically(
             _poly_from_arrays(pts, faces), self.edge,
             n_iter=REMESH_ITERS, connectivity_iter=REMESH_CONN_ITERS,
+            sizes=self.sizing(pts),
         )
         p, f = _compact(*_poly_arrays(out))
         return self.snap_rims(p, f)
@@ -1445,7 +1474,7 @@ class CaseModel:
             rep["loop_ostium"] = dict(zip(ri.tolist(), ci.tolist()))
             if off > PLANE_TOL_MM:
                 issues.append(f"a rim is {off:.3f} mm off its ostium plane")
-        if rep["edge_min"] < 0.05 * self.edge:
+        if rep["edge_min"] < 0.05 * self.sac_edge:
             issues.append(f"edge {rep['edge_min']:.4f} mm")
         if rep["q_min"] < 0.05:
             issues.append(f"sliver triangle (q={rep['q_min']:.3f})")
@@ -1458,7 +1487,8 @@ class CaseModel:
         return rep
 
     def manifold(self, centers, radii, verbose=True):
-        """Uniform open surface of parent tube smooth-union the spheres."""
+        """Open surface of parent tube smooth-union the spheres, finer on the sac."""
+        self.spheres = (np.asarray(centers, float).reshape(-1, 3), np.asarray(radii, float).reshape(-1))
         t = {}
         t0 = time.perf_counter()
         field = self.field_with_spheres(centers, radii)
@@ -1489,8 +1519,8 @@ class CaseModel:
             if verbose:
                 print(f"  Remesh gate: {'; '.join(rep['issues'])}; retrying")
             rpts2, rfaces2 = self.snap_rims(*_compact(*_poly_arrays(remesh_surface_isotropically(
-                _poly_from_arrays(pts, faces), 0.97 * self.edge,
-                n_iter=6, connectivity_iter=6))))
+                _poly_from_arrays(pts, faces), self.edge,
+                n_iter=6, connectivity_iter=6, sizes=self.sizing(pts), factor=0.97))))
             rep2 = self.check(rpts2, rfaces2)
             if not rep2["issues"]:
                 rpts, rfaces, rep = rpts2, rfaces2, rep2
@@ -1505,14 +1535,26 @@ class CaseModel:
 
 
 def remesh_surface_isotropically(surface, target_edge_length, n_iter=REMESH_ITERS,
-                                 connectivity_iter=REMESH_CONN_ITERS):
-    """VMTK isotropic remesh that also resamples the rims (clip edges are uneven)."""
+                                 connectivity_iter=REMESH_CONN_ITERS, sizes=None, factor=1.0):
+    """VMTK isotropic remesh that also resamples the rims (clip edges are uneven).
+
+    ``sizes`` (per input point) switches to a graded target edge length;
+    without it, or when it is constant, the uniform ``target_edge_length``.
+    """
     from vmtk import vmtkscripts
 
     remesher = vmtkscripts.vmtkSurfaceRemeshing()
     remesher.Surface = surface
-    remesher.ElementSizeMode = "edgelength"
-    remesher.TargetEdgeLength = float(target_edge_length)
+    if sizes is not None and float(np.ptp(sizes)) > 1e-6:
+        arr = numpy_to_vtk(np.ascontiguousarray(sizes, dtype=np.float64), deep=True)
+        arr.SetName("TargetEdgeLength")
+        surface.GetPointData().AddArray(arr)
+        remesher.ElementSizeMode = "edgelengtharray"
+        remesher.TargetEdgeLengthArrayName = "TargetEdgeLength"
+        remesher.TargetEdgeLengthFactor = float(factor)
+    else:
+        remesher.ElementSizeMode = "edgelength"
+        remesher.TargetEdgeLength = float(factor) * float(target_edge_length)
     remesher.PreserveBoundaryEdges = 0
     remesher.NumberOfIterations = int(n_iter)
     remesher.NumberOfConnectivityOptimizationIterations = int(connectivity_iter)
@@ -1605,8 +1647,8 @@ def to_vtk_surface(pts, faces):
 
 
 def prepare_case(dataset_id, v_file, centerline_path, grid_spacing=DEFAULT_GRID_SPACING,
-                 max_grid_size=DEFAULT_MAX_GRID_SIZE, target_edge_length=DEFAULT_TARGET_EDGE_LENGTH,
-                 radius_knot_mm=RADIUS_KNOT_MM):
+                 max_grid_size=DEFAULT_MAX_GRID_SIZE, target_edge_length=TARGET_EDGE_MM,
+                 radius_knot_mm=RADIUS_KNOT_MM, sac_edge_length=SAC_EDGE_MM):
     """Detection, sphere fit and the parent field: everything before the surface."""
     case = load_case(v_file, centerline_path, dataset_id)
     pts, faces, up = case["pts"], case["faces"], case["up"]
@@ -1621,7 +1663,7 @@ def prepare_case(dataset_id, v_file, centerline_path, grid_spacing=DEFAULT_GRID_
     r_tmpl = sparse_radius(up, r_par, case["cl_edges"], radius_knot_mm)
     model = CaseModel(up, r_tmpl, case["cl_edges"], case["frames"], case["mesh"].bounds,
                       node_cat=cat, grid_spacing=grid_spacing, max_grid_size=max_grid_size,
-                      target_edge_length=target_edge_length)
+                      target_edge_length=target_edge_length, sac_edge=sac_edge_length)
     centers, radii, fit = fit_aneurysm_spheres(pts, normals, mask, up, r_tmpl, cat=cat,
                                                gap=model.gap)
     return case, mask, det, centers, radii, fit, model
@@ -1660,17 +1702,18 @@ def process_vessel_aneurysm_dataset(
     v_file,
     output_dir,
     centerline_path,
-    target_edge_length=DEFAULT_TARGET_EDGE_LENGTH,
+    target_edge_length=TARGET_EDGE_MM,
     grid_spacing=DEFAULT_GRID_SPACING,
     max_grid_size=DEFAULT_MAX_GRID_SIZE,
     radius_knot_mm=RADIUS_KNOT_MM,
+    sac_edge_length=SAC_EDGE_MM,
 ):
     """Detect the sac, fit the spheres, and write one uniform manifold."""
     t_all = time.perf_counter()
     print(f"\n=========================================\nVessel+aneurysm template: {dataset_id}")
     case, mask, det, centers, radii, fit, model = prepare_case(
         dataset_id, v_file, centerline_path, grid_spacing, max_grid_size, target_edge_length,
-        radius_knot_mm,
+        radius_knot_mm, sac_edge_length,
     )
     print(
         f"  Sac: {100 * det['frac']:.1f}% of vertices, diameter {det['diameter_mm']:.1f} mm, "
@@ -1685,7 +1728,7 @@ def process_vessel_aneurysm_dataset(
     )
     print(
         f"  Parent field {model.shape[::-1]} at {model.g:.3f} mm, {len(model.ostia)} ostia, "
-        f"edge {model.edge:.3f} mm ({model.seconds_parent:.2f}s)"
+        f"edge {model.edge:.3f} mm, sac {model.sac_edge:.3f} mm ({model.seconds_parent:.2f}s)"
     )
     try:
         pts, faces, rep = build_surface(model, centers, radii)
@@ -1697,7 +1740,7 @@ def process_vessel_aneurysm_dataset(
         print(f"  {exc}; rebuilding on the dense centerline radius")
         case, mask, det, centers, radii, fit, model = prepare_case(
             dataset_id, v_file, centerline_path, grid_spacing, max_grid_size,
-            target_edge_length, 0.0,
+            target_edge_length, 0.0, sac_edge_length,
         )
         pts, faces, rep = build_surface(model, centers, radii)
     tm = rep["timing"]
@@ -1721,6 +1764,7 @@ def process_vessel_aneurysm_dataset(
         radii=radii,
         sac_vertex_ids=np.flatnonzero(mask).astype(np.int32),
         edge_length=np.float64(model.edge),
+        sac_edge_length=np.float64(model.sac_edge),
     )
     print(f"  Saved {out_file} (area {ratio:.2f}x GT) in {time.perf_counter() - t_all:.2f}s")
     return out_file
@@ -1738,6 +1782,7 @@ def _process_one(dataset_id, v_file, args):
             grid_spacing=args.grid_spacing,
             max_grid_size=args.max_grid_size,
             radius_knot_mm=args.radius_knot_mm,
+            sac_edge_length=args.sac_edge_length,
         )
 
     return run_logged_case(
@@ -1757,8 +1802,12 @@ def main():
     parser.add_argument("--radius-knot-mm", type=float, default=RADIUS_KNOT_MM,
                         help="Spacing of the parent-radius knots along the centerline "
                              "(larger = coarser vessel; 0 keeps the dense radius)")
+    parser.add_argument("--sac-edge-length", type=float, default=SAC_EDGE_MM,
+                        help="VMTK target edge length on the aneurysm sac (mm; the vessel uses "
+                             "--target-edge-length; 0 = same as the vessel)")
     add_run_log_args(parser, LOG_FOLDER)
     parser.set_defaults(
+        target_edge_length=TARGET_EDGE_MM,
         from_folder=True,
         vessel_dir=CLEANDATA_UNIFORM,
         grid_spacing=DEFAULT_GRID_SPACING,
@@ -1775,6 +1824,7 @@ def main():
         "--max-grid-size", str(args.max_grid_size),
         "--centerline-dir", args.centerline_dir,
         "--radius-knot-mm", str(args.radius_knot_mm),
+        "--sac-edge-length", str(args.sac_edge_length),
         "--from-folder",
     ] + extra_log
     try:
