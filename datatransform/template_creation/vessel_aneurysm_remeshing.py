@@ -866,13 +866,16 @@ def place_spheres(C, R, up, r_parent, neck_ids, foreign_ids, gap, r_min=0.3):
     reaching within ``gap`` of a foreign tube is shrunk until it does not,
     or, when that would take more than 40% of it, moved straight away from
     that tube; anything left over is what the field's carve removes. A few
-    rounds, since a connecting move can undo a clearing one.
+    rounds, since a connecting move can undo a clearing one; the last move is
+    always a connecting one, because a detached sphere is a lost sac while a
+    sphere too close to foreign vessel is only trimmed by the carve.
     """
     C = np.array(C, dtype=np.float64)
     R = np.array(R, dtype=np.float64)
     neck_ids = neck_ids if len(neck_ids) else np.arange(len(up))
     tree_n = cKDTree(up[neck_ids])
     moved = 0
+    cleared = True
     for _ in range(3):
         C, m = connect_spheres(C, R, up[neck_ids], r_parent[neck_ids], tree_n)
         moved += m
@@ -896,6 +899,9 @@ def place_spheres(C, R, up, r_parent, neck_ids, foreign_ids, gap, r_min=0.3):
                     * (r_parent[j] + gap + R[i])
         if cleared:
             break
+    if not cleared:
+        C, m = connect_spheres(C, R, up[neck_ids], r_parent[neck_ids], tree_n)
+        moved += m
     return C, R, moved
 
 
@@ -955,6 +961,10 @@ def _sample_segments(p0, p1, r0, r1, step):
     c = p0[idx] + t[:, None] * seg[idx]
     r = r0[idx] + t * (r1[idx] - r0[idx])
     return np.vstack((c, p1)), np.concatenate((r, r1))
+
+
+class SacDetachedError(TemplateQualityError):
+    """The spheres came out as an island the surface dropped."""
 
 
 class CaseModel:
@@ -1057,6 +1067,7 @@ class CaseModel:
             g = float(np.max(hi - lo)) / (max_grid_size - 1)
         self.g = g
         self.gap = max(CARVE_GAP_MM, 2.5 * g)
+        self.carve = True
         dims = np.ceil((hi - lo) / g).astype(np.int64) + 1
         self.origin = lo
         self.shape = (int(dims[2]), int(dims[1]), int(dims[0]))
@@ -1146,7 +1157,7 @@ class CaseModel:
                 return out
 
             sac = smin(local(self.neck_balls, float(k) + 2.0 * g), S, k)
-            if len(self.foreign_balls[0]):
+            if self.carve and len(self.foreign_balls[0]):
                 np.maximum(sac, gap - local(self.foreign_balls, float(gap) + 2.0 * g), out=sac)
             sl = field[i0[2]:i1[2], i0[1]:i1[1], i0[0]:i1[0]]
             np.minimum(sl, sac.astype(np.float32), out=sl)
@@ -1457,7 +1468,7 @@ class CaseModel:
         idx = np.round((np.asarray(centers, float) - self.origin) / self.g).astype(int)[:, ::-1]
         idx = np.clip(idx, 0, np.array(self.shape) - 1)
         if np.any(field[tuple(idx.T)] >= 0.0):
-            raise TemplateQualityError("a sac sphere is not part of the surface")
+            raise SacDetachedError("a sac sphere is not part of the surface")
         t["contour"] = time.perf_counter() - t0
         t0 = time.perf_counter()
         pts = self.smooth(pts, faces)
@@ -1616,6 +1627,28 @@ def prepare_case(dataset_id, v_file, centerline_path, grid_spacing=DEFAULT_GRID_
     return case, mask, det, centers, radii, fit, model
 
 
+def build_surface(model, centers, radii):
+    """``model.manifold`` with its fallbacks, each tried at most once."""
+    flushed = False
+    while True:
+        try:
+            return model.manifold(centers, radii)
+        except TemplateQualityError as exc:
+            # Fallbacks, each at most once: a sac the carve cut off keeps its
+            # foreign-vessel contact instead; anything else flattens whatever
+            # sits on or just past an ostium plane.
+            if isinstance(exc, SacDetachedError) and model.carve:
+                model.carve = False
+                how = "without the foreign-vessel carve"
+            elif not flushed:
+                flushed = True
+                model.set_flush(FLUSH_FALLBACK_MM)
+                how = "with walls flattened behind the ostium planes"
+            else:
+                raise
+            print(f"  {exc}; retrying {how}")
+
+
 @with_dataset_id
 def process_vessel_aneurysm_dataset(
     dataset_id,
@@ -1650,12 +1683,18 @@ def process_vessel_aneurysm_dataset(
         f"edge {model.edge:.3f} mm ({model.seconds_parent:.2f}s)"
     )
     try:
-        pts, faces, rep = model.manifold(centers, radii)
+        pts, faces, rep = build_surface(model, centers, radii)
     except TemplateQualityError as exc:
-        # One fallback: flatten whatever sits on or just past an ostium plane.
-        print(f"  {exc}; retrying with walls flattened behind the ostium planes")
-        model.set_flush(FLUSH_FALLBACK_MM)
-        pts, faces, rep = model.manifold(centers, radii)
+        if radius_knot_mm <= 0:
+            raise
+        # Last resort: the parent on the full centerline radius, which never
+        # moves the tube wall next to a crowded ostium.
+        print(f"  {exc}; rebuilding on the dense centerline radius")
+        case, mask, det, centers, radii, fit, model = prepare_case(
+            dataset_id, v_file, centerline_path, grid_spacing, max_grid_size,
+            target_edge_length, 0.0,
+        )
+        pts, faces, rep = build_surface(model, centers, radii)
     tm = rep["timing"]
     print(
         "  Surface: " + ", ".join(f"{k} {v:.2f}s" for k, v in tm.items())
