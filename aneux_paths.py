@@ -56,7 +56,7 @@ EXTRA_CENTERLINES = os.path.join(EXPERIMENT_DIR, "centerlines")
 
 # Training-ready meshes. Each subfolder holds only `{dataset_id}.vtp` files.
 # uniformly_remeshed: original vessels remeshed finely (GT surface).
-# template_mesh: parent templates from variable_remeshing.py (decoder baseline).
+# template_mesh: parent vessel plus a three-sphere aneurysm (decoder baseline).
 # original_centerline: centerline_creation.py on uniformly_remeshed.
 # template_centerline was dropped (§15 item 3 / STAGE2 §2.5): same curve as
 # original_centerline; training parametrises from original_centerline.

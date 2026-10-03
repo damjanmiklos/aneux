@@ -887,6 +887,12 @@ def run_stage2_training(
         n_ram = dataset.preload_ram()
         if main:
             print(f"RAM preload: {n_ram} graphs")
+    n_worker_cache = dataset.enable_worker_cache(val_dataset.indices)
+    if main and n_worker_cache:
+        print(
+            f"Validation worker cache: {n_worker_cache} indices "
+            "(each loader worker keeps the graphs it reads; training stays on disk)"
+        )
 
     sample_idx = _first_cache_ready_index(dataset)
     if sample_idx is not None and main:

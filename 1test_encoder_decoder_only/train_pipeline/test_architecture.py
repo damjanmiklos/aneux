@@ -109,6 +109,7 @@ from raycast import (
     mesh_r_star_edge_stats,
     r_star_grid_stats,
     select_r_star_from_hits,
+    select_surface_residual_from_hits,
     template_ray_r_star,
     transform_vessel_mesh,
     voronoi_ok_hit,
@@ -850,7 +851,7 @@ def test_cross_attention_gaussian_distance_bias():
     from config import ATTN_SIGMA_INIT_MM, ATTN_SIGMA_MAX_MM, ATTN_SIGMA_MIN_MM
     from model import LatentCrossAttention, ProgressiveSplineDecoder, _decoder_token_allow
 
-    _assert(ATTN_SIGMA_INIT_MM == 2.0 and ATTN_SIGMA_MIN_MM == 1.0 and ATTN_SIGMA_MAX_MM == 2.5, "sigma bounds")
+    _assert(ATTN_SIGMA_INIT_MM == 2.0 and ATTN_SIGMA_MIN_MM == 1.0 and ATTN_SIGMA_MAX_MM == 3.0, "sigma bounds")
     dim = 6
     layer = LatentCrossAttention(dim, dim, dim, dim)
     _assert(abs(float(layer.log_sigma) - math.log(2.0)) < 1e-6, float(layer.log_sigma))
@@ -860,7 +861,7 @@ def test_cross_attention_gaussian_distance_bias():
     _assert(abs(float(layer.sigma()) - 1.0) < 1e-5, "sigma must clamp at 1 mm")
     with torch.no_grad():
         layer.log_sigma.fill_(math.log(8.0))
-    _assert(abs(float(layer.sigma()) - 2.5) < 1e-5, "sigma must clamp at 2.5 mm")
+    _assert(abs(float(layer.sigma()) - 3.0) < 1e-5, "sigma must clamp at 3 mm")
     with torch.no_grad():
         layer.log_sigma.fill_(math.log(2.0))
     _content_free_cross_attention(layer)
@@ -1330,6 +1331,7 @@ def test_tree_token_mask():
     is_junc = data.latent_is_junction.cpu().numpy()
     for tid in range(n_tracts):
         _assert(bool(attend[:, tid].any()), f"tract {tid} has no attending tokens")
+    _assert(not bool(data.latent_is_sphere.any()), "tube scaffold has no sphere tokens")
     exclusive = (tract_ids == 0) & (is_junc == 0)
     _assert(bool(exclusive.any()), "expected exclusive tract-0 tokens")
     slot0 = int(np.where(exclusive)[0][0])
@@ -1424,6 +1426,63 @@ def test_cache_hit():
         torch.save(stale, path)
         _ = factory[0]
         _assert(built["n"] == 2, "stale cache_version should rebuild")
+    finally:
+        shutil.rmtree(factory.cache_dir, ignore_errors=True)
+
+
+def test_worker_cache_keeps_val_indices_only():
+    import pickle
+
+    factory = _make_factory()
+    factory.cache_dir = tempfile.mkdtemp(prefix="aneux_wcache_")
+    factory.samples = [
+        {"dataset_id": "synthetic0", "vessel_file": "n/a", "centerline_file": "n/a"},
+        {"dataset_id": "synthetic1", "vessel_file": "n/a", "centerline_file": "n/a"},
+    ]
+    built = {"n": 0}
+
+    def _build(_sample):
+        built["n"] += 1
+        return make_synthetic_data(sac=False)
+
+    factory._build_data = _build
+    try:
+        n_keep = factory.enable_worker_cache([0])
+        _assert(n_keep == 1, n_keep)
+        a = factory[0]
+        stored = factory._worker_cache[0].x.clone()
+        a.x.add_(3.0)
+        _assert(torch.allclose(factory._worker_cache[0].x, stored), "getitem mutated the cache")
+        os.remove(factory._cache_path("synthetic0"))
+        b = factory[0]
+        _assert(built["n"] == 1, f"val index reloaded after the file was removed ({built['n']})")
+        _assert(torch.allclose(b.x, stored), "cached graph changed")
+        _assert(not torch.allclose(a.x, b.x), "clone shares storage with the caller")
+
+        _ = factory[1]
+        _assert(1 not in factory._worker_cache, "train index was stored")
+        _assert(built["n"] == 2, built["n"])
+        os.remove(factory._cache_path("synthetic1"))
+        _ = factory[1]
+        _assert(built["n"] == 3, "train index should rebuild when its file is gone")
+
+        state = factory.__getstate__()
+        _assert(state["_worker_cache"] == {}, "spawn state kept graphs")
+        _assert(state["_worker_cache_indices"] == {0}, state["_worker_cache_indices"])
+        _assert(0 in factory._worker_cache, "getstate cleared the live cache")
+
+        del factory._build_data
+        restored = pickle.loads(pickle.dumps(factory))
+        _assert(restored._worker_cache == {}, restored._worker_cache)
+        _assert(restored._worker_cache_indices == {0}, restored._worker_cache_indices)
+        path = restored._cache_path("synthetic0")
+        _assert(not os.path.isfile(path), path)
+        try:
+            restored[0]
+            raised = False
+        except Exception:
+            raised = True
+        _assert(raised, "unpickled worker should not see the parent's graphs")
     finally:
         shutil.rmtree(factory.cache_dir, ignore_errors=True)
 
@@ -1593,6 +1652,10 @@ def test_synthetic_data_fp32():
     _assert(data.token_attend.dtype == torch.bool, data.token_attend.dtype)
     _assert(data.latent_valid.dtype == torch.bool, data.latent_valid.dtype)
     _assert(data.latent_valid.shape[0] == data.latent_u.shape[0], "latent_valid length")
+    _assert(
+        data.latent_is_sphere.dtype == torch.bool and not bool(data.latent_is_sphere.any()),
+        "template without spheres has no centroid tokens",
+    )
     _assert(data.s_mm.shape[0] == data.u.shape[0], "s_mm must match fine nodes")
     _assert(data.s_mm_mid.shape[0] == data.u_mid.shape[0], "s_mm_mid must match mid nodes")
     _assert(data.s_mm_coarse.shape[0] == data.u_coarse.shape[0], "s_mm_coarse must match coarse nodes")
@@ -2076,6 +2139,46 @@ def test_ray_copies_sac_membership_from_the_hit_face():
     _assert(abs(got[1]) < 1e-6, got)
 
 
+def test_ray_membership_uses_the_wall_the_vertex_sits_on():
+    """A vertex just outside the sac must not copy the far wall further along the ray."""
+    from raycast import ray_sac_membership
+
+    gt_pts = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 5.0],
+            [1.0, 0.0, 5.0],
+            [0.0, 1.0, 5.0],
+        ],
+        dtype=np.float64,
+    )
+    gt_faces = np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int64)
+    gt_m = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    pos = np.array([[1.0 / 3.0, 1.0 / 3.0, 0.4]], dtype=np.float64)
+    normal = np.array([[0.0, 0.0, 1.0]], dtype=np.float64)
+    got = ray_sac_membership(pos, normal, gt_pts, gt_faces, gt_m)
+    _assert(abs(got[0] - 1.0 / 3.0) < 1e-3, got)
+
+
+def test_saved_sac_ids_are_membership_one():
+    from sac_membership import membership_from_sac_ids
+
+    pts = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]],
+        dtype=np.float64,
+    )
+    faces = np.array([[0, 1, 2], [1, 3, 2]], dtype=np.int64)
+    cl = np.array([[0.0, 0.0, -2.0], [2.0, 0.0, -2.0]], dtype=np.float64)
+    rad = np.ones(2, dtype=np.float64)
+    lines = np.array([2, 0, 1], dtype=np.int64)
+    got = membership_from_sac_ids(pts, faces, [0, 1], cl, rad, lines)
+    _assert(got is not None, got)
+    _assert(abs(float(got[0]) - 1.0) < 1e-6 and abs(float(got[1]) - 1.0) < 1e-6, got)
+    _assert(membership_from_sac_ids(pts, faces, [9], cl, rad, lines) is None, "out of range")
+
+
 def test_failed_detection_leaves_membership_absent():
     """A wall with no sac, and a missing radius, stay unweighted. Import stays numpy-only."""
     import warnings
@@ -2166,6 +2269,63 @@ def test_token_zero_decode_gain_is_per_token():
     _assert(out["z0_gain_sac_mm"] > 1.5, out)
     _assert(abs(out["per_token_gain"][1]) < 0.05, out["per_token_gain"])
     _assert(out["z0_gain_sac_mm"] > out["z0_gain_mm"], out)
+
+
+def test_token_gain_follows_membership_not_the_gap():
+    """The sac token is the aneurysm patch, even when the parent gap is larger."""
+    from latent_metrics import token_zero_decode_gain
+
+    template = torch.tensor(
+        [
+            [0.0, 0.0, 0.0],
+            [0.2, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+            [4.2, 0.0, 0.0],
+        ]
+    )
+    gt = template.clone()
+    gt[:2, 1] = 2.0
+    encoded = gt.clone()
+    zero = template.clone()
+    out = token_zero_decode_gain(
+        encoded,
+        zero,
+        template,
+        torch.zeros(4, dtype=torch.long),
+        torch.zeros(4, dtype=torch.long),
+        torch.tensor([0.0, 0.2, 4.0, 4.2]),
+        gt,
+        None,
+        torch.tensor([[0.0, 4.0]]),
+        torch.zeros(1, 2, dtype=torch.long),
+        torch.ones(1, 2, dtype=torch.bool),
+        n_graphs=1,
+        n_sac=1,
+        min_verts=1,
+        vert_sac=torch.tensor([0.0, 0.0, 1.0, 1.0]),
+    )
+    _assert(out["sac_token_index"] == [1], out["sac_token_index"])
+    _assert(out["z0_gain_sac_mm"] < 0.05, out)
+
+
+def test_surface_residual_keeps_a_near_inward_hit():
+    hits = [
+        {"t": -0.3, "voronoi_ok": True, "normal_dot": 0.9},
+        {"t": 6.0, "voronoi_ok": True, "normal_dot": 0.9},
+    ]
+    val, ok, amb = select_surface_residual_from_hits(hits)
+    _assert(ok and not amb and abs(val + 0.3) < 1e-6, (val, ok, amb))
+    near, ok_near, amb_near = select_surface_residual_from_hits(
+        [{"t": 0.02, "voronoi_ok": True, "normal_dot": 0.9}]
+    )
+    _assert(ok_near and not amb_near and abs(near - 0.02) < 1e-6, (near, ok_near, amb_near))
+    _tie, ok_tie, amb_tie = select_surface_residual_from_hits(
+        [
+            {"t": 0.20, "voronoi_ok": True, "normal_dot": 0.9},
+            {"t": 0.35, "voronoi_ok": True, "normal_dot": 0.9},
+        ]
+    )
+    _assert((not ok_tie) and amb_tie, (ok_tie, amb_tie))
 
 
 def test_kl_objective_uses_floor_only_during_warmup():
@@ -2877,6 +3037,249 @@ def test_rim_normal_term_sees_only_the_projected_slide():
             "weighted_total includes rim_normal")
 
 
+def _token_rows(pos, s, u, tract, length):
+    latent_pos = torch.zeros(length, 3)
+    latent_s = torch.zeros(length)
+    latent_u = torch.zeros(length)
+    latent_tract = torch.zeros(length, dtype=torch.long)
+    valid = torch.zeros(length, dtype=torch.bool)
+    attend = torch.zeros(length, MAX_TRACTS, dtype=torch.bool)
+    for i, p in enumerate(pos):
+        latent_pos[i] = torch.tensor(p, dtype=torch.float32)
+        latent_s[i] = float(s[i])
+        latent_u[i] = float(u[i])
+        latent_tract[i] = int(tract[i])
+        valid[i] = True
+        attend[i, int(tract[i])] = True
+    return {
+        "latent_u": latent_u,
+        "latent_s_mm": latent_s,
+        "latent_tract_id": latent_tract,
+        "latent_pos": latent_pos,
+        "latent_valid": valid,
+        "latent_is_junction": torch.zeros(length, dtype=torch.long),
+        "token_u": latent_u.clone(),
+        "token_pos": latent_pos.clone(),
+        "token_tract_id": latent_tract.clone(),
+        "token_attend": attend,
+    }
+
+
+def test_sphere_sidecar_centers():
+    from sac_membership import load_sphere_centers
+
+    tmp = tempfile.mkdtemp()
+    try:
+        path = os.path.join(tmp, "case.spheres.npz")
+        np.savez(
+            path,
+            centers=np.array([[1.0, 2.0, 3.0], [np.nan, 0.0, 0.0], [4.0, 5.0, 6.0]]),
+        )
+        got = load_sphere_centers(path)
+        _assert(got.shape == (2, 3), got.shape)
+        _assert(np.allclose(got[0], [1.0, 2.0, 3.0]) and np.allclose(got[1], [4.0, 5.0, 6.0]), got)
+        _assert(load_sphere_centers(os.path.join(tmp, "missing.npz")) is None, "missing sidecar")
+        np.savez(os.path.join(tmp, "bare.npz"), radii=np.array([1.0]))
+        _assert(load_sphere_centers(os.path.join(tmp, "bare.npz")) is None, "no centers key")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_sphere_centroid_tokens_keep_the_neck_station():
+    """Centroid tokens copy the neck station and land after it."""
+    from dataset import insert_sphere_tokens
+
+    tokens = _token_rows(
+        [(0.0, 0.0, 0.0), (6.0, 0.0, 0.0)],
+        [0.0, 6.0],
+        [0.0, 0.6],
+        [0, 0],
+        length=8,
+    )
+    neck = tokens["latent_pos"][0].clone()
+    out = insert_sphere_tokens(
+        tokens,
+        np.array([[0.0, 3.0, 0.0], [0.0, 3.0, 1.0], [1.0, 3.0, 0.0], [9.0, 9.0, 9.0]]),
+    )
+    sphere = out["latent_is_sphere"]
+    _assert(int(sphere.sum()) == 3, int(sphere.sum()))
+    slots = sphere.nonzero().view(-1)
+    _assert(int(slots.min()) > 1, slots.tolist())
+    _assert(bool(out["latent_valid"][0]) and not bool(sphere[0]), "neck station stays a centerline token")
+    _assert(torch.allclose(out["latent_pos"][0], neck), "neck position")
+    _assert(torch.allclose(out["latent_u"][int(slots[0])], out["latent_u"][0]), "copied u")
+    _assert(torch.allclose(out["latent_s_mm"][int(slots[0])], out["latent_s_mm"][0]), "copied s")
+    _assert(int(out["latent_tract_id"][int(slots[0])]) == 0, "copied tract")
+    _assert(torch.allclose(out["latent_pos"][int(slots[0])], torch.tensor([0.0, 3.0, 0.0])), "centroid")
+    _assert(bool(out["token_attend"][int(slots[0]), 0]), "sphere attends its tract")
+    _assert(not bool(out["token_attend"][int(slots[0]), 1:].any()), "sphere does not attend other tracts")
+    _assert(torch.equal(out["token_pos"], out["latent_pos"]), "token_pos clone")
+    _assert(torch.equal(out["token_u"], out["latent_u"]), "token_u clone")
+    _assert(torch.equal(out["token_tract_id"], out["latent_tract_id"]), "token tract clone")
+
+    full = insert_sphere_tokens(
+        _token_rows(
+            [(0.0, 0.0, 0.0), (8.0, 0.0, 0.0)],
+            [0.0, 8.0],
+            [0.0, 1.0],
+            [0, 0],
+            length=2,
+        ),
+        np.array([[0.0, 3.0, 0.0]]),
+    )
+    _assert(bool(full["latent_is_sphere"][1]) and not bool(full["latent_is_sphere"][0]), full["latent_is_sphere"])
+    _assert(bool(full["latent_valid"][0]) and bool(full["latent_valid"][1]), "both slots stay occupied")
+    _assert(torch.allclose(full["latent_s_mm"][1], full["latent_s_mm"][0]), "dropped slot copies the neck arc")
+
+    stuck_rows = _token_rows(
+        [(0.0, 0.0, 0.0), (0.0, 3.0, 0.0)],
+        [0.0, 4.0],
+        [0.0, 0.4],
+        [0, 0],
+        length=2,
+    )
+    before = stuck_rows["latent_pos"].clone()
+    stuck = insert_sphere_tokens(stuck_rows, np.array([[0.0, 3.0, 0.0]]))
+    _assert(not bool(stuck["latent_is_sphere"].any()), "must not take an earlier index than the copied station")
+    _assert(torch.allclose(stuck["latent_pos"], before), "stations unchanged when no later slot exists")
+
+    lone = insert_sphere_tokens(
+        _token_rows(
+            [(0.0, 0.0, 0.0), (5.0, 0.0, 0.0)],
+            [0.0, 5.0],
+            [0.0, 0.0],
+            [0, 1],
+            length=2,
+        ),
+        np.array([[0.0, 2.0, 0.0]]),
+    )
+    _assert(not bool(lone["latent_is_sphere"].any()), "the only token of a tract is not dropped")
+
+    plain = _token_rows([(0.0, 0.0, 0.0)], [0.0], [0.0], [0], length=4)
+    plain_pos = plain["latent_pos"].clone()
+    plain = insert_sphere_tokens(plain, None)
+    _assert(not bool(plain["latent_is_sphere"].any()), "None centers")
+    _assert(torch.allclose(plain["latent_pos"], plain_pos), "None does not move tokens")
+
+
+def test_sphere_token_attends_by_distance():
+    """A centroid is read when it is nearer than the centerline, including past the |Δu| mask."""
+    from model import CenterlineLatentHead, _decoder_token_allow
+
+    token_u = torch.tensor([0.00, 0.70, 0.75, 0.80, 0.85, 0.90, 0.00, 0.00])
+    token_tract = torch.zeros(8, dtype=torch.long)
+    token_pos = torch.tensor(
+        [
+            [0.0, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+            [0.0, 5.0, 0.0],
+            [0.0, 0.0, 0.0],
+        ]
+    )
+    valid = torch.tensor([True, True, True, True, True, True, True, False])
+    is_sphere = torch.tensor([False, False, False, False, False, False, True, False])
+    attend = torch.zeros(8, MAX_TRACTS, dtype=torch.bool)
+    attend[valid, 0] = True
+    node_u = torch.tensor([0.00, 0.00, 0.90, 0.90])
+    node_tract = torch.zeros(4, dtype=torch.long)
+    node_pos = torch.tensor(
+        [
+            [0.0, 5.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 5.0, 0.0],
+            [10.0, 0.0, 0.0],
+        ]
+    )
+    allow = _decoder_token_allow(
+        attend, node_tract, token_u, valid, token_tract, node_u, token_pos, node_pos, 5, 4.0,
+        token_is_sphere=is_sphere,
+    )
+    _assert(bool(allow[0, 6]) and bool(allow[0, 0]), allow[0].tolist())
+    _assert(not bool(allow[1, 6]) and bool(allow[1, 0]), allow[1].tolist())
+    _assert(bool(allow[2, 6]) and not bool(allow[2, 0]), allow[2].tolist())
+    _assert(not bool(allow[3, 6]) and bool(allow[3, 5]), allow[3].tolist())
+    _assert(not bool(allow[:, 7].any()), "padding stays out")
+
+    far_u = torch.tensor([0.50, 0.51, 0.52, 0.53, 0.54, 0.80])
+    far_pos = torch.tensor(
+        [[3.0, 0.0, 0.0], [6.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+    )
+    bare = _decoder_token_allow(
+        torch.ones(6, MAX_TRACTS, dtype=torch.bool),
+        torch.zeros(1, dtype=torch.long),
+        far_u,
+        torch.ones(6, dtype=torch.bool),
+        torch.zeros(6, dtype=torch.long),
+        torch.tensor([0.50]),
+        far_pos,
+        torch.zeros(1, 3),
+        5,
+        4.0,
+    )
+    _assert(bool(bare[0, :5].all()) and not bool(bare[0, 5]), bare[0].tolist())
+
+    head = CenterlineLatentHead(4, 4, 4, 4)
+    assign = head._assign_centres(
+        node_u, node_tract, node_pos, token_u, token_tract, token_pos, valid, is_sphere=is_sphere,
+    )
+    _assert(assign.tolist() == [6, 0, 6, 5], assign.tolist())
+
+
+def test_tract_mixer_skips_sphere_tokens():
+    from model import LatentTractSelfAttention
+
+    mix = LatentTractSelfAttention(4, n_heads=1)
+    torch.manual_seed(0)
+    torch.nn.init.normal_(mix.out.weight, std=0.8)
+    torch.nn.init.zeros_(mix.out.bias)
+    with torch.no_grad():
+        mix.alpha_raw.fill_(5.0)
+    z = torch.tensor([[[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]]])
+    pack = _token_pack(
+        torch.tensor([[0.2, 0.4, 0.4]]),
+        torch.zeros(1, 3, dtype=torch.long),
+        torch.zeros(1, 3, dtype=torch.long),
+    )
+    pack.latent_valid = torch.ones(1, 3, dtype=torch.bool)
+    pack.latent_is_sphere = torch.tensor([[False, False, True]])
+    with torch.no_grad():
+        kept = mix(z, pack)
+    _assert(torch.allclose(kept[0, 2], z[0, 2]), "sphere token must stay put")
+    _assert(not torch.allclose(kept[0, 0], z[0, 0], atol=1e-5), "centerline tokens still mix")
+    pack.latent_is_sphere = torch.zeros(1, 3, dtype=torch.bool)
+    with torch.no_grad():
+        blended = mix(z, pack)
+    _assert(not torch.allclose(blended[0, 2], z[0, 2], atol=1e-5), "without the flag the copied station is mixed")
+
+
+def test_scaffold_poses_sphere_centroids():
+    factory = _make_factory(latent_len=32)
+    cl, tpl, gt = _template_cylinder_pair()
+    world = np.array([[0.0, 4.0, 10.0]], dtype=np.float64)
+    data = factory.build_scaffold(cl, vessel_mesh=gt, template_mesh=tpl, sphere_centers=world)
+    flag = data.latent_is_sphere
+    _assert(int(flag.sum()) == 1, int(flag.sum()))
+    slot = int(flag.nonzero()[0])
+    origin = data.origin_shift.detach().cpu().numpy().reshape(3)
+    rotation = data.pose_R.detach().cpu().numpy().reshape(3, 3)
+    expected = ((world - origin) @ rotation).reshape(3)
+    got = data.latent_pos[slot].detach().cpu().numpy()
+    _assert(np.allclose(got, expected, atol=1e-4), (got, expected))
+    _assert(torch.equal(data.token_pos, data.latent_pos), "token_pos clone")
+    _assert(torch.equal(data.token_u, data.latent_u), "token_u clone")
+    same = (
+        (~flag)
+        & data.latent_valid
+        & (data.latent_tract_id == data.latent_tract_id[slot])
+        & torch.isclose(data.latent_s_mm, data.latent_s_mm[slot])
+    )
+    _assert(bool((torch.where(same)[0] < slot).any()), "centerline station keeps the earlier index")
+
+
 def main():
     configure_stage2_precision()
     tests = [
@@ -2923,6 +3326,7 @@ def main():
         test_pose_roundtrip,
         test_hybrid_far_points,
         test_cache_hit,
+        test_worker_cache_keeps_val_indices_only,
         test_batch_inc,
         test_scaffold_decode_without_vessel,
         test_train_val_split_covers_all,
@@ -2935,6 +3339,8 @@ def main():
         test_persist_if_remote_skips_same_path,
         test_geco_beta_not_clipped_to_zero_at_epoch_one,
         test_token_zero_decode_gain_is_per_token,
+        test_token_gain_follows_membership_not_the_gap,
+        test_surface_residual_keeps_a_near_inward_hit,
         test_kl_objective_uses_floor_only_during_warmup,
         test_scale_hpc_workers_follows_gpus,
         test_resource_monitor_snapshots_on_this_os,
@@ -2945,6 +3351,8 @@ def main():
         test_huber_and_radial_loss,
         test_sac_membership_is_one_on_the_lip_and_cosines_off_it,
         test_ray_copies_sac_membership_from_the_hit_face,
+        test_ray_membership_uses_the_wall_the_vertex_sits_on,
+        test_saved_sac_ids_are_membership_one,
         test_failed_detection_leaves_membership_absent,
         test_mesh_r_star_stats_stay_in_millimetres,
         test_kl_penalty_is_excess_over_target,
@@ -2975,6 +3383,11 @@ def main():
         test_mesh_terms_have_finite_gradients_at_identity,
         test_cross_attention_reads_world_direction,
         test_cross_attention_gaussian_distance_bias,
+        test_sphere_sidecar_centers,
+        test_sphere_centroid_tokens_keep_the_neck_station,
+        test_sphere_token_attends_by_distance,
+        test_tract_mixer_skips_sphere_tokens,
+        test_scaffold_poses_sphere_centroids,
         test_rim_normal_term_sees_only_the_projected_slide,
     ]
     failed = 0

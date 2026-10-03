@@ -1149,8 +1149,9 @@ def compute_latent_epoch_metrics(
     return acc.compute(beta=beta, rate_target=rate_target)
 
 
-# Tokens per case whose template sits farthest from the GT surface. That
-# gap is the sac: a healthy station's template already lies on the wall.
+# Tokens per case with the highest aneurysm membership. The three-sphere
+# template already lies on the wall, parent and sac alike, so the gap to the
+# GT no longer says where the aneurysm is.
 SAC_LIKE_TOKENS_PER_CASE = 5
 
 
@@ -1192,6 +1193,7 @@ def token_zero_decode_gain(
     n_graphs: int,
     n_sac: int | None = None,
     min_verts: int = 8,
+    vert_sac: Tensor | None = None,
 ) -> dict[str, Any]:
     """Per-token millimetres by which the encoded surface beats a z=0 decode.
 
@@ -1200,10 +1202,12 @@ def token_zero_decode_gain(
     vertices to the GT cloud. Gain = error(z=0) − error(encoded); positive
     means the latent moved the surface toward the GT.
 
-    Sac-like tokens are the ``n_sac`` eligible tokens whose template vertices
-    sit farthest from the GT (the bulge; about five per case). Val recon is
-    dominated by the healthy wall, so this split is the number that says
-    whether the latent is doing anything at the sac.
+    Sac tokens are the ``n_sac`` eligible tokens with the highest mean
+    aneurysm membership (``vert_sac``, about five per case). Without a
+    membership field the split falls back to the tokens whose template
+    vertices sit farthest from the GT. Val recon is dominated by the healthy
+    wall, so this split is the number that says whether the latent is doing
+    anything at the sac.
 
     ``token_*`` are ``[B, L]``. Returns case-averaged scalars plus the
     per-token gains of the last graph (tests). ``n_cases`` is 0 when nothing
@@ -1227,6 +1231,11 @@ def token_zero_decode_gain(
     case_n_sac: list[float] = []
     last_gains: list[float] = []
     last_sac_index: list[int] = []
+    sac_all = None
+    if vert_sac is not None and torch.is_tensor(vert_sac):
+        flat = vert_sac.detach().reshape(-1).float()
+        if int(flat.numel()) == int(vert_batch.reshape(-1).numel()):
+            sac_all = flat
 
     for g in range(n_graphs):
         vm = vert_batch.reshape(-1) == g
@@ -1251,8 +1260,10 @@ def token_zero_decode_gain(
         err_e = _nn_euclidean(x_encoded[vm], gt_g)
         err_z = _nn_euclidean(x_zero[vm], gt_g)
         err_t = _nn_euclidean(template[vm], gt_g)
+        sac_v = sac_all[vm] if sac_all is not None else None
         gains: list[float] = []
         gaps: list[float] = []
+        members: list[float] = []
         encs: list[float] = []
         zeros: list[float] = []
         for t in range(int(s_tok.numel())):
@@ -1266,11 +1277,13 @@ def token_zero_decode_gain(
             z = float(err_z[sel].mean())
             gains.append(z - e)
             gaps.append(float(err_t[sel].mean()))
+            members.append(float(sac_v[sel].mean()) if sac_v is not None else 0.0)
             encs.append(e)
             zeros.append(z)
         if not gains:
             continue
-        order = sorted(range(len(gains)), key=lambda i: gaps[i], reverse=True)
+        rank = members if max(members) > 1e-6 else gaps
+        order = sorted(range(len(gains)), key=lambda i: rank[i], reverse=True)
         k = min(n_sac, len(order))
         sac_idx = order[:k]
         other_idx = order[k:]

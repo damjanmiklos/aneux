@@ -1,10 +1,12 @@
 """Soft aneurysm membership on the ground-truth wall.
 
-The detector in ``aneurysm_detection`` labels the dome and a short neck
-lip. Membership is 1 on that patch and falls with a cosine over one parent
+The three-sphere template is built from a saved sac mask
+(``{id}.spheres.npz``, vertex ids into the uniformly remeshed vessel).
+Membership is 1 on that patch and falls with a cosine over one opened parent
 radius of geodesic distance past the lip, so the loss has no step at the neck.
-Template vertices copy the value of the ground-truth face their ray hits; the
-predicted mesh is never searched for an aneurysm.
+When the sidecar is missing, the same field is computed by
+``aneurysm_detection``. Template vertices copy the value of the ground-truth
+face their ray hits; the predicted mesh is never searched for an aneurysm.
 """
 from __future__ import annotations
 
@@ -15,6 +17,7 @@ import warnings
 import numpy as np
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import dijkstra
+from scipy.spatial import cKDTree
 
 
 def geodesic_distance_to_mask(pts, faces, mask):
@@ -87,6 +90,78 @@ def _detector():
     )
 
     return AneurysmDetectionError, _dedup_centerline, detect_aneurysm, parent_radius
+
+
+def load_sac_vertex_ids(path):
+    """Sac vertex ids from a template's ``.spheres.npz``, or None."""
+    if not path or not os.path.isfile(path):
+        return None
+    with np.load(path) as blob:
+        if "sac_vertex_ids" not in blob.files:
+            return None
+        ids = np.asarray(blob["sac_vertex_ids"], dtype=np.int64).reshape(-1)
+    if ids.size == 0:
+        return None
+    return ids
+
+
+def load_sphere_centers(path):
+    """World-frame sphere centroids from a template's ``.spheres.npz``, or None."""
+    if not path or not os.path.isfile(path):
+        return None
+    with np.load(path) as blob:
+        if "centers" not in blob.files:
+            return None
+        centers = np.asarray(blob["centers"], dtype=np.float64).reshape(-1, 3)
+    keep = np.isfinite(centers).all(axis=1)
+    centers = centers[keep]
+    if centers.shape[0] == 0:
+        return None
+    return np.ascontiguousarray(centers)
+
+
+def _neck_decay_mm(pts, mask, cl_pts, cl_rad, cl_lines):
+    """One opened parent radius at the sac, clipped to a usable band."""
+    _, dedup, _, opened_radius = _detector()
+    up, ur, edges = dedup(cl_pts, cl_rad, cl_lines)
+    r_parent = opened_radius(up, ur, edges)
+    _, nearest = cKDTree(up).query(pts[mask], k=1, workers=1)
+    r_neck = float(np.median(r_parent[np.asarray(nearest, dtype=np.int64)]))
+    if not np.isfinite(r_neck):
+        return None
+    return float(np.clip(r_neck, 0.35, 8.0))
+
+
+def membership_from_sac_ids(pts, faces, sac_ids, cl_pts, cl_rad, cl_lines):
+    """Membership from the ids the three-sphere template was fitted to.
+
+    Returns None when the ids do not index this wall, so the caller can fall
+    back to detecting the sac again.
+    """
+    pts = np.asarray(pts, dtype=np.float64).reshape(-1, 3)
+    faces = np.asarray(faces, dtype=np.int64).reshape(-1, 3)
+    n = int(pts.shape[0])
+    ids = np.asarray(sac_ids, dtype=np.int64).reshape(-1)
+    if n == 0 or faces.shape[0] == 0 or ids.size == 0:
+        return None
+    if int(ids.min()) < 0 or int(ids.max()) >= n:
+        return None
+    if cl_rad is None:
+        return None
+    cl_pts = np.asarray(cl_pts, dtype=np.float64).reshape(-1, 3)
+    cl_rad = np.asarray(cl_rad, dtype=np.float64).reshape(-1)
+    cl_lines = np.asarray(cl_lines, dtype=np.int64).reshape(-1)
+    if cl_pts.shape[0] == 0 or cl_rad.shape[0] != cl_pts.shape[0] or cl_lines.size == 0:
+        return None
+    mask = np.zeros(n, dtype=bool)
+    mask[ids] = True
+    try:
+        decay = _neck_decay_mm(pts, mask, cl_pts, cl_rad, cl_lines)
+    except Exception:
+        return None
+    if decay is None:
+        return None
+    return membership_from_mask(pts, faces, mask, decay)
 
 
 def wall_sac_membership(pts, faces, cl_pts, cl_rad, cl_lines):

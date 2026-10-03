@@ -3,7 +3,8 @@
 Folders (each `{dataset_id}.vtp`):
 
 - uniformly_remeshed: original vessels remeshed finely (GT surface)
-- template_mesh: `variable_remeshing.py` parent templates (decoder baseline)
+- template_mesh: three-sphere aneurysm templates (decoder baseline), each
+  with a sibling `{id}.spheres.npz`
 - original_centerline: `centerline_creation.py` on uniformly_remeshed
 
 `template_centerline` is dropped (§15 item 3). Completeness gating does not

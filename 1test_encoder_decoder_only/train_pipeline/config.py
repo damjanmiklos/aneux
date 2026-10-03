@@ -69,7 +69,12 @@ FAR_CL_MARGIN_MM = 1.0
 #     not reused.
 # 15: aneurysm membership (gt_sac_m, sac_m, sac_m_mid, sac_m_coarse) for the
 #     40/60 reconstruction and radial split. v14 files are not reused.
-CACHE_VERSION = 15
+# 16: three-sphere templates replaced the parent-tube meshes. r* is the signed
+#     normal residual (a vertex already outside the GT must move inward), and
+#     sac membership is taken from the companion .spheres.npz. The cache key
+#     has no source hash, so v15 files are not reused.
+# 17: one latent token at each sphere centroid. v16 files are not reused.
+CACHE_VERSION = 17
 
 # (n_length, n_radial) per hierarchy level
 LEVEL_COARSE = (40, 6)
@@ -78,11 +83,11 @@ LEVEL_FINE = (1000, 64)
 HIERARCHY_LEVELS = (LEVEL_COARSE, LEVEL_MID, LEVEL_FINE)
 
 # Template hierarchy is built at cache time from template_mesh by sizing-field
-# edge collapse (coarsen.py): h_L = max(h, min(k_L h, 2 pi R_template / N_min)),
-# with h the template's TargetEdgeLength.  k keeps the sac/parent density
-# ratio (decimation erased it); N_min is the fewest vertices a thin branch or
-# a rim may keep around its circumference.  Over the 742 templates this gives
-# mid ~24 % and coarse ~10 % of the fine vertices.
+# edge collapse (coarsen.py): h_L = max(h, min(k_L h, 2 pi R / N_min)).
+# The three-sphere meshes do not store TargetEdgeLength; h is the realized
+# edge (about 0.15 mm on the sac, about 0.3 mm on the vessel). k keeps that
+# ratio. N_min is the fewest vertices a thin branch or a rim may keep around
+# its circumference. R falls back to the distance to the centerline.
 TEMPLATE_MID_K = 2.0
 TEMPLATE_COARSE_K = 3.5
 TEMPLATE_MID_N_MIN = 8
@@ -113,6 +118,9 @@ GAMMA_THETA_DIM = 2 * len(THETA_HARMONICS)  # 8
 # --- Latent trajectory (tree-valued; 1 mm / 2 mm contract, §5.4) ---
 # Shared with Stage 1. Distinct from DENSE_CL_SPACING_MM (cache-time samples).
 TOKEN_SPACING_MM = 2.0
+# One latent token per aneurysm sphere, at its centroid. The centerline
+# tokens stay every TOKEN_SPACING_MM; these three are extra stations.
+N_SPHERE_LATENT_TOKENS = 3
 CL_SAMPLE_MM = 1.0
 # LATENT_LEN is a padding maximum, not the token count. Per branch
 # n_tok = floor(L / TOKEN_SPACING_MM) + 1; unused slots are masked by
@@ -139,9 +147,10 @@ OSTIUM_NEIGHBOR_MM = 4.0
 #   score = q·k / sqrt(d) − ||x_vertex − p_token||² / (2 σ²), distances in mm.
 # One learnable log σ per decoder level (the cross-attention is a single head).
 # σ = exp(log_sigma), clamped to [ATTN_SIGMA_MIN_MM, ATTN_SIGMA_MAX_MM].
+# 3 mm reaches the wall of a larger sphere from the token at its centroid.
 ATTN_SIGMA_INIT_MM = 2.0
 ATTN_SIGMA_MIN_MM = 1.0
-ATTN_SIGMA_MAX_MM = 2.5
+ATTN_SIGMA_MAX_MM = 3.0
 # Active-unit test for post-training standardisation (§5.3.6 item 7, §5.3.7).
 ACTIVE_UNIT_KL_THRESH = 0.01
 Z_ATTN_HEADS = 4
@@ -196,22 +205,21 @@ SHEAR_MAX_MM = SHEAR_MAX_BASE_MM  # fallback alias; prefer SHEAR_MAX_BASE_MM
 # −RADIAL_FLOOR_FRAC * r_local. Mid/fine residuals stay ≥ that floor.
 R_MARGIN_MM = TUBE_RADIUS_MM
 # Mid/fine residuals are bounded to RESIDUAL_BOUND_EDGES × the level's local
-# template edge length (tanh), so the free coarse level must carry the bulk
-# deformation and each finer level only adds detail at its own scale.  With
-# the old r_local-relative bounds (shear up to max(3 mm, 1.5 r)) the fine head
-# took the whole 8.8 mm sac inflation on p131 per vertex -- |ds| p50 4.6 mm,
-# tanh saturated, 41 % of the sac triangles flipped -- while the coarse level
-# stayed at |dx| 0.04 mm.  None restores the old heads.
+# template edge length (tanh). The three-sphere template is already within
+# about a millimetre of the wall, so these levels only add detail at their
+# own edge scale; the coarse level stays free for the remaining offset.
+# The bound is what stopped the fine head from taking an 8 mm inflation on
+# its own (p131: |ds| p50 4.6 mm, 41 % of the sac triangles flipped).
 RESIDUAL_BOUND_EDGES = 2.0
 # Rim vertices keep their template position along the ostium-plane normal
 # (the displacement is projected, not the position): a template rim that sits
 # 0.7 mm off its fitted plane (p131) was snapped onto it even at identity.
 RIM_PROJECT_DISPLACEMENT = True
 # The decoder's latent cross-attention also queries with each node's
-# world-frame template normal (the encoder's frame), not only (u, θ): θ's
-# zero is an arbitrary per-case Bishop direction, so without it a node could
-# not ask the latent "am I on the side with the bulge?".  False restores the
-# old layer shapes (for pre-v11 checkpoints).
+# world-frame template normal, not only (u, θ). The three-sphere sac is
+# already in the vertex positions; θ's zero is still an arbitrary Bishop
+# direction, so the normal is what says which way is out. False restores
+# the old layer shapes (for pre-v11 checkpoints).
 DECODER_QUERY_DIRECTION = True
 
 # --- Optimisation ---
@@ -265,8 +273,9 @@ GECO_BETA_MIN = 1e-4  # dual floor; the always-on weight is separate and does no
 GECO_BETA_MAX = 10.0  # cap so reconstruction is not starved if the dual overshoots
 GECO_ETA = 1e-3  # log-space step per nat of (KL̄_raw − R*) per optimiser step
 TOKEN_KL_FLOOR_NATS = 0.5  # per-token minimum during KL_WARMUP_EPOCHS only
-# How many of the most sac-like tokens (largest template-to-GT gap) are
-# averaged when logging the encoded-vs-z=0 gain. A case has about this many.
+# How many tokens with the highest aneurysm membership are averaged when
+# logging the encoded-vs-z=0 gain. The template already contains the sac, so
+# the largest template-to-GT gap is no longer where the aneurysm is.
 Z0_SAC_TOKENS = 5
 
 LAMBDA_DISP = 0.15
@@ -348,6 +357,7 @@ FOLLOW_BATCH = [
     "latent_s_mm",
     "latent_tract_id",
     "latent_is_junction",
+    "latent_is_sphere",
     "latent_pos",
     "latent_valid",
     "token_attend",

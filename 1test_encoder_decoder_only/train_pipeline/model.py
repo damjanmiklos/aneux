@@ -101,7 +101,7 @@ TOKEN_ATTEND_K = int(_cfg_get("TOKEN_ATTEND_K", 5))
 OSTIUM_NEIGHBOR_MM = float(_cfg_get("OSTIUM_NEIGHBOR_MM", 4.0))
 ATTN_SIGMA_INIT_MM = float(_cfg_get("ATTN_SIGMA_INIT_MM", 2.0))
 ATTN_SIGMA_MIN_MM = float(_cfg_get("ATTN_SIGMA_MIN_MM", 1.0))
-ATTN_SIGMA_MAX_MM = float(_cfg_get("ATTN_SIGMA_MAX_MM", 2.5))
+ATTN_SIGMA_MAX_MM = float(_cfg_get("ATTN_SIGMA_MAX_MM", 3.0))
 RADIAL_FLOOR_FRAC = float(_cfg_get("RADIAL_FLOOR_FRAC", 0.8))
 SHEAR_RLOCAL_K = float(_cfg_get("SHEAR_RLOCAL_K", 1.5))
 LATENT_HEAD_LAYERS = int(_cfg_get("LATENT_HEAD_LAYERS", 3))
@@ -261,6 +261,15 @@ def _token_tables(data, n_graphs: int, latent_len: int):
     if n_graphs != 1:
         raise ValueError("Missing latent_u_batch for batched tree tokens")
     return u, tract, attend, is_junc, valid
+
+
+def _token_sphere_table(data, n_graphs: int, latent_len: int, device) -> Tensor:
+    """``[B, L]`` bool. Missing field means every token is a centerline station."""
+    flag = getattr(data, "latent_is_sphere", None)
+    if flag is None or not torch.is_tensor(flag):
+        return torch.zeros(n_graphs, latent_len, dtype=torch.bool, device=device)
+    flag = _reshape_token_field(_as_bool_mask(flag), n_graphs, latent_len)
+    return flag.to(device=device)
 
 
 def _token_s_table(data, n_graphs: int, latent_len: int) -> Tensor:
@@ -614,32 +623,64 @@ class CenterlineLatentHead(nn.Module):
         token_tract: Tensor,
         token_pos: Tensor | None,
         valid: Tensor,
+        is_sphere: Tensor | None = None,
     ) -> Tensor:
-        """Nearest token along the tree (same-tract |Δu|; 3-D fallback)."""
+        """Nearest centerline token along the tree, then a closer sphere centroid.
+
+        Sphere tokens share the neck station's arc length, so they are kept
+        out of the |Δu| tie. A point moves to a centroid only when that
+        centroid is strictly closer in millimetres than its centerline token.
+        """
         n_c = u_pts.size(0)
         if n_c == 0:
             return u_pts.new_zeros((0,), dtype=torch.long)
+        sphere = None
+        if is_sphere is not None:
+            sphere = is_sphere.reshape(-1).bool().to(device=valid.device)
+            if sphere.numel() != valid.numel():
+                sphere = None
+        centerline = valid if sphere is None else valid & ~sphere
         du = (u_pts.unsqueeze(1) - token_u.unsqueeze(0)).abs()
         same = tract_pts.unsqueeze(1) == token_tract.unsqueeze(0)
         large = du.new_tensor(1.0e6)
         dist = torch.where(same, du, large)
-        dist = dist.masked_fill(~valid.unsqueeze(0), large)
-        has_same = (same & valid.unsqueeze(0)).any(dim=1)
+        dist = dist.masked_fill(~centerline.unsqueeze(0), large)
+        has_same = (same & centerline.unsqueeze(0)).any(dim=1)
         if pos is not None and token_pos is not None and pos.size(0) == n_c:
             d3 = torch.cdist(pos, token_pos)
-            d3 = d3.masked_fill(~valid.unsqueeze(0), large)
+            d3 = d3.masked_fill(~centerline.unsqueeze(0), large)
             dist = torch.where(has_same.unsqueeze(1), dist, d3)
         else:
-            du_all = du.masked_fill(~valid.unsqueeze(0), large)
+            du_all = du.masked_fill(~centerline.unsqueeze(0), large)
             dist = torch.where(has_same.unsqueeze(1), dist, du_all)
-        return dist.argmin(dim=1)
+        assign = dist.argmin(dim=1)
+        if (
+            sphere is None
+            or pos is None
+            or token_pos is None
+            or pos.size(0) != n_c
+            or not bool((sphere & valid).any())
+        ):
+            return assign
+        d_sp = torch.cdist(pos, token_pos)
+        d_sp = d_sp.masked_fill(~(sphere & valid).unsqueeze(0), large)
+        nearest = d_sp.argmin(dim=1)
+        d_near = d_sp.gather(1, nearest.unsqueeze(1)).squeeze(1)
+        if bool(centerline.any()):
+            d_as = (pos - token_pos[assign]).norm(dim=-1)
+            take = centerline[assign] & (d_near < d_as)
+        else:
+            take = d_near < large
+        return torch.where(take, nearest, assign)
 
-    def _pool_graph(self, h, u_pts, tract_pts, pos, token_u, token_tract, token_pos, valid):
+    def _pool_graph(self, h, u_pts, tract_pts, pos, token_u, token_tract, token_pos, valid, is_sphere=None):
         l = token_u.size(0)
         pooled = h.new_zeros(l, h.size(-1))
         if h.size(0) == 0 or not bool(valid.any()):
             return pooled
-        assign = self._assign_centres(u_pts, tract_pts, pos, token_u, token_tract, token_pos, valid)
+        assign = self._assign_centres(
+            u_pts, tract_pts, pos, token_u, token_tract, token_pos, valid, is_sphere=is_sphere,
+        )
         pooled = scatter(h, assign, dim=0, dim_size=l, reduce="max")
         return pooled * valid.unsqueeze(-1).to(dtype=pooled.dtype)
 
@@ -668,6 +709,7 @@ class CenterlineLatentHead(nn.Module):
         token_u, token_tract, _, _, valid = _token_tables(data, n_graphs, self.latent_len)
         token_s = _token_s_table(data, n_graphs, self.latent_len)
         token_pos = _token_pos_table(data, n_graphs, self.latent_len)
+        is_sphere = _token_sphere_table(data, n_graphs, self.latent_len, h.device)
         depth = _token_depth_table(data, n_graphs, self.latent_len, h.device, h.dtype)
         valid = valid.to(device=h.device)
         token_u = token_u.to(device=h.device, dtype=h.dtype)
@@ -680,6 +722,7 @@ class CenterlineLatentHead(nn.Module):
             tpos = None if token_pos is None else token_pos[0]
             pooled[0] = self._pool_graph(
                 h, u_pts, tract_pts, pos, token_u[0], token_tract[0], tpos, valid[0],
+                is_sphere=is_sphere[0],
             )
         else:
             for g in range(n_graphs):
@@ -689,6 +732,7 @@ class CenterlineLatentHead(nn.Module):
                 pooled[g] = self._pool_graph(
                     h[mask], u_pts[mask], tract_pts[mask], gpos,
                     token_u[g], token_tract[g], tpos, valid[g],
+                    is_sphere=is_sphere[g],
                 )
         return self._encode_tokens(pooled, token_s, token_u, token_tract, depth, valid)
 
@@ -766,15 +810,31 @@ def _decoder_token_allow(
     node_pos: Tensor | None,
     k: int,
     ostium_mm: float,
+    token_is_sphere: Tensor | None = None,
 ):
-    """[N, L] mask: K nearest same-branch tokens + ostium-neighbour tokens."""
+    """[N, L] mask: K nearest same-branch tokens + ostium-neighbour tokens.
+
+    Sphere tokens copy a neck station's arc length, so they are left out of
+    that |Δu| set and out of the ostium rule. A sphere is added only when its
+    centroid is strictly closer in millimetres than the nearest allowed
+    centerline token.
+    """
     tract = node_tract.clamp(0, MAX_TRACTS - 1)
     allow = token_attend[:, tract].transpose(0, 1)
     allow = allow & latent_valid.unsqueeze(0)
     if token_tract is None:
         return allow
+    sphere = None
+    if token_is_sphere is not None:
+        sphere = token_is_sphere.reshape(-1).bool()
+        if sphere.numel() != token_u.numel():
+            sphere = None
+        else:
+            sphere = sphere.to(device=allow.device)
     same = tract.unsqueeze(1) == token_tract.unsqueeze(0)
     cand = allow & same
+    if sphere is not None:
+        cand = cand & ~sphere.unsqueeze(0)
     du = (node_u.unsqueeze(1) - token_u.unsqueeze(0)).abs()
     large = du.new_tensor(1.0e6)
     dist = torch.where(cand, du, large)
@@ -786,11 +846,15 @@ def _decoder_token_allow(
         knn = knn & cand
     extra = torch.zeros_like(allow)
     ost_tok = ((token_u <= 0.05) | (token_u >= 0.95)) & latent_valid
+    if sphere is not None:
+        ost_tok = ost_tok & ~sphere
     if token_pos is not None and node_pos is not None and bool(ost_tok.any()):
         d_tt = torch.cdist(token_pos, token_pos)
         near_ost = (d_tt <= float(ostium_mm)) & ost_tok.unsqueeze(0)
         diff_tr = token_tract.unsqueeze(1) != token_tract.unsqueeze(0)
         nbr = ((near_ost & diff_tr).any(dim=1) & latent_valid)
+        if sphere is not None:
+            nbr = nbr & ~sphere
         d_vo = torch.cdist(node_pos, token_pos[ost_tok])
         v_near = (d_vo <= float(ostium_mm)).any(dim=1)
         extra = v_near.unsqueeze(1) & nbr.unsqueeze(0)
@@ -798,7 +862,23 @@ def _decoder_token_allow(
         v_near = (node_u <= 0.15) | (node_u >= 0.85)
         other = (token_tract.unsqueeze(0) != tract.unsqueeze(1)) & ost_tok.unsqueeze(0)
         extra = v_near.unsqueeze(1) & other
-    return (knn | extra) & latent_valid.unsqueeze(0)
+    allow = (knn | extra) & latent_valid.unsqueeze(0)
+    if (
+        sphere is None
+        or token_pos is None
+        or node_pos is None
+        or node_pos.numel() == 0
+        or not bool(sphere.any())
+    ):
+        return allow
+    allow = allow & ~sphere.unsqueeze(0)
+    node_xyz = node_pos.to(device=allow.device, dtype=token_pos.dtype)
+    token_xyz = token_pos.to(device=allow.device)
+    dist3 = torch.cdist(node_xyz, token_xyz)
+    inf = dist3.new_tensor(float("inf"))
+    nearest_cl = dist3.masked_fill(~allow, inf).min(dim=1).values
+    closer = (dist3 < nearest_cl.unsqueeze(1)) & sphere.unsqueeze(0) & latent_valid.unsqueeze(0)
+    return allow | closer
 
 
 class LatentCrossAttention(nn.Module):
@@ -884,6 +964,7 @@ class LatentCrossAttention(nn.Module):
         token_pos: Tensor | None = None,
         node_pos: Tensor | None = None,
         node_dir: Tensor | None = None,
+        token_is_sphere: Tensor | None = None,
     ) -> Tensor:
         gamma_u = harmonic_encoding_u(s, u)
         gamma_th = harmonic_encoding_theta(theta)
@@ -925,6 +1006,7 @@ class LatentCrossAttention(nn.Module):
                     npos,
                     self.k_tokens,
                     self.ostium_mm,
+                    None if token_is_sphere is None else token_is_sphere[g],
                 )
             else:
                 allow = token_attend[g][:, tract[node_idx]].transpose(0, 1)
@@ -1081,8 +1163,9 @@ class LatentTractSelfAttention(nn.Module):
     """Mild per-tract residual mix of latent tokens *before* reparameterization.
 
     Q/K concatenate [LN(z), γ(u)]; values come from z. Junction tokens
-    (tract_id < 0) and padded tokens (`latent_valid=False`) are left unchanged
-    so KL still sees independent stations on those slots.
+    (tract_id < 0), sphere-centroid tokens, and padded tokens
+    (`latent_valid=False`) are left unchanged so KL still sees independent
+    stations on those slots.
     """
 
     def __init__(
@@ -1125,7 +1208,8 @@ class LatentTractSelfAttention(nn.Module):
         token_u = token_u.to(device=z.device, dtype=z.dtype)
         token_s = token_s.to(device=z.device, dtype=z.dtype)
         valid = valid.to(device=z.device)
-        junc = is_junc.bool() | (token_tract < 0) | ~valid
+        is_sphere = _token_sphere_table(data, n_graphs, latent_len, z.device)
+        junc = is_junc.bool() | (token_tract < 0) | ~valid | is_sphere
         z_n = self.ln(z)
         gamma_u = harmonic_encoding_u(token_s, token_u).view(n_graphs, latent_len, -1)
         qk = torch.cat([z_n, gamma_u], dim=-1)
@@ -1485,6 +1569,7 @@ class ProgressiveSplineDecoder(nn.Module):
         token_pos,
         node_pos,
         node_dir=None,
+        token_is_sphere=None,
     ):
         return layer(
             z, s, u, theta, node_batch, tract, token_s, token_u, token_attend,
@@ -1493,6 +1578,7 @@ class ProgressiveSplineDecoder(nn.Module):
             token_pos=token_pos,
             node_pos=node_pos,
             node_dir=node_dir if self.query_dir else None,
+            token_is_sphere=token_is_sphere,
         )
 
     def _fuse_geom(self, h, fuse, data, n, level):
@@ -1507,6 +1593,7 @@ class ProgressiveSplineDecoder(nn.Module):
         )
         token_s = _token_s_table(data, n_graphs, self.latent_len)
         token_pos = _token_pos_table(data, n_graphs, self.latent_len)
+        token_is_sphere = _token_sphere_table(data, n_graphs, self.latent_len, z.device)
         if token_pos is not None:
             token_pos = token_pos.to(device=z.device, dtype=z.dtype)
         token_u = token_u.to(device=z.device, dtype=z.dtype)
@@ -1530,6 +1617,7 @@ class ProgressiveSplineDecoder(nn.Module):
             self.cross_coarse, z, s_c, data.u_coarse, data.theta_coarse, batch_c,
             data.tract_id_coarse, token_s, token_u, token_attend, latent_valid, token_tract,
             token_pos, pos_c, getattr(data, "normal_coarse", None),
+            token_is_sphere=token_is_sphere,
         )
         h_c = self._fuse_geom(h_c, self.geom_fuse_c, data, pos_c.size(0), "coarse")
         h_c = self._run_attn(
@@ -1567,6 +1655,7 @@ class ProgressiveSplineDecoder(nn.Module):
             self.cross_mid, z, s_m, data.u_mid, data.theta_mid, batch_m,
             data.tract_id_mid, token_s, token_u, token_attend, latent_valid, token_tract,
             token_pos, pos_m, getattr(data, "normal_mid", None),
+            token_is_sphere=token_is_sphere,
         ) + self.mid_init(dx_m0) + torch.sigmoid(self.alpha_c_raw) * h_c_up
         h_m = self._fuse_geom(h_m, self.geom_fuse_m, data, pos_m.size(0), "mid")
         r_m = _level_r_local(data, pos_m.size(0), "mid", self.r_margin)
@@ -1605,6 +1694,7 @@ class ProgressiveSplineDecoder(nn.Module):
             self.cross_fine, z, s_f, data.u, data.theta, batch_f,
             data.tract_id, token_s, token_u, token_attend, latent_valid, token_tract,
             token_pos, pos_f, getattr(data, "normal", None),
+            token_is_sphere=token_is_sphere,
         ) + self.fine_init(dx_f0) + torch.sigmoid(self.alpha_m_raw) * h_m_up
         h_f = self._fuse_geom(h_f, self.geom_fuse_f, data, pos_f.size(0), "fine")
         r_f = _level_r_local(data, pos_f.size(0), "fine", self.r_margin)

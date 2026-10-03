@@ -4,7 +4,7 @@
 Hardware: `gpu` node — 64-core EPYC 7763, 256 GB, 4× A100 40 GB (16 cores/GPU).
 Workers and DDP ranks follow the GPUs/CPUs Slurm actually gave this job.
 
-Production (4 GPU, 2 days 4 hours)::
+Production (4 GPU, batch 4/GPU, 250 epochs, 30 hours)::
 
     sbatch --account=<account> --mail-user=YOU@email hpc/train_stage2.sbatch
 
@@ -68,14 +68,14 @@ from run_report import make_run_dir
 # same global batch, so what it picks carries over to this production setup.
 # The split has 493 training cases, so 25/GPU gave 5 optimiser steps an
 # epoch and ~2.5k steps in total, far too few for the decoder to converge;
-# 4/GPU gives ~31 steps an epoch (~15k over 500 epochs) at about the same
+# 4/GPU gives ~31 steps an epoch (~7.8k over 250 epochs) at about the same
 # wall time: ~94% of a step is SplineConv, whose cost is per sample, so an
 # epoch costs the same whatever the batch (the old run: ~195 s an epoch).
 # DataLoader / cache workers follow SLURM_CPUS_PER_TASK (2× oversubscribe on
 # 16 cores/GPU). Override with ANEUX_NUM_WORKERS / ANEUX_CACHE_WORKERS.
 BATCH_SIZE = int(os.environ.get("ANEUX_BATCH_SIZE", "4"))
 ACCUM_STEPS = int(os.environ.get("ANEUX_ACCUM_STEPS", "1"))
-EPOCHS = int(os.environ.get("ANEUX_EPOCHS", "500"))
+EPOCHS = int(os.environ.get("ANEUX_EPOCHS", "250"))
 # Every 5th epoch. Validating every epoch (three decoder passes, workers off)
 # was about 30% of the previous job. z=0 is scored on the same passes.
 VAL_EVERY = int(os.environ.get("ANEUX_VAL_EVERY", "5"))

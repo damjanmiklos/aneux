@@ -1182,11 +1182,10 @@ def apply_train_augmentations(batch, generator=None):
     """§8 train-time augs: L/R mirror (per graph) and ±5° pose jitter.
 
     No θ-phase.  It rotated only the decoder's θ labels while the encoder saw
-    the unrotated points and the scaffold kept its geometry, so the angular
-    position the decoder queries the latent with no longer matched where the
-    aneurysm is -- the latent could not say *where* around the vessel anything
-    sits, and the decoder fell back to finding the sac from template density
-    (z = 0 decoded the same mesh as μ on the failed run).
+    the unrotated points and the scaffold kept its geometry, so the query no
+    longer matched the side of the vessel the latent was describing. The
+    three-sphere bulge is already in the template; a θ-only rotation would
+    still point the query at the wrong side of that bulge.
     """
     apply_mirror(batch, p=0.5, generator=generator)
     apply_pose_jitter(batch, max_deg=POSE_JITTER_DEG, generator=generator)
@@ -1377,6 +1376,7 @@ def _score_zero_decode(model, batch, out):
         token_tract,
         token_valid,
         n_graphs=n_g,
+        vert_sac=getattr(batch, "sac_m", None),
     )
 
 
@@ -1394,8 +1394,8 @@ def evaluate_epoch(
     """Validation recon. `sample=False` is the μ path (σ=0, used for best.pt).
 
     ``zero_decode`` also decodes z=0 and records, per token, how many
-    millimetres the encoded surface beats it. The sac-like slice of that
-    gain is the number val recon itself does not show.
+    millimetres the encoded surface beats it. The sac-membership slice of
+    that gain is the number val recon itself does not show.
     """
     model.eval()
     totals = _zero_tensor_meters()
@@ -2034,7 +2034,7 @@ def train_model(
                 _log(
                     "  z=0: encoded beats it by "
                     f"{float(val_metrics['z0_gain_mm']):.3f} mm/token"
-                    f" (sac-like {float(val_metrics['z0_gain_sac_mm']):.3f} mm"
+                    f" (sac {float(val_metrics['z0_gain_sac_mm']):.3f} mm"
                     f" on ~{float(val_metrics.get('z0_n_sac_tokens', 0)):.0f} tokens,"
                     f" other {float(val_metrics['z0_gain_other_mm']):.3f} mm)"
                 )

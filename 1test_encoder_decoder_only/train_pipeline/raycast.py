@@ -157,6 +157,36 @@ def select_r_star_from_hits(
     return float(max(t_star, float(t_eps))), True, False
 
 
+def select_surface_residual_from_hits(hits, *, normal_dot_min=0.2, tie_mm=0.35):
+    """Signed distance from a template vertex to the wall it already sits on.
+
+    Rays that start on the centerline want the nearest outward hit. A template
+    vertex is already the vessel, so the hit that belongs to it is the closest
+    one, and that distance is negative when the vertex is outside the GT.
+    A second hit several millimetres farther is the other side of the lumen.
+    Two hits at the same distance (a crease, or two kissing walls) are
+    ambiguous: no radial target, smoothness unlocked.
+    """
+    lo = float(normal_dot_min)
+    tie = float(tie_mm)
+    ts = []
+    for h in hits:
+        if not h.get("voronoi_ok", True):
+            continue
+        if abs(float(h["normal_dot"])) < lo:
+            continue
+        ts.append(float(h["t"]))
+    if not ts:
+        return 0.0, False, False
+    t_star = min(ts, key=lambda t: (abs(t), -t))
+    for t in ts:
+        if abs(t - t_star) <= 1e-6:
+            continue
+        if abs(abs(t) - abs(t_star)) <= tie:
+            return 0.0, False, True
+    return float(t_star), True, False
+
+
 def r_star_grid_stats(r_star, valid, branch_nl, n_radial):
     """Per-vertex wrapped Δθ r*, longitudinal Δu r*, and per-ring median r*."""
     r_star = np.asarray(r_star, dtype=np.float64).reshape(-1)
@@ -327,14 +357,18 @@ def template_ray_r_star(
     normal_dot_min=R_STAR_NORMAL_DOT,
     ambiguous_mm=R_STAR_AMBIGUOUS_MM,
 ):
-    """Outward ray from each template vertex along its normal to the GT.
+    """Ray from each template vertex along its normal to the GT.
 
-    `r* = r_local + t_hit` with `t_hit` the signed distance along the already
-    outward template normal. Misses and grazes (`|n · n_cell|` too small) stay
-    `valid=False`. Two accepted hits more than `ambiguous_mm` apart are
-    `ambiguous=True` (neck / double wall). Invalid nodes are never flipped to
-    `valid=True`.
+    `r* = r_local + t_hit`. `t_hit` is the signed distance to the closest
+    accepted hit: positive when the GT is outside the template, negative when
+    the vertex already sticks out. Misses and grazes (`|n · n_cell|` too small)
+    stay `valid=False`. Two hits at the same distance are `ambiguous=True`.
+    A farther hit on the opposite wall does not mask the near one. Invalid
+    nodes are never flipped to `valid=True`.
+    ``t_eps`` and ``ambiguous_mm`` sized the old nearest-outward rule and
+    are ignored.
     """
+    del t_eps, ambiguous_mm
     pos = np.asarray(pos, dtype=np.float64).reshape(-1, 3)
     normal = np.asarray(normal, dtype=np.float64).reshape(-1, 3)
     r_local = np.asarray(r_local, dtype=np.float64).reshape(-1)
@@ -405,12 +439,9 @@ def template_ray_r_star(
             }
             for j in range(nh)
         ]
-        val, ok, amb = select_r_star_from_hits(
+        val, ok, amb = select_surface_residual_from_hits(
             hits,
-            t_eps=t_eps,
-            ambiguous_mm=ambiguous_mm,
             normal_dot_min=lo,
-            normal_sign=1.0,
         )
         if ok:
             r_star[i] = float(r_local[i]) + float(val)
@@ -752,12 +783,12 @@ def ray_sac_membership(
     hit_tol=R_STAR_HIT_TOL,
     normal_dot_min=R_STAR_NORMAL_DOT,
 ):
-    """Copy GT membership onto template vertices along their outward rays.
+    """Copy GT membership onto template vertices from the nearest ray hit.
 
-    The hit is the nearest outward face the normal meets, including a double
-    wall: the first surface is the one this vertex is responsible for. A miss
-    stays 0. The label does not depend on where the network later moves the
-    vertex; callers store it once.
+    The template is already the vessel, so the face this vertex is responsible
+    for is the closest intersection along its normal, including one just
+    behind the vertex. A miss stays 0. The label does not depend on where the
+    network later moves the vertex; callers store it once.
     """
     pos = np.asarray(pos, dtype=np.float64).reshape(-1, 3)
     normal = np.asarray(normal, dtype=np.float64).reshape(-1, 3)
@@ -793,7 +824,6 @@ def ray_sac_membership(
     hit_cells = vtk.vtkIdList()
     t_max = float(t_max)
     t_inward = float(t_inward)
-    t_eps = float(t_eps)
     lo = float(normal_dot_min)
     n_faces = int(gt_faces.shape[0])
     for i in range(n):
@@ -818,10 +848,9 @@ def ray_sac_membership(
             nd = abs(float(np.dot(n_v, fn[cid])))
             if nd < lo:
                 continue
-            # Nearest outward hit. Inward-only rays take the one closest to
-            # the vertex (largest t, since those t are negative).
-            outward = t >= t_eps
-            key = (0, t) if outward else (1, -t)
+            # Closest wall, inward or outward. An equal distance keeps the
+            # outward hit.
+            key = (abs(t), 0 if t >= 0.0 else 1)
             if best_key is None or key < best_key:
                 best_key = key
                 best = (xyz, cid)

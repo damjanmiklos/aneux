@@ -35,10 +35,9 @@
 #SBATCH --cpus-per-task=64
 #SBATCH --gres=gpu:4
 #SBATCH --exclusive
-# 2 days 4 hours. The previous 1 day 16 hour cap finished with about a
-# 2 hour margin; this leaves more than that, including the z=0 validation
-# decode. Validation itself runs every 5 epochs (ANEUX_VAL_EVERY).
-#SBATCH --time=2-04:00:00
+# 30 hours. 250 epochs, batch 4/GPU (global 16 on this 4-GPU node).
+# Validation runs every 5 epochs (ANEUX_VAL_EVERY).
+#SBATCH --time=30:00:00
 #SBATCH --mem=0
 #SBATCH --no-requeue
 # 30 min: a validation epoch (μ, σ, and the z=0 decode) has to finish,
@@ -68,7 +67,12 @@ export ANEUX_REPO_ROOT="$REPO"
 export ANEUX_CLEANDATA="${ANEUX_CLEANDATA:-$REPO/cleandata}"
 export ANEUX_CACHE="${ANEUX_CACHE:-$REPO/1test_encoder_decoder_only/tube_cache}"
 export ANEUX_OUTPUT="${ANEUX_OUTPUT:-$REPO/1test_encoder_decoder_only/output}"
+# 4 graphs per GPU and no gradient accumulation: 16 on the 4-GPU allocation.
+export ANEUX_BATCH_SIZE="${ANEUX_BATCH_SIZE:-4}"
+export ANEUX_ACCUM_STEPS="${ANEUX_ACCUM_STEPS:-1}"
+export ANEUX_EPOCHS="${ANEUX_EPOCHS:-250}"
 echo "repo=$REPO"
+echo "batch_per_gpu=${ANEUX_BATCH_SIZE} accum=${ANEUX_ACCUM_STEPS} epochs=${ANEUX_EPOCHS}"
 
 _source_conda() {
   local cand

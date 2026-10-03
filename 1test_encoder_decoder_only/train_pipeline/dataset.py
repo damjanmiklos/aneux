@@ -54,11 +54,17 @@ from raycast import (
     template_ray_r_star,
     transform_vessel_mesh,
 )
-from sac_membership import wall_sac_membership
+from sac_membership import (
+    load_sac_vertex_ids,
+    load_sphere_centers,
+    membership_from_sac_ids,
+    wall_sac_membership,
+)
 
 # Config agent lands LATENT_DIM=16 / LATENT_LEN=128 / TOKEN_SPACING_MM=2.0.
 # getattr keeps this file working if an older config is still imported.
 TOKEN_SPACING_MM = float(getattr(_config, "TOKEN_SPACING_MM", 2.0))
+N_SPHERE_LATENT_TOKENS = int(getattr(_config, "N_SPHERE_LATENT_TOKENS", 3))
 LATENT_DIM = int(getattr(_config, "LATENT_DIM", 16))  # dataset does not allocate codes
 GROUPID_ENDPOINT_SNAP_MM = float(getattr(_config, "GROUPID_ENDPOINT_SNAP_MM", 1.0))
 _LATENT_PAD_DEFAULT = int(getattr(_config, "LATENT_LEN", 128))
@@ -75,6 +81,117 @@ def _dedup_polyline(pts):
 
 def _as_f64(x):
     return np.asarray(x, dtype=np.float64)
+
+
+def _pose_points(points, origin, rotation):
+    """World points into the scaffold frame: ``(p - origin) @ R``."""
+    if points is None:
+        return None
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    origin = np.asarray(origin, dtype=np.float64).reshape(3)
+    rotation = np.asarray(rotation, dtype=np.float64).reshape(3, 3)
+    return (pts - origin) @ rotation
+
+
+def insert_sphere_tokens(tokens, centers):
+    """One latent token per sphere centroid, copying the nearest centerline station.
+
+    ``centers`` are already in the scaffold frame. Each token keeps that
+    station's arc length and tract, and its position is the centroid. Slots
+    are padding indices after every centerline token, so an equal arc length
+    still resolves to the centerline station. A full buffer drops the
+    highest-arc centerline token that is not the copied station and not the
+    last token of its tract, and only when that slot is still after the
+    copied station. ``centers is None`` leaves the centerline tokens and
+    writes an all-false ``latent_is_sphere``.
+    """
+    valid = tokens["latent_valid"]
+    length = int(valid.shape[0])
+    tokens["latent_is_sphere"] = torch.zeros(length, dtype=torch.bool, device=valid.device)
+    if centers is None:
+        return tokens
+    centers = np.asarray(centers, dtype=np.float64).reshape(-1, 3)
+    centers = centers[np.isfinite(centers).all(axis=1)][: int(N_SPHERE_LATENT_TOKENS)]
+    if centers.shape[0] == 0:
+        return tokens
+
+    valid_np = valid.detach().cpu().numpy().astype(bool)
+    pos = tokens["latent_pos"].detach().cpu().numpy().astype(np.float64)
+    s_np = tokens["latent_s_mm"].detach().cpu().numpy().astype(np.float64)
+    tract_np = tokens["latent_tract_id"].detach().cpu().numpy().astype(np.int64)
+    cl = np.flatnonzero(valid_np)
+    if cl.size == 0:
+        return tokens
+    _, nn = cKDTree(pos[cl]).query(centers, k=1)
+    source = cl[np.asarray(nn, dtype=np.int64)]
+
+    protected = {int(i) for i in source}
+    counts = {}
+    for i in cl.tolist():
+        tid = int(tract_np[i])
+        counts[tid] = counts.get(tid, 0) + 1
+    slots = []
+    for i in np.flatnonzero(~valid_np).tolist():
+        if len(slots) >= centers.shape[0]:
+            break
+        if int(i) <= int(source[len(slots)]):
+            continue
+        slots.append(int(i))
+    while len(slots) < centers.shape[0]:
+        src = int(source[len(slots)])
+        best = None
+        for i in range(length):
+            if not valid_np[i] or i in protected or i in slots or i <= src:
+                continue
+            tid = int(tract_np[i])
+            if counts.get(tid, 0) <= 1:
+                continue
+            key = (float(s_np[i]), i)
+            if best is None or key > best[0]:
+                best = (key, i, tid)
+        if best is None:
+            break
+        _, i, tid = best
+        slots.append(i)
+        counts[tid] -= 1
+        valid_np[i] = False
+
+    n_place = min(len(slots), int(centers.shape[0]))
+    u = tokens["latent_u"].clone()
+    s = tokens["latent_s_mm"].clone()
+    tract = tokens["latent_tract_id"].clone()
+    pos_t = tokens["latent_pos"].clone()
+    attend = tokens["token_attend"].clone()
+    valid_t = tokens["latent_valid"].clone()
+    sphere = tokens["latent_is_sphere"]
+    junc = tokens["latent_is_junction"].clone() if "latent_is_junction" in tokens else None
+    for k in range(n_place):
+        slot = int(slots[k])
+        src = int(source[k])
+        sphere[slot] = True
+        valid_t[slot] = True
+        u[slot] = u[src]
+        s[slot] = s[src]
+        tract[slot] = tract[src]
+        pos_t[slot] = torch.as_tensor(centers[k], dtype=pos_t.dtype, device=pos_t.device)
+        attend[slot] = False
+        tid = int(tract[slot].item())
+        if 0 <= tid < int(attend.shape[1]):
+            attend[slot, tid] = True
+        if junc is not None:
+            junc[slot] = 0
+    tokens["latent_u"] = u
+    tokens["latent_s_mm"] = s
+    tokens["latent_tract_id"] = tract
+    tokens["latent_pos"] = pos_t
+    tokens["latent_valid"] = valid_t
+    tokens["token_attend"] = attend
+    tokens["token_u"] = u.clone()
+    tokens["token_pos"] = pos_t.clone()
+    tokens["token_tract_id"] = tract.clone()
+    if junc is not None:
+        tokens["latent_is_junction"] = junc
+    return tokens
 
 
 def _torch_f32(x):
@@ -1028,6 +1145,10 @@ class AneurysmDataset(Dataset):
             vtp_centerline_dir=vtp_centerline_dir,
             quiet=quiet,
         )
+        # None until enable_worker_cache(). The graph dict is per process and
+        # is cleared in __getstate__ so spawn workers do not receive copies.
+        self._worker_cache_indices = None
+        self._worker_cache = {}
 
     def _discover_samples(self, vtp_vessel_dir, vtp_centerline_dir, quiet=False):
         if (vtp_vessel_dir is None) ^ (vtp_centerline_dir is None):
@@ -1536,6 +1657,7 @@ class AneurysmDataset(Dataset):
             "latent_s_mm": latent_s,
             "latent_tract_id": latent_tract,
             "latent_is_junction": _torch_long(token_is_junc),
+            "latent_is_sphere": torch.zeros(pad, dtype=torch.bool),
             "latent_pos": latent_pos,
             "latent_valid": latent_valid,
             "token_u": latent_u.clone(),
@@ -1811,11 +1933,12 @@ class AneurysmDataset(Dataset):
     def _template_levels(self, posed_tpl, fine_faces, fine):
         """Nested mid/coarse levels by sizing-field edge collapse (coarsen.py).
 
-        Decimation erased the template's density: the flat, finely meshed sac
-        went first, and on p131 the sac/parent edge ratio fell from 4.9 to
-        0.83.  The collapse keeps the ratio, keeps >= N_min vertices around
-        thin branches and rims, and prolongs by barycentric projection instead
-        of a Euclidean kNN that reached across thin branches.
+        Three-sphere templates store no TargetEdgeLength. The remesher already
+        baked the grading into the edges (finer on the sac), so the sizing
+        field is the mean incident edge. R_template is likewise absent; the
+        distance to the centerline keeps thin branches from collapsing below
+        N_min vertices around. Prolongation is barycentric, so a thin branch
+        cannot borrow a displacement from its opposite wall.
         """
         pts = _as_f64(posed_tpl.points)
         tel = _point_data_array(posed_tpl, "TargetEdgeLength")
@@ -2371,8 +2494,15 @@ class AneurysmDataset(Dataset):
             return None
         return np.ascontiguousarray(f, dtype=np.int64)
 
-    def _sac_membership_extra(self, centerline_mesh, origin, R, gt_pts, gt_faces, fine, mid, coarse):
-        """Cache GT membership and copy it onto each template level along the ray."""
+    def _sac_membership_extra(
+        self, centerline_mesh, origin, R, gt_pts, gt_faces, fine, mid, coarse, sac_vertex_ids=None,
+    ):
+        """Cache GT membership and copy it onto each template level along the ray.
+
+        ``sac_vertex_ids`` are the dome-and-lip vertices the three-sphere
+        template was fitted to. Detection is only the fallback when that
+        sidecar does not index this wall.
+        """
         if centerline_mesh is None or gt_pts is None:
             return {}
         gt_pts = np.asarray(gt_pts, dtype=np.float64).reshape(-1, 3)
@@ -2389,7 +2519,11 @@ class AneurysmDataset(Dataset):
         origin = np.asarray(origin, dtype=np.float64).reshape(1, 3)
         rot = np.asarray(R, dtype=np.float64).reshape(3, 3)
         cl_pts = (_as_f64(centerline_mesh.points) - origin) @ rot
-        m_gt = wall_sac_membership(gt_pts, faces, cl_pts, rad, lines)
+        m_gt = None
+        if sac_vertex_ids is not None:
+            m_gt = membership_from_sac_ids(gt_pts, faces, sac_vertex_ids, cl_pts, rad, lines)
+        if m_gt is None:
+            m_gt = wall_sac_membership(gt_pts, faces, cl_pts, rad, lines)
         if m_gt is None or m_gt.shape[0] != gt_pts.shape[0]:
             return {}
         out = {"gt_sac_m": _torch_f32(m_gt)}
@@ -2409,6 +2543,8 @@ class AneurysmDataset(Dataset):
         vessel_mesh=None,
         require_groupids=False,
         ostium_frames=None,
+        sac_vertex_ids=None,
+        sphere_centers=None,
     ):
         tracts, junc_inc, junc_xyz, origin, R, _ = self._prepare_tracts(
             centerline_mesh, require_groupids=require_groupids
@@ -2446,6 +2582,7 @@ class AneurysmDataset(Dataset):
         tokens, cl_pack, gt_mesh, x_true, x_true_cl_dist, x_true_normal, gt_extra = self._gt_and_tokens(
             dense_tracts, junc_inc, junc_xyz, arc_lengths, origin, R, vessel_points, vessel_mesh
         )
+        insert_sphere_tokens(tokens, _pose_points(sphere_centers, origin, R))
         extra.update(gt_extra)
         frames = ostium_frames if ostium_frames is not None else self._ostium_frames_from_mesh(template_mesh)
         posed_frames = self._pose_ostium_frames(frames, origin, R)
@@ -2472,6 +2609,7 @@ class AneurysmDataset(Dataset):
         extra["r_ring_med_mid"] = r_mid["ring_med"]
         extra.update(self._sac_membership_extra(
             centerline_mesh, origin, R, gt_pts, extra.get("gt_faces"), fine, mid, coarse,
+            sac_vertex_ids=sac_vertex_ids,
         ))
         return self._assemble_scaffold_data(
             fine, mid, coarse, tokens, cl_pack, x_true, x_true_cl_dist, x_true_normal,
@@ -2486,6 +2624,8 @@ class AneurysmDataset(Dataset):
         template_mesh=None,
         require_groupids=False,
         ostium_frames=None,
+        sac_vertex_ids=None,
+        sphere_centers=None,
     ):
         """Build decoder tensors. With `template_mesh`, identity stays on that surface."""
         if template_mesh is not None:
@@ -2496,6 +2636,8 @@ class AneurysmDataset(Dataset):
                 vessel_mesh=vessel_mesh,
                 require_groupids=require_groupids,
                 ostium_frames=ostium_frames,
+                sac_vertex_ids=sac_vertex_ids,
+                sphere_centers=sphere_centers,
             )
         tracts, junc_inc, junc_xyz, origin, R, _ = self._prepare_tracts(
             centerline_mesh, require_groupids=require_groupids
@@ -2590,10 +2732,17 @@ class AneurysmDataset(Dataset):
         if getattr(self, "require_templates", False) and not has_template:
             raise FileNotFoundError(
                 f"{sample['dataset_id']}: template_mesh missing. "
-                "Write it with variable_remeshing.py into cleandata/template_mesh. "
+                "Write the three-sphere template into cleandata/template_mesh "
+                "(vessel_aneurysm_remeshing.py). "
                 "Tracts / pose / tokens use original_centerline (§2.5)."
             )
         template_mesh = pv.read(tpl_mesh_path) if has_template else None
+        sac_vertex_ids = None
+        sphere_centers = None
+        if has_template:
+            spheres_path = os.path.splitext(tpl_mesh_path)[0] + ".spheres.npz"
+            sac_vertex_ids = load_sac_vertex_ids(spheres_path)
+            sphere_centers = load_sphere_centers(spheres_path)
         ostium_frames = self._load_ostium_frames_sidecar(sample)
         try:
             return self.build_scaffold(
@@ -2602,6 +2751,8 @@ class AneurysmDataset(Dataset):
                 template_mesh=template_mesh,
                 require_groupids=True,
                 ostium_frames=ostium_frames,
+                sac_vertex_ids=sac_vertex_ids,
+                sphere_centers=sphere_centers,
             )
         finally:
             del vessel_mesh, centerline_mesh
@@ -2742,6 +2893,45 @@ class AneurysmDataset(Dataset):
         path = self._cache_path(sample["dataset_id"])
         return bool(path and os.path.isfile(path))
 
+    def enable_worker_cache(self, indices):
+        """Keep finalized graphs for these dataset indices inside each process.
+
+        Training stays on the ``.pt`` files. Validation workers fill this the
+        first time they read a listed index and reuse it on later passes.
+        ``__getstate__`` ships the index list and an empty graph dict, so a
+        spawned worker does not inherit another process's copies. Each hit
+        returns a clone.
+        """
+        self._worker_cache_indices = {int(i) for i in indices}
+        self._worker_cache = {}
+        return len(self._worker_cache_indices)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_worker_cache"] = {}
+        return state
+
+    def _worker_cache_hit(self, idx):
+        indices = getattr(self, "_worker_cache_indices", None)
+        cache = getattr(self, "_worker_cache", None)
+        if not indices or cache is None or idx not in indices:
+            return None
+        data = cache.get(idx)
+        if data is None:
+            return None
+        return data.clone()
+
+    def _offer_worker_cache(self, idx, data):
+        indices = getattr(self, "_worker_cache_indices", None)
+        if not indices or idx not in indices:
+            return data
+        cache = getattr(self, "_worker_cache", None)
+        if cache is None:
+            cache = {}
+            self._worker_cache = cache
+        cache[idx] = data
+        return data.clone()
+
     def __getitem__(self, idx):
         sample = self.samples[idx]
         cache_path = self._cache_path(sample["dataset_id"])
@@ -2750,11 +2940,15 @@ class AneurysmDataset(Dataset):
         if ram is not None and idx in ram:
             return ram[idx].clone()
 
+        hit = self._worker_cache_hit(idx)
+        if hit is not None:
+            return hit
+
         if cache_path and os.path.exists(cache_path):
             try:
                 data = _load_cached_graph(cache_path)
                 if int(getattr(data, "cache_version", torch.tensor(-1))) == CACHE_VERSION:
-                    return _finalize_item(data)
+                    return self._offer_worker_cache(idx, _finalize_item(data))
             except Exception:
                 pass
 
@@ -2776,7 +2970,7 @@ class AneurysmDataset(Dataset):
                     os.remove(tmp)
             gc.collect()
 
-        return _finalize_item(data)
+        return self._offer_worker_cache(idx, _finalize_item(data))
 
 
 _WARMUP_DS = None
