@@ -1487,6 +1487,35 @@ def test_worker_cache_keeps_val_indices_only():
         shutil.rmtree(factory.cache_dir, ignore_errors=True)
 
 
+def test_publish_ready_is_visible_to_wait():
+    import threading
+    import time
+
+    from dist_utils import publish_ready, wait_ready
+
+    root = tempfile.mkdtemp(prefix="aneux_ready_")
+    path = os.path.join(root, "nested", ".ready")
+    try:
+        started = threading.Event()
+
+        def _wait():
+            started.set()
+            wait_ready(path, poll_s=0.05)
+
+        thread = threading.Thread(target=_wait)
+        thread.start()
+        _assert(started.wait(2.0), "waiter did not start")
+        time.sleep(0.15)
+        _assert(thread.is_alive(), "waiter returned before the flag existed")
+        publish_ready(path)
+        thread.join(2.0)
+        _assert(not thread.is_alive(), "waiter did not observe the flag")
+        wait_ready(path, poll_s=0.05)
+        _assert(os.path.isfile(path), path)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_batch_inc():
     d1 = make_synthetic_data(sac=False)
     d2 = make_synthetic_data(sac=False)
@@ -3327,6 +3356,7 @@ def main():
         test_hybrid_far_points,
         test_cache_hit,
         test_worker_cache_keeps_val_indices_only,
+        test_publish_ready_is_visible_to_wait,
         test_batch_inc,
         test_scaffold_decode_without_vessel,
         test_train_val_split_covers_all,

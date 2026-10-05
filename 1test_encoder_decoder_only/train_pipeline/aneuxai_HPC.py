@@ -49,6 +49,8 @@ from dist_utils import (
     env_local_rank,
     init_distributed,
     is_main_process,
+    publish_ready,
+    wait_ready,
     world_size,
 )
 from hpc_runtime import (
@@ -241,6 +243,19 @@ def main():
     workspace = None
     staged = None
     run_dir = None
+    # Other ranks must not enter the NCCL broadcast while rank 0 is still
+    # rsyncing. A full tube cache takes longer than NCCL's 10-minute watchdog.
+    stage_flag = None
+    skip_stage = os.environ.get("ANEUX_SKIP_STAGE", "").strip().lower() in ("1", "true", "yes")
+    if world_size() > 1 and not skip_stage:
+        try:
+            stage_flag = os.path.join(job_workspace(account), ".stage_ready")
+        except RuntimeError:
+            stage_flag = None
+    if stage_flag and main_rank and os.path.isfile(stage_flag):
+        os.remove(stage_flag)
+    if stage_flag:
+        barrier()
 
     if main_rank:
         print(f"[hpc] account={account!r}  project_root={proj!r}")
@@ -275,10 +290,14 @@ def main():
             job_tag = f"{job_tag}_{RUN_TAG}" if job_tag else RUN_TAG
         run_dir = make_run_dir(output_dir, job_id=job_tag or None)
         print(f"[hpc] run_dir={run_dir}")
+        if stage_flag:
+            publish_ready(stage_flag)
     else:
         cleandata_root = cleandata_src
         cache_dir = cache_src
         output_dir = output_persist
+        if stage_flag:
+            wait_ready(stage_flag)
 
     packed = [cleandata_root, cache_dir, output_dir, run_dir, workspace]
     if torch.distributed.is_available() and torch.distributed.is_initialized():

@@ -19,7 +19,7 @@ from aneux_paths import CLEANDATA_UNIFORM, TEMPLATE_OUTPUT_VESSEL_ANEURYSM
 
 # --- CONFIGURATION ---
 FOLDER_1 = CLEANDATA_UNIFORM
-FOLDER_2 = TEMPLATE_OUTPUT_VESSEL_ANEURYSM
+FOLDER_2 = "C:/dev/UQ/aneux/scratch/review_2026-10-03/new"
 
 SUPPORTED_EXTENSIONS = ('.vtp', '.stl', '.vtk')
 LOAD_WORKERS = min(8, os.cpu_count() or 4)

@@ -6,6 +6,7 @@ When WORLD_SIZE is unset the helpers are no-ops so aneuxai.py stays single-GPU.
 from __future__ import annotations
 
 import os
+import time
 
 import torch
 import torch.distributed as dist
@@ -77,6 +78,46 @@ def init_distributed(backend=None):
 def barrier():
     if distributed_active():
         dist.barrier()
+
+
+def publish_ready(path):
+    """Atomically create ``path`` so other ranks can leave a filesystem wait."""
+    path = os.path.abspath(path)
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as handle:
+        handle.write("ok\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
+
+def wait_ready(path, poll_s=5.0):
+    """Block until ``path`` exists. Does not enter an NCCL collective.
+
+    NCCL aborts a collective that stays open for 10 minutes. Rank-0 scratch
+    copies and the tube-cache build both run longer than that, so the waiting
+    ranks must not sit inside ``barrier()`` while that work is in progress.
+    """
+    path = os.path.abspath(path)
+    if os.path.isfile(path):
+        return
+    rank_id = env_rank()
+    print(f"rank {rank_id} waiting for {path}", flush=True)
+    t0 = time.time()
+    next_note = t0 + 60.0
+    while not os.path.isfile(path):
+        now = time.time()
+        if now >= next_note:
+            print(
+                f"rank {rank_id} still waiting ({now - t0:.0f}s) for {os.path.basename(path)}",
+                flush=True,
+            )
+            next_note = now + 60.0
+        time.sleep(poll_s)
+    print(f"rank {rank_id} wait finished after {time.time() - t0:.0f}s", flush=True)
 
 
 def broadcast_object(obj, src=0):

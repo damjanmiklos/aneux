@@ -42,7 +42,7 @@ from config import (
     normalize_gradient_checkpointing,
 )
 from dataset import AneurysmDataset
-from dist_utils import barrier, broadcast_object, is_main_process
+from dist_utils import barrier, broadcast_object, is_main_process, publish_ready, wait_ready
 from model import GraphVAE
 from run_report import dump_json, hardware_snapshot, make_run_dir, write_skipped_samples_report
 from train import train_model
@@ -850,6 +850,7 @@ def run_stage2_training(
             train_dataset, val_dataset, test_dataset, split_payload = load_or_create_fixed_split(
                 dataset, split_path, VAL_SPLIT, TEST_SPLIT, SEED, write=False
             )
+        ready_flag = os.path.join(run_dir, "data", ".tube_cache_ready")
         if main:
             print("Warming tube cache (parallel raycast; not used as DataLoader workers)...")
             cache_errors = dataset.warmup_cache(num_workers=cache_build_workers)
@@ -859,6 +860,9 @@ def run_stage2_training(
                 persist_tube_cache(cache_dir)
             except Exception as exc:
                 print(f"tube_cache persist failed: {exc}")
+            publish_ready(ready_flag)
+        else:
+            wait_ready(ready_flag)
         barrier()
         cache_errors = broadcast_object(cache_errors)
         if cache_errors:
