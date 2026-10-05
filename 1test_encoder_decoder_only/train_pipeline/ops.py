@@ -64,7 +64,9 @@ def fps_indices(pts: Tensor, k: int) -> Tensor:
         perm[start] = 0
     swapped = pts_f[perm]
     _, loc = sample_farthest_points(swapped.unsqueeze(0), K=k, random_start_point=False)
-    return perm[loc.squeeze(0).long()]
+    # The kernel fills a buffer of -1. A short write must not gather perm[-1].
+    loc = loc.squeeze(0).long().clamp(0, int(perm.numel()) - 1)
+    return perm[loc]
 
 
 def ball_query_packed(

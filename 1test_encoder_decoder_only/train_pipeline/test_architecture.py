@@ -2071,6 +2071,34 @@ def test_mirror_twice_is_identity():
     _assert(raised, "a flip mask of the wrong length must raise")
 
 
+def test_oob_face_is_dropped_and_mirror_does_not_gather_it():
+    """An id past the cloud must not be gathered: that is an illegal CUDA access once the graph is last."""
+    from dataset import AneurysmData, _drop_unindexed_faces
+    from train import apply_mirror, _min_euclid
+
+    n = 4
+    data = AneurysmData(
+        gt_points=torch.zeros(n, 3),
+        gt_faces=torch.tensor([[0, 1], [1, 2], [n, 0]], dtype=torch.long),
+    )
+    _drop_unindexed_faces(data)
+    _assert(tuple(data.gt_faces.shape) == (3, 1), tuple(data.gt_faces.shape))
+    _assert(int(data.gt_faces.max()) < n, data.gt_faces)
+
+    b = _mirror_pair_batch()
+    n_pts = int(b.x.size(0))
+    planted = torch.tensor([[n_pts], [0], [1]], dtype=torch.long)
+    b.face = torch.cat([b.face, planted], dim=1)
+    apply_mirror(b, flip=[True, False])
+    _assert(torch.equal(b.face[:, -1], planted.view(-1)), b.face[:, -1])
+
+    pts = torch.tensor([[0.0, 0.0, 0.0], [3.0, 0.0, 0.0], [0.0, 4.0, 0.0]])
+    cl = torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    got = _min_euclid(pts, cl, row_chunk=1, col_chunk=1)
+    exp = torch.cdist(pts, cl).min(dim=1).values
+    _assert(torch.allclose(got, exp), (got, exp))
+
+
 def test_add_meter_accepts_fold_and_stretch():
     from train import _add_meter, _flush_meters, _zero_tensor_meters
 
@@ -3376,6 +3404,7 @@ def main():
         test_resource_monitor_snapshots_on_this_os,
         test_mirror_reflects_one_graph_consistently,
         test_mirror_twice_is_identity,
+        test_oob_face_is_dropped_and_mirror_does_not_gather_it,
         test_add_meter_accepts_fold_and_stretch,
         test_chamfer_weight_cap,
         test_huber_and_radial_loss,

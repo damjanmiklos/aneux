@@ -817,6 +817,30 @@ def _subset_indices(points, n_keep, generator=None):
         return perm[:n_keep]
 
 
+def _min_euclid(points, cl, row_chunk=2048, col_chunk=8192):
+    """Min distance from each point to ``cl``, in chunks so N×M is never allocated.
+
+    One dense vessel against a long centerline is large enough that ``torch.cdist``
+    builds an index that does not fit in 32 bits, and the kernel then reports an
+    illegal access on whichever later call happens to synchronize.
+    """
+    pts = points.detach().to(dtype=torch.float32).reshape(-1, 3)
+    ref = cl.detach().to(device=pts.device, dtype=torch.float32).reshape(-1, 3)
+    n = int(pts.size(0))
+    m = int(ref.size(0))
+    out = pts.new_full((n,), float("inf"))
+    if n == 0 or m == 0:
+        return out
+    for i0 in range(0, n, int(row_chunk)):
+        block = pts[i0:i0 + int(row_chunk)]
+        best = block.new_full((block.size(0),), float("inf"))
+        for j0 in range(0, m, int(col_chunk)):
+            dist = torch.cdist(block, ref[j0:j0 + int(col_chunk)])
+            best = torch.minimum(best, dist.min(dim=1).values)
+        out[i0:i0 + block.size(0)] = best
+    return out
+
+
 def _hybrid_subset_indices(points, n_keep, cl_xyz=None, generator=None):
     n_keep = int(n_keep)
     n_far = int(round(n_keep * float(N_TRUE_FAR_FRAC)))
@@ -826,7 +850,7 @@ def _hybrid_subset_indices(points, n_keep, cl_xyz=None, generator=None):
         extra = _subset_indices(points, n_far, generator=generator) if n_far else uni[:0]
         return torch.cat([uni, extra], dim=0)[:n_keep]
     cl = cl_xyz.to(device=points.device, dtype=points.dtype).reshape(-1, 3)
-    dmin = torch.cdist(points.float(), cl.float()).min(dim=1).values
+    dmin = _min_euclid(points, cl)
     far_mask = dmin > (float(TUBE_RADIUS_MM) + 1.0)
     far_idx = far_mask.nonzero(as_tuple=False).view(-1)
     if far_idx.numel() == 0:
@@ -1055,7 +1079,17 @@ def apply_mirror(batch, p=0.5, generator=None, flip=None):
         g = _mirror_rows_graph(batch, pkey, pts.size(0), n_graphs)
         if g is None:
             raise ValueError(f"apply_mirror: cannot assign {fkey!r} to graphs")
-        m = flip.to(f.device)[g.to(f.device)[f[0]]]
+        # Face ids are local to each cloud, then offset by collate. An id that
+        # is only one past its own cloud still lands inside the next graph, so
+        # it does not fault until this graph is last in the batch.
+        g_dev = g.to(device=f.device, dtype=torch.long)
+        n_pts = int(g_dev.numel())
+        if n_pts == 0:
+            continue
+        idx = f[0].to(dtype=torch.long)
+        in_range = (idx >= 0) & (idx < n_pts)
+        gid = g_dev[idx.clamp(0, n_pts - 1)].clamp(0, max(n_graphs - 1, 0))
+        m = flip.to(device=f.device)[gid] & in_range
         out = f.clone()
         out[1] = torch.where(m, f[2], f[1])
         out[2] = torch.where(m, f[1], f[2])
