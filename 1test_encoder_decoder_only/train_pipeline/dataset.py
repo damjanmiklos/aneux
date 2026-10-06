@@ -1,4 +1,5 @@
 import gc
+import json
 import os
 from collections import defaultdict, deque
 
@@ -278,53 +279,12 @@ def _refresh_r_star_smoothness(data):
     return data
 
 
-def _drop_unindexed_faces(data):
-    """Drop triangles whose vertex ids are outside the point set they index.
-
-    Template faces are checked while the cache is built. ``gt_faces`` is copied
-    off the vessel mesh and is not. A single id equal to the vertex count is
-    still in range of a batch until that graph is last; the gather then
-    reads past the concatenated cloud and CUDA reports an illegal access.
-    """
-    pairs = (
-        ("face", "x"),
-        ("face_mid", "pos_mid"),
-        ("face_coarse", "pos_coarse"),
-        ("gt_faces", "gt_points"),
-    )
-    for fkey, pkey in pairs:
-        if fkey not in data or pkey not in data:
-            continue
-        faces = data[fkey]
-        pts = data[pkey]
-        if not torch.is_tensor(faces) or faces.numel() == 0 or not torch.is_tensor(pts):
-            continue
-        if faces.dim() != 2:
-            continue
-        if int(faces.size(0)) == 3:
-            oriented = faces
-            as_rows = False
-        elif int(faces.size(-1)) == 3:
-            oriented = faces.transpose(0, 1).contiguous()
-            as_rows = True
-        else:
-            continue
-        n = int(pts.size(0))
-        keep = ((oriented >= 0) & (oriented < n)).all(dim=0)
-        if bool(keep.all()):
-            continue
-        kept = oriented[:, keep].contiguous()
-        data[fkey] = kept.transpose(0, 1).contiguous() if as_rows else kept
-    return data
-
-
 def _finalize_item(data):
     if getattr(data, "face", None) is None and getattr(data, "faces", None) is not None:
         faces = data.faces
         data.face = faces.t().contiguous() if faces.size(-1) == 3 else faces
     if not isinstance(data, AneurysmData):
         data = _as_aneurysm_data(data)
-    data = _drop_unindexed_faces(data)
     data = _ensure_fp32_data(data)
     data = _refresh_r_star_smoothness(data)
     data.has_true_normal = torch.tensor(
@@ -2974,6 +2934,26 @@ class AneurysmDataset(Dataset):
         return data.clone()
 
     def __getitem__(self, idx):
+        data = self._load_item(idx)
+        if os.environ.get("ANEUX_DIAG", "").strip().lower() in ("1", "true", "yes"):
+            data = self._annotate_diag(idx, data)
+        return data
+
+    def _annotate_diag(self, idx, data):
+        """ANEUX_DIAG only: attach the sample id and a one-off scan of the graph."""
+        seen = self.__dict__.setdefault("_diag_seen", {})
+        if idx not in seen:
+            from crash_diag import scan_sample
+
+            problems, sizes = scan_sample(data)
+            seen[idx] = (";".join(problems), json.dumps(sizes))
+        flags, sizes = seen[idx]
+        data.sample_id = self.samples[idx]["dataset_id"]
+        data.diag_flags = flags
+        data.diag_sizes = sizes
+        return data
+
+    def _load_item(self, idx):
         sample = self.samples[idx]
         cache_path = self._cache_path(sample["dataset_id"])
 

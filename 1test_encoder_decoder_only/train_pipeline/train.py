@@ -57,6 +57,7 @@ from config import (
     configure_stage2_precision,
 )
 from dataset import _CPU_TENSOR_KEYS
+import crash_diag
 import losses as _losses_mod
 from losses import compute_losses
 
@@ -800,9 +801,8 @@ def _subset_indices(points, n_keep, generator=None):
         return points.new_zeros((0,), dtype=torch.long)
     if n_keep == n_pts:
         return torch.arange(n_pts, device=points.device)
-    # ops.fps_indices is deterministic (centroid start). On CUDA it is a
-    # PyTorch loop, not pytorch3d's CUDA kernel. Seeded diversity comes from
-    # a random permutation; FPS is applied only on a proper random pool.
+    # ops.fps_indices is deterministic (centroid start). Seeded diversity comes
+    # from a random permutation; FPS is applied only on a proper random pool.
     g = _cpu_generator(generator)
     perm = torch.randperm(n_pts, device="cpu", generator=g).to(device=points.device)
     pool_n = min(n_pts, max(n_keep * 4, n_keep))
@@ -818,30 +818,6 @@ def _subset_indices(points, n_keep, generator=None):
         return perm[:n_keep]
 
 
-def _min_euclid(points, cl, row_chunk=2048, col_chunk=8192):
-    """Min distance from each point to ``cl``, in chunks so N×M is never allocated.
-
-    One dense vessel against a long centerline is large enough that ``torch.cdist``
-    builds an index that does not fit in 32 bits, and the kernel then reports an
-    illegal access on whichever later call happens to synchronize.
-    """
-    pts = points.detach().to(dtype=torch.float32).reshape(-1, 3)
-    ref = cl.detach().to(device=pts.device, dtype=torch.float32).reshape(-1, 3)
-    n = int(pts.size(0))
-    m = int(ref.size(0))
-    out = pts.new_full((n,), float("inf"))
-    if n == 0 or m == 0:
-        return out
-    for i0 in range(0, n, int(row_chunk)):
-        block = pts[i0:i0 + int(row_chunk)]
-        best = block.new_full((block.size(0),), float("inf"))
-        for j0 in range(0, m, int(col_chunk)):
-            dist = torch.cdist(block, ref[j0:j0 + int(col_chunk)])
-            best = torch.minimum(best, dist.min(dim=1).values)
-        out[i0:i0 + block.size(0)] = best
-    return out
-
-
 def _hybrid_subset_indices(points, n_keep, cl_xyz=None, generator=None):
     n_keep = int(n_keep)
     n_far = int(round(n_keep * float(N_TRUE_FAR_FRAC)))
@@ -851,7 +827,7 @@ def _hybrid_subset_indices(points, n_keep, cl_xyz=None, generator=None):
         extra = _subset_indices(points, n_far, generator=generator) if n_far else uni[:0]
         return torch.cat([uni, extra], dim=0)[:n_keep]
     cl = cl_xyz.to(device=points.device, dtype=points.dtype).reshape(-1, 3)
-    dmin = _min_euclid(points, cl)
+    dmin = torch.cdist(points.float(), cl.float()).min(dim=1).values
     far_mask = dmin > (float(TUBE_RADIUS_MM) + 1.0)
     far_idx = far_mask.nonzero(as_tuple=False).view(-1)
     if far_idx.numel() == 0:
@@ -1080,17 +1056,7 @@ def apply_mirror(batch, p=0.5, generator=None, flip=None):
         g = _mirror_rows_graph(batch, pkey, pts.size(0), n_graphs)
         if g is None:
             raise ValueError(f"apply_mirror: cannot assign {fkey!r} to graphs")
-        # Face ids are local to each cloud, then offset by collate. An id that
-        # is only one past its own cloud still lands inside the next graph, so
-        # it does not fault until this graph is last in the batch.
-        g_dev = g.to(device=f.device, dtype=torch.long)
-        n_pts = int(g_dev.numel())
-        if n_pts == 0:
-            continue
-        idx = f[0].to(dtype=torch.long)
-        in_range = (idx >= 0) & (idx < n_pts)
-        gid = g_dev[idx.clamp(0, n_pts - 1)].clamp(0, max(n_graphs - 1, 0))
-        m = flip.to(device=f.device)[gid] & in_range
+        m = flip.to(f.device)[g.to(f.device)[f[0]]]
         out = f.clone()
         out[1] = torch.where(m, f[2], f[1])
         out[2] = torch.where(m, f[1], f[2])
@@ -1263,15 +1229,26 @@ def train_epoch(
         torch.cuda.reset_peak_memory_stats(_cuda_index(device))
 
     show_bar = is_main_process()
+    rec = crash_diag.recorder()  # None unless ANEUX_DIAG=1
     for step, batch in enumerate(tqdm(dataloader, desc="Training", disable=not show_bar)):
+        if rec is not None:
+            rec.begin(epoch, step, batch)
         batch = _keep_meta_on_cpu(batch.to(device))
         if augment:
+            if rec is not None:
+                rec.mark("augment")
             apply_train_augmentations(batch)
+            if rec is not None:
+                rec.check_device(batch, "after_augment")
         batch_size = int(batch.num_graphs)
         total_samples += batch_size
         window_len = _accum_window_len(step, n_batches, accum_steps)
 
+        if rec is not None:
+            rec.mark("forward")
         out = _forward_model(model, batch, sample=True)
+        if rec is not None:
+            rec.mark("loss")
         terms = losses_from_output(out, batch, **kl_kwargs)
         loss = _weighted_total(terms, weights) / window_len
 
@@ -1281,8 +1258,11 @@ def train_epoch(
             if (hasattr(model, "no_sync") and not is_update)
             else contextlib.nullcontext()
         )
+        if rec is not None:
+            rec.mark("backward")
         with sync_ctx:
             loss.backward()
+        grad_norm = None
         if vram_probe and use_cuda and not logged_first_batch:
             _print_vram("after first batch (forward+backward, no optimizer.step yet)", device, unwrap_model(model))
             logged_first_batch = True
@@ -1293,14 +1273,20 @@ def train_epoch(
             window_kl_n += batch_size
 
         if is_update:
+            if rec is not None:
+                rec.mark("optimizer")
             if grad_clip is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+            if rec is not None:
+                rec.mark("ema")
             if ema is not None:
                 ema.update(unwrap_model(model))
             if scheduler is not None:
                 scheduler.step()
+            if rec is not None:
+                rec.mark("geco")
             if use_geco:
                 window_kl_sum, window_kl_n = all_reduce_sum_pair(
                     window_kl_sum, window_kl_n, device=device if use_cuda else None
@@ -1350,6 +1336,9 @@ def train_epoch(
                     val = _tensor_scalar(val)
                 if val is not None:
                     _add_meter(totals, key, val, float(batch_size))
+        if rec is not None:
+            rec.after_step(loss, grad_norm)
+            rec.mark("between_steps")
         del out, terms, loss, batch
 
     if vram_probe and use_cuda:

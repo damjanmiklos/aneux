@@ -386,6 +386,14 @@ def main():
             extra_meta=extra,
             run_dir=run_dir,
         )
+    except Exception as exc:
+        # ANEUX_DIAG only: write the crash report, then exit this rank at once
+        # so torchrun stops the others instead of the 10-minute NCCL watchdog.
+        import crash_diag
+
+        if crash_diag.enabled():
+            crash_diag.fatal(exc, where="run_stage2_training")
+        raise
     finally:
         destroy_distributed()
         _copy_back()
