@@ -41,6 +41,8 @@
 #SBATCH --no-requeue
 #SBATCH --output=aneux_replay_%j.out
 #SBATCH --error=aneux_replay_%j.err
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=miklos.damjan@gmail.com
 
 set -euo pipefail
 
