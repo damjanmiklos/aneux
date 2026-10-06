@@ -30,6 +30,28 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
 import torch  # noqa: E402
 
 
+def aug_only(entry, device, args):
+    """The exact pre-model part of a train step, repeated. With CUDA_LAUNCH_BLOCKING=1 the
+    first pass that faults names its kernel; ``--sweep`` tries other RNG draws on the batch."""
+    from train import _keep_meta_on_cpu, apply_train_augmentations
+
+    def one_pass(tag):
+        batch = _keep_meta_on_cpu(entry["batch"].clone().to(device))
+        apply_train_augmentations(batch)
+        torch.cuda.synchronize()
+        print(f"{tag}: ok", flush=True)
+
+    for i in range(max(1, args.repeat)):
+        torch.set_rng_state(entry["rng_cpu"])
+        if entry.get("rng_cuda") is not None:
+            torch.cuda.set_rng_state(entry["rng_cuda"], device)
+        one_pass(f"exact replay {i + 1}/{args.repeat}")
+    for i in range(args.sweep):
+        torch.manual_seed(1000 + i)
+        one_pass(f"sweep {i + 1}/{args.sweep} (seed {1000 + i})")
+    print("augmentation passes completed without a CUDA error", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dump", help="crash_rank*_e*_s*.pt written by crash_diag")
@@ -37,6 +59,10 @@ def main():
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--repeat", type=int, default=1)
     ap.add_argument("--no-aug", action="store_true", help="skip the train augmentations")
+    ap.add_argument("--aug-only", action="store_true",
+                    help="run only batch.to(device) + the train augmentations (no model, seconds per pass)")
+    ap.add_argument("--sweep", type=int, default=0,
+                    help="with --aug-only: after the exact replays, N more passes with fresh RNG draws on the same batch")
     args = ap.parse_args()
 
     from config import (
@@ -55,6 +81,10 @@ def main():
     flags = [f for f in entry.get("flags", []) if f]
     if flags:
         print(f"scan flags recorded for this batch: {flags}")
+
+    if args.aug_only:
+        aug_only(entry, device, args)
+        return
 
     model = GraphVAE(
         latent_dim=LATENT_DIM,
