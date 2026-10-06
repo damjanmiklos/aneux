@@ -46,13 +46,14 @@
 #SBATCH --cpus-per-task=64
 #SBATCH --gres=gpu:4
 #SBATCH --exclusive
-#SBATCH --time=12:00:00
+#SBATCH --time=5:00:00
 #SBATCH --mem=0
 #SBATCH --no-requeue
 #SBATCH --signal=TERM@1800
 #SBATCH --output=aneux_s2_diag_%j.out
 #SBATCH --error=aneux_s2_diag_%j.err
 #SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=miklos.damjan@gmail.com
 
 set -euo pipefail
 
