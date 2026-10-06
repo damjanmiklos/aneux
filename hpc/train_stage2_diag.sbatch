@@ -4,9 +4,23 @@
 # (jobs 14506605 and 14509551: one rank "illegal memory access", the other three
 # stuck in an all-reduce until the 10-minute NCCL watchdog).
 #
-# It must run the SAME code the crashed jobs ran (commit 3a88db5 plus the opt-in
-# diagnostics). The two attempted fixes are reverted on purpose: a fix that hides
-# the crash cannot tell us what caused it.
+# What the diagnostic run 14511899 showed (pulled to scratch/aneux_pull_14511899):
+#   * rank 1 faulted in torch.cat (parallel_cat) on index tensors created a few
+#     lines earlier, with CUDA_LAUNCH_BLOCKING=1. Data scan was clean (flags=[]).
+#   * kernel log: Xid 13 "Out Of Range Address" + Xid 43 on that GPU; ECC and
+#     retired pages clean, so not a failing card.
+#   * the crashed jobs ran on kernel 4.18.0-553.170.1 (built 2026-09-29) and, for
+#     14511899, NVIDIA driver 615.71.09 (module built 2026-10-05). The good runs
+#     (Sep 22 4-GPU, Sep 27 sweep) ran on 4.18.0-553.144.1 and driver 610.43.02.
+#   * the crashed jobs had PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True. That
+#     allocator maps memory through the driver's virtual-memory API, which is the
+#     part most sensitive to a driver change.
+# So this run keeps every diagnostic but turns expandable_segments OFF. If it
+# gets past ~30 epochs (a 10 percent per-epoch hazard would crash it with 96 percent
+# probability), the allocator mode was the trigger and the real runs can use the
+# same setting. If it still crashes, summary.txt names the stage and the allocator
+# counters, and the cause is the driver itself (open a ticket with Komondor).
+#   ANEUX_EXPANDABLE=1 sbatch ...  brings expandable_segments back for a control run.
 #
 # What it adds over train_stage2.sbatch:
 #   CUDA_LAUNCH_BLOCKING=1   the Python traceback names the kernel that faulted,
@@ -143,7 +157,10 @@ export PYTHONUNBUFFERED=1
 export PYTHONFAULTHANDLER=1
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# expandable_segments is OFF on Komondor since the 2026-10-05 driver/kernel update (see
+# hpc/train_stage2_diag.sbatch). Re-enable with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False}"
+if [[ "${ANEUX_EXPANDABLE:-0}" == "1" ]]; then export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"; fi
 
 # Single-node DDP as in the Komondor PyTorch example.
 # --cpu-bind=none: DataLoader workers must not be pinned to one core.
@@ -186,6 +203,10 @@ for m in ("torch_geometric", "pyg_lib", "pytorch3d", "numpy", "scipy", "vtk", "p
         print(m, "MISSING", exc)
 PY
   echo "--- node: $(hostname)"
+  echo "--- kernel: $(uname -r)  $(uname -v)"
+  echo "--- NVIDIA kernel module: $(head -1 /proc/driver/nvidia/version 2>/dev/null)"
+  nvidia-smi 2>&1 | sed -n 1,4p || true
+  echo "--- allocator: PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-<unset>}"
   nvidia-smi -L
 } > "${DIAG_DIR}/env.txt" 2>&1 || true
 nvidia-smi -q -d ECC,PAGE_RETIREMENT > "${DIAG_DIR}/gpu_before.txt" 2>&1 || true

@@ -165,6 +165,31 @@ def _scan_spline_pseudo(data):
     return out
 
 
+def _allocator_lines():
+    """Host-side allocator state (works after a sticky CUDA error): did the
+    allocator ever give memory back to the driver, and is it expandable."""
+    out = []
+    try:
+        st = torch.cuda.memory_stats()
+        out.append(
+            "allocator  alloc_retries={} ooms={} device_alloc={} device_free={} "
+            "sync_all_streams={} segments={}".format(
+                st.get("num_alloc_retries"), st.get("num_ooms"), st.get("segment.all.allocated"),
+                st.get("segment.all.freed"), st.get("num_sync_all_streams"), st.get("segment.all.current"),
+            )
+        )
+    except Exception as exc:
+        out.append(f"allocator  stats unavailable ({type(exc).__name__})")
+    try:
+        snap = torch.cuda.memory_snapshot()
+        n_exp = sum(1 for seg in snap if seg.get("is_expandable"))
+        out.append(f"allocator  {len(snap)} segments, {n_exp} expandable, "
+                   f"{sum(seg.get('total_size', 0) for seg in snap) / 2**30:.2f} GiB reserved")
+    except Exception as exc:
+        out.append(f"allocator  snapshot unavailable ({type(exc).__name__})")
+    return out
+
+
 class Recorder:
     """Per-rank recorder. One instance per training process."""
 
@@ -215,8 +240,11 @@ class Recorder:
         ids = list(getattr(cpu_batch, "sample_id", None) or [])
         flags = [f for f in (getattr(cpu_batch, "diag_flags", None) or [])]
         sizes = [s for s in (getattr(cpu_batch, "diag_sizes", None) or [])]
+        # PyG's Batch.to() moves the tensors in place, so a plain reference would be
+        # on the GPU by the time the dump is written (job 14511899: the dump failed
+        # with the same CUDA error). Keep a host copy.
         entry = {"epoch": self.epoch, "step": self.step, "ids": ids, "flags": flags,
-                 "sizes": sizes, "batch": cpu_batch, "rng_cpu": torch.get_rng_state()}
+                 "sizes": sizes, "batch": cpu_batch.clone(), "rng_cpu": torch.get_rng_state()}
         try:
             entry["rng_cuda"] = torch.cuda.get_rng_state()
         except Exception:
@@ -224,8 +252,11 @@ class Recorder:
         self.recent.append(entry)
         mem = {}
         try:
+            stats = torch.cuda.memory_stats()
             mem = {"alloc_gib": round(torch.cuda.memory_allocated() / 2**30, 3),
-                   "reserved_gib": round(torch.cuda.memory_reserved() / 2**30, 3)}
+                   "reserved_gib": round(torch.cuda.memory_reserved() / 2**30, 3),
+                   "alloc_retries": int(stats.get("num_alloc_retries", 0)),
+                   "dev_frees": int(stats.get("num_device_free", 0))}
         except Exception:
             pass
         flagged = [f for f in flags if f]
@@ -289,6 +320,8 @@ class Recorder:
             )
         except Exception as mem_exc:
             lines.append(f"cuda mem  unavailable ({type(mem_exc).__name__})")
+        lines.append(f"alloc conf  {os.environ.get('PYTORCH_CUDA_ALLOC_CONF', '<unset>')}")
+        lines.extend(_allocator_lines())
         try:
             smi = subprocess.run(
                 ["nvidia-smi", "-i", str(self.local_rank), "--query-gpu=name,ecc.errors.uncorrected.volatile.total,"

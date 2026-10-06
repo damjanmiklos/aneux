@@ -75,7 +75,9 @@ export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export PYTHONUNBUFFERED=1
 export PYTHONFAULTHANDLER=1
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# expandable_segments is OFF on Komondor since the 2026-10-05 driver/kernel update (see
+# hpc/train_stage2_diag.sbatch). Re-enable with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False}"
 
 # Job statistics next to the run's data/. seff and jobstats are not on the
 # compute nodes' PATH (the 2026-09-22 job logged "command not found"), and

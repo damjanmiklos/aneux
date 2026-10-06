@@ -48,7 +48,9 @@ export PYTHONUNBUFFERED=1
 export PYTHONFAULTHANDLER=1
 export CUDA_LAUNCH_BLOCKING=1
 export TORCH_SHOW_CPP_STACKTRACES=1
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# expandable_segments is OFF on Komondor since the 2026-10-05 driver/kernel update (see
+# hpc/train_stage2_diag.sbatch). Re-enable with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False}"
 
 REPLAY="${REPO}/1test_encoder_decoder_only/train_pipeline/diag_replay.py"
 ARGS=("$CRASH_DUMP")

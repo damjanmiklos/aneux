@@ -21,7 +21,11 @@ import torch
 
 
 def configure_cuda_allocator():
-    """Linux CUDA caching allocator can grow in-place; Windows cannot."""
+    """Expandable segments are opt-in (PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True).
+
+    Windows cannot use them at all. On Komondor they are off since the 2026-10-05
+    driver update: three Stage-2 jobs hit CUDA error 700 inside plain torch kernels.
+    """
     key = "PYTORCH_CUDA_ALLOC_CONF"
     if os.name == "nt":
         conf = os.environ.get(key, "")
@@ -35,7 +39,7 @@ def configure_cuda_allocator():
         else:
             os.environ.pop(key, None)
         return
-    os.environ.setdefault(key, "expandable_segments:True")
+    os.environ.setdefault(key, "expandable_segments:False")
 
 
 def configure_stage2_precision():

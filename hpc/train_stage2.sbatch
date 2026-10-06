@@ -137,7 +137,9 @@ export PYTHONUNBUFFERED=1
 export PYTHONFAULTHANDLER=1
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# expandable_segments is OFF on Komondor since the 2026-10-05 driver/kernel update (see
+# hpc/train_stage2_diag.sbatch). Re-enable with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False}"
 
 # Single-node DDP as in the Komondor PyTorch example.
 # --cpu-bind=none: DataLoader workers must not be pinned to one core.

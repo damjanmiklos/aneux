@@ -192,7 +192,7 @@ def main():
     os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
     os.environ.setdefault("NCCL_DEBUG", os.environ.get("NCCL_DEBUG", "WARN"))
     os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
-    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:False")
     os.environ.setdefault("ANEUX_MONITOR_SEC", "15")
 
     if os.environ.get("ANEUX_CACHE_ONLY", "").strip() in ("1", "true", "yes"):
