@@ -49,6 +49,25 @@ def _centroid_start_index(pts: Tensor) -> Tensor:
     return (pts - c).pow(2).sum(dim=-1).argmax()
 
 
+# pytorch3d's CUDA FPS launches FarthestPointSamplingKernel<4> and <2> (clouds of 2..7
+# points) as <<<threads, threads>>> instead of <<<N, threads>>>: for one cloud, blocks
+# 1..threads-1 read lengths/K/start_idxs past their end and write idxs[b][0] past its end.
+# On the A100 that is a wild read (Xid 13) and elsewhere a silent heap write. Clouds this
+# small are done in torch.
+_FPS_MIN_CUDA_POINTS = 8
+
+
+def _fps_tiny(pts: Tensor, k: int) -> Tensor:
+    """FPS on a handful of points [N, 3], starting at the centroid-farthest point."""
+    sel = [_centroid_start_index(pts)]
+    dist = (pts - pts[sel[0]]).pow(2).sum(dim=-1)
+    for _ in range(k - 1):
+        nxt = dist.argmax()
+        sel.append(nxt)
+        dist = torch.minimum(dist, (pts - pts[nxt]).pow(2).sum(dim=-1))
+    return torch.stack(sel).to(torch.long)
+
+
 def fps_indices(pts: Tensor, k: int) -> Tensor:
     """FPS indices for a single cloud [N, 3] via pytorch3d, starting at the centroid-farthest point."""
     k = min(int(k), int(pts.size(0)))
@@ -57,6 +76,8 @@ def fps_indices(pts: Tensor, k: int) -> Tensor:
     if k == pts.size(0):
         return torch.arange(k, device=pts.device)
     pts_f = pts.to(dtype=torch.float32).contiguous()
+    if pts_f.size(0) < _FPS_MIN_CUDA_POINTS:
+        return _fps_tiny(pts_f, k)
     start = int(_centroid_start_index(pts_f).item())
     perm = torch.arange(pts_f.size(0), device=pts_f.device)
     if start != 0:

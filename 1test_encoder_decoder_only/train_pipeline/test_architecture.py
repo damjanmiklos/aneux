@@ -442,6 +442,31 @@ def test_fps_cuda_path():
     _assert(int(idx_g[0]) == start, "CUDA FPS start")
 
 
+def test_fps_tiny_clouds_match_pytorch3d():
+    """Clouds of 2..7 points skip pytorch3d's CUDA FPS (its <4>/<2> launches use the wrong
+    grid); the torch version must pick what pytorch3d's reference FPS picks."""
+    from pytorch3d.ops import sample_farthest_points
+
+    from ops import _fps_tiny
+
+    rs = np.random.RandomState(3)
+    for n in range(2, 8):
+        pts = torch.from_numpy(rs.randn(n, 3).astype(np.float32))
+        start = int((pts - pts.mean(0)).pow(2).sum(-1).argmax())
+        perm = torch.arange(n)
+        if start != 0:
+            perm[0], perm[start] = start, 0
+        for k in range(1, n):
+            _, loc = sample_farthest_points(pts[perm].unsqueeze(0), K=k, random_start_point=False)
+            want = perm[loc.squeeze(0).long()]
+            got = fps_indices(pts, k)
+            _assert(torch.equal(got, want), f"n={n} k={k}: {got.tolist()} != {want.tolist()}")
+            if torch.cuda.is_available():
+                got_g = fps_indices(pts.cuda(), k)
+                _assert(got_g.device.type == "cuda" and torch.equal(got_g.cpu(), want), f"cuda n={n} k={k}")
+    _assert(torch.equal(_fps_tiny(pts, 3), fps_indices(pts, 3)), "fps_indices must route tiny clouds to _fps_tiny")
+
+
 def test_ball_query_index_order():
     from ops import ball_query_packed
 
@@ -3323,6 +3348,7 @@ def main():
         test_bishop_frames_orthonormal,
         test_fps_count,
         test_fps_cuda_path,
+        test_fps_tiny_clouds_match_pytorch3d,
         test_ball_query_index_order,
         test_radius_all_in_ball,
         test_allocate_rings,
