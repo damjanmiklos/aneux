@@ -800,8 +800,9 @@ def _subset_indices(points, n_keep, generator=None):
         return points.new_zeros((0,), dtype=torch.long)
     if n_keep == n_pts:
         return torch.arange(n_pts, device=points.device)
-    # ops.fps_indices is deterministic (centroid start). Seeded diversity comes
-    # from a random permutation; FPS is applied only on a proper random pool.
+    # ops.fps_indices is deterministic (centroid start). On CUDA it is a
+    # PyTorch loop, not pytorch3d's CUDA kernel. Seeded diversity comes from
+    # a random permutation; FPS is applied only on a proper random pool.
     g = _cpu_generator(generator)
     perm = torch.randperm(n_pts, device="cpu", generator=g).to(device=points.device)
     pool_n = min(n_pts, max(n_keep * 4, n_keep))

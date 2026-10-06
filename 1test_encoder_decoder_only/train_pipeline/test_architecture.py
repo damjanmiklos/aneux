@@ -426,19 +426,58 @@ def test_fps_count():
 
 
 def test_fps_cuda_path():
+    from model import fps_packed
+
     pts = torch.randn(128, 3)
     idx_cpu = fps_indices(pts, 16)
     _assert(idx_cpu.numel() == 16, idx_cpu.shape)
     _assert(idx_cpu.min() >= 0 and idx_cpu.max() < 128, "CPU FPS out of range")
+    _assert(idx_cpu.unique().numel() == 16, "FPS repeated an index")
     start = int((pts - pts.mean(0)).pow(2).sum(-1).argmax())
     _assert(int(idx_cpu[0]) == start, "FPS start")
+    from ops import _fps_uniform_torch
+
+    idx_loop = _fps_uniform_torch(pts.reshape(1, 128, 3), 16).reshape(-1)
+    _assert(int(idx_loop[0]) == start, "loop FPS start")
+    _assert(int(idx_loop.min()) >= 0 and int(idx_loop.max()) < 128, "loop FPS out of range")
+    _assert(idx_loop.unique().numel() == 16, "loop FPS repeated an index")
+    bad = pts.clone()
+    bad[3] = float("nan")
+    bad[4] = float("inf")
+    idx_bad = fps_indices(bad, 16)
+    _assert(int(idx_bad.min()) >= 0 and int(idx_bad.max()) < 128, "nonfinite FPS out of range")
+    dup = torch.zeros(32, 3)
+    dup[:8] = torch.randn(8, 3)
+    idx_dup = fps_indices(dup, 10)
+    _assert(int(idx_dup.min()) >= 0 and int(idx_dup.max()) < 32, "duplicate FPS out of range")
+    g0 = torch.randn(40, 3)
+    g1 = torch.randn(40, 3)
+    packed = torch.cat([g0, g1], dim=0)
+    batch = torch.cat([
+        torch.zeros(40, dtype=torch.long),
+        torch.ones(40, dtype=torch.long),
+    ])
+    got = fps_packed(packed, batch, 8, n_graphs=2)
+    expect = torch.cat([fps_indices(g0, 8), fps_indices(g1, 8) + 40])
+    _assert(torch.equal(got, expect), "uniform packed FPS diverged")
+    h0 = torch.randn(18, 3)
+    h1 = torch.randn(27, 3)
+    mixed = torch.cat([h0, h1], dim=0)
+    mixed_batch = torch.cat([
+        torch.zeros(18, dtype=torch.long),
+        torch.ones(27, dtype=torch.long),
+    ])
+    got_mixed = fps_packed(mixed, mixed_batch, 6, n_graphs=2)
+    expect_mixed = torch.cat([fps_indices(h0, 6), fps_indices(h1, 6) + 18])
+    _assert(torch.equal(got_mixed, expect_mixed), "variable packed FPS diverged")
     if not torch.cuda.is_available():
         return
     pts_g = pts.cuda()
     idx_g = fps_indices(pts_g, 16)
     _assert(idx_g.device.type == "cuda", f"expected CUDA indices, got {idx_g.device}")
     _assert(idx_g.numel() == 16, idx_g.shape)
-    _assert(int(idx_g.max()) < 128, "CUDA FPS out of range")
+    _assert(idx_g.unique().numel() == 16, "CUDA FPS repeated an index")
+    _assert(int(idx_g.min()) >= 0 and int(idx_g.max()) < 128, "CUDA FPS out of range")
     _assert(int(idx_g[0]) == start, "CUDA FPS start")
 
 

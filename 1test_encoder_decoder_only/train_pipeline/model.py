@@ -58,7 +58,7 @@ from geometry import (
     knn_weighted_upsample,
     upsample_branch_concat,
 )
-from ops import ball_query_packed, fps_indices, make_spline_conv, radius_graph_packed
+from ops import ball_query_packed, fps_indices, fps_uniform, make_spline_conv, radius_graph_packed
 
 
 def _cfg_get(name: str, default):
@@ -161,6 +161,23 @@ def fps_packed(pos: Tensor, batch: Tensor, n_out: int, n_graphs: int | None = No
         if k == pos.size(0):
             return torch.arange(pos.size(0), device=pos.device)
         return fps_indices(pos, k)
+    counts = torch.bincount(batch.detach(), minlength=n_graphs)
+    width = int(counts[0])
+    packed_uniform = (
+        width > 0
+        and int(pos.size(0)) == n_graphs * width
+        and bool(torch.all(counts == width))
+        and (int(batch.numel()) < 2 or bool(torch.all(batch[1:] >= batch[:-1])))
+    )
+    if packed_uniform:
+        k = min(int(n_out), width)
+        if k <= 0:
+            return pos.new_zeros((0,), dtype=torch.long)
+        if k == width:
+            return torch.arange(pos.size(0), device=pos.device)
+        local = fps_uniform(pos.reshape(n_graphs, width, -1), k)
+        base = torch.arange(n_graphs, device=pos.device, dtype=torch.long) * width
+        return (local + base.unsqueeze(1)).reshape(-1)
     pieces = []
     for g in range(n_graphs):
         node_idx = (batch == g).nonzero(as_tuple=False).view(-1)
