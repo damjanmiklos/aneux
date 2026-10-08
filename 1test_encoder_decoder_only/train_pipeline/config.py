@@ -78,7 +78,9 @@ FAR_CL_MARGIN_MM = 1.0
 #     sac membership is taken from the companion .spheres.npz. The cache key
 #     has no source hash, so v15 files are not reused.
 # 17: one latent token at each sphere centroid. v16 files are not reused.
-CACHE_VERSION = 17
+# 18: cleandata regenerated 2026-10-08 (approved keep-one set, p430 back,
+#     multi-start connected sphere fit). v17 files are not reused.
+CACHE_VERSION = 18
 
 # (n_length, n_radial) per hierarchy level
 LEVEL_COARSE = (40, 6)

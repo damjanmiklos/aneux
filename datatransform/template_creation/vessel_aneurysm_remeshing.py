@@ -106,6 +106,16 @@ def detect_aneurysm(pts, faces, up, r_parent):
 
 LOG_FOLDER = "vessel_aneurysm_logs"
 N_SPHERES = 3
+# Sphere-fit descents from different seeds (the greedy cover first), and the
+# iteration cap of each. One 60-iteration descent was chaotic: a few microns
+# of surface change moved blended sac RMSE by >0.1 mm on 1 in 6 cases.
+FIT_STARTS = 4
+FIT_MAXITER = 200
+# Refine each placed fit once more with a penalty on spheres that
+# place_spheres would have to pull in (p390 keep 2: 0.62 -> 1.18 mm without).
+# On the 320 cases the 2026-10-07 regen changed: mean blended RMSE 0.292 ->
+# 0.260 mm, none worse by >0.1 mm, 21 better; ~6 s more per case.
+FIT_CONNECT = True
 
 # Voxel of the implicit field. The surface is smoothed and remeshed at
 # >= 0.3 mm afterwards, so 0.2 mm resolves the thinnest kept tube (0.35 mm
@@ -619,32 +629,48 @@ def fit_aneurysm_spheres(pts, normals, mask, up, r_parent, cat=None, blend=BLEND
     def union(C, R):
         return sac_model(C, R, S, fp_S, fn_S, ff_S, blend, gap)
 
-    # Greedy cover of the sac wall, gain measured with the blended model.
-    chosen = []
-    cur = float(np.mean(fp_S ** 2))
-    for _ in range(n_spheres):
-        best_gain, best_i, best_cost = 0.0, None, cur
-        for i in range(len(cand_c)):
-            if i in chosen:
-                continue
-            ids = chosen + [i]
-            c = float(np.mean(union(cand_c[ids], cand_r[ids]) ** 2))
-            if cur - c > best_gain:
-                best_gain, best_i, best_cost = cur - c, i, c
-        if best_i is None:
+    def greedy(first=None):
+        """Greedy cover of the sac wall, gain measured with the blended model."""
+        chosen = [] if first is None else [first]
+        cur = float(np.mean((union(cand_c[chosen], cand_r[chosen]) if chosen else fp_S) ** 2))
+        for _ in range(n_spheres - len(chosen)):
+            best_gain, best_i, best_cost = 0.0, None, cur
+            for i in range(len(cand_c)):
+                if i in chosen:
+                    continue
+                ids = chosen + [i]
+                c = float(np.mean(union(cand_c[ids], cand_r[ids]) ** 2))
+                if cur - c > best_gain:
+                    best_gain, best_i, best_cost = cur - c, i, c
+            if best_i is None:
+                break
+            chosen.append(best_i)
+            cur = best_cost
+        C0 = [cand_c[i] for i in chosen]
+        R0 = [cand_r[i] for i in chosen]
+        while len(C0) < n_spheres:
+            # Fewer medial maxima than spheres: split the largest ball.
+            k = int(np.argmax(R0))
+            jitter = np.array([0.3, -0.2, 0.25]) * R0[k] * (1 + len(C0)) / n_spheres
+            C0.append(C0[k] + jitter)
+            R0.append(0.7 * R0[k])
+        return chosen, np.asarray(C0, dtype=np.float64), np.asarray(R0, dtype=np.float64)
+
+    # One local descent from one seed lands in whichever minimum is nearest,
+    # and a surface change of a few microns can move the seed into another
+    # one. The greedy cover is the first start; each further start forces a
+    # different deep medial ball to be the first sphere, and the start whose
+    # descent ends lowest wins.
+    first, C0, R0 = greedy()
+    seeds = [(C0, R0)]
+    firsts = [cand_c[first[0]]] if first else []
+    for k in range(len(cand_c)):
+        if len(seeds) >= FIT_STARTS:
             break
-        chosen.append(best_i)
-        cur = best_cost
-    C0 = [cand_c[i] for i in chosen]
-    R0 = [cand_r[i] for i in chosen]
-    while len(C0) < n_spheres:
-        # Fewer medial maxima than spheres: split the largest ball.
-        k = int(np.argmax(R0))
-        jitter = np.array([0.3, -0.2, 0.25]) * R0[k] * (1 + len(C0)) / n_spheres
-        C0.append(C0[k] + jitter)
-        R0.append(0.7 * R0[k])
-    C0 = np.asarray(C0, dtype=np.float64)
-    R0 = np.asarray(R0, dtype=np.float64)
+        if any(np.linalg.norm(cand_c[k] - c) < 0.5 * cand_r[k] for c in firsts):
+            continue
+        firsts.append(cand_c[k])
+        seeds.append(greedy(k)[1:])
 
     U = _fib_sphere(40)
     # How deep a sphere may sink into each nearby node's tube: a little into
@@ -657,6 +683,7 @@ def fit_aneurysm_spheres(pts, normals, mask, up, r_parent, cat=None, blend=BLEND
                       default=np.inf)
     pen_on = np.isfinite(allow)
     near, allow = near[pen_on], allow[pen_on]
+    conn_ids = neck_ids if len(neck_ids) else np.arange(len(up))
     r_min = 0.3
 
     def cost(x):
@@ -677,17 +704,53 @@ def fit_aneurysm_spheres(pts, normals, mask, up, r_parent, cat=None, blend=BLEND
         if len(near):
             pen = R[:, None] + r_parent[near][None] - np.linalg.norm(C[:, None, :] - up[near][None], axis=2)
             sink = np.sum(np.max(np.maximum(pen - allow[None], 0.0), axis=1) ** 2)
-        return fit + 2.0 * cross + 10.0 * small + 10.0 * sink
+        attach = 0.0
+        if attach_on[0]:
+            # place_spheres pulls every sphere into the neck (or onto another
+            # sphere) afterwards, and on a sac beside foreign vessel that pull
+            # then forces a shrink the fit never saw: p390 keep 2 lost 1.3 mm
+            # of one radius. Asking for the overlap here makes that pull small.
+            g_neck = (np.linalg.norm(C[:, None, :] - up[conn_ids][None], axis=2)
+                      - r_parent[conn_ids][None] - R[:, None]).min(axis=1)
+            g_pair = np.linalg.norm(C[:, None, :] - C[None], axis=2) - R[:, None] - R[None]
+            np.fill_diagonal(g_pair, np.inf)
+            g = np.minimum(g_neck, g_pair.min(axis=1))
+            attach = (np.sum(np.maximum(g + CONNECT_OVERLAP_MM, 0.0) ** 2)
+                      + np.maximum(g_neck.min() + CONNECT_OVERLAP_MM, 0.0) ** 2)
+        return fit + 2.0 * cross + 10.0 * small + 10.0 * sink + 10.0 * attach
 
     def fp_Q_cache(Q):
         return _parent_value(Q, up, r_parent, ptree, kn=4)
 
-    x0 = np.concatenate((C0.ravel(), R0))
-    res = minimize(cost, x0, method="L-BFGS-B", options={"maxiter": 60, "eps": 1e-3})
-    x = res.x if np.isfinite(res.fun) and res.fun <= cost(x0) else x0
-    C = x[: 3 * n_spheres].reshape(n_spheres, 3)
-    R = np.maximum(x[3 * n_spheres:], r_min)
-    C, R, n_moved = place_spheres(C, R, up, r_parent, neck_ids, foreign_ids, gap)
+    attach_on = [False]
+
+    def descend(C0, R0):
+        x0 = np.concatenate((C0.ravel(), R0))
+        res = minimize(cost, x0, method="L-BFGS-B", options={"maxiter": FIT_MAXITER, "eps": 1e-3})
+        x = res.x if np.isfinite(res.fun) and res.fun <= cost(x0) else x0
+        C = x[: 3 * n_spheres].reshape(n_spheres, 3)
+        R = np.maximum(x[3 * n_spheres:], r_min)
+        C, R, n_moved = place_spheres(C, R, up, r_parent, neck_ids, foreign_ids, gap)
+        return C, R, n_moved, res
+
+    # Each start is judged where it ends up, after place_spheres: a descent
+    # that ends lowest can still be the one the placement has to wreck. The
+    # attach term only refines an already placed (so connected) result: as
+    # the first descent's objective its penalty on a far-off seed dominates
+    # and L-BFGS stops early in a poor fit (C0096 blended 0.81 -> 2.24).
+    best = None
+    judge = len(seeds) > 1 or FIT_CONNECT
+    for C0, R0 in seeds:
+        tries = [descend(C0, R0)]
+        if FIT_CONNECT:
+            attach_on[0] = True
+            tries.append(descend(tries[0][0], tries[0][1]))
+            attach_on[0] = False
+        for C, R, n_moved, res in tries:
+            f_placed = cost(np.concatenate((C.ravel(), R))) if judge else 0.0
+            if best is None or f_placed < best[0]:
+                best = (f_placed, C, R, n_moved, res)
+    f_placed, C, R, n_moved, res = best
     f_par = fp_S
     f_fin = union(C, R)
     info = {
@@ -697,6 +760,7 @@ def fit_aneurysm_spheres(pts, normals, mask, up, r_parent, cat=None, blend=BLEND
         "iters": int(res.nit),
         "moved": n_moved,
         "seconds": time.perf_counter() - t0,
+        "cost": float(cost(np.concatenate((C.ravel(), R)))),
     }
     return C, R, info
 
@@ -1392,6 +1456,31 @@ class CaseModel:
         t0 = time.perf_counter()
         rep = self.check(rpts, rfaces)
         if rep["issues"]:
+            # A few-micron edge the remesher left in a cluster of tiny
+            # triangles (UPF_P0123: 0.006 mm, every pass and every rung):
+            # welding it on the output moves nothing by more than tol.
+            cpts, cfaces = _collapse_short(rpts, rfaces, 0.15 * self.sac_edge)
+            if len(cpts) < len(rpts):
+                rep2 = self.check(cpts, cfaces)
+                if verbose:
+                    print(f"  Remesh gate: {'; '.join(rep['issues'])}; welded {len(rpts) - len(cpts)} "
+                          f"short edges: {'; '.join(rep2['issues']) or 'ok'}")
+                if not rep2["issues"]:
+                    rpts, rfaces, rep = cpts, cfaces, rep2
+        if rep["issues"]:
+            # A knot of microscopic triangles the remesher reproduces on every
+            # pass, however many: untie it in its input and remesh once more.
+            kpts, kfaces, n_knots = _untie_knots(pts, faces, 0.15 * self.sac_edge)
+            if n_knots:
+                if verbose:
+                    print(f"  Remesh gate: {'; '.join(rep['issues'])}; "
+                          f"untying {n_knots} knot vertices and remeshing")
+                pts, faces = kpts, kfaces
+                rpts2, rfaces2 = self.remesh(pts, faces)
+                rep2 = self.check(rpts2, rfaces2)
+                if not rep2["issues"]:
+                    rpts, rfaces, rep = rpts2, rfaces2, rep2
+        if rep["issues"]:
             # One retry: a remesh that tore is usually fine with more passes.
             if verbose:
                 print(f"  Remesh gate: {'; '.join(rep['issues'])}; retrying")
@@ -1502,6 +1591,63 @@ def _collapse_short(pts, faces, tol):
         good = (faces[:, 0] != faces[:, 1]) & (faces[:, 1] != faces[:, 2]) & (faces[:, 0] != faces[:, 2])
         pts, faces = _compact(pts, faces[good])
     return pts, faces
+
+
+def _drop_knot_vertices(pts, faces, tol):
+    """Replace each interior valence-3 vertex on an edge shorter than ``tol``
+    (and its three triangles) by the one triangle of its neighbours.
+
+    ``_collapse_short`` leaves these: in a cluster of microscopic marching-cubes
+    triangles its greedy collapses can end on a vertex whose short edges all
+    fail the link condition, and the remesher's own collapses fail the same
+    way, so the cluster survives every pass (UPF_P0123: a 0.002 mm edge after
+    2, 6 and 12 iterations). Removing a valence-3 vertex never changes the
+    topology unless its neighbours' triangle already exists, which is skipped.
+    """
+    uniq, _inv, cnt = _edge_table(faces)
+    elen = np.linalg.norm(pts[uniq[:, 0]] - pts[uniq[:, 1]], axis=1)
+    rim = np.zeros(len(pts), dtype=bool)
+    rim[uniq[cnt == 1].ravel()] = True
+    short = np.zeros(len(pts), dtype=bool)
+    short[uniq[elen < tol].ravel()] = True
+    valence = np.bincount(faces.ravel(), minlength=len(pts))
+    cand = np.flatnonzero((valence == 3) & short & ~rim)
+    if not len(cand):
+        return pts, faces, 0
+    existing = set(map(tuple, np.sort(faces, axis=1).tolist()))
+    keep = np.ones(len(faces), dtype=bool)
+    used = np.zeros(len(pts), dtype=bool)
+    new = []
+    for v in cand.tolist():
+        fi = np.flatnonzero((faces == v).any(axis=1))
+        ring = set(faces[fi].ravel().tolist()) - {v}
+        if len(fi) != 3 or len(ring) != 3 or used[v] or used[list(ring)].any():
+            continue
+        f0 = faces[fi[0]].copy()
+        f0[f0 == v] = (ring - set(f0.tolist())).pop()  # keeps the orientation of fi[0]
+        if tuple(sorted(f0.tolist())) in existing:
+            continue
+        keep[fi] = False
+        used[v] = True
+        used[list(ring)] = True
+        new.append(f0)
+    if not new:
+        return pts, faces, 0
+    p, f = _compact(pts, np.vstack([faces[keep], np.asarray(new)]))
+    return p, f, len(new)
+
+
+def _untie_knots(pts, faces, tol, rounds=5):
+    """Alternate ``_drop_knot_vertices`` and ``_collapse_short`` until neither
+    changes anything. Returns the surface and the number of vertices dropped."""
+    total = 0
+    for _ in range(rounds):
+        pts, faces, k = _drop_knot_vertices(pts, faces, tol)
+        if not k:
+            break
+        total += k
+        pts, faces = _collapse_short(pts, faces, tol)
+    return pts, faces, total
 
 
 # ---------------------------------------------------------------------------
