@@ -25,9 +25,11 @@ if 'sph' in parts:
         p.add_mesh(pv.Sphere(radius=float(Rr),center=C,theta_resolution=40,phi_resolution=40),color=col,opacity=0.6,smooth_shading=True)
     cam(p); p.screenshot(f'{OUT}/{tag}_sph.png'); p.close()
 if 'dist' in parts:
-    # distance of every GT vertex to the template surface: the stricter, GT-side direction, so a part of the sac the spheres miss shows up
-    uraw['d']=sdist(uraw,t.extract_surface(algorithm='dataset_surface'))
-    d=np.asarray(uraw['d']); s_=np.asarray(uraw['sac'])>0
-    print('GT->template all med %.3f p95 %.3f | sac med %.3f p90 %.3f p95 %.3f max %.3f'%(np.median(d),np.percentile(d,95),np.median(d[s_]),np.percentile(d[s_],90),np.percentile(d[s_],95),d[s_].max()))
-    p=plotter(size,size); p.add_mesh(uraw.triangulate(),scalars='d',cmap='magma_r',clim=[0,clim],smooth_shading=True,show_scalar_bar=False,specular=0.2); cam(p); p.screenshot(f'{OUT}/{tag}_dist.png'); p.close()
+    # the finished template (smoothed, meshed, ostia cut), coloured by each vertex's distance to the nearest point of the GT surface
+    gts=uraw.extract_surface(algorithm='dataset_surface')
+    t['d']=sdist(t,gts); d=np.asarray(t['d'])
+    Pt=np.asarray(t.points); sdf=np.min([np.linalg.norm(Pt-C,axis=1)-Rr for C,Rr in zip(sp['centers'],sp['radii'])],axis=0)
+    s_=sdf<0.25
+    print('template->GT all med %.3f p95 %.3f max %.3f | sac region (%d verts) med %.3f p90 %.3f p95 %.3f max %.3f'%(np.median(d),np.percentile(d,95),d.max(),s_.sum(),np.median(d[s_]),np.percentile(d[s_],90),np.percentile(d[s_],95),d[s_].max()))
+    p=plotter(size,size); p.add_mesh(t,scalars='d',cmap='magma_r',clim=[0,clim],smooth_shading=True,show_scalar_bar=False,specular=0.2); cam(p); p.screenshot(f'{OUT}/{tag}_dist.png'); p.close()
 print(case,'ps',round(ps,1),'ext',round(ext,1))
