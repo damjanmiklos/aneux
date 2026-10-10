@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 from aneux_paths import DATATRANSFORM, LABEL_DIR
 
 # --- CONFIGURATION ---
-FOLDER_PATH = "C:/dev/UQ/aneux/scratch/review_2026-10-06/all_115/"
+FOLDER_PATH = "C:/dev/UQ/aneux/cleandata/template_mesh/"
 OUTPUT_CSV_PATH = os.path.join(LABEL_DIR, "keep_one_surfaces.csv")
 
 SUPPORTED_EXTENSIONS = ('.vtp', '.stl')

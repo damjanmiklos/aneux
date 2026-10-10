@@ -1,0 +1,4743 @@
+% $ biblatex auxiliary file $
+% $ biblatex bbl format version 3.3 $
+% Do not modify the above lines!
+%
+% This is an auxiliary file used by the 'biblatex' package.
+% This file may safely be deleted. It will be recreated by
+% biber as required.
+%
+\begingroup
+\makeatletter
+\@ifundefined{ver@biblatex.sty}
+  {\@latex@error
+     {Missing 'biblatex' package}
+     {The bibliography requires the 'biblatex' package.}
+      \aftergroup\endinput}
+  {}
+\endgroup
+
+
+\refsection{0}
+  \datalist[entry]{apa/apasortcite//global/global/global}
+    \entry{amenta2001}{article}{}{}
+      \name{author}{3}{}{%
+        {{un=0,uniquepart=base,hash=3801643f38748f7da022ea9ed456be84}{%
+           family={Amenta},
+           familyi={A\bibinitperiod},
+           given={Nina},
+           giveni={N\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=771ef2b9d623774a07843a8ca0eceee9}{%
+           family={Choi},
+           familyi={C\bibinitperiod},
+           given={Sunghee},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=440093ecf83113e69986c3590bf2be8f}{%
+           family={Kolluri},
+           familyi={K\bibinitperiod},
+           given={Ravi\bibnamedelima Krishna},
+           giveni={R\bibinitperiod\bibinitdelim K\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {Elsevier BV}%
+      }
+      \strng{namehash}{b35cdf80bd36fb61978a5c2c259d0495}
+      \strng{fullhash}{88dfb69be1dd7452e9bca5a232ab6cb5}
+      \strng{fullhashraw}{88dfb69be1dd7452e9bca5a232ab6cb5}
+      \strng{bibnamehash}{88dfb69be1dd7452e9bca5a232ab6cb5}
+      \strng{authorbibnamehash}{88dfb69be1dd7452e9bca5a232ab6cb5}
+      \strng{authornamehash}{b35cdf80bd36fb61978a5c2c259d0495}
+      \strng{authorfullhash}{88dfb69be1dd7452e9bca5a232ab6cb5}
+      \strng{authorfullhashraw}{88dfb69be1dd7452e9bca5a232ab6cb5}
+      \field{sortinit}{A}
+      \field{sortinithash}{2f401846e2029bad6b3ecc16d50031e2}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{0925-7721}
+      \field{journaltitle}{Computational Geometry}
+      \field{number}{2-3}
+      \field{title}{The power crust, unions of balls, and the medial axis transform}
+      \field{volume}{19}
+      \field{year}{2001}
+      \field{pages}{127\bibrangedash 153}
+      \range{pages}{27}
+      \verb{doi}
+      \verb 10.1016/s0925-7721(01)00017-7
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1016/S0925-7721(01)00017-7
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1016/S0925-7721(01)00017-7
+      \endverb
+    \endentry
+    \entry{antiga2004}{article}{}{}
+      \name{author}{2}{}{%
+        {{un=0,uniquepart=base,hash=79de9b452b6fca4de4f21bae9bb927b8}{%
+           family={Antiga},
+           familyi={A\bibinitperiod},
+           given={L.},
+           giveni={L\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=c13fea8063d24b059d0f72c22750dc51}{%
+           family={Steinman},
+           familyi={S\bibinitperiod},
+           given={D.A.},
+           giveni={D\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{2}{%
+        {Institute of Electrical}%
+        {Electronics Engineers (IEEE)}%
+      }
+      \strng{namehash}{68201d1c516935e083975ef4ab8cbc71}
+      \strng{fullhash}{68201d1c516935e083975ef4ab8cbc71}
+      \strng{fullhashraw}{68201d1c516935e083975ef4ab8cbc71}
+      \strng{bibnamehash}{68201d1c516935e083975ef4ab8cbc71}
+      \strng{authorbibnamehash}{68201d1c516935e083975ef4ab8cbc71}
+      \strng{authornamehash}{68201d1c516935e083975ef4ab8cbc71}
+      \strng{authorfullhash}{68201d1c516935e083975ef4ab8cbc71}
+      \strng{authorfullhashraw}{68201d1c516935e083975ef4ab8cbc71}
+      \field{sortinit}{A}
+      \field{sortinithash}{2f401846e2029bad6b3ecc16d50031e2}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{0278-0062}
+      \field{journaltitle}{IEEE Transactions on Medical Imaging}
+      \field{number}{6}
+      \field{title}{Robust and Objective Decomposition and Mapping of Bifurcating Vessels}
+      \field{volume}{23}
+      \field{year}{2004}
+      \field{pages}{704\bibrangedash 713}
+      \range{pages}{10}
+      \verb{doi}
+      \verb 10.1109/tmi.2004.826946
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1109/TMI.2004.826946
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1109/TMI.2004.826946
+      \endverb
+    \endentry
+    \entry{antiga2008}{article}{}{}
+      \name{author}{6}{}{%
+        {{un=0,uniquepart=base,hash=f65a80959d520337ae99a0798515036c}{%
+           family={Antiga},
+           familyi={A\bibinitperiod},
+           given={Luca},
+           giveni={L\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=784a9d01dd0a11187df8eef377cc3295}{%
+           family={Piccinelli},
+           familyi={P\bibinitperiod},
+           given={Marina},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=b3ee1691d83087d6c41478d3ca208da3}{%
+           family={Botti},
+           familyi={B\bibinitperiod},
+           given={Lorenzo},
+           giveni={L\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=b40aa5dc4b52f7233527b32e80da1505}{%
+           family={Ene-Iordache},
+           familyi={E\bibinithyphendelim I\bibinitperiod},
+           given={Bogdan},
+           giveni={B\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=04f80f4aa3ea334c53fac6d1fe0287c2}{%
+           family={Remuzzi},
+           familyi={R\bibinitperiod},
+           given={Andrea},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=cb534fd04c099001a59246c4f6ad921a}{%
+           family={Steinman},
+           familyi={S\bibinitperiod},
+           given={David\bibnamedelima A.},
+           giveni={D\bibinitperiod\bibinitdelim A\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{2}{%
+        {Springer Science}%
+        {Business Media LLC}%
+      }
+      \strng{namehash}{d3c34fc07e155d8d1bb4676ea1259166}
+      \strng{fullhash}{9f73cba2e2eef5340c63d1d64bf68cf8}
+      \strng{fullhashraw}{9f73cba2e2eef5340c63d1d64bf68cf8}
+      \strng{bibnamehash}{9f73cba2e2eef5340c63d1d64bf68cf8}
+      \strng{authorbibnamehash}{9f73cba2e2eef5340c63d1d64bf68cf8}
+      \strng{authornamehash}{d3c34fc07e155d8d1bb4676ea1259166}
+      \strng{authorfullhash}{9f73cba2e2eef5340c63d1d64bf68cf8}
+      \strng{authorfullhashraw}{9f73cba2e2eef5340c63d1d64bf68cf8}
+      \field{sortinit}{A}
+      \field{sortinithash}{2f401846e2029bad6b3ecc16d50031e2}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{1741-0444}
+      \field{journaltitle}{Medical \& Biological Engineering \& Computing}
+      \field{month}{11}
+      \field{number}{11}
+      \field{title}{An image-based modeling framework for patient-specific computational hemodynamics}
+      \field{volume}{46}
+      \field{year}{2008}
+      \verb{doi}
+      \verb 10.1007/s11517-008-0420-1
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1007/s11517-008-0420-1
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1007/s11517-008-0420-1
+      \endverb
+    \endentry
+    \entry{botsch2008}{article}{}{}
+      \name{author}{2}{}{%
+        {{un=0,uniquepart=base,hash=5c45d9bb93058b174f07674cc6e29938}{%
+           family={Botsch},
+           familyi={B\bibinitperiod},
+           given={M.},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=ffe7efd395c7e209ed890e3927cad723}{%
+           family={Sorkine},
+           familyi={S\bibinitperiod},
+           given={O.},
+           giveni={O\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{2}{%
+        {Institute of Electrical}%
+        {Electronics Engineers (IEEE)}%
+      }
+      \strng{namehash}{bd5a08abdc5891cff71b4af5afa35a0c}
+      \strng{fullhash}{bd5a08abdc5891cff71b4af5afa35a0c}
+      \strng{fullhashraw}{bd5a08abdc5891cff71b4af5afa35a0c}
+      \strng{bibnamehash}{bd5a08abdc5891cff71b4af5afa35a0c}
+      \strng{authorbibnamehash}{bd5a08abdc5891cff71b4af5afa35a0c}
+      \strng{authornamehash}{bd5a08abdc5891cff71b4af5afa35a0c}
+      \strng{authorfullhash}{bd5a08abdc5891cff71b4af5afa35a0c}
+      \strng{authorfullhashraw}{bd5a08abdc5891cff71b4af5afa35a0c}
+      \field{sortinit}{B}
+      \field{sortinithash}{d7095fff47cda75ca2589920aae98399}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{1077-2626}
+      \field{journaltitle}{IEEE Transactions on Visualization and Computer Graphics}
+      \field{month}{1}
+      \field{number}{1}
+      \field{title}{On Linear Variational Surface Deformation Methods}
+      \field{volume}{14}
+      \field{year}{2008}
+      \field{pages}{213\bibrangedash 230}
+      \range{pages}{18}
+      \verb{doi}
+      \verb 10.1109/tvcg.2007.1054
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1109/TVCG.2007.1054
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1109/TVCG.2007.1054
+      \endverb
+    \endentry
+    \entry{botsch2004}{article}{}{}
+      \name{author}{2}{}{%
+        {{un=0,uniquepart=base,hash=a0765e06ad46483a64643f0c7a324057}{%
+           family={Botsch},
+           familyi={B\bibinitperiod},
+           given={Mario},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=40f084401451fa652a2cc0beb43fe9f1}{%
+           family={Kobbelt},
+           familyi={K\bibinitperiod},
+           given={Leif},
+           giveni={L\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {ACM}%
+      }
+      \strng{namehash}{b303b245135aff96cb423bc9daed15c9}
+      \strng{fullhash}{b303b245135aff96cb423bc9daed15c9}
+      \strng{fullhashraw}{b303b245135aff96cb423bc9daed15c9}
+      \strng{bibnamehash}{b303b245135aff96cb423bc9daed15c9}
+      \strng{authorbibnamehash}{b303b245135aff96cb423bc9daed15c9}
+      \strng{authornamehash}{b303b245135aff96cb423bc9daed15c9}
+      \strng{authorfullhash}{b303b245135aff96cb423bc9daed15c9}
+      \strng{authorfullhashraw}{b303b245135aff96cb423bc9daed15c9}
+      \field{sortinit}{B}
+      \field{sortinithash}{d7095fff47cda75ca2589920aae98399}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{journaltitle}{Proceedings of the 2004 Eurographics/ACM SIGGRAPH symposium on Geometry processing}
+      \field{series}{SGP04}
+      \field{title}{A remeshing approach to multiresolution modeling}
+      \field{year}{2004}
+      \field{pages}{185\bibrangedash 192}
+      \range{pages}{8}
+      \verb{doi}
+      \verb 10.1145/1057432.1057457
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1145/1057432.1057457
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1145/1057432.1057457
+      \endverb
+    \endentry
+    \entry{botsch2010}{book}{}{}
+      \name{author}{5}{}{%
+        {{un=0,uniquepart=base,hash=a0765e06ad46483a64643f0c7a324057}{%
+           family={Botsch},
+           familyi={B\bibinitperiod},
+           given={Mario},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=40f084401451fa652a2cc0beb43fe9f1}{%
+           family={Kobbelt},
+           familyi={K\bibinitperiod},
+           given={Leif},
+           giveni={L\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=f27430fa205103cec8dd42ab86c2ba53}{%
+           family={Pauly},
+           familyi={P\bibinitperiod},
+           given={Mark},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=5a41513f72cfe8224163441d30854e41}{%
+           family={Alliez},
+           familyi={A\bibinitperiod},
+           given={Pierre},
+           giveni={P\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=56d2d17f2dd78ca45cdeaf2fae7813f1}{%
+           family={Levy},
+           familyi={L\bibinitperiod},
+           given={Bruno},
+           giveni={B\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {A K Peters/CRC Press}%
+      }
+      \strng{namehash}{26ae6ff0ce3f9b6b67a50bef1bbf083c}
+      \strng{fullhash}{955463099e04ba718707e250d9f3c421}
+      \strng{fullhashraw}{955463099e04ba718707e250d9f3c421}
+      \strng{bibnamehash}{955463099e04ba718707e250d9f3c421}
+      \strng{authorbibnamehash}{955463099e04ba718707e250d9f3c421}
+      \strng{authornamehash}{26ae6ff0ce3f9b6b67a50bef1bbf083c}
+      \strng{authorfullhash}{955463099e04ba718707e250d9f3c421}
+      \strng{authorfullhashraw}{955463099e04ba718707e250d9f3c421}
+      \field{sortinit}{B}
+      \field{sortinithash}{d7095fff47cda75ca2589920aae98399}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{isbn}{9781439865316}
+      \field{month}{10}
+      \field{title}{Polygon Mesh Processing}
+      \field{year}{2010}
+      \verb{doi}
+      \verb 10.1201/b10688
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1201/b10688
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1201/b10688
+      \endverb
+    \endentry
+    \entry{byrd1995}{article}{}{}
+      \name{author}{4}{}{%
+        {{un=0,uniquepart=base,hash=5a28551b79116d5aa47933899f1dfee0}{%
+           family={Byrd},
+           familyi={B\bibinitperiod},
+           given={Richard\bibnamedelima H.},
+           giveni={R\bibinitperiod\bibinitdelim H\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=8c2f3741ab4369f5590e2e16412db71b}{%
+           family={Lu},
+           familyi={L\bibinitperiod},
+           given={Peihuang},
+           giveni={P\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=88a342d927bf795b0d92af8a5613da31}{%
+           family={Nocedal},
+           familyi={N\bibinitperiod},
+           given={Jorge},
+           giveni={J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=db29c9e94410252c9dd6938604f708b8}{%
+           family={Zhu},
+           familyi={Z\bibinitperiod},
+           given={Ciyou},
+           giveni={C\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {Society for Industrial \& Applied Mathematics (SIAM)}%
+      }
+      \strng{namehash}{baf523517e047c9f98b50b0ed26ebe81}
+      \strng{fullhash}{f5975dd93e119527dc785af7466cba20}
+      \strng{fullhashraw}{f5975dd93e119527dc785af7466cba20}
+      \strng{bibnamehash}{f5975dd93e119527dc785af7466cba20}
+      \strng{authorbibnamehash}{f5975dd93e119527dc785af7466cba20}
+      \strng{authornamehash}{baf523517e047c9f98b50b0ed26ebe81}
+      \strng{authorfullhash}{f5975dd93e119527dc785af7466cba20}
+      \strng{authorfullhashraw}{f5975dd93e119527dc785af7466cba20}
+      \field{sortinit}{B}
+      \field{sortinithash}{d7095fff47cda75ca2589920aae98399}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{1095-7197}
+      \field{journaltitle}{SIAM Journal on Scientific Computing}
+      \field{number}{5}
+      \field{title}{A Limited Memory Algorithm for Bound Constrained Optimization}
+      \field{volume}{16}
+      \field{year}{1995}
+      \field{pages}{1190\bibrangedash 1208}
+      \range{pages}{19}
+      \verb{doi}
+      \verb 10.1137/0916069
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1137/0916069
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1137/0916069
+      \endverb
+    \endentry
+    \entry{cardenes2011}{article}{}{}
+      \name{author}{5}{}{%
+        {{un=0,uniquepart=base,hash=7c28c1fd055567145b334387381c89c7}{%
+           family={Cardenes},
+           familyi={C\bibinitperiod},
+           given={R.},
+           giveni={R\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=f3bb55c958ddc9eb0fc7311eef2bca07}{%
+           family={Pozo},
+           familyi={P\bibinitperiod},
+           given={J.\bibnamedelimi M.},
+           giveni={J\bibinitperiod\bibinitdelim M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=71a746482d41fd82d88ef21ae01b4540}{%
+           family={Bogunovic},
+           familyi={B\bibinitperiod},
+           given={H.},
+           giveni={H\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=9e988c1d2b9724320e4b5820a853725a}{%
+           family={Larrabide},
+           familyi={L\bibinitperiod},
+           given={I.},
+           giveni={I\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=366bab417a227a65435cd7e5821cdd9a}{%
+           family={Frangi},
+           familyi={F\bibinitperiod},
+           given={A.\bibnamedelimi F.},
+           giveni={A\bibinitperiod\bibinitdelim F\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{2}{%
+        {Institute of Electrical}%
+        {Electronics Engineers (IEEE)}%
+      }
+      \strng{namehash}{f0c662acb58710d9f8af9c4b066c7ee0}
+      \strng{fullhash}{3f3894b9141246e0d5a071d10185d07c}
+      \strng{fullhashraw}{3f3894b9141246e0d5a071d10185d07c}
+      \strng{bibnamehash}{3f3894b9141246e0d5a071d10185d07c}
+      \strng{authorbibnamehash}{3f3894b9141246e0d5a071d10185d07c}
+      \strng{authornamehash}{f0c662acb58710d9f8af9c4b066c7ee0}
+      \strng{authorfullhash}{3f3894b9141246e0d5a071d10185d07c}
+      \strng{authorfullhashraw}{3f3894b9141246e0d5a071d10185d07c}
+      \field{sortinit}{C}
+      \field{sortinithash}{4d103a86280481745c9c897c925753c0}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{1558-254X}
+      \field{journaltitle}{IEEE Transactions on Medical Imaging}
+      \field{month}{10}
+      \field{number}{10}
+      \field{title}{Automatic Aneurysm Neck Detection Using Surface Voronoi Diagrams}
+      \field{volume}{30}
+      \field{year}{2011}
+      \field{pages}{1863\bibrangedash 1876}
+      \range{pages}{14}
+      \verb{doi}
+      \verb 10.1109/tmi.2011.2157698
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1109/tmi.2011.2157698
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1109/tmi.2011.2157698
+      \endverb
+    \endentry
+    \entry{ford2009}{article}{}{}
+      \name{author}{5}{}{%
+        {{un=0,uniquepart=base,hash=ac4ffc5acb2e20e244c75c245a747467}{%
+           family={Ford},
+           familyi={F\bibinitperiod},
+           given={M\bibnamedelima D},
+           giveni={M\bibinitperiod\bibinitdelim D\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=a50682a7a949fc498333c6dc41b8dcb4}{%
+           family={Hoi},
+           familyi={H\bibinitperiod},
+           given={Y},
+           giveni={Y\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=5bbd87326dc176132df64e326f8b1818}{%
+           family={Piccinelli},
+           familyi={P\bibinitperiod},
+           given={M},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=79de9b452b6fca4de4f21bae9bb927b8}{%
+           family={Antiga},
+           familyi={A\bibinitperiod},
+           given={L},
+           giveni={L\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=c13fea8063d24b059d0f72c22750dc51}{%
+           family={Steinman},
+           familyi={S\bibinitperiod},
+           given={D\bibnamedelima A},
+           giveni={D\bibinitperiod\bibinitdelim A\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {Oxford University Press (OUP)}%
+      }
+      \strng{namehash}{f582762146826b8cc198ffd8f06ea03b}
+      \strng{fullhash}{93508b4c589c0ac426c83fc84d1b7ffb}
+      \strng{fullhashraw}{93508b4c589c0ac426c83fc84d1b7ffb}
+      \strng{bibnamehash}{93508b4c589c0ac426c83fc84d1b7ffb}
+      \strng{authorbibnamehash}{93508b4c589c0ac426c83fc84d1b7ffb}
+      \strng{authornamehash}{f582762146826b8cc198ffd8f06ea03b}
+      \strng{authorfullhash}{93508b4c589c0ac426c83fc84d1b7ffb}
+      \strng{authorfullhashraw}{93508b4c589c0ac426c83fc84d1b7ffb}
+      \field{sortinit}{F}
+      \field{sortinithash}{2638baaa20439f1b5a8f80c6c08a13b4}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{1748-880X}
+      \field{journaltitle}{The British Journal of Radiology}
+      \field{month}{1}
+      \field{number}{special_issue_1}
+      \field{title}{An objective approach to digital removal of saccular aneurysms: technique and applications}
+      \field{volume}{82}
+      \field{year}{2009}
+      \field{pages}{S55\bibrangedash S61}
+      \range{pages}{-1}
+      \verb{doi}
+      \verb 10.1259/bjr/67593727
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1259/bjr/67593727
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1259/bjr/67593727
+      \endverb
+    \endentry
+    \entry{izzo2018}{article}{}{}
+      \name{author}{4}{}{%
+        {{un=0,uniquepart=base,hash=47b0575040c180a7af0872a8dfbe3b8e}{%
+           family={Izzo},
+           familyi={I\bibinitperiod},
+           given={Richard},
+           giveni={R\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=e0999b99ce67dc691f974ac1621e113f}{%
+           family={Steinman},
+           familyi={S\bibinitperiod},
+           given={David},
+           giveni={D\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=0b4c7f9f1fa9cab88e541fcea0a927c6}{%
+           family={Manini},
+           familyi={M\bibinitperiod},
+           given={Simone},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=f65a80959d520337ae99a0798515036c}{%
+           family={Antiga},
+           familyi={A\bibinitperiod},
+           given={Luca},
+           giveni={L\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {The Open Journal}%
+      }
+      \strng{namehash}{4de665450b9cf485d0b5b55b49874c01}
+      \strng{fullhash}{49f7823616ed8c6786a3263d5457fe0b}
+      \strng{fullhashraw}{49f7823616ed8c6786a3263d5457fe0b}
+      \strng{bibnamehash}{49f7823616ed8c6786a3263d5457fe0b}
+      \strng{authorbibnamehash}{49f7823616ed8c6786a3263d5457fe0b}
+      \strng{authornamehash}{4de665450b9cf485d0b5b55b49874c01}
+      \strng{authorfullhash}{49f7823616ed8c6786a3263d5457fe0b}
+      \strng{authorfullhashraw}{49f7823616ed8c6786a3263d5457fe0b}
+      \field{sortinit}{I}
+      \field{sortinithash}{8d291c51ee89b6cd86bf5379f0b151d8}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{2475-9066}
+      \field{journaltitle}{Journal of Open Source Software}
+      \field{month}{5}
+      \field{number}{25}
+      \field{title}{The Vascular Modeling Toolkit: A Python Library for the Analysis of Tubular Structures in Medical Images}
+      \field{volume}{3}
+      \field{year}{2018}
+      \field{pages}{745}
+      \range{pages}{1}
+      \verb{doi}
+      \verb 10.21105/joss.00745
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.21105/joss.00745
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.21105/joss.00745
+      \endverb
+    \endentry
+    \entry{juchler2022}{misc}{}{}
+      \name{author}{3}{ul=2}{%
+        {{un=0,uniquepart=base,hash=ab52fc80a6e9733e6453d7a7b3a27f8d}{%
+           family={Juchler},
+           familyi={J\bibinitperiod},
+           given={Norman},
+           giveni={N\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=6c65063d4a7edab1b83a604b77224f9c}{%
+           family={Bijlenga},
+           familyi={B\bibinitperiod},
+           given={Philippe},
+           giveni={P\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=494435132d6d3891c280f4fc85d9884d}{%
+           family={Hirsch},
+           familyi={H\bibinitperiod},
+           given={Sven},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{language}{1}{%
+        {en}%
+      }
+      \list{publisher}{1}{%
+        {Zenodo}%
+      }
+      \strng{namehash}{bf167a19cd6100cc330dce66409ddc67}
+      \strng{fullhash}{bf167a19cd6100cc330dce66409ddc67}
+      \strng{fullhashraw}{bf167a19cd6100cc330dce66409ddc67}
+      \strng{bibnamehash}{bf167a19cd6100cc330dce66409ddc67}
+      \strng{authorbibnamehash}{bf167a19cd6100cc330dce66409ddc67}
+      \strng{authornamehash}{bf167a19cd6100cc330dce66409ddc67}
+      \strng{authorfullhash}{bf167a19cd6100cc330dce66409ddc67}
+      \strng{authorfullhashraw}{bf167a19cd6100cc330dce66409ddc67}
+      \field{sortinit}{J}
+      \field{sortinithash}{b2f54a9081ace9966a7cb9413811edb4}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{title}{AneuX morphology database}
+      \field{year}{2022}
+      \verb{doi}
+      \verb 10.5281/ZENODO.6678442
+      \endverb
+      \verb{urlraw}
+      \verb https://zenodo.org/doi/10.5281/zenodo.6678442
+      \endverb
+      \verb{url}
+      \verb https://zenodo.org/doi/10.5281/zenodo.6678442
+      \endverb
+      \keyw{Intracranial aneurysms,Geometric models,Morphological analysis}
+    \endentry
+    \entry{juchler2022shape}{article}{}{}
+      \name{author}{5}{ul=2}{%
+        {{un=0,uniquepart=base,hash=ab52fc80a6e9733e6453d7a7b3a27f8d}{%
+           family={Juchler},
+           familyi={J\bibinitperiod},
+           given={Norman},
+           giveni={N\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=e12c0c0e8490a438ff22ec39ee381ec5}{%
+           family={Schilling},
+           familyi={S\bibinitperiod},
+           given={Sabine},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=6c65063d4a7edab1b83a604b77224f9c}{%
+           family={Bijlenga},
+           familyi={B\bibinitperiod},
+           given={Philippe},
+           giveni={P\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=a70e54b11d6ff82d4505e93fddf8e62b}{%
+           family={Kurtcuoglu},
+           familyi={K\bibinitperiod},
+           given={Vartan},
+           giveni={V\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=494435132d6d3891c280f4fc85d9884d}{%
+           family={Hirsch},
+           familyi={H\bibinitperiod},
+           given={Sven},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {Frontiers Media SA}%
+      }
+      \strng{namehash}{5d0fac3ec260d24434e387e881f7c9e6}
+      \strng{fullhash}{78514b48ddf87bb2d25050d59bc482e2}
+      \strng{fullhashraw}{78514b48ddf87bb2d25050d59bc482e2}
+      \strng{bibnamehash}{78514b48ddf87bb2d25050d59bc482e2}
+      \strng{authorbibnamehash}{78514b48ddf87bb2d25050d59bc482e2}
+      \strng{authornamehash}{5d0fac3ec260d24434e387e881f7c9e6}
+      \strng{authorfullhash}{78514b48ddf87bb2d25050d59bc482e2}
+      \strng{authorfullhashraw}{78514b48ddf87bb2d25050d59bc482e2}
+      \field{sortinit}{J}
+      \field{sortinithash}{b2f54a9081ace9966a7cb9413811edb4}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{1664-2295}
+      \field{journaltitle}{Frontiers in Neurology}
+      \field{month}{5}
+      \field{title}{Shape Trumps Size: Image-Based Morphological Analysis Reveals That the 3D Shape Discriminates Intracranial Aneurysm Disease Status Better Than Aneurysm Size}
+      \field{volume}{13}
+      \field{year}{2022}
+      \verb{doi}
+      \verb 10.3389/fneur.2022.809391
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.3389/fneur.2022.809391
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.3389/fneur.2022.809391
+      \endverb
+    \endentry
+    \entry{juvela2000}{article}{}{}
+      \name{author}{1}{}{%
+        {{un=0,uniquepart=base,hash=148610dbfe1d97015f03324a765685b0}{%
+           family={Juvela},
+           familyi={J\bibinitperiod},
+           given={Seppo},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {Ovid Technologies (Wolters Kluwer Health)}%
+      }
+      \strng{namehash}{148610dbfe1d97015f03324a765685b0}
+      \strng{fullhash}{148610dbfe1d97015f03324a765685b0}
+      \strng{fullhashraw}{148610dbfe1d97015f03324a765685b0}
+      \strng{bibnamehash}{148610dbfe1d97015f03324a765685b0}
+      \strng{authorbibnamehash}{148610dbfe1d97015f03324a765685b0}
+      \strng{authornamehash}{148610dbfe1d97015f03324a765685b0}
+      \strng{authorfullhash}{148610dbfe1d97015f03324a765685b0}
+      \strng{authorfullhashraw}{148610dbfe1d97015f03324a765685b0}
+      \field{sortinit}{J}
+      \field{sortinithash}{b2f54a9081ace9966a7cb9413811edb4}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{1524-4628}
+      \field{journaltitle}{Stroke}
+      \field{month}{2}
+      \field{number}{2}
+      \field{title}{Risk Factors for Multiple Intracranial Aneurysms}
+      \field{volume}{31}
+      \field{year}{2000}
+      \field{pages}{392\bibrangedash 397}
+      \range{pages}{6}
+      \verb{doi}
+      \verb 10.1161/01.str.31.2.392
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1161/01.str.31.2.392
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1161/01.str.31.2.392
+      \endverb
+    \endentry
+    \entry{lorensen1987}{article}{}{}
+      \name{author}{2}{}{%
+        {{un=0,uniquepart=base,hash=966edb0a4087f42b3518503987e61399}{%
+           family={Lorensen},
+           familyi={L\bibinitperiod},
+           given={William\bibnamedelima E.},
+           giveni={W\bibinitperiod\bibinitdelim E\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=74f056f6ffac9cb2f26904eca44820de}{%
+           family={Cline},
+           familyi={C\bibinitperiod},
+           given={Harvey\bibnamedelima E.},
+           giveni={H\bibinitperiod\bibinitdelim E\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {Association for Computing Machinery (ACM)}%
+      }
+      \strng{namehash}{c04f319f1cd4852327f00c52da26c78e}
+      \strng{fullhash}{c04f319f1cd4852327f00c52da26c78e}
+      \strng{fullhashraw}{c04f319f1cd4852327f00c52da26c78e}
+      \strng{bibnamehash}{c04f319f1cd4852327f00c52da26c78e}
+      \strng{authorbibnamehash}{c04f319f1cd4852327f00c52da26c78e}
+      \strng{authornamehash}{c04f319f1cd4852327f00c52da26c78e}
+      \strng{authorfullhash}{c04f319f1cd4852327f00c52da26c78e}
+      \strng{authorfullhashraw}{c04f319f1cd4852327f00c52da26c78e}
+      \field{sortinit}{L}
+      \field{sortinithash}{7c47d417cecb1f4bd38d1825c427a61a}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{0097-8930}
+      \field{journaltitle}{ACM SIGGRAPH Computer Graphics}
+      \field{month}{8}
+      \field{number}{4}
+      \field{title}{Marching cubes: A high resolution 3D surface construction algorithm}
+      \field{volume}{21}
+      \field{year}{1987}
+      \field{pages}{163\bibrangedash 169}
+      \range{pages}{7}
+      \verb{doi}
+      \verb 10.1145/37402.37422
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1145/37402.37422
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1145/37402.37422
+      \endverb
+    \endentry
+    \entry{pasko1995}{article}{}{}
+      \name{author}{4}{}{%
+        {{un=0,uniquepart=base,hash=db99e2eb4f20639f4cab1328aa3c6b18}{%
+           family={Pasko},
+           familyi={P\bibinitperiod},
+           given={A.},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=1e61e287f0baa1ef36781aa231025b42}{%
+           family={Adzhiev},
+           familyi={A\bibinitperiod},
+           given={V.},
+           giveni={V\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=8bf12a3b916e5c4cf503fc5c1f85038c}{%
+           family={Sourin},
+           familyi={S\bibinitperiod},
+           given={A.},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=7c8d1fff2f2d39080ce051bf4b147a81}{%
+           family={Savchenko},
+           familyi={S\bibinitperiod},
+           given={V.},
+           giveni={V\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{2}{%
+        {Springer Science}%
+        {Business Media LLC}%
+      }
+      \strng{namehash}{3b02d006f3d094bab1e1934b360599bc}
+      \strng{fullhash}{e3e859c43a587b912b3bb6af4a436336}
+      \strng{fullhashraw}{e3e859c43a587b912b3bb6af4a436336}
+      \strng{bibnamehash}{e3e859c43a587b912b3bb6af4a436336}
+      \strng{authorbibnamehash}{e3e859c43a587b912b3bb6af4a436336}
+      \strng{authornamehash}{3b02d006f3d094bab1e1934b360599bc}
+      \strng{authorfullhash}{e3e859c43a587b912b3bb6af4a436336}
+      \strng{authorfullhashraw}{e3e859c43a587b912b3bb6af4a436336}
+      \field{sortinit}{P}
+      \field{sortinithash}{ff3bcf24f47321b42cb156c2cc8a8422}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{1432-2315}
+      \field{journaltitle}{The Visual Computer}
+      \field{month}{8}
+      \field{number}{8}
+      \field{title}{Function representation in geometric modeling: concepts, implementation and applications}
+      \field{volume}{11}
+      \field{year}{1995}
+      \field{pages}{429\bibrangedash 446}
+      \range{pages}{18}
+      \verb{doi}
+      \verb 10.1007/bf02464333
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1007/bf02464333
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1007/bf02464333
+      \endverb
+    \endentry
+    \entry{piccinelli2009}{article}{}{}
+      \name{author}{5}{}{%
+        {{un=0,uniquepart=base,hash=5bbd87326dc176132df64e326f8b1818}{%
+           family={Piccinelli},
+           familyi={P\bibinitperiod},
+           given={M.},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=9d64cbdfb15a079a4bc930d9e279aeeb}{%
+           family={Veneziani},
+           familyi={V\bibinitperiod},
+           given={A.},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=c13fea8063d24b059d0f72c22750dc51}{%
+           family={Steinman},
+           familyi={S\bibinitperiod},
+           given={D.A.},
+           giveni={D\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=f9f2eda025fd4629c925764bbe624730}{%
+           family={Remuzzi},
+           familyi={R\bibinitperiod},
+           given={A.},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=79de9b452b6fca4de4f21bae9bb927b8}{%
+           family={Antiga},
+           familyi={A\bibinitperiod},
+           given={L.},
+           giveni={L\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{2}{%
+        {Institute of Electrical}%
+        {Electronics Engineers (IEEE)}%
+      }
+      \strng{namehash}{d9fd75573230ba528f512e4e8b8525b6}
+      \strng{fullhash}{0a92149c4865d0e895ba0b6b630f6441}
+      \strng{fullhashraw}{0a92149c4865d0e895ba0b6b630f6441}
+      \strng{bibnamehash}{0a92149c4865d0e895ba0b6b630f6441}
+      \strng{authorbibnamehash}{0a92149c4865d0e895ba0b6b630f6441}
+      \strng{authornamehash}{d9fd75573230ba528f512e4e8b8525b6}
+      \strng{authorfullhash}{0a92149c4865d0e895ba0b6b630f6441}
+      \strng{authorfullhashraw}{0a92149c4865d0e895ba0b6b630f6441}
+      \field{sortinit}{P}
+      \field{sortinithash}{ff3bcf24f47321b42cb156c2cc8a8422}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{1558-254X}
+      \field{journaltitle}{IEEE Transactions on Medical Imaging}
+      \field{month}{8}
+      \field{number}{8}
+      \field{title}{A Framework for Geometric Analysis of Vascular Structures: Application to Cerebral Aneurysms}
+      \field{volume}{28}
+      \field{year}{2009}
+      \field{pages}{1141\bibrangedash 1155}
+      \range{pages}{15}
+      \verb{doi}
+      \verb 10.1109/tmi.2009.2021652
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1109/TMI.2009.2021652
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1109/TMI.2009.2021652
+      \endverb
+    \endentry
+    \entry{ricci1973}{article}{}{}
+      \name{author}{1}{}{%
+        {{un=0,uniquepart=base,hash=ac0fc03ab8d15e47abddd7523c31dc88}{%
+           family={Ricci},
+           familyi={R\bibinitperiod},
+           given={A.},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {Oxford University Press (OUP)}%
+      }
+      \strng{namehash}{ac0fc03ab8d15e47abddd7523c31dc88}
+      \strng{fullhash}{ac0fc03ab8d15e47abddd7523c31dc88}
+      \strng{fullhashraw}{ac0fc03ab8d15e47abddd7523c31dc88}
+      \strng{bibnamehash}{ac0fc03ab8d15e47abddd7523c31dc88}
+      \strng{authorbibnamehash}{ac0fc03ab8d15e47abddd7523c31dc88}
+      \strng{authornamehash}{ac0fc03ab8d15e47abddd7523c31dc88}
+      \strng{authorfullhash}{ac0fc03ab8d15e47abddd7523c31dc88}
+      \strng{authorfullhashraw}{ac0fc03ab8d15e47abddd7523c31dc88}
+      \field{sortinit}{R}
+      \field{sortinithash}{5e1c39a9d46ffb6bebd8f801023a9486}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{1460-2067}
+      \field{journaltitle}{The Computer Journal}
+      \field{month}{2}
+      \field{number}{2}
+      \field{title}{A constructive geometry for computer graphics}
+      \field{volume}{16}
+      \field{year}{1973}
+      \field{pages}{157\bibrangedash 160}
+      \range{pages}{4}
+      \verb{doi}
+      \verb 10.1093/comjnl/16.2.157
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1093/comjnl/16.2.157
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1093/comjnl/16.2.157
+      \endverb
+    \endentry
+    \entry{sangalli2009}{article}{}{}
+      \name{author}{4}{}{%
+        {{un=0,uniquepart=base,hash=8906a8f4441e6a9e200f97c19467d981}{%
+           family={Sangalli},
+           familyi={S\bibinitperiod},
+           given={Laura\bibnamedelima M.},
+           giveni={L\bibinitperiod\bibinitdelim M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=4c1630858c3c30f274fac5f1dde6e05a}{%
+           family={Secchi},
+           familyi={S\bibinitperiod},
+           given={Piercesare},
+           giveni={P\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=b1648e6d14214fcb260b8b3e5ca8450b}{%
+           family={Vantini},
+           familyi={V\bibinitperiod},
+           given={Simone},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=208f5793fba9a23a322eea9dd4372d91}{%
+           family={Veneziani},
+           familyi={V\bibinitperiod},
+           given={Alessandro},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {Informa UK Limited}%
+      }
+      \strng{namehash}{0959a88aed6255aa7b14501c274f2bed}
+      \strng{fullhash}{1f8cf15742a4c27d5b9ddadfd2487071}
+      \strng{fullhashraw}{1f8cf15742a4c27d5b9ddadfd2487071}
+      \strng{bibnamehash}{1f8cf15742a4c27d5b9ddadfd2487071}
+      \strng{authorbibnamehash}{1f8cf15742a4c27d5b9ddadfd2487071}
+      \strng{authornamehash}{0959a88aed6255aa7b14501c274f2bed}
+      \strng{authorfullhash}{1f8cf15742a4c27d5b9ddadfd2487071}
+      \strng{authorfullhashraw}{1f8cf15742a4c27d5b9ddadfd2487071}
+      \field{sortinit}{S}
+      \field{sortinithash}{b164b07b29984b41daf1e85279fbc5ab}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{1537-274X}
+      \field{journaltitle}{Journal of the American Statistical Association}
+      \field{month}{3}
+      \field{number}{485}
+      \field{title}{A Case Study in Exploratory Functional Data Analysis: Geometrical Features of the Internal Carotid Artery}
+      \field{volume}{104}
+      \field{year}{2009}
+      \field{pages}{37\bibrangedash 48}
+      \range{pages}{12}
+      \verb{doi}
+      \verb 10.1198/jasa.2009.0002
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1198/jasa.2009.0002
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1198/jasa.2009.0002
+      \endverb
+    \endentry
+    \entry{schroeder2006}{book}{}{}
+      \name{author}{3}{}{%
+        {{un=0,uniquepart=base,hash=f2debcce030b32c7f2016e566261199c}{%
+           family={Schroeder},
+           familyi={S\bibinitperiod},
+           given={Will},
+           giveni={W\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=417386cd55d38dbbe1bbebccbbc8e8ed}{%
+           family={Martin},
+           familyi={M\bibinitperiod},
+           given={Ken},
+           giveni={K\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=02d5a325a8f2c3733843953a7005298b}{%
+           family={Lorensen},
+           familyi={L\bibinitperiod},
+           given={Bill},
+           giveni={B\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {Kitware}%
+      }
+      \strng{namehash}{dd0f40f214396cc2ecc0aec2965786bc}
+      \strng{fullhash}{340ff298ce91155ae09c9a40578df722}
+      \strng{fullhashraw}{340ff298ce91155ae09c9a40578df722}
+      \strng{bibnamehash}{340ff298ce91155ae09c9a40578df722}
+      \strng{authorbibnamehash}{340ff298ce91155ae09c9a40578df722}
+      \strng{authornamehash}{dd0f40f214396cc2ecc0aec2965786bc}
+      \strng{authorfullhash}{340ff298ce91155ae09c9a40578df722}
+      \strng{authorfullhashraw}{340ff298ce91155ae09c9a40578df722}
+      \field{sortinit}{S}
+      \field{sortinithash}{b164b07b29984b41daf1e85279fbc5ab}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{edition}{4}
+      \field{isbn}{978-1-930934-19-1}
+      \field{title}{The Visualization Toolkit: An Object-Oriented Approach to 3D Graphics}
+      \field{year}{2006}
+    \endentry
+    \entry{sullivan2019}{article}{}{}
+      \name{author}{2}{}{%
+        {{un=0,uniquepart=base,hash=443d0e969358d31ec8265c1cc88a28ed}{%
+           family={Sullivan},
+           familyi={S\bibinitperiod},
+           given={C.},
+           giveni={C\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=4375f88434492e8c13a9b0a0d848e1b4}{%
+           family={Kaszynski},
+           familyi={K\bibinitperiod},
+           given={Alexander},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {The Open Journal}%
+      }
+      \strng{namehash}{4ca0e6d2f546d1c09ad7941ee6369f6d}
+      \strng{fullhash}{4ca0e6d2f546d1c09ad7941ee6369f6d}
+      \strng{fullhashraw}{4ca0e6d2f546d1c09ad7941ee6369f6d}
+      \strng{bibnamehash}{4ca0e6d2f546d1c09ad7941ee6369f6d}
+      \strng{authorbibnamehash}{4ca0e6d2f546d1c09ad7941ee6369f6d}
+      \strng{authornamehash}{4ca0e6d2f546d1c09ad7941ee6369f6d}
+      \strng{authorfullhash}{4ca0e6d2f546d1c09ad7941ee6369f6d}
+      \strng{authorfullhashraw}{4ca0e6d2f546d1c09ad7941ee6369f6d}
+      \field{sortinit}{S}
+      \field{sortinithash}{b164b07b29984b41daf1e85279fbc5ab}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{2475-9066}
+      \field{journaltitle}{Journal of Open Source Software}
+      \field{month}{5}
+      \field{number}{37}
+      \field{title}{PyVista: 3D plotting and mesh analysis through a streamlined interface for the Visualization Toolkit (VTK)}
+      \field{volume}{4}
+      \field{year}{2019}
+      \field{pages}{1450}
+      \range{pages}{1}
+      \verb{doi}
+      \verb 10.21105/joss.01450
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.21105/joss.01450
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.21105/joss.01450
+      \endverb
+    \endentry
+    \entry{taubin1995}{article}{}{}
+      \name{author}{1}{}{%
+        {{un=0,uniquepart=base,hash=b3b3511f4ef528ffb91c3a5b925a0337}{%
+           family={Taubin},
+           familyi={T\bibinitperiod},
+           given={Gabriel},
+           giveni={G\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {ACM Press}%
+      }
+      \strng{namehash}{b3b3511f4ef528ffb91c3a5b925a0337}
+      \strng{fullhash}{b3b3511f4ef528ffb91c3a5b925a0337}
+      \strng{fullhashraw}{b3b3511f4ef528ffb91c3a5b925a0337}
+      \strng{bibnamehash}{b3b3511f4ef528ffb91c3a5b925a0337}
+      \strng{authorbibnamehash}{b3b3511f4ef528ffb91c3a5b925a0337}
+      \strng{authornamehash}{b3b3511f4ef528ffb91c3a5b925a0337}
+      \strng{authorfullhash}{b3b3511f4ef528ffb91c3a5b925a0337}
+      \strng{authorfullhashraw}{b3b3511f4ef528ffb91c3a5b925a0337}
+      \field{sortinit}{T}
+      \field{sortinithash}{9af77f0292593c26bde9a56e688eaee9}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{journaltitle}{Proceedings of the 22nd annual conference on Computer graphics and interactive techniques - SIGGRAPH ’95}
+      \field{series}{SIGGRAPH ’95}
+      \field{title}{A signal processing approach to fair surface design}
+      \field{year}{1995}
+      \field{pages}{351\bibrangedash 358}
+      \range{pages}{8}
+      \verb{doi}
+      \verb 10.1145/218380.218473
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1145/218380.218473
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1145/218380.218473
+      \endverb
+    \endentry
+    \entry{taubin1996}{inbook}{}{}
+      \name{author}{3}{}{%
+        {{un=0,uniquepart=base,hash=b3b3511f4ef528ffb91c3a5b925a0337}{%
+           family={Taubin},
+           familyi={T\bibinitperiod},
+           given={Gabriel},
+           giveni={G\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=55926e2ed0c54f92266d978954a4cdc3}{%
+           family={Zhang},
+           familyi={Z\bibinitperiod},
+           given={Tong},
+           giveni={T\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=23923ccfdde2f6663af778e44cdfb81f}{%
+           family={Golub},
+           familyi={G\bibinitperiod},
+           given={Gene},
+           giveni={G\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {Springer Berlin Heidelberg}%
+      }
+      \strng{namehash}{5b073f6f5ba62056a98e875e7bcfde84}
+      \strng{fullhash}{4152d08feb6b94f500bb866e109e2422}
+      \strng{fullhashraw}{4152d08feb6b94f500bb866e109e2422}
+      \strng{bibnamehash}{4152d08feb6b94f500bb866e109e2422}
+      \strng{authorbibnamehash}{4152d08feb6b94f500bb866e109e2422}
+      \strng{authornamehash}{5b073f6f5ba62056a98e875e7bcfde84}
+      \strng{authorfullhash}{4152d08feb6b94f500bb866e109e2422}
+      \strng{authorfullhashraw}{4152d08feb6b94f500bb866e109e2422}
+      \field{sortinit}{T}
+      \field{sortinithash}{9af77f0292593c26bde9a56e688eaee9}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{booktitle}{Computer Vision — ECCV ’96}
+      \field{isbn}{9783540499497}
+      \field{issn}{1611-3349}
+      \field{title}{Optimal surface smoothing as filter design}
+      \field{year}{1996}
+      \field{pages}{283\bibrangedash 292}
+      \range{pages}{10}
+      \verb{doi}
+      \verb 10.1007/bfb0015544
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1007/bfb0015544
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1007/bfb0015544
+      \endverb
+    \endentry
+    \entry{valensendstad2018}{article}{}{}
+      \name{author}{55}{}{%
+        {{un=0,uniquepart=base,hash=fea61649a4ffb03a13cda324c6f2e117}{%
+           family={Valen-Sendstad},
+           familyi={V\bibinithyphendelim S\bibinitperiod},
+           given={Kristian},
+           giveni={K\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=b89a864e317631cab18e42e1e11e9ea3}{%
+           family={Bergersen},
+           familyi={B\bibinitperiod},
+           given={Aslak\bibnamedelima W.},
+           giveni={A\bibinitperiod\bibinitdelim W\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=5e83309be7a40f8fbc91e8cdddca3bc8}{%
+           family={Shimogonya},
+           familyi={S\bibinitperiod},
+           given={Yuji},
+           giveni={Y\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=24fba5cda8ac264b91cedc8004cf03a0}{%
+           family={Goubergrits},
+           familyi={G\bibinitperiod},
+           given={Leonid},
+           giveni={L\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=143bde1d4fc81263d115813911c405d9}{%
+           family={Bruening},
+           familyi={B\bibinitperiod},
+           given={Jan},
+           giveni={J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=5fb112c4956708326385323bfca042a1}{%
+           family={Pallares},
+           familyi={P\bibinitperiod},
+           given={Jordi},
+           giveni={J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=41ff0fd2d2059b2f349711813072c656}{%
+           family={Cito},
+           familyi={C\bibinitperiod},
+           given={Salvatore},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=bba763434a7e98547f5a5dc1f88ce031}{%
+           family={Piskin},
+           familyi={P\bibinitperiod},
+           given={Senol},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=4e0be74734adc3c1cf83a15394afccad}{%
+           family={Pekkan},
+           familyi={P\bibinitperiod},
+           given={Kerem},
+           giveni={K\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=0b18db7e73907c1c066175bd42796c4f}{%
+           family={Geers},
+           familyi={G\bibinitperiod},
+           given={Arjan\bibnamedelima J.},
+           giveni={A\bibinitperiod\bibinitdelim J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=48126d59b85b6cc56af032b114d3094d}{%
+           family={Larrabide},
+           familyi={L\bibinitperiod},
+           given={Ignacio},
+           giveni={I\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=817b483b93f6bc8bd6ea2c23964a1a03}{%
+           family={Rapaka},
+           familyi={R\bibinitperiod},
+           given={Saikiran},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=2311e2a19282c884814e04cb4790b4c7}{%
+           family={Mihalef},
+           familyi={M\bibinitperiod},
+           given={Viorel},
+           giveni={V\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=ac53801b57df0187b3224c864e90103b}{%
+           family={Fu},
+           familyi={F\bibinitperiod},
+           given={Wenyu},
+           giveni={W\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=d0952645d815d04fc9caa6ca84ea73cb}{%
+           family={Qiao},
+           familyi={Q\bibinitperiod},
+           given={Aike},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=259770d2871a4b2d10da058fd9be5922}{%
+           family={Jain},
+           familyi={J\bibinitperiod},
+           given={Kartik},
+           giveni={K\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=5d2779821873663e25c2cb345e239e2f}{%
+           family={Roller},
+           familyi={R\bibinitperiod},
+           given={Sabine},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=7c098c845b5c93103aab7bcdeb7d8028}{%
+           family={Mardal},
+           familyi={M\bibinitperiod},
+           given={Kent-Andre},
+           giveni={K\bibinithyphendelim A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=ad0cef70680ecf0d1ba33de904dff8ec}{%
+           family={Kamakoti},
+           familyi={K\bibinitperiod},
+           given={Ramji},
+           giveni={R\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=bb9ce5220e5ac9c9c085e5b176f5f9ab}{%
+           family={Spirka},
+           familyi={S\bibinitperiod},
+           given={Thomas},
+           giveni={T\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=0d8727be935c0c010e3b21b11d99453c}{%
+           family={Ashton},
+           familyi={A\bibinitperiod},
+           given={Neil},
+           giveni={N\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=81d6ff6a1b46b59e7f1942716a969a16}{%
+           family={Revell},
+           familyi={R\bibinitperiod},
+           given={Alistair},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=fe9e2dd9102c6bf6b93d5c7e2f7408fe}{%
+           family={Aristokleous},
+           familyi={A\bibinitperiod},
+           given={Nicolas},
+           giveni={N\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=790589fe3607f0ec81abfa245c3255f7}{%
+           family={Houston},
+           familyi={H\bibinitperiod},
+           given={J.\bibnamedelimi Graeme},
+           giveni={J\bibinitperiod\bibinitdelim G\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=4b861e5b39cd4f30218075a736bb37ea}{%
+           family={Tsuji},
+           familyi={T\bibinitperiod},
+           given={Masanori},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=6c15acd1e89d02da434e8271b0790937}{%
+           family={Ishida},
+           familyi={I\bibinitperiod},
+           given={Fujimaro},
+           giveni={F\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=e9c0481c16c918aed9e2b5f74298b557}{%
+           family={Menon},
+           familyi={M\bibinitperiod},
+           given={Prahlad\bibnamedelima G.},
+           giveni={P\bibinitperiod\bibinitdelim G\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=3564769f06b6f4eae8650c390a872aee}{%
+           family={Browne},
+           familyi={B\bibinitperiod},
+           given={Leonard\bibnamedelima D.},
+           giveni={L\bibinitperiod\bibinitdelim D\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=6624dfe28f4a786688d076018a244a5c}{%
+           family={Broderick},
+           familyi={B\bibinitperiod},
+           given={Stephen},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=710d03b9ae716e69efb5a88b45ea8610}{%
+           family={Shojima},
+           familyi={S\bibinitperiod},
+           given={Masaaki},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=7c0c396e244d60b7a424215bb6a42404}{%
+           family={Koizumi},
+           familyi={K\bibinitperiod},
+           given={Satoshi},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=d9c08ac95200f3f7f3403d7e3412a52a}{%
+           family={Barbour},
+           familyi={B\bibinitperiod},
+           given={Michael},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=7f838ceffd84917047dbf0493217fbd7}{%
+           family={Aliseda},
+           familyi={A\bibinitperiod},
+           given={Alberto},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=cd2ba3ee0f139e2a255215d69f13c7bd}{%
+           family={Morales},
+           familyi={M\bibinitperiod},
+           given={Hernán\bibnamedelima G.},
+           giveni={H\bibinitperiod\bibinitdelim G\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=33f76f6d01d753a35344db2f1c0012af}{%
+           family={Lefèvre},
+           familyi={L\bibinitperiod},
+           given={Thierry},
+           giveni={T\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=a0b2e33a852cfc0af491ce4020cd56c4}{%
+           family={Hodis},
+           familyi={H\bibinitperiod},
+           given={Simona},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=3fc788c0a00a67f502d268c51f48205b}{%
+           family={Al-Smadi},
+           familyi={A\bibinithyphendelim S\bibinitperiod},
+           given={Yahia\bibnamedelima M.},
+           giveni={Y\bibinitperiod\bibinitdelim M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=6aec120e701ff84d18eba68a8fe7bf5c}{%
+           family={Tran},
+           familyi={T\bibinitperiod},
+           given={Justin\bibnamedelima S.},
+           giveni={J\bibinitperiod\bibinitdelim S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=bc255845502b0d3a9fcb6b763118f61f}{%
+           family={Marsden},
+           familyi={M\bibinitperiod},
+           given={Alison\bibnamedelima L.},
+           giveni={A\bibinitperiod\bibinitdelim L\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=48a9551b242e401696145aa7290ae32c}{%
+           family={Vaippummadhom},
+           familyi={V\bibinitperiod},
+           given={Sreeja},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=f1898fcf0e8191aec183fef3b4cb381f}{%
+           family={Einstein},
+           familyi={E\bibinitperiod},
+           given={G.\bibnamedelimi Albert},
+           giveni={G\bibinitperiod\bibinitdelim A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=2a5ccf1be9b50b6757b2bf8ccc1f5aa2}{%
+           family={Brown},
+           familyi={B\bibinitperiod},
+           given={Alistair\bibnamedelima G.},
+           giveni={A\bibinitperiod\bibinitdelim G\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=94d7c7d6d67868ea82b50530ec6a4863}{%
+           family={Debus},
+           familyi={D\bibinitperiod},
+           given={Kristian},
+           giveni={K\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=8d8bf270f302de24b17f636cfa7b06de}{%
+           family={Niizuma},
+           familyi={N\bibinitperiod},
+           given={Kuniyasu},
+           giveni={K\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=3cc489a09c45aed8251b475a70a3dc9c}{%
+           family={Rashad},
+           familyi={R\bibinitperiod},
+           given={Sherif},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=48a471a2516c79ce69355a80a1c296b0}{%
+           family={Sugiyama},
+           familyi={S\bibinitperiod},
+           given={Shin-ichiro},
+           giveni={S\bibinithyphendelim i\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=d1aacab779b17369a984451f55f828cc}{%
+           family={Owais\bibnamedelima Khan},
+           familyi={O\bibinitperiod\bibinitdelim K\bibinitperiod},
+           given={M.},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=afac1e0c4b0fa86ad03f1f6dc6b34e10}{%
+           family={Updegrove},
+           familyi={U\bibinitperiod},
+           given={Adam\bibnamedelima R.},
+           giveni={A\bibinitperiod\bibinitdelim R\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=d5817166a9f9122ad50f24c39d4f0e0b}{%
+           family={Shadden},
+           familyi={S\bibinitperiod},
+           given={Shawn\bibnamedelima C.},
+           giveni={S\bibinitperiod\bibinitdelim C\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=1fcbbaa7ad51747f5e95f18cf40ac38a}{%
+           family={Cornelissen},
+           familyi={C\bibinitperiod},
+           given={Bart\bibnamedelimb M.\bibnamedelimi W.},
+           giveni={B\bibinitperiod\bibinitdelim M\bibinitperiod\bibinitdelim W\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=a0a6d2a1076b4ce43db3c2071aef3dc1}{%
+           family={Majoie},
+           familyi={M\bibinitperiod},
+           given={Charles\bibnamedelimb B.\bibnamedelimi L.\bibnamedelimi M.},
+           giveni={C\bibinitperiod\bibinitdelim B\bibinitperiod\bibinitdelim L\bibinitperiod\bibinitdelim M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=80dd6e45113c3b52003a6333573a9b7b}{%
+           family={Berg},
+           familyi={B\bibinitperiod},
+           given={Philipp},
+           giveni={P\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=d77a86e4e6e4673c79724996ababb1a1}{%
+           family={Saalfield},
+           familyi={S\bibinitperiod},
+           given={Sylvia},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=d1308c72dd14797e4d714490f60ddc54}{%
+           family={Kono},
+           familyi={K\bibinitperiod},
+           given={Kenichi},
+           giveni={K\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=cb534fd04c099001a59246c4f6ad921a}{%
+           family={Steinman},
+           familyi={S\bibinitperiod},
+           given={David\bibnamedelima A.},
+           giveni={D\bibinitperiod\bibinitdelim A\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{2}{%
+        {Springer Science}%
+        {Business Media LLC}%
+      }
+      \strng{namehash}{ad1174badf612066531fb5670e6680bc}
+      \strng{fullhash}{81504cc0f2dd997649d91f86aa13b6cc}
+      \strng{fullhashraw}{81504cc0f2dd997649d91f86aa13b6cc}
+      \strng{bibnamehash}{4011a0a1b40dab7ab61856fcd8f6053d}
+      \strng{authorbibnamehash}{4011a0a1b40dab7ab61856fcd8f6053d}
+      \strng{authornamehash}{ad1174badf612066531fb5670e6680bc}
+      \strng{authorfullhash}{81504cc0f2dd997649d91f86aa13b6cc}
+      \strng{authorfullhashraw}{81504cc0f2dd997649d91f86aa13b6cc}
+      \field{sortinit}{V}
+      \field{sortinithash}{afb52128e5b4dc4b843768c0113d673b}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{1869-4098}
+      \field{journaltitle}{Cardiovascular Engineering and Technology}
+      \field{number}{4}
+      \field{title}{Real-World Variability in the Prediction of Intracranial Aneurysm Wall Shear Stress: The 2015 International Aneurysm CFD Challenge}
+      \field{volume}{9}
+      \field{year}{2018}
+      \field{pages}{544\bibrangedash 564}
+      \range{pages}{21}
+      \verb{doi}
+      \verb 10.1007/s13239-018-00374-2
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1007/s13239-018-00374-2
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1007/s13239-018-00374-2
+      \endverb
+    \endentry
+    \entry{virtanen2020}{article}{}{}
+      \name{author}{111}{}{%
+        {{un=0,uniquepart=base,hash=18703a2bb6a62484483c193a212da2f8}{%
+           family={Virtanen},
+           familyi={V\bibinitperiod},
+           given={Pauli},
+           giveni={P\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=646fbfe08374cc41c2f9bd971d8c4725}{%
+           family={Gommers},
+           familyi={G\bibinitperiod},
+           given={Ralf},
+           giveni={R\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=d500f4849030f34359cdb3e1513acf83}{%
+           family={Oliphant},
+           familyi={O\bibinitperiod},
+           given={Travis\bibnamedelima E.},
+           giveni={T\bibinitperiod\bibinitdelim E\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=35bb9c71f55048509a3e9018c349ed73}{%
+           family={Haberland},
+           familyi={H\bibinitperiod},
+           given={Matt},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=fbb0c40f5d70be8ce47ce9daafdf5749}{%
+           family={Reddy},
+           familyi={R\bibinitperiod},
+           given={Tyler},
+           giveni={T\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=9fd9ed8466bbb96364ae008f2a665e6e}{%
+           family={Cournapeau},
+           familyi={C\bibinitperiod},
+           given={David},
+           giveni={D\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=09a667aa6a26526bfcccb2676a494e55}{%
+           family={Burovski},
+           familyi={B\bibinitperiod},
+           given={Evgeni},
+           giveni={E\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=3d6efaaa3d9682e20787eb06ff70a3d7}{%
+           family={Peterson},
+           familyi={P\bibinitperiod},
+           given={Pearu},
+           giveni={P\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=4c7e4c94b846fa41e2fc0a88e0dc656d}{%
+           family={Weckesser},
+           familyi={W\bibinitperiod},
+           given={Warren},
+           giveni={W\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=7447cb057596bc2645d3980bb04f5c78}{%
+           family={Bright},
+           familyi={B\bibinitperiod},
+           given={Jonathan},
+           giveni={J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=9a5a65a789013a8d1e8035ec28df9b6e}{%
+           family={Walt},
+           familyi={W\bibinitperiod},
+           given={Stéfan\bibnamedelima J.},
+           giveni={S\bibinitperiod\bibinitdelim J\bibinitperiod},
+           givenun=0,
+           prefix={van\bibnamedelima der},
+           prefixi={v\bibinitperiod\bibinitdelim d\bibinitperiod}}}%
+        {{un=0,uniquepart=base,hash=626cc151613864abeb653c0d8172d98c}{%
+           family={Brett},
+           familyi={B\bibinitperiod},
+           given={Matthew},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=57849e8550281b202bd611bf6f11e14b}{%
+           family={Wilson},
+           familyi={W\bibinitperiod},
+           given={Joshua},
+           giveni={J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=b053969d2c6a9ec8689980fb6463cd56}{%
+           family={Millman},
+           familyi={M\bibinitperiod},
+           given={K.\bibnamedelimi Jarrod},
+           giveni={K\bibinitperiod\bibinitdelim J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=fbaf80580622bd40577f4a6d38021c0a}{%
+           family={Mayorov},
+           familyi={M\bibinitperiod},
+           given={Nikolay},
+           giveni={N\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=7bcf847eaccba039f7a4523540673aea}{%
+           family={Nelson},
+           familyi={N\bibinitperiod},
+           given={Andrew\bibnamedelimb R.\bibnamedelimi J.},
+           giveni={A\bibinitperiod\bibinitdelim R\bibinitperiod\bibinitdelim J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=4b3d26f886661aa723985bcfd835ba18}{%
+           family={Jones},
+           familyi={J\bibinitperiod},
+           given={Eric},
+           giveni={E\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=9ad1d38817acd2f00cb7f324ec7d37ea}{%
+           family={Kern},
+           familyi={K\bibinitperiod},
+           given={Robert},
+           giveni={R\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=8d336f110675c46226ece1db501ce712}{%
+           family={Larson},
+           familyi={L\bibinitperiod},
+           given={Eric},
+           giveni={E\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=65b1934a87acb0abe09c469aaf11c326}{%
+           family={Carey},
+           familyi={C\bibinitperiod},
+           given={C\bibnamedelima J},
+           giveni={C\bibinitperiod\bibinitdelim J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=9989e8a18827e34b15112d671f52bd35}{%
+           family={Polat},
+           familyi={P\bibinitperiod},
+           given={İlhan},
+           giveni={İ\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=b8b88d61c79de60e6e1b5d44e03f5dec}{%
+           family={Feng},
+           familyi={F\bibinitperiod},
+           given={Yu},
+           giveni={Y\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=bf4be16325cb4f641345ca394443fd18}{%
+           family={Moore},
+           familyi={M\bibinitperiod},
+           given={Eric\bibnamedelima W.},
+           giveni={E\bibinitperiod\bibinitdelim W\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=0fd9a0e34f1b2adda41357c948d14986}{%
+           family={VanderPlas},
+           familyi={V\bibinitperiod},
+           given={Jake},
+           giveni={J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=c6a95a8ced3b86b4e7e60a74bc6ebf5a}{%
+           family={Laxalde},
+           familyi={L\bibinitperiod},
+           given={Denis},
+           giveni={D\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=85242652d69220e83cf71ceb8d90a8cb}{%
+           family={Perktold},
+           familyi={P\bibinitperiod},
+           given={Josef},
+           giveni={J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=5bca159e697db439e23b8947dfa4b614}{%
+           family={Cimrman},
+           familyi={C\bibinitperiod},
+           given={Robert},
+           giveni={R\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=70b659f5067a8a2efbee66f770681598}{%
+           family={Henriksen},
+           familyi={H\bibinitperiod},
+           given={Ian},
+           giveni={I\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=fa5163c76600eb11a4d07a28f0701cb0}{%
+           family={Quintero},
+           familyi={Q\bibinitperiod},
+           given={E.\bibnamedelimi A.},
+           giveni={E\bibinitperiod\bibinitdelim A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=db2b4761cc46be347b418e68660c9554}{%
+           family={Harris},
+           familyi={H\bibinitperiod},
+           given={Charles\bibnamedelima R.},
+           giveni={C\bibinitperiod\bibinitdelim R\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=7d86aea5ad1f2b4e27f2f014c71712c2}{%
+           family={Archibald},
+           familyi={A\bibinitperiod},
+           given={Anne\bibnamedelima M.},
+           giveni={A\bibinitperiod\bibinitdelim M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=3876f7c3dbbb1a17823dcd135d07cfc6}{%
+           family={Ribeiro},
+           familyi={R\bibinitperiod},
+           given={Antônio\bibnamedelima H.},
+           giveni={A\bibinitperiod\bibinitdelim H\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=bab4e5caee2d67831e464ce575022b37}{%
+           family={Pedregosa},
+           familyi={P\bibinitperiod},
+           given={Fabian},
+           giveni={F\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=1af2e1049c0f42049401999babb9f7b2}{%
+           family={Mulbregt},
+           familyi={M\bibinitperiod},
+           given={Paul},
+           giveni={P\bibinitperiod},
+           givenun=0,
+           prefix={van},
+           prefixi={v\bibinitperiod}}}%
+        {{un=0,uniquepart=base,hash=aa05dec222bd6e161fb71869fe3f7197}{%
+           family={Vijaykumar},
+           familyi={V\bibinitperiod},
+           given={Aditya},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=be52b28aaad045da57e9e8f251799408}{%
+           family={Bardelli},
+           familyi={B\bibinitperiod},
+           given={Alessandro\bibnamedelima Pietro},
+           giveni={A\bibinitperiod\bibinitdelim P\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=a7526804275259ec551c12acb6ff6031}{%
+           family={Rothberg},
+           familyi={R\bibinitperiod},
+           given={Alex},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=c45a40496577a1a9fa2368bec5cc4ead}{%
+           family={Hilboll},
+           familyi={H\bibinitperiod},
+           given={Andreas},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=4c5c274c284d56db6c924d1a15e8961d}{%
+           family={Kloeckner},
+           familyi={K\bibinitperiod},
+           given={Andreas},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=89373eb06418d6530c31b0fb655f5b04}{%
+           family={Scopatz},
+           familyi={S\bibinitperiod},
+           given={Anthony},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=66a10017a89513b8272bcedcc279b8b4}{%
+           family={Lee},
+           familyi={L\bibinitperiod},
+           given={Antony},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=848bbb8a883bec42d46ee442da523381}{%
+           family={Rokem},
+           familyi={R\bibinitperiod},
+           given={Ariel},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=0ed8e41e1d9c2d0971bdd14c9ee88627}{%
+           family={Woods},
+           familyi={W\bibinitperiod},
+           given={C.\bibnamedelimi Nathan},
+           giveni={C\bibinitperiod\bibinitdelim N\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=61abf0e349b6ac223448eba7aa3c99ad}{%
+           family={Fulton},
+           familyi={F\bibinitperiod},
+           given={Chad},
+           giveni={C\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=ee39bc3045bdce26bb617bb993a841c4}{%
+           family={Masson},
+           familyi={M\bibinitperiod},
+           given={Charles},
+           giveni={C\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=b213c3f14fbb35237220ace796186f7a}{%
+           family={Häggström},
+           familyi={H\bibinitperiod},
+           given={Christian},
+           giveni={C\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=00ca2f3aec7fd0f59d04154070c51ab0}{%
+           family={Fitzgerald},
+           familyi={F\bibinitperiod},
+           given={Clark},
+           giveni={C\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=3aca461f88b9ecb9857e9c33b893a695}{%
+           family={Nicholson},
+           familyi={N\bibinitperiod},
+           given={David\bibnamedelima A.},
+           giveni={D\bibinitperiod\bibinitdelim A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=d20b554274c1bd1d4d143a32b7f1de7e}{%
+           family={Hagen},
+           familyi={H\bibinitperiod},
+           given={David\bibnamedelima R.},
+           giveni={D\bibinitperiod\bibinitdelim R\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=5f43c659188539774f5e840d6eee537f}{%
+           family={Pasechnik},
+           familyi={P\bibinitperiod},
+           given={Dmitrii\bibnamedelima V.},
+           giveni={D\bibinitperiod\bibinitdelim V\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=afdb93cdfde1e7883ee852f0023fb4b0}{%
+           family={Olivetti},
+           familyi={O\bibinitperiod},
+           given={Emanuele},
+           giveni={E\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=6eaa2bfd29afeb561a216016319d6646}{%
+           family={Martin},
+           familyi={M\bibinitperiod},
+           given={Eric},
+           giveni={E\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=4321feefe3d5715c6fe12639d2a1f7f1}{%
+           family={Wieser},
+           familyi={W\bibinitperiod},
+           given={Eric},
+           giveni={E\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=b98e088807fc11eda9211e7f4ff90e24}{%
+           family={Silva},
+           familyi={S\bibinitperiod},
+           given={Fabrice},
+           giveni={F\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=57982dd776f41f6a7d3a5f079d381a6d}{%
+           family={Lenders},
+           familyi={L\bibinitperiod},
+           given={Felix},
+           giveni={F\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=a0d2270ae2410f7abf6d0a56340d9449}{%
+           family={Wilhelm},
+           familyi={W\bibinitperiod},
+           given={Florian},
+           giveni={F\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=bfc347fb1e07aa6e0887b3bb8eae633a}{%
+           family={Young},
+           familyi={Y\bibinitperiod},
+           given={G.},
+           giveni={G\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=c870b38e79337432e4c59f29da7d769b}{%
+           family={Price},
+           familyi={P\bibinitperiod},
+           given={Gavin\bibnamedelima A.},
+           giveni={G\bibinitperiod\bibinitdelim A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=2840fb90e21a5d1c97d471453e0c2cca}{%
+           family={Ingold},
+           familyi={I\bibinitperiod},
+           given={Gert-Ludwig},
+           giveni={G\bibinithyphendelim L\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=29cd4a91196977b126cf70678ee417f7}{%
+           family={Allen},
+           familyi={A\bibinitperiod},
+           given={Gregory\bibnamedelima E.},
+           giveni={G\bibinitperiod\bibinitdelim E\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=235032fbc12d47e45283ca9a714aeda7}{%
+           family={Lee},
+           familyi={L\bibinitperiod},
+           given={Gregory\bibnamedelima R.},
+           giveni={G\bibinitperiod\bibinitdelim R\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=2e8b9805bba2fca015c8d25da55e631e}{%
+           family={Audren},
+           familyi={A\bibinitperiod},
+           given={Hervé},
+           giveni={H\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=c515a6e33d101c89570e3a6f9b3b31d3}{%
+           family={Probst},
+           familyi={P\bibinitperiod},
+           given={Irvin},
+           giveni={I\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=638e5ffc9fa426c83a13d623ef715ea2}{%
+           family={Dietrich},
+           familyi={D\bibinitperiod},
+           given={Jörg\bibnamedelima P.},
+           giveni={J\bibinitperiod\bibinitdelim P\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=af5c6c9503dfee3ab3d9b4a940fc6c02}{%
+           family={Silterra},
+           familyi={S\bibinitperiod},
+           given={Jacob},
+           giveni={J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=f74f6cbd534b3da24a45aeec1e9a383f}{%
+           family={Webber},
+           familyi={W\bibinitperiod},
+           given={James\bibnamedelima T},
+           giveni={J\bibinitperiod\bibinitdelim T\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=a2e13f3aaf432fc62a2f4b6d209b1f49}{%
+           family={Slavič},
+           familyi={S\bibinitperiod},
+           given={Janko},
+           giveni={J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=b92b9241b4c25551cd7ea434e96dc8de}{%
+           family={Nothman},
+           familyi={N\bibinitperiod},
+           given={Joel},
+           giveni={J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=4a66cc2c3e7389d3fe45a0517beadeb0}{%
+           family={Buchner},
+           familyi={B\bibinitperiod},
+           given={Johannes},
+           giveni={J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=6ad936d33caf10e79930dd94371fa21f}{%
+           family={Kulick},
+           familyi={K\bibinitperiod},
+           given={Johannes},
+           giveni={J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=85c10679ad8f08c2b0ea65e5de627728}{%
+           family={Schönberger},
+           familyi={S\bibinitperiod},
+           given={Johannes\bibnamedelima L.},
+           giveni={J\bibinitperiod\bibinitdelim L\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=41468f7fa2c19a7c5888e3d0ce686cf2}{%
+           family={Miranda\bibnamedelima Cardoso},
+           familyi={M\bibinitperiod\bibinitdelim C\bibinitperiod},
+           given={José\bibnamedelima Vinícius},
+           giveni={J\bibinitperiod\bibinitdelim V\bibinitperiod},
+           givenun=0,
+           prefix={de},
+           prefixi={d\bibinitperiod}}}%
+        {{un=0,uniquepart=base,hash=00626d473856bea1990e1c2236d987bb}{%
+           family={Reimer},
+           familyi={R\bibinitperiod},
+           given={Joscha},
+           giveni={J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=e469354cc6ed20924b52439df7606aa2}{%
+           family={Harrington},
+           familyi={H\bibinitperiod},
+           given={Joseph},
+           giveni={J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=0c7ac973adeee6d9391d583b298c3e4d}{%
+           family={Rodríguez},
+           familyi={R\bibinitperiod},
+           given={Juan\bibnamedelimb Luis\bibnamedelima Cano},
+           giveni={J\bibinitperiod\bibinitdelim L\bibinitperiod\bibinitdelim C\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=8c435c98f7175eec5cb17c38ccd93512}{%
+           family={Nunez-Iglesias},
+           familyi={N\bibinithyphendelim I\bibinitperiod},
+           given={Juan},
+           giveni={J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=0568dd9ebd78bb327b3ad58f66444daa}{%
+           family={Kuczynski},
+           familyi={K\bibinitperiod},
+           given={Justin},
+           giveni={J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=b66b79f7398fdf7e05f13d995e0085f0}{%
+           family={Tritz},
+           familyi={T\bibinitperiod},
+           given={Kevin},
+           giveni={K\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=140f3f1af8537ad5e6f9e6ef92c046d8}{%
+           family={Thoma},
+           familyi={T\bibinitperiod},
+           given={Martin},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=60eb67cc225c58ee93309a22b68a3776}{%
+           family={Newville},
+           familyi={N\bibinitperiod},
+           given={Matthew},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=9110ca3cb1148151e8c6c4402b54e220}{%
+           family={Kümmerer},
+           familyi={K\bibinitperiod},
+           given={Matthias},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=49770833f6986345aaf831d83e18c697}{%
+           family={Bolingbroke},
+           familyi={B\bibinitperiod},
+           given={Maximilian},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=f8a39cb6c0141eb1be39621d310d3bae}{%
+           family={Tartre},
+           familyi={T\bibinitperiod},
+           given={Michael},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=81b9dd62937b64275110797d8a43ba1b}{%
+           family={Pak},
+           familyi={P\bibinitperiod},
+           given={Mikhail},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=e4d23819637a961e0e598e1c82a8f10d}{%
+           family={Smith},
+           familyi={S\bibinitperiod},
+           given={Nathaniel\bibnamedelima J.},
+           giveni={N\bibinitperiod\bibinitdelim J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=98c47f992836f8ea7d889f5134f751f4}{%
+           family={Nowaczyk},
+           familyi={N\bibinitperiod},
+           given={Nikolai},
+           giveni={N\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=44efb56671232d232b95014856ca438d}{%
+           family={Shebanov},
+           familyi={S\bibinitperiod},
+           given={Nikolay},
+           giveni={N\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=47a2574f7100983f6caf38bde6abc7cd}{%
+           family={Pavlyk},
+           familyi={P\bibinitperiod},
+           given={Oleksandr},
+           giveni={O\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=3aa5fcd928686e8420ae5df426418e04}{%
+           family={Brodtkorb},
+           familyi={B\bibinitperiod},
+           given={Per\bibnamedelima A.},
+           giveni={P\bibinitperiod\bibinitdelim A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=6d61e2f2c7fea6ab51c26c2caf6fe957}{%
+           family={Lee},
+           familyi={L\bibinitperiod},
+           given={Perry},
+           giveni={P\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=7e8f543421b415613202c26e32c43f1d}{%
+           family={McGibbon},
+           familyi={M\bibinitperiod},
+           given={Robert\bibnamedelima T.},
+           giveni={R\bibinitperiod\bibinitdelim T\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=5137612ca11ad7b3dcd5fe4273348265}{%
+           family={Feldbauer},
+           familyi={F\bibinitperiod},
+           given={Roman},
+           giveni={R\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=c1ec5d726b397cbdde5d399cd578a9ac}{%
+           family={Lewis},
+           familyi={L\bibinitperiod},
+           given={Sam},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=a97d5d83dca4b11b91cc05daba7cde59}{%
+           family={Tygier},
+           familyi={T\bibinitperiod},
+           given={Sam},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=6ac85e461ddda955d4724d185829529c}{%
+           family={Sievert},
+           familyi={S\bibinitperiod},
+           given={Scott},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=fb3b77ad742e7c12096b67272f1cf7e5}{%
+           family={Vigna},
+           familyi={V\bibinitperiod},
+           given={Sebastiano},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=8c6d5e5a357ab6333c33f718b25985e4}{%
+           family={Peterson},
+           familyi={P\bibinitperiod},
+           given={Stefan},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=9eb1d76883803e1d1c7ca78792273163}{%
+           family={More},
+           familyi={M\bibinitperiod},
+           given={Surhud},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=9e6336c94d448e3efed147cf15bcdbe7}{%
+           family={Pudlik},
+           familyi={P\bibinitperiod},
+           given={Tadeusz},
+           giveni={T\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=4c89667601d344e72ad8807ce00a1e6b}{%
+           family={Oshima},
+           familyi={O\bibinitperiod},
+           given={Takuya},
+           giveni={T\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=493c3600e64c3952e72887ef47eedf2e}{%
+           family={Pingel},
+           familyi={P\bibinitperiod},
+           given={Thomas\bibnamedelima J.},
+           giveni={T\bibinitperiod\bibinitdelim J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=3236a008975b02dc3605613ce12da1c4}{%
+           family={Robitaille},
+           familyi={R\bibinitperiod},
+           given={Thomas\bibnamedelima P.},
+           giveni={T\bibinitperiod\bibinitdelim P\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=96cc97b5c8d21d7f8fe98412e20339e6}{%
+           family={Spura},
+           familyi={S\bibinitperiod},
+           given={Thomas},
+           giveni={T\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=513dd6de64f279f2db06ae98629a452f}{%
+           family={Jones},
+           familyi={J\bibinitperiod},
+           given={Thouis\bibnamedelima R.},
+           giveni={T\bibinitperiod\bibinitdelim R\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=ed4111dcc8b824a2aa5c2d782f1ca57a}{%
+           family={Cera},
+           familyi={C\bibinitperiod},
+           given={Tim},
+           giveni={T\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=b9aafe8db25e9e0504ef1975bde9a59d}{%
+           family={Leslie},
+           familyi={L\bibinitperiod},
+           given={Tim},
+           giveni={T\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=0f2d393099735f59c19ebcf04efbb524}{%
+           family={Zito},
+           familyi={Z\bibinitperiod},
+           given={Tiziano},
+           giveni={T\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=02500b85887810c5283b5ccff6767f84}{%
+           family={Krauss},
+           familyi={K\bibinitperiod},
+           given={Tom},
+           giveni={T\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=7360c864bd358b9cfd6c68cd9aecc77c}{%
+           family={Upadhyay},
+           familyi={U\bibinitperiod},
+           given={Utkarsh},
+           giveni={U\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=e2fb284cc447dda0b361d24f661475ce}{%
+           family={Halchenko},
+           familyi={H\bibinitperiod},
+           given={Yaroslav\bibnamedelima O.},
+           giveni={Y\bibinitperiod\bibinitdelim O\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=12df80534e59fa5a3d59c001f6d1fca1}{%
+           family={Vázquez-Baeza},
+           familyi={V\bibinithyphendelim B\bibinitperiod},
+           given={Yoshiki},
+           giveni={Y\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{2}{%
+        {Springer Science}%
+        {Business Media LLC}%
+      }
+      \strng{namehash}{f252038edd7f112d75da3bf0c1edecbc}
+      \strng{fullhash}{f246fa3ac781d04e4ac2713d3fcea43e}
+      \strng{fullhashraw}{f246fa3ac781d04e4ac2713d3fcea43e}
+      \strng{bibnamehash}{dc159e012c4dc37ee525c8496a42c366}
+      \strng{authorbibnamehash}{dc159e012c4dc37ee525c8496a42c366}
+      \strng{authornamehash}{f252038edd7f112d75da3bf0c1edecbc}
+      \strng{authorfullhash}{f246fa3ac781d04e4ac2713d3fcea43e}
+      \strng{authorfullhashraw}{f246fa3ac781d04e4ac2713d3fcea43e}
+      \field{sortinit}{V}
+      \field{sortinithash}{afb52128e5b4dc4b843768c0113d673b}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{1548-7105}
+      \field{journaltitle}{Nature Methods}
+      \field{month}{2}
+      \field{number}{3}
+      \field{title}{SciPy 1.0: fundamental algorithms for scientific computing in Python}
+      \field{volume}{17}
+      \field{year}{2020}
+      \field{pages}{261\bibrangedash 272}
+      \range{pages}{12}
+      \verb{doi}
+      \verb 10.1038/s41592-019-0686-2
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1038/s41592-019-0686-2
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1038/s41592-019-0686-2
+      \endverb
+    \endentry
+  \enddatalist
+  \datalist[entry]{apa/global//global/global/global}
+    \entry{amenta2001}{article}{}{}
+      \name{author}{3}{}{%
+        {{un=0,uniquepart=base,hash=3801643f38748f7da022ea9ed456be84}{%
+           family={Amenta},
+           familyi={A\bibinitperiod},
+           given={Nina},
+           giveni={N\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=771ef2b9d623774a07843a8ca0eceee9}{%
+           family={Choi},
+           familyi={C\bibinitperiod},
+           given={Sunghee},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=440093ecf83113e69986c3590bf2be8f}{%
+           family={Kolluri},
+           familyi={K\bibinitperiod},
+           given={Ravi\bibnamedelima Krishna},
+           giveni={R\bibinitperiod\bibinitdelim K\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {Elsevier BV}%
+      }
+      \strng{namehash}{b35cdf80bd36fb61978a5c2c259d0495}
+      \strng{fullhash}{88dfb69be1dd7452e9bca5a232ab6cb5}
+      \strng{fullhashraw}{88dfb69be1dd7452e9bca5a232ab6cb5}
+      \strng{bibnamehash}{88dfb69be1dd7452e9bca5a232ab6cb5}
+      \strng{authorbibnamehash}{88dfb69be1dd7452e9bca5a232ab6cb5}
+      \strng{authornamehash}{b35cdf80bd36fb61978a5c2c259d0495}
+      \strng{authorfullhash}{88dfb69be1dd7452e9bca5a232ab6cb5}
+      \strng{authorfullhashraw}{88dfb69be1dd7452e9bca5a232ab6cb5}
+      \field{sortinit}{A}
+      \field{sortinithash}{2f401846e2029bad6b3ecc16d50031e2}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{0925-7721}
+      \field{journaltitle}{Computational Geometry}
+      \field{number}{2-3}
+      \field{title}{The power crust, unions of balls, and the medial axis transform}
+      \field{volume}{19}
+      \field{year}{2001}
+      \field{pages}{127\bibrangedash 153}
+      \range{pages}{27}
+      \verb{doi}
+      \verb 10.1016/s0925-7721(01)00017-7
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1016/S0925-7721(01)00017-7
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1016/S0925-7721(01)00017-7
+      \endverb
+    \endentry
+    \entry{antiga2004}{article}{}{}
+      \name{author}{2}{}{%
+        {{un=0,uniquepart=base,hash=79de9b452b6fca4de4f21bae9bb927b8}{%
+           family={Antiga},
+           familyi={A\bibinitperiod},
+           given={L.},
+           giveni={L\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=c13fea8063d24b059d0f72c22750dc51}{%
+           family={Steinman},
+           familyi={S\bibinitperiod},
+           given={D.A.},
+           giveni={D\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{2}{%
+        {Institute of Electrical}%
+        {Electronics Engineers (IEEE)}%
+      }
+      \strng{namehash}{68201d1c516935e083975ef4ab8cbc71}
+      \strng{fullhash}{68201d1c516935e083975ef4ab8cbc71}
+      \strng{fullhashraw}{68201d1c516935e083975ef4ab8cbc71}
+      \strng{bibnamehash}{68201d1c516935e083975ef4ab8cbc71}
+      \strng{authorbibnamehash}{68201d1c516935e083975ef4ab8cbc71}
+      \strng{authornamehash}{68201d1c516935e083975ef4ab8cbc71}
+      \strng{authorfullhash}{68201d1c516935e083975ef4ab8cbc71}
+      \strng{authorfullhashraw}{68201d1c516935e083975ef4ab8cbc71}
+      \field{sortinit}{A}
+      \field{sortinithash}{2f401846e2029bad6b3ecc16d50031e2}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{0278-0062}
+      \field{journaltitle}{IEEE Transactions on Medical Imaging}
+      \field{number}{6}
+      \field{title}{Robust and Objective Decomposition and Mapping of Bifurcating Vessels}
+      \field{volume}{23}
+      \field{year}{2004}
+      \field{pages}{704\bibrangedash 713}
+      \range{pages}{10}
+      \verb{doi}
+      \verb 10.1109/tmi.2004.826946
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1109/TMI.2004.826946
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1109/TMI.2004.826946
+      \endverb
+    \endentry
+    \entry{antiga2008}{article}{}{}
+      \name{author}{6}{}{%
+        {{un=0,uniquepart=base,hash=f65a80959d520337ae99a0798515036c}{%
+           family={Antiga},
+           familyi={A\bibinitperiod},
+           given={Luca},
+           giveni={L\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=784a9d01dd0a11187df8eef377cc3295}{%
+           family={Piccinelli},
+           familyi={P\bibinitperiod},
+           given={Marina},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=b3ee1691d83087d6c41478d3ca208da3}{%
+           family={Botti},
+           familyi={B\bibinitperiod},
+           given={Lorenzo},
+           giveni={L\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=b40aa5dc4b52f7233527b32e80da1505}{%
+           family={Ene-Iordache},
+           familyi={E\bibinithyphendelim I\bibinitperiod},
+           given={Bogdan},
+           giveni={B\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=04f80f4aa3ea334c53fac6d1fe0287c2}{%
+           family={Remuzzi},
+           familyi={R\bibinitperiod},
+           given={Andrea},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=cb534fd04c099001a59246c4f6ad921a}{%
+           family={Steinman},
+           familyi={S\bibinitperiod},
+           given={David\bibnamedelima A.},
+           giveni={D\bibinitperiod\bibinitdelim A\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{2}{%
+        {Springer Science}%
+        {Business Media LLC}%
+      }
+      \strng{namehash}{d3c34fc07e155d8d1bb4676ea1259166}
+      \strng{fullhash}{9f73cba2e2eef5340c63d1d64bf68cf8}
+      \strng{fullhashraw}{9f73cba2e2eef5340c63d1d64bf68cf8}
+      \strng{bibnamehash}{9f73cba2e2eef5340c63d1d64bf68cf8}
+      \strng{authorbibnamehash}{9f73cba2e2eef5340c63d1d64bf68cf8}
+      \strng{authornamehash}{d3c34fc07e155d8d1bb4676ea1259166}
+      \strng{authorfullhash}{9f73cba2e2eef5340c63d1d64bf68cf8}
+      \strng{authorfullhashraw}{9f73cba2e2eef5340c63d1d64bf68cf8}
+      \field{sortinit}{A}
+      \field{sortinithash}{2f401846e2029bad6b3ecc16d50031e2}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{1741-0444}
+      \field{journaltitle}{Medical \& Biological Engineering \& Computing}
+      \field{month}{11}
+      \field{number}{11}
+      \field{title}{An image-based modeling framework for patient-specific computational hemodynamics}
+      \field{volume}{46}
+      \field{year}{2008}
+      \verb{doi}
+      \verb 10.1007/s11517-008-0420-1
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1007/s11517-008-0420-1
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1007/s11517-008-0420-1
+      \endverb
+    \endentry
+    \entry{botsch2008}{article}{}{}
+      \name{author}{2}{}{%
+        {{un=0,uniquepart=base,hash=5c45d9bb93058b174f07674cc6e29938}{%
+           family={Botsch},
+           familyi={B\bibinitperiod},
+           given={M.},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=ffe7efd395c7e209ed890e3927cad723}{%
+           family={Sorkine},
+           familyi={S\bibinitperiod},
+           given={O.},
+           giveni={O\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{2}{%
+        {Institute of Electrical}%
+        {Electronics Engineers (IEEE)}%
+      }
+      \strng{namehash}{bd5a08abdc5891cff71b4af5afa35a0c}
+      \strng{fullhash}{bd5a08abdc5891cff71b4af5afa35a0c}
+      \strng{fullhashraw}{bd5a08abdc5891cff71b4af5afa35a0c}
+      \strng{bibnamehash}{bd5a08abdc5891cff71b4af5afa35a0c}
+      \strng{authorbibnamehash}{bd5a08abdc5891cff71b4af5afa35a0c}
+      \strng{authornamehash}{bd5a08abdc5891cff71b4af5afa35a0c}
+      \strng{authorfullhash}{bd5a08abdc5891cff71b4af5afa35a0c}
+      \strng{authorfullhashraw}{bd5a08abdc5891cff71b4af5afa35a0c}
+      \field{sortinit}{B}
+      \field{sortinithash}{d7095fff47cda75ca2589920aae98399}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{1077-2626}
+      \field{journaltitle}{IEEE Transactions on Visualization and Computer Graphics}
+      \field{month}{1}
+      \field{number}{1}
+      \field{title}{On Linear Variational Surface Deformation Methods}
+      \field{volume}{14}
+      \field{year}{2008}
+      \field{pages}{213\bibrangedash 230}
+      \range{pages}{18}
+      \verb{doi}
+      \verb 10.1109/tvcg.2007.1054
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1109/TVCG.2007.1054
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1109/TVCG.2007.1054
+      \endverb
+    \endentry
+    \entry{botsch2004}{article}{}{}
+      \name{author}{2}{}{%
+        {{un=0,uniquepart=base,hash=a0765e06ad46483a64643f0c7a324057}{%
+           family={Botsch},
+           familyi={B\bibinitperiod},
+           given={Mario},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=40f084401451fa652a2cc0beb43fe9f1}{%
+           family={Kobbelt},
+           familyi={K\bibinitperiod},
+           given={Leif},
+           giveni={L\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {ACM}%
+      }
+      \strng{namehash}{b303b245135aff96cb423bc9daed15c9}
+      \strng{fullhash}{b303b245135aff96cb423bc9daed15c9}
+      \strng{fullhashraw}{b303b245135aff96cb423bc9daed15c9}
+      \strng{bibnamehash}{b303b245135aff96cb423bc9daed15c9}
+      \strng{authorbibnamehash}{b303b245135aff96cb423bc9daed15c9}
+      \strng{authornamehash}{b303b245135aff96cb423bc9daed15c9}
+      \strng{authorfullhash}{b303b245135aff96cb423bc9daed15c9}
+      \strng{authorfullhashraw}{b303b245135aff96cb423bc9daed15c9}
+      \field{sortinit}{B}
+      \field{sortinithash}{d7095fff47cda75ca2589920aae98399}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{journaltitle}{Proceedings of the 2004 Eurographics/ACM SIGGRAPH symposium on Geometry processing}
+      \field{series}{SGP04}
+      \field{title}{A remeshing approach to multiresolution modeling}
+      \field{year}{2004}
+      \field{pages}{185\bibrangedash 192}
+      \range{pages}{8}
+      \verb{doi}
+      \verb 10.1145/1057432.1057457
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1145/1057432.1057457
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1145/1057432.1057457
+      \endverb
+    \endentry
+    \entry{botsch2010}{book}{}{}
+      \name{author}{5}{}{%
+        {{un=0,uniquepart=base,hash=a0765e06ad46483a64643f0c7a324057}{%
+           family={Botsch},
+           familyi={B\bibinitperiod},
+           given={Mario},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=40f084401451fa652a2cc0beb43fe9f1}{%
+           family={Kobbelt},
+           familyi={K\bibinitperiod},
+           given={Leif},
+           giveni={L\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=f27430fa205103cec8dd42ab86c2ba53}{%
+           family={Pauly},
+           familyi={P\bibinitperiod},
+           given={Mark},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=5a41513f72cfe8224163441d30854e41}{%
+           family={Alliez},
+           familyi={A\bibinitperiod},
+           given={Pierre},
+           giveni={P\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=56d2d17f2dd78ca45cdeaf2fae7813f1}{%
+           family={Levy},
+           familyi={L\bibinitperiod},
+           given={Bruno},
+           giveni={B\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {A K Peters/CRC Press}%
+      }
+      \strng{namehash}{26ae6ff0ce3f9b6b67a50bef1bbf083c}
+      \strng{fullhash}{955463099e04ba718707e250d9f3c421}
+      \strng{fullhashraw}{955463099e04ba718707e250d9f3c421}
+      \strng{bibnamehash}{955463099e04ba718707e250d9f3c421}
+      \strng{authorbibnamehash}{955463099e04ba718707e250d9f3c421}
+      \strng{authornamehash}{26ae6ff0ce3f9b6b67a50bef1bbf083c}
+      \strng{authorfullhash}{955463099e04ba718707e250d9f3c421}
+      \strng{authorfullhashraw}{955463099e04ba718707e250d9f3c421}
+      \field{sortinit}{B}
+      \field{sortinithash}{d7095fff47cda75ca2589920aae98399}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{isbn}{9781439865316}
+      \field{month}{10}
+      \field{title}{Polygon Mesh Processing}
+      \field{year}{2010}
+      \verb{doi}
+      \verb 10.1201/b10688
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1201/b10688
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1201/b10688
+      \endverb
+    \endentry
+    \entry{byrd1995}{article}{}{}
+      \name{author}{4}{}{%
+        {{un=0,uniquepart=base,hash=5a28551b79116d5aa47933899f1dfee0}{%
+           family={Byrd},
+           familyi={B\bibinitperiod},
+           given={Richard\bibnamedelima H.},
+           giveni={R\bibinitperiod\bibinitdelim H\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=8c2f3741ab4369f5590e2e16412db71b}{%
+           family={Lu},
+           familyi={L\bibinitperiod},
+           given={Peihuang},
+           giveni={P\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=88a342d927bf795b0d92af8a5613da31}{%
+           family={Nocedal},
+           familyi={N\bibinitperiod},
+           given={Jorge},
+           giveni={J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=db29c9e94410252c9dd6938604f708b8}{%
+           family={Zhu},
+           familyi={Z\bibinitperiod},
+           given={Ciyou},
+           giveni={C\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {Society for Industrial \& Applied Mathematics (SIAM)}%
+      }
+      \strng{namehash}{baf523517e047c9f98b50b0ed26ebe81}
+      \strng{fullhash}{f5975dd93e119527dc785af7466cba20}
+      \strng{fullhashraw}{f5975dd93e119527dc785af7466cba20}
+      \strng{bibnamehash}{f5975dd93e119527dc785af7466cba20}
+      \strng{authorbibnamehash}{f5975dd93e119527dc785af7466cba20}
+      \strng{authornamehash}{baf523517e047c9f98b50b0ed26ebe81}
+      \strng{authorfullhash}{f5975dd93e119527dc785af7466cba20}
+      \strng{authorfullhashraw}{f5975dd93e119527dc785af7466cba20}
+      \field{sortinit}{B}
+      \field{sortinithash}{d7095fff47cda75ca2589920aae98399}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{1095-7197}
+      \field{journaltitle}{SIAM Journal on Scientific Computing}
+      \field{number}{5}
+      \field{title}{A Limited Memory Algorithm for Bound Constrained Optimization}
+      \field{volume}{16}
+      \field{year}{1995}
+      \field{pages}{1190\bibrangedash 1208}
+      \range{pages}{19}
+      \verb{doi}
+      \verb 10.1137/0916069
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1137/0916069
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1137/0916069
+      \endverb
+    \endentry
+    \entry{cardenes2011}{article}{}{}
+      \name{author}{5}{}{%
+        {{un=0,uniquepart=base,hash=7c28c1fd055567145b334387381c89c7}{%
+           family={Cardenes},
+           familyi={C\bibinitperiod},
+           given={R.},
+           giveni={R\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=f3bb55c958ddc9eb0fc7311eef2bca07}{%
+           family={Pozo},
+           familyi={P\bibinitperiod},
+           given={J.\bibnamedelimi M.},
+           giveni={J\bibinitperiod\bibinitdelim M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=71a746482d41fd82d88ef21ae01b4540}{%
+           family={Bogunovic},
+           familyi={B\bibinitperiod},
+           given={H.},
+           giveni={H\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=9e988c1d2b9724320e4b5820a853725a}{%
+           family={Larrabide},
+           familyi={L\bibinitperiod},
+           given={I.},
+           giveni={I\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=366bab417a227a65435cd7e5821cdd9a}{%
+           family={Frangi},
+           familyi={F\bibinitperiod},
+           given={A.\bibnamedelimi F.},
+           giveni={A\bibinitperiod\bibinitdelim F\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{2}{%
+        {Institute of Electrical}%
+        {Electronics Engineers (IEEE)}%
+      }
+      \strng{namehash}{f0c662acb58710d9f8af9c4b066c7ee0}
+      \strng{fullhash}{3f3894b9141246e0d5a071d10185d07c}
+      \strng{fullhashraw}{3f3894b9141246e0d5a071d10185d07c}
+      \strng{bibnamehash}{3f3894b9141246e0d5a071d10185d07c}
+      \strng{authorbibnamehash}{3f3894b9141246e0d5a071d10185d07c}
+      \strng{authornamehash}{f0c662acb58710d9f8af9c4b066c7ee0}
+      \strng{authorfullhash}{3f3894b9141246e0d5a071d10185d07c}
+      \strng{authorfullhashraw}{3f3894b9141246e0d5a071d10185d07c}
+      \field{sortinit}{C}
+      \field{sortinithash}{4d103a86280481745c9c897c925753c0}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{1558-254X}
+      \field{journaltitle}{IEEE Transactions on Medical Imaging}
+      \field{month}{10}
+      \field{number}{10}
+      \field{title}{Automatic Aneurysm Neck Detection Using Surface Voronoi Diagrams}
+      \field{volume}{30}
+      \field{year}{2011}
+      \field{pages}{1863\bibrangedash 1876}
+      \range{pages}{14}
+      \verb{doi}
+      \verb 10.1109/tmi.2011.2157698
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1109/tmi.2011.2157698
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1109/tmi.2011.2157698
+      \endverb
+    \endentry
+    \entry{ford2009}{article}{}{}
+      \name{author}{5}{}{%
+        {{un=0,uniquepart=base,hash=ac4ffc5acb2e20e244c75c245a747467}{%
+           family={Ford},
+           familyi={F\bibinitperiod},
+           given={M\bibnamedelima D},
+           giveni={M\bibinitperiod\bibinitdelim D\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=a50682a7a949fc498333c6dc41b8dcb4}{%
+           family={Hoi},
+           familyi={H\bibinitperiod},
+           given={Y},
+           giveni={Y\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=5bbd87326dc176132df64e326f8b1818}{%
+           family={Piccinelli},
+           familyi={P\bibinitperiod},
+           given={M},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=79de9b452b6fca4de4f21bae9bb927b8}{%
+           family={Antiga},
+           familyi={A\bibinitperiod},
+           given={L},
+           giveni={L\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=c13fea8063d24b059d0f72c22750dc51}{%
+           family={Steinman},
+           familyi={S\bibinitperiod},
+           given={D\bibnamedelima A},
+           giveni={D\bibinitperiod\bibinitdelim A\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {Oxford University Press (OUP)}%
+      }
+      \strng{namehash}{f582762146826b8cc198ffd8f06ea03b}
+      \strng{fullhash}{93508b4c589c0ac426c83fc84d1b7ffb}
+      \strng{fullhashraw}{93508b4c589c0ac426c83fc84d1b7ffb}
+      \strng{bibnamehash}{93508b4c589c0ac426c83fc84d1b7ffb}
+      \strng{authorbibnamehash}{93508b4c589c0ac426c83fc84d1b7ffb}
+      \strng{authornamehash}{f582762146826b8cc198ffd8f06ea03b}
+      \strng{authorfullhash}{93508b4c589c0ac426c83fc84d1b7ffb}
+      \strng{authorfullhashraw}{93508b4c589c0ac426c83fc84d1b7ffb}
+      \field{sortinit}{F}
+      \field{sortinithash}{2638baaa20439f1b5a8f80c6c08a13b4}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{1748-880X}
+      \field{journaltitle}{The British Journal of Radiology}
+      \field{month}{1}
+      \field{number}{special_issue_1}
+      \field{title}{An objective approach to digital removal of saccular aneurysms: technique and applications}
+      \field{volume}{82}
+      \field{year}{2009}
+      \field{pages}{S55\bibrangedash S61}
+      \range{pages}{-1}
+      \verb{doi}
+      \verb 10.1259/bjr/67593727
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1259/bjr/67593727
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1259/bjr/67593727
+      \endverb
+    \endentry
+    \entry{izzo2018}{article}{}{}
+      \name{author}{4}{}{%
+        {{un=0,uniquepart=base,hash=47b0575040c180a7af0872a8dfbe3b8e}{%
+           family={Izzo},
+           familyi={I\bibinitperiod},
+           given={Richard},
+           giveni={R\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=e0999b99ce67dc691f974ac1621e113f}{%
+           family={Steinman},
+           familyi={S\bibinitperiod},
+           given={David},
+           giveni={D\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=0b4c7f9f1fa9cab88e541fcea0a927c6}{%
+           family={Manini},
+           familyi={M\bibinitperiod},
+           given={Simone},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=f65a80959d520337ae99a0798515036c}{%
+           family={Antiga},
+           familyi={A\bibinitperiod},
+           given={Luca},
+           giveni={L\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {The Open Journal}%
+      }
+      \strng{namehash}{4de665450b9cf485d0b5b55b49874c01}
+      \strng{fullhash}{49f7823616ed8c6786a3263d5457fe0b}
+      \strng{fullhashraw}{49f7823616ed8c6786a3263d5457fe0b}
+      \strng{bibnamehash}{49f7823616ed8c6786a3263d5457fe0b}
+      \strng{authorbibnamehash}{49f7823616ed8c6786a3263d5457fe0b}
+      \strng{authornamehash}{4de665450b9cf485d0b5b55b49874c01}
+      \strng{authorfullhash}{49f7823616ed8c6786a3263d5457fe0b}
+      \strng{authorfullhashraw}{49f7823616ed8c6786a3263d5457fe0b}
+      \field{sortinit}{I}
+      \field{sortinithash}{8d291c51ee89b6cd86bf5379f0b151d8}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{2475-9066}
+      \field{journaltitle}{Journal of Open Source Software}
+      \field{month}{5}
+      \field{number}{25}
+      \field{title}{The Vascular Modeling Toolkit: A Python Library for the Analysis of Tubular Structures in Medical Images}
+      \field{volume}{3}
+      \field{year}{2018}
+      \field{pages}{745}
+      \range{pages}{1}
+      \verb{doi}
+      \verb 10.21105/joss.00745
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.21105/joss.00745
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.21105/joss.00745
+      \endverb
+    \endentry
+    \entry{juchler2022}{misc}{}{}
+      \name{author}{3}{ul=2}{%
+        {{un=0,uniquepart=base,hash=ab52fc80a6e9733e6453d7a7b3a27f8d}{%
+           family={Juchler},
+           familyi={J\bibinitperiod},
+           given={Norman},
+           giveni={N\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=6c65063d4a7edab1b83a604b77224f9c}{%
+           family={Bijlenga},
+           familyi={B\bibinitperiod},
+           given={Philippe},
+           giveni={P\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=494435132d6d3891c280f4fc85d9884d}{%
+           family={Hirsch},
+           familyi={H\bibinitperiod},
+           given={Sven},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{language}{1}{%
+        {en}%
+      }
+      \list{publisher}{1}{%
+        {Zenodo}%
+      }
+      \strng{namehash}{bf167a19cd6100cc330dce66409ddc67}
+      \strng{fullhash}{bf167a19cd6100cc330dce66409ddc67}
+      \strng{fullhashraw}{bf167a19cd6100cc330dce66409ddc67}
+      \strng{bibnamehash}{bf167a19cd6100cc330dce66409ddc67}
+      \strng{authorbibnamehash}{bf167a19cd6100cc330dce66409ddc67}
+      \strng{authornamehash}{bf167a19cd6100cc330dce66409ddc67}
+      \strng{authorfullhash}{bf167a19cd6100cc330dce66409ddc67}
+      \strng{authorfullhashraw}{bf167a19cd6100cc330dce66409ddc67}
+      \field{sortinit}{J}
+      \field{sortinithash}{b2f54a9081ace9966a7cb9413811edb4}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{title}{AneuX morphology database}
+      \field{year}{2022}
+      \verb{doi}
+      \verb 10.5281/ZENODO.6678442
+      \endverb
+      \verb{urlraw}
+      \verb https://zenodo.org/doi/10.5281/zenodo.6678442
+      \endverb
+      \verb{url}
+      \verb https://zenodo.org/doi/10.5281/zenodo.6678442
+      \endverb
+      \keyw{Intracranial aneurysms,Geometric models,Morphological analysis}
+    \endentry
+    \entry{juchler2022shape}{article}{}{}
+      \name{author}{5}{ul=2}{%
+        {{un=0,uniquepart=base,hash=ab52fc80a6e9733e6453d7a7b3a27f8d}{%
+           family={Juchler},
+           familyi={J\bibinitperiod},
+           given={Norman},
+           giveni={N\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=e12c0c0e8490a438ff22ec39ee381ec5}{%
+           family={Schilling},
+           familyi={S\bibinitperiod},
+           given={Sabine},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=6c65063d4a7edab1b83a604b77224f9c}{%
+           family={Bijlenga},
+           familyi={B\bibinitperiod},
+           given={Philippe},
+           giveni={P\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=a70e54b11d6ff82d4505e93fddf8e62b}{%
+           family={Kurtcuoglu},
+           familyi={K\bibinitperiod},
+           given={Vartan},
+           giveni={V\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=494435132d6d3891c280f4fc85d9884d}{%
+           family={Hirsch},
+           familyi={H\bibinitperiod},
+           given={Sven},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {Frontiers Media SA}%
+      }
+      \strng{namehash}{5d0fac3ec260d24434e387e881f7c9e6}
+      \strng{fullhash}{78514b48ddf87bb2d25050d59bc482e2}
+      \strng{fullhashraw}{78514b48ddf87bb2d25050d59bc482e2}
+      \strng{bibnamehash}{78514b48ddf87bb2d25050d59bc482e2}
+      \strng{authorbibnamehash}{78514b48ddf87bb2d25050d59bc482e2}
+      \strng{authornamehash}{5d0fac3ec260d24434e387e881f7c9e6}
+      \strng{authorfullhash}{78514b48ddf87bb2d25050d59bc482e2}
+      \strng{authorfullhashraw}{78514b48ddf87bb2d25050d59bc482e2}
+      \field{sortinit}{J}
+      \field{sortinithash}{b2f54a9081ace9966a7cb9413811edb4}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{1664-2295}
+      \field{journaltitle}{Frontiers in Neurology}
+      \field{month}{5}
+      \field{title}{Shape Trumps Size: Image-Based Morphological Analysis Reveals That the 3D Shape Discriminates Intracranial Aneurysm Disease Status Better Than Aneurysm Size}
+      \field{volume}{13}
+      \field{year}{2022}
+      \verb{doi}
+      \verb 10.3389/fneur.2022.809391
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.3389/fneur.2022.809391
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.3389/fneur.2022.809391
+      \endverb
+    \endentry
+    \entry{juvela2000}{article}{}{}
+      \name{author}{1}{}{%
+        {{un=0,uniquepart=base,hash=148610dbfe1d97015f03324a765685b0}{%
+           family={Juvela},
+           familyi={J\bibinitperiod},
+           given={Seppo},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {Ovid Technologies (Wolters Kluwer Health)}%
+      }
+      \strng{namehash}{148610dbfe1d97015f03324a765685b0}
+      \strng{fullhash}{148610dbfe1d97015f03324a765685b0}
+      \strng{fullhashraw}{148610dbfe1d97015f03324a765685b0}
+      \strng{bibnamehash}{148610dbfe1d97015f03324a765685b0}
+      \strng{authorbibnamehash}{148610dbfe1d97015f03324a765685b0}
+      \strng{authornamehash}{148610dbfe1d97015f03324a765685b0}
+      \strng{authorfullhash}{148610dbfe1d97015f03324a765685b0}
+      \strng{authorfullhashraw}{148610dbfe1d97015f03324a765685b0}
+      \field{sortinit}{J}
+      \field{sortinithash}{b2f54a9081ace9966a7cb9413811edb4}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{1524-4628}
+      \field{journaltitle}{Stroke}
+      \field{month}{2}
+      \field{number}{2}
+      \field{title}{Risk Factors for Multiple Intracranial Aneurysms}
+      \field{volume}{31}
+      \field{year}{2000}
+      \field{pages}{392\bibrangedash 397}
+      \range{pages}{6}
+      \verb{doi}
+      \verb 10.1161/01.str.31.2.392
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1161/01.str.31.2.392
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1161/01.str.31.2.392
+      \endverb
+    \endentry
+    \entry{lorensen1987}{article}{}{}
+      \name{author}{2}{}{%
+        {{un=0,uniquepart=base,hash=966edb0a4087f42b3518503987e61399}{%
+           family={Lorensen},
+           familyi={L\bibinitperiod},
+           given={William\bibnamedelima E.},
+           giveni={W\bibinitperiod\bibinitdelim E\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=74f056f6ffac9cb2f26904eca44820de}{%
+           family={Cline},
+           familyi={C\bibinitperiod},
+           given={Harvey\bibnamedelima E.},
+           giveni={H\bibinitperiod\bibinitdelim E\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {Association for Computing Machinery (ACM)}%
+      }
+      \strng{namehash}{c04f319f1cd4852327f00c52da26c78e}
+      \strng{fullhash}{c04f319f1cd4852327f00c52da26c78e}
+      \strng{fullhashraw}{c04f319f1cd4852327f00c52da26c78e}
+      \strng{bibnamehash}{c04f319f1cd4852327f00c52da26c78e}
+      \strng{authorbibnamehash}{c04f319f1cd4852327f00c52da26c78e}
+      \strng{authornamehash}{c04f319f1cd4852327f00c52da26c78e}
+      \strng{authorfullhash}{c04f319f1cd4852327f00c52da26c78e}
+      \strng{authorfullhashraw}{c04f319f1cd4852327f00c52da26c78e}
+      \field{sortinit}{L}
+      \field{sortinithash}{7c47d417cecb1f4bd38d1825c427a61a}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{0097-8930}
+      \field{journaltitle}{ACM SIGGRAPH Computer Graphics}
+      \field{month}{8}
+      \field{number}{4}
+      \field{title}{Marching cubes: A high resolution 3D surface construction algorithm}
+      \field{volume}{21}
+      \field{year}{1987}
+      \field{pages}{163\bibrangedash 169}
+      \range{pages}{7}
+      \verb{doi}
+      \verb 10.1145/37402.37422
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1145/37402.37422
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1145/37402.37422
+      \endverb
+    \endentry
+    \entry{pasko1995}{article}{}{}
+      \name{author}{4}{}{%
+        {{un=0,uniquepart=base,hash=db99e2eb4f20639f4cab1328aa3c6b18}{%
+           family={Pasko},
+           familyi={P\bibinitperiod},
+           given={A.},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=1e61e287f0baa1ef36781aa231025b42}{%
+           family={Adzhiev},
+           familyi={A\bibinitperiod},
+           given={V.},
+           giveni={V\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=8bf12a3b916e5c4cf503fc5c1f85038c}{%
+           family={Sourin},
+           familyi={S\bibinitperiod},
+           given={A.},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=7c8d1fff2f2d39080ce051bf4b147a81}{%
+           family={Savchenko},
+           familyi={S\bibinitperiod},
+           given={V.},
+           giveni={V\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{2}{%
+        {Springer Science}%
+        {Business Media LLC}%
+      }
+      \strng{namehash}{3b02d006f3d094bab1e1934b360599bc}
+      \strng{fullhash}{e3e859c43a587b912b3bb6af4a436336}
+      \strng{fullhashraw}{e3e859c43a587b912b3bb6af4a436336}
+      \strng{bibnamehash}{e3e859c43a587b912b3bb6af4a436336}
+      \strng{authorbibnamehash}{e3e859c43a587b912b3bb6af4a436336}
+      \strng{authornamehash}{3b02d006f3d094bab1e1934b360599bc}
+      \strng{authorfullhash}{e3e859c43a587b912b3bb6af4a436336}
+      \strng{authorfullhashraw}{e3e859c43a587b912b3bb6af4a436336}
+      \field{sortinit}{P}
+      \field{sortinithash}{ff3bcf24f47321b42cb156c2cc8a8422}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{1432-2315}
+      \field{journaltitle}{The Visual Computer}
+      \field{month}{8}
+      \field{number}{8}
+      \field{title}{Function representation in geometric modeling: concepts, implementation and applications}
+      \field{volume}{11}
+      \field{year}{1995}
+      \field{pages}{429\bibrangedash 446}
+      \range{pages}{18}
+      \verb{doi}
+      \verb 10.1007/bf02464333
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1007/bf02464333
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1007/bf02464333
+      \endverb
+    \endentry
+    \entry{piccinelli2009}{article}{}{}
+      \name{author}{5}{}{%
+        {{un=0,uniquepart=base,hash=5bbd87326dc176132df64e326f8b1818}{%
+           family={Piccinelli},
+           familyi={P\bibinitperiod},
+           given={M.},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=9d64cbdfb15a079a4bc930d9e279aeeb}{%
+           family={Veneziani},
+           familyi={V\bibinitperiod},
+           given={A.},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=c13fea8063d24b059d0f72c22750dc51}{%
+           family={Steinman},
+           familyi={S\bibinitperiod},
+           given={D.A.},
+           giveni={D\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=f9f2eda025fd4629c925764bbe624730}{%
+           family={Remuzzi},
+           familyi={R\bibinitperiod},
+           given={A.},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=79de9b452b6fca4de4f21bae9bb927b8}{%
+           family={Antiga},
+           familyi={A\bibinitperiod},
+           given={L.},
+           giveni={L\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{2}{%
+        {Institute of Electrical}%
+        {Electronics Engineers (IEEE)}%
+      }
+      \strng{namehash}{d9fd75573230ba528f512e4e8b8525b6}
+      \strng{fullhash}{0a92149c4865d0e895ba0b6b630f6441}
+      \strng{fullhashraw}{0a92149c4865d0e895ba0b6b630f6441}
+      \strng{bibnamehash}{0a92149c4865d0e895ba0b6b630f6441}
+      \strng{authorbibnamehash}{0a92149c4865d0e895ba0b6b630f6441}
+      \strng{authornamehash}{d9fd75573230ba528f512e4e8b8525b6}
+      \strng{authorfullhash}{0a92149c4865d0e895ba0b6b630f6441}
+      \strng{authorfullhashraw}{0a92149c4865d0e895ba0b6b630f6441}
+      \field{sortinit}{P}
+      \field{sortinithash}{ff3bcf24f47321b42cb156c2cc8a8422}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{1558-254X}
+      \field{journaltitle}{IEEE Transactions on Medical Imaging}
+      \field{month}{8}
+      \field{number}{8}
+      \field{title}{A Framework for Geometric Analysis of Vascular Structures: Application to Cerebral Aneurysms}
+      \field{volume}{28}
+      \field{year}{2009}
+      \field{pages}{1141\bibrangedash 1155}
+      \range{pages}{15}
+      \verb{doi}
+      \verb 10.1109/tmi.2009.2021652
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1109/TMI.2009.2021652
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1109/TMI.2009.2021652
+      \endverb
+    \endentry
+    \entry{ricci1973}{article}{}{}
+      \name{author}{1}{}{%
+        {{un=0,uniquepart=base,hash=ac0fc03ab8d15e47abddd7523c31dc88}{%
+           family={Ricci},
+           familyi={R\bibinitperiod},
+           given={A.},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {Oxford University Press (OUP)}%
+      }
+      \strng{namehash}{ac0fc03ab8d15e47abddd7523c31dc88}
+      \strng{fullhash}{ac0fc03ab8d15e47abddd7523c31dc88}
+      \strng{fullhashraw}{ac0fc03ab8d15e47abddd7523c31dc88}
+      \strng{bibnamehash}{ac0fc03ab8d15e47abddd7523c31dc88}
+      \strng{authorbibnamehash}{ac0fc03ab8d15e47abddd7523c31dc88}
+      \strng{authornamehash}{ac0fc03ab8d15e47abddd7523c31dc88}
+      \strng{authorfullhash}{ac0fc03ab8d15e47abddd7523c31dc88}
+      \strng{authorfullhashraw}{ac0fc03ab8d15e47abddd7523c31dc88}
+      \field{sortinit}{R}
+      \field{sortinithash}{5e1c39a9d46ffb6bebd8f801023a9486}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{1460-2067}
+      \field{journaltitle}{The Computer Journal}
+      \field{month}{2}
+      \field{number}{2}
+      \field{title}{A constructive geometry for computer graphics}
+      \field{volume}{16}
+      \field{year}{1973}
+      \field{pages}{157\bibrangedash 160}
+      \range{pages}{4}
+      \verb{doi}
+      \verb 10.1093/comjnl/16.2.157
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1093/comjnl/16.2.157
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1093/comjnl/16.2.157
+      \endverb
+    \endentry
+    \entry{sangalli2009}{article}{}{}
+      \name{author}{4}{}{%
+        {{un=0,uniquepart=base,hash=8906a8f4441e6a9e200f97c19467d981}{%
+           family={Sangalli},
+           familyi={S\bibinitperiod},
+           given={Laura\bibnamedelima M.},
+           giveni={L\bibinitperiod\bibinitdelim M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=4c1630858c3c30f274fac5f1dde6e05a}{%
+           family={Secchi},
+           familyi={S\bibinitperiod},
+           given={Piercesare},
+           giveni={P\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=b1648e6d14214fcb260b8b3e5ca8450b}{%
+           family={Vantini},
+           familyi={V\bibinitperiod},
+           given={Simone},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=208f5793fba9a23a322eea9dd4372d91}{%
+           family={Veneziani},
+           familyi={V\bibinitperiod},
+           given={Alessandro},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {Informa UK Limited}%
+      }
+      \strng{namehash}{0959a88aed6255aa7b14501c274f2bed}
+      \strng{fullhash}{1f8cf15742a4c27d5b9ddadfd2487071}
+      \strng{fullhashraw}{1f8cf15742a4c27d5b9ddadfd2487071}
+      \strng{bibnamehash}{1f8cf15742a4c27d5b9ddadfd2487071}
+      \strng{authorbibnamehash}{1f8cf15742a4c27d5b9ddadfd2487071}
+      \strng{authornamehash}{0959a88aed6255aa7b14501c274f2bed}
+      \strng{authorfullhash}{1f8cf15742a4c27d5b9ddadfd2487071}
+      \strng{authorfullhashraw}{1f8cf15742a4c27d5b9ddadfd2487071}
+      \field{sortinit}{S}
+      \field{sortinithash}{b164b07b29984b41daf1e85279fbc5ab}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{1537-274X}
+      \field{journaltitle}{Journal of the American Statistical Association}
+      \field{month}{3}
+      \field{number}{485}
+      \field{title}{A Case Study in Exploratory Functional Data Analysis: Geometrical Features of the Internal Carotid Artery}
+      \field{volume}{104}
+      \field{year}{2009}
+      \field{pages}{37\bibrangedash 48}
+      \range{pages}{12}
+      \verb{doi}
+      \verb 10.1198/jasa.2009.0002
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1198/jasa.2009.0002
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1198/jasa.2009.0002
+      \endverb
+    \endentry
+    \entry{schroeder2006}{book}{}{}
+      \name{author}{3}{}{%
+        {{un=0,uniquepart=base,hash=f2debcce030b32c7f2016e566261199c}{%
+           family={Schroeder},
+           familyi={S\bibinitperiod},
+           given={Will},
+           giveni={W\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=417386cd55d38dbbe1bbebccbbc8e8ed}{%
+           family={Martin},
+           familyi={M\bibinitperiod},
+           given={Ken},
+           giveni={K\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=02d5a325a8f2c3733843953a7005298b}{%
+           family={Lorensen},
+           familyi={L\bibinitperiod},
+           given={Bill},
+           giveni={B\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {Kitware}%
+      }
+      \strng{namehash}{dd0f40f214396cc2ecc0aec2965786bc}
+      \strng{fullhash}{340ff298ce91155ae09c9a40578df722}
+      \strng{fullhashraw}{340ff298ce91155ae09c9a40578df722}
+      \strng{bibnamehash}{340ff298ce91155ae09c9a40578df722}
+      \strng{authorbibnamehash}{340ff298ce91155ae09c9a40578df722}
+      \strng{authornamehash}{dd0f40f214396cc2ecc0aec2965786bc}
+      \strng{authorfullhash}{340ff298ce91155ae09c9a40578df722}
+      \strng{authorfullhashraw}{340ff298ce91155ae09c9a40578df722}
+      \field{sortinit}{S}
+      \field{sortinithash}{b164b07b29984b41daf1e85279fbc5ab}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{edition}{4}
+      \field{isbn}{978-1-930934-19-1}
+      \field{title}{The Visualization Toolkit: An Object-Oriented Approach to 3D Graphics}
+      \field{year}{2006}
+    \endentry
+    \entry{sullivan2019}{article}{}{}
+      \name{author}{2}{}{%
+        {{un=0,uniquepart=base,hash=443d0e969358d31ec8265c1cc88a28ed}{%
+           family={Sullivan},
+           familyi={S\bibinitperiod},
+           given={C.},
+           giveni={C\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=4375f88434492e8c13a9b0a0d848e1b4}{%
+           family={Kaszynski},
+           familyi={K\bibinitperiod},
+           given={Alexander},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {The Open Journal}%
+      }
+      \strng{namehash}{4ca0e6d2f546d1c09ad7941ee6369f6d}
+      \strng{fullhash}{4ca0e6d2f546d1c09ad7941ee6369f6d}
+      \strng{fullhashraw}{4ca0e6d2f546d1c09ad7941ee6369f6d}
+      \strng{bibnamehash}{4ca0e6d2f546d1c09ad7941ee6369f6d}
+      \strng{authorbibnamehash}{4ca0e6d2f546d1c09ad7941ee6369f6d}
+      \strng{authornamehash}{4ca0e6d2f546d1c09ad7941ee6369f6d}
+      \strng{authorfullhash}{4ca0e6d2f546d1c09ad7941ee6369f6d}
+      \strng{authorfullhashraw}{4ca0e6d2f546d1c09ad7941ee6369f6d}
+      \field{sortinit}{S}
+      \field{sortinithash}{b164b07b29984b41daf1e85279fbc5ab}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{2475-9066}
+      \field{journaltitle}{Journal of Open Source Software}
+      \field{month}{5}
+      \field{number}{37}
+      \field{title}{PyVista: 3D plotting and mesh analysis through a streamlined interface for the Visualization Toolkit (VTK)}
+      \field{volume}{4}
+      \field{year}{2019}
+      \field{pages}{1450}
+      \range{pages}{1}
+      \verb{doi}
+      \verb 10.21105/joss.01450
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.21105/joss.01450
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.21105/joss.01450
+      \endverb
+    \endentry
+    \entry{taubin1995}{article}{}{}
+      \name{author}{1}{}{%
+        {{un=0,uniquepart=base,hash=b3b3511f4ef528ffb91c3a5b925a0337}{%
+           family={Taubin},
+           familyi={T\bibinitperiod},
+           given={Gabriel},
+           giveni={G\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {ACM Press}%
+      }
+      \strng{namehash}{b3b3511f4ef528ffb91c3a5b925a0337}
+      \strng{fullhash}{b3b3511f4ef528ffb91c3a5b925a0337}
+      \strng{fullhashraw}{b3b3511f4ef528ffb91c3a5b925a0337}
+      \strng{bibnamehash}{b3b3511f4ef528ffb91c3a5b925a0337}
+      \strng{authorbibnamehash}{b3b3511f4ef528ffb91c3a5b925a0337}
+      \strng{authornamehash}{b3b3511f4ef528ffb91c3a5b925a0337}
+      \strng{authorfullhash}{b3b3511f4ef528ffb91c3a5b925a0337}
+      \strng{authorfullhashraw}{b3b3511f4ef528ffb91c3a5b925a0337}
+      \field{sortinit}{T}
+      \field{sortinithash}{9af77f0292593c26bde9a56e688eaee9}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{journaltitle}{Proceedings of the 22nd annual conference on Computer graphics and interactive techniques - SIGGRAPH ’95}
+      \field{series}{SIGGRAPH ’95}
+      \field{title}{A signal processing approach to fair surface design}
+      \field{year}{1995}
+      \field{pages}{351\bibrangedash 358}
+      \range{pages}{8}
+      \verb{doi}
+      \verb 10.1145/218380.218473
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1145/218380.218473
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1145/218380.218473
+      \endverb
+    \endentry
+    \entry{taubin1996}{inbook}{}{}
+      \name{author}{3}{}{%
+        {{un=0,uniquepart=base,hash=b3b3511f4ef528ffb91c3a5b925a0337}{%
+           family={Taubin},
+           familyi={T\bibinitperiod},
+           given={Gabriel},
+           giveni={G\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=55926e2ed0c54f92266d978954a4cdc3}{%
+           family={Zhang},
+           familyi={Z\bibinitperiod},
+           given={Tong},
+           giveni={T\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=23923ccfdde2f6663af778e44cdfb81f}{%
+           family={Golub},
+           familyi={G\bibinitperiod},
+           given={Gene},
+           giveni={G\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {Springer Berlin Heidelberg}%
+      }
+      \strng{namehash}{5b073f6f5ba62056a98e875e7bcfde84}
+      \strng{fullhash}{4152d08feb6b94f500bb866e109e2422}
+      \strng{fullhashraw}{4152d08feb6b94f500bb866e109e2422}
+      \strng{bibnamehash}{4152d08feb6b94f500bb866e109e2422}
+      \strng{authorbibnamehash}{4152d08feb6b94f500bb866e109e2422}
+      \strng{authornamehash}{5b073f6f5ba62056a98e875e7bcfde84}
+      \strng{authorfullhash}{4152d08feb6b94f500bb866e109e2422}
+      \strng{authorfullhashraw}{4152d08feb6b94f500bb866e109e2422}
+      \field{sortinit}{T}
+      \field{sortinithash}{9af77f0292593c26bde9a56e688eaee9}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{booktitle}{Computer Vision — ECCV ’96}
+      \field{isbn}{9783540499497}
+      \field{issn}{1611-3349}
+      \field{title}{Optimal surface smoothing as filter design}
+      \field{year}{1996}
+      \field{pages}{283\bibrangedash 292}
+      \range{pages}{10}
+      \verb{doi}
+      \verb 10.1007/bfb0015544
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1007/bfb0015544
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1007/bfb0015544
+      \endverb
+    \endentry
+    \entry{valensendstad2018}{article}{}{}
+      \name{author}{55}{}{%
+        {{un=0,uniquepart=base,hash=fea61649a4ffb03a13cda324c6f2e117}{%
+           family={Valen-Sendstad},
+           familyi={V\bibinithyphendelim S\bibinitperiod},
+           given={Kristian},
+           giveni={K\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=b89a864e317631cab18e42e1e11e9ea3}{%
+           family={Bergersen},
+           familyi={B\bibinitperiod},
+           given={Aslak\bibnamedelima W.},
+           giveni={A\bibinitperiod\bibinitdelim W\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=5e83309be7a40f8fbc91e8cdddca3bc8}{%
+           family={Shimogonya},
+           familyi={S\bibinitperiod},
+           given={Yuji},
+           giveni={Y\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=24fba5cda8ac264b91cedc8004cf03a0}{%
+           family={Goubergrits},
+           familyi={G\bibinitperiod},
+           given={Leonid},
+           giveni={L\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=143bde1d4fc81263d115813911c405d9}{%
+           family={Bruening},
+           familyi={B\bibinitperiod},
+           given={Jan},
+           giveni={J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=5fb112c4956708326385323bfca042a1}{%
+           family={Pallares},
+           familyi={P\bibinitperiod},
+           given={Jordi},
+           giveni={J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=41ff0fd2d2059b2f349711813072c656}{%
+           family={Cito},
+           familyi={C\bibinitperiod},
+           given={Salvatore},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=bba763434a7e98547f5a5dc1f88ce031}{%
+           family={Piskin},
+           familyi={P\bibinitperiod},
+           given={Senol},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=4e0be74734adc3c1cf83a15394afccad}{%
+           family={Pekkan},
+           familyi={P\bibinitperiod},
+           given={Kerem},
+           giveni={K\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=0b18db7e73907c1c066175bd42796c4f}{%
+           family={Geers},
+           familyi={G\bibinitperiod},
+           given={Arjan\bibnamedelima J.},
+           giveni={A\bibinitperiod\bibinitdelim J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=48126d59b85b6cc56af032b114d3094d}{%
+           family={Larrabide},
+           familyi={L\bibinitperiod},
+           given={Ignacio},
+           giveni={I\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=817b483b93f6bc8bd6ea2c23964a1a03}{%
+           family={Rapaka},
+           familyi={R\bibinitperiod},
+           given={Saikiran},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=2311e2a19282c884814e04cb4790b4c7}{%
+           family={Mihalef},
+           familyi={M\bibinitperiod},
+           given={Viorel},
+           giveni={V\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=ac53801b57df0187b3224c864e90103b}{%
+           family={Fu},
+           familyi={F\bibinitperiod},
+           given={Wenyu},
+           giveni={W\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=d0952645d815d04fc9caa6ca84ea73cb}{%
+           family={Qiao},
+           familyi={Q\bibinitperiod},
+           given={Aike},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=259770d2871a4b2d10da058fd9be5922}{%
+           family={Jain},
+           familyi={J\bibinitperiod},
+           given={Kartik},
+           giveni={K\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=5d2779821873663e25c2cb345e239e2f}{%
+           family={Roller},
+           familyi={R\bibinitperiod},
+           given={Sabine},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=7c098c845b5c93103aab7bcdeb7d8028}{%
+           family={Mardal},
+           familyi={M\bibinitperiod},
+           given={Kent-Andre},
+           giveni={K\bibinithyphendelim A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=ad0cef70680ecf0d1ba33de904dff8ec}{%
+           family={Kamakoti},
+           familyi={K\bibinitperiod},
+           given={Ramji},
+           giveni={R\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=bb9ce5220e5ac9c9c085e5b176f5f9ab}{%
+           family={Spirka},
+           familyi={S\bibinitperiod},
+           given={Thomas},
+           giveni={T\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=0d8727be935c0c010e3b21b11d99453c}{%
+           family={Ashton},
+           familyi={A\bibinitperiod},
+           given={Neil},
+           giveni={N\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=81d6ff6a1b46b59e7f1942716a969a16}{%
+           family={Revell},
+           familyi={R\bibinitperiod},
+           given={Alistair},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=fe9e2dd9102c6bf6b93d5c7e2f7408fe}{%
+           family={Aristokleous},
+           familyi={A\bibinitperiod},
+           given={Nicolas},
+           giveni={N\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=790589fe3607f0ec81abfa245c3255f7}{%
+           family={Houston},
+           familyi={H\bibinitperiod},
+           given={J.\bibnamedelimi Graeme},
+           giveni={J\bibinitperiod\bibinitdelim G\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=4b861e5b39cd4f30218075a736bb37ea}{%
+           family={Tsuji},
+           familyi={T\bibinitperiod},
+           given={Masanori},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=6c15acd1e89d02da434e8271b0790937}{%
+           family={Ishida},
+           familyi={I\bibinitperiod},
+           given={Fujimaro},
+           giveni={F\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=e9c0481c16c918aed9e2b5f74298b557}{%
+           family={Menon},
+           familyi={M\bibinitperiod},
+           given={Prahlad\bibnamedelima G.},
+           giveni={P\bibinitperiod\bibinitdelim G\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=3564769f06b6f4eae8650c390a872aee}{%
+           family={Browne},
+           familyi={B\bibinitperiod},
+           given={Leonard\bibnamedelima D.},
+           giveni={L\bibinitperiod\bibinitdelim D\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=6624dfe28f4a786688d076018a244a5c}{%
+           family={Broderick},
+           familyi={B\bibinitperiod},
+           given={Stephen},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=710d03b9ae716e69efb5a88b45ea8610}{%
+           family={Shojima},
+           familyi={S\bibinitperiod},
+           given={Masaaki},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=7c0c396e244d60b7a424215bb6a42404}{%
+           family={Koizumi},
+           familyi={K\bibinitperiod},
+           given={Satoshi},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=d9c08ac95200f3f7f3403d7e3412a52a}{%
+           family={Barbour},
+           familyi={B\bibinitperiod},
+           given={Michael},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=7f838ceffd84917047dbf0493217fbd7}{%
+           family={Aliseda},
+           familyi={A\bibinitperiod},
+           given={Alberto},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=cd2ba3ee0f139e2a255215d69f13c7bd}{%
+           family={Morales},
+           familyi={M\bibinitperiod},
+           given={Hernán\bibnamedelima G.},
+           giveni={H\bibinitperiod\bibinitdelim G\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=33f76f6d01d753a35344db2f1c0012af}{%
+           family={Lefèvre},
+           familyi={L\bibinitperiod},
+           given={Thierry},
+           giveni={T\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=a0b2e33a852cfc0af491ce4020cd56c4}{%
+           family={Hodis},
+           familyi={H\bibinitperiod},
+           given={Simona},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=3fc788c0a00a67f502d268c51f48205b}{%
+           family={Al-Smadi},
+           familyi={A\bibinithyphendelim S\bibinitperiod},
+           given={Yahia\bibnamedelima M.},
+           giveni={Y\bibinitperiod\bibinitdelim M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=6aec120e701ff84d18eba68a8fe7bf5c}{%
+           family={Tran},
+           familyi={T\bibinitperiod},
+           given={Justin\bibnamedelima S.},
+           giveni={J\bibinitperiod\bibinitdelim S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=bc255845502b0d3a9fcb6b763118f61f}{%
+           family={Marsden},
+           familyi={M\bibinitperiod},
+           given={Alison\bibnamedelima L.},
+           giveni={A\bibinitperiod\bibinitdelim L\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=48a9551b242e401696145aa7290ae32c}{%
+           family={Vaippummadhom},
+           familyi={V\bibinitperiod},
+           given={Sreeja},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=f1898fcf0e8191aec183fef3b4cb381f}{%
+           family={Einstein},
+           familyi={E\bibinitperiod},
+           given={G.\bibnamedelimi Albert},
+           giveni={G\bibinitperiod\bibinitdelim A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=2a5ccf1be9b50b6757b2bf8ccc1f5aa2}{%
+           family={Brown},
+           familyi={B\bibinitperiod},
+           given={Alistair\bibnamedelima G.},
+           giveni={A\bibinitperiod\bibinitdelim G\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=94d7c7d6d67868ea82b50530ec6a4863}{%
+           family={Debus},
+           familyi={D\bibinitperiod},
+           given={Kristian},
+           giveni={K\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=8d8bf270f302de24b17f636cfa7b06de}{%
+           family={Niizuma},
+           familyi={N\bibinitperiod},
+           given={Kuniyasu},
+           giveni={K\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=3cc489a09c45aed8251b475a70a3dc9c}{%
+           family={Rashad},
+           familyi={R\bibinitperiod},
+           given={Sherif},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=48a471a2516c79ce69355a80a1c296b0}{%
+           family={Sugiyama},
+           familyi={S\bibinitperiod},
+           given={Shin-ichiro},
+           giveni={S\bibinithyphendelim i\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=d1aacab779b17369a984451f55f828cc}{%
+           family={Owais\bibnamedelima Khan},
+           familyi={O\bibinitperiod\bibinitdelim K\bibinitperiod},
+           given={M.},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=afac1e0c4b0fa86ad03f1f6dc6b34e10}{%
+           family={Updegrove},
+           familyi={U\bibinitperiod},
+           given={Adam\bibnamedelima R.},
+           giveni={A\bibinitperiod\bibinitdelim R\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=d5817166a9f9122ad50f24c39d4f0e0b}{%
+           family={Shadden},
+           familyi={S\bibinitperiod},
+           given={Shawn\bibnamedelima C.},
+           giveni={S\bibinitperiod\bibinitdelim C\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=1fcbbaa7ad51747f5e95f18cf40ac38a}{%
+           family={Cornelissen},
+           familyi={C\bibinitperiod},
+           given={Bart\bibnamedelimb M.\bibnamedelimi W.},
+           giveni={B\bibinitperiod\bibinitdelim M\bibinitperiod\bibinitdelim W\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=a0a6d2a1076b4ce43db3c2071aef3dc1}{%
+           family={Majoie},
+           familyi={M\bibinitperiod},
+           given={Charles\bibnamedelimb B.\bibnamedelimi L.\bibnamedelimi M.},
+           giveni={C\bibinitperiod\bibinitdelim B\bibinitperiod\bibinitdelim L\bibinitperiod\bibinitdelim M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=80dd6e45113c3b52003a6333573a9b7b}{%
+           family={Berg},
+           familyi={B\bibinitperiod},
+           given={Philipp},
+           giveni={P\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=d77a86e4e6e4673c79724996ababb1a1}{%
+           family={Saalfield},
+           familyi={S\bibinitperiod},
+           given={Sylvia},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=d1308c72dd14797e4d714490f60ddc54}{%
+           family={Kono},
+           familyi={K\bibinitperiod},
+           given={Kenichi},
+           giveni={K\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=cb534fd04c099001a59246c4f6ad921a}{%
+           family={Steinman},
+           familyi={S\bibinitperiod},
+           given={David\bibnamedelima A.},
+           giveni={D\bibinitperiod\bibinitdelim A\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{2}{%
+        {Springer Science}%
+        {Business Media LLC}%
+      }
+      \strng{namehash}{ad1174badf612066531fb5670e6680bc}
+      \strng{fullhash}{81504cc0f2dd997649d91f86aa13b6cc}
+      \strng{fullhashraw}{81504cc0f2dd997649d91f86aa13b6cc}
+      \strng{bibnamehash}{4011a0a1b40dab7ab61856fcd8f6053d}
+      \strng{authorbibnamehash}{4011a0a1b40dab7ab61856fcd8f6053d}
+      \strng{authornamehash}{ad1174badf612066531fb5670e6680bc}
+      \strng{authorfullhash}{81504cc0f2dd997649d91f86aa13b6cc}
+      \strng{authorfullhashraw}{81504cc0f2dd997649d91f86aa13b6cc}
+      \field{sortinit}{V}
+      \field{sortinithash}{afb52128e5b4dc4b843768c0113d673b}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{1869-4098}
+      \field{journaltitle}{Cardiovascular Engineering and Technology}
+      \field{number}{4}
+      \field{title}{Real-World Variability in the Prediction of Intracranial Aneurysm Wall Shear Stress: The 2015 International Aneurysm CFD Challenge}
+      \field{volume}{9}
+      \field{year}{2018}
+      \field{pages}{544\bibrangedash 564}
+      \range{pages}{21}
+      \verb{doi}
+      \verb 10.1007/s13239-018-00374-2
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1007/s13239-018-00374-2
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1007/s13239-018-00374-2
+      \endverb
+    \endentry
+    \entry{virtanen2020}{article}{}{}
+      \name{author}{111}{}{%
+        {{un=0,uniquepart=base,hash=18703a2bb6a62484483c193a212da2f8}{%
+           family={Virtanen},
+           familyi={V\bibinitperiod},
+           given={Pauli},
+           giveni={P\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=646fbfe08374cc41c2f9bd971d8c4725}{%
+           family={Gommers},
+           familyi={G\bibinitperiod},
+           given={Ralf},
+           giveni={R\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=d500f4849030f34359cdb3e1513acf83}{%
+           family={Oliphant},
+           familyi={O\bibinitperiod},
+           given={Travis\bibnamedelima E.},
+           giveni={T\bibinitperiod\bibinitdelim E\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=35bb9c71f55048509a3e9018c349ed73}{%
+           family={Haberland},
+           familyi={H\bibinitperiod},
+           given={Matt},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=fbb0c40f5d70be8ce47ce9daafdf5749}{%
+           family={Reddy},
+           familyi={R\bibinitperiod},
+           given={Tyler},
+           giveni={T\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=9fd9ed8466bbb96364ae008f2a665e6e}{%
+           family={Cournapeau},
+           familyi={C\bibinitperiod},
+           given={David},
+           giveni={D\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=09a667aa6a26526bfcccb2676a494e55}{%
+           family={Burovski},
+           familyi={B\bibinitperiod},
+           given={Evgeni},
+           giveni={E\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=3d6efaaa3d9682e20787eb06ff70a3d7}{%
+           family={Peterson},
+           familyi={P\bibinitperiod},
+           given={Pearu},
+           giveni={P\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=4c7e4c94b846fa41e2fc0a88e0dc656d}{%
+           family={Weckesser},
+           familyi={W\bibinitperiod},
+           given={Warren},
+           giveni={W\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=7447cb057596bc2645d3980bb04f5c78}{%
+           family={Bright},
+           familyi={B\bibinitperiod},
+           given={Jonathan},
+           giveni={J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=9a5a65a789013a8d1e8035ec28df9b6e}{%
+           family={Walt},
+           familyi={W\bibinitperiod},
+           given={Stéfan\bibnamedelima J.},
+           giveni={S\bibinitperiod\bibinitdelim J\bibinitperiod},
+           givenun=0,
+           prefix={van\bibnamedelima der},
+           prefixi={v\bibinitperiod\bibinitdelim d\bibinitperiod}}}%
+        {{un=0,uniquepart=base,hash=626cc151613864abeb653c0d8172d98c}{%
+           family={Brett},
+           familyi={B\bibinitperiod},
+           given={Matthew},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=57849e8550281b202bd611bf6f11e14b}{%
+           family={Wilson},
+           familyi={W\bibinitperiod},
+           given={Joshua},
+           giveni={J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=b053969d2c6a9ec8689980fb6463cd56}{%
+           family={Millman},
+           familyi={M\bibinitperiod},
+           given={K.\bibnamedelimi Jarrod},
+           giveni={K\bibinitperiod\bibinitdelim J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=fbaf80580622bd40577f4a6d38021c0a}{%
+           family={Mayorov},
+           familyi={M\bibinitperiod},
+           given={Nikolay},
+           giveni={N\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=7bcf847eaccba039f7a4523540673aea}{%
+           family={Nelson},
+           familyi={N\bibinitperiod},
+           given={Andrew\bibnamedelimb R.\bibnamedelimi J.},
+           giveni={A\bibinitperiod\bibinitdelim R\bibinitperiod\bibinitdelim J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=4b3d26f886661aa723985bcfd835ba18}{%
+           family={Jones},
+           familyi={J\bibinitperiod},
+           given={Eric},
+           giveni={E\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=9ad1d38817acd2f00cb7f324ec7d37ea}{%
+           family={Kern},
+           familyi={K\bibinitperiod},
+           given={Robert},
+           giveni={R\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=8d336f110675c46226ece1db501ce712}{%
+           family={Larson},
+           familyi={L\bibinitperiod},
+           given={Eric},
+           giveni={E\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=65b1934a87acb0abe09c469aaf11c326}{%
+           family={Carey},
+           familyi={C\bibinitperiod},
+           given={C\bibnamedelima J},
+           giveni={C\bibinitperiod\bibinitdelim J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=9989e8a18827e34b15112d671f52bd35}{%
+           family={Polat},
+           familyi={P\bibinitperiod},
+           given={İlhan},
+           giveni={İ\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=b8b88d61c79de60e6e1b5d44e03f5dec}{%
+           family={Feng},
+           familyi={F\bibinitperiod},
+           given={Yu},
+           giveni={Y\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=bf4be16325cb4f641345ca394443fd18}{%
+           family={Moore},
+           familyi={M\bibinitperiod},
+           given={Eric\bibnamedelima W.},
+           giveni={E\bibinitperiod\bibinitdelim W\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=0fd9a0e34f1b2adda41357c948d14986}{%
+           family={VanderPlas},
+           familyi={V\bibinitperiod},
+           given={Jake},
+           giveni={J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=c6a95a8ced3b86b4e7e60a74bc6ebf5a}{%
+           family={Laxalde},
+           familyi={L\bibinitperiod},
+           given={Denis},
+           giveni={D\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=85242652d69220e83cf71ceb8d90a8cb}{%
+           family={Perktold},
+           familyi={P\bibinitperiod},
+           given={Josef},
+           giveni={J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=5bca159e697db439e23b8947dfa4b614}{%
+           family={Cimrman},
+           familyi={C\bibinitperiod},
+           given={Robert},
+           giveni={R\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=70b659f5067a8a2efbee66f770681598}{%
+           family={Henriksen},
+           familyi={H\bibinitperiod},
+           given={Ian},
+           giveni={I\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=fa5163c76600eb11a4d07a28f0701cb0}{%
+           family={Quintero},
+           familyi={Q\bibinitperiod},
+           given={E.\bibnamedelimi A.},
+           giveni={E\bibinitperiod\bibinitdelim A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=db2b4761cc46be347b418e68660c9554}{%
+           family={Harris},
+           familyi={H\bibinitperiod},
+           given={Charles\bibnamedelima R.},
+           giveni={C\bibinitperiod\bibinitdelim R\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=7d86aea5ad1f2b4e27f2f014c71712c2}{%
+           family={Archibald},
+           familyi={A\bibinitperiod},
+           given={Anne\bibnamedelima M.},
+           giveni={A\bibinitperiod\bibinitdelim M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=3876f7c3dbbb1a17823dcd135d07cfc6}{%
+           family={Ribeiro},
+           familyi={R\bibinitperiod},
+           given={Antônio\bibnamedelima H.},
+           giveni={A\bibinitperiod\bibinitdelim H\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=bab4e5caee2d67831e464ce575022b37}{%
+           family={Pedregosa},
+           familyi={P\bibinitperiod},
+           given={Fabian},
+           giveni={F\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=1af2e1049c0f42049401999babb9f7b2}{%
+           family={Mulbregt},
+           familyi={M\bibinitperiod},
+           given={Paul},
+           giveni={P\bibinitperiod},
+           givenun=0,
+           prefix={van},
+           prefixi={v\bibinitperiod}}}%
+        {{un=0,uniquepart=base,hash=aa05dec222bd6e161fb71869fe3f7197}{%
+           family={Vijaykumar},
+           familyi={V\bibinitperiod},
+           given={Aditya},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=be52b28aaad045da57e9e8f251799408}{%
+           family={Bardelli},
+           familyi={B\bibinitperiod},
+           given={Alessandro\bibnamedelima Pietro},
+           giveni={A\bibinitperiod\bibinitdelim P\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=a7526804275259ec551c12acb6ff6031}{%
+           family={Rothberg},
+           familyi={R\bibinitperiod},
+           given={Alex},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=c45a40496577a1a9fa2368bec5cc4ead}{%
+           family={Hilboll},
+           familyi={H\bibinitperiod},
+           given={Andreas},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=4c5c274c284d56db6c924d1a15e8961d}{%
+           family={Kloeckner},
+           familyi={K\bibinitperiod},
+           given={Andreas},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=89373eb06418d6530c31b0fb655f5b04}{%
+           family={Scopatz},
+           familyi={S\bibinitperiod},
+           given={Anthony},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=66a10017a89513b8272bcedcc279b8b4}{%
+           family={Lee},
+           familyi={L\bibinitperiod},
+           given={Antony},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=848bbb8a883bec42d46ee442da523381}{%
+           family={Rokem},
+           familyi={R\bibinitperiod},
+           given={Ariel},
+           giveni={A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=0ed8e41e1d9c2d0971bdd14c9ee88627}{%
+           family={Woods},
+           familyi={W\bibinitperiod},
+           given={C.\bibnamedelimi Nathan},
+           giveni={C\bibinitperiod\bibinitdelim N\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=61abf0e349b6ac223448eba7aa3c99ad}{%
+           family={Fulton},
+           familyi={F\bibinitperiod},
+           given={Chad},
+           giveni={C\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=ee39bc3045bdce26bb617bb993a841c4}{%
+           family={Masson},
+           familyi={M\bibinitperiod},
+           given={Charles},
+           giveni={C\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=b213c3f14fbb35237220ace796186f7a}{%
+           family={Häggström},
+           familyi={H\bibinitperiod},
+           given={Christian},
+           giveni={C\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=00ca2f3aec7fd0f59d04154070c51ab0}{%
+           family={Fitzgerald},
+           familyi={F\bibinitperiod},
+           given={Clark},
+           giveni={C\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=3aca461f88b9ecb9857e9c33b893a695}{%
+           family={Nicholson},
+           familyi={N\bibinitperiod},
+           given={David\bibnamedelima A.},
+           giveni={D\bibinitperiod\bibinitdelim A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=d20b554274c1bd1d4d143a32b7f1de7e}{%
+           family={Hagen},
+           familyi={H\bibinitperiod},
+           given={David\bibnamedelima R.},
+           giveni={D\bibinitperiod\bibinitdelim R\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=5f43c659188539774f5e840d6eee537f}{%
+           family={Pasechnik},
+           familyi={P\bibinitperiod},
+           given={Dmitrii\bibnamedelima V.},
+           giveni={D\bibinitperiod\bibinitdelim V\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=afdb93cdfde1e7883ee852f0023fb4b0}{%
+           family={Olivetti},
+           familyi={O\bibinitperiod},
+           given={Emanuele},
+           giveni={E\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=6eaa2bfd29afeb561a216016319d6646}{%
+           family={Martin},
+           familyi={M\bibinitperiod},
+           given={Eric},
+           giveni={E\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=4321feefe3d5715c6fe12639d2a1f7f1}{%
+           family={Wieser},
+           familyi={W\bibinitperiod},
+           given={Eric},
+           giveni={E\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=b98e088807fc11eda9211e7f4ff90e24}{%
+           family={Silva},
+           familyi={S\bibinitperiod},
+           given={Fabrice},
+           giveni={F\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=57982dd776f41f6a7d3a5f079d381a6d}{%
+           family={Lenders},
+           familyi={L\bibinitperiod},
+           given={Felix},
+           giveni={F\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=a0d2270ae2410f7abf6d0a56340d9449}{%
+           family={Wilhelm},
+           familyi={W\bibinitperiod},
+           given={Florian},
+           giveni={F\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=bfc347fb1e07aa6e0887b3bb8eae633a}{%
+           family={Young},
+           familyi={Y\bibinitperiod},
+           given={G.},
+           giveni={G\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=c870b38e79337432e4c59f29da7d769b}{%
+           family={Price},
+           familyi={P\bibinitperiod},
+           given={Gavin\bibnamedelima A.},
+           giveni={G\bibinitperiod\bibinitdelim A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=2840fb90e21a5d1c97d471453e0c2cca}{%
+           family={Ingold},
+           familyi={I\bibinitperiod},
+           given={Gert-Ludwig},
+           giveni={G\bibinithyphendelim L\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=29cd4a91196977b126cf70678ee417f7}{%
+           family={Allen},
+           familyi={A\bibinitperiod},
+           given={Gregory\bibnamedelima E.},
+           giveni={G\bibinitperiod\bibinitdelim E\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=235032fbc12d47e45283ca9a714aeda7}{%
+           family={Lee},
+           familyi={L\bibinitperiod},
+           given={Gregory\bibnamedelima R.},
+           giveni={G\bibinitperiod\bibinitdelim R\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=2e8b9805bba2fca015c8d25da55e631e}{%
+           family={Audren},
+           familyi={A\bibinitperiod},
+           given={Hervé},
+           giveni={H\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=c515a6e33d101c89570e3a6f9b3b31d3}{%
+           family={Probst},
+           familyi={P\bibinitperiod},
+           given={Irvin},
+           giveni={I\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=638e5ffc9fa426c83a13d623ef715ea2}{%
+           family={Dietrich},
+           familyi={D\bibinitperiod},
+           given={Jörg\bibnamedelima P.},
+           giveni={J\bibinitperiod\bibinitdelim P\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=af5c6c9503dfee3ab3d9b4a940fc6c02}{%
+           family={Silterra},
+           familyi={S\bibinitperiod},
+           given={Jacob},
+           giveni={J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=f74f6cbd534b3da24a45aeec1e9a383f}{%
+           family={Webber},
+           familyi={W\bibinitperiod},
+           given={James\bibnamedelima T},
+           giveni={J\bibinitperiod\bibinitdelim T\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=a2e13f3aaf432fc62a2f4b6d209b1f49}{%
+           family={Slavič},
+           familyi={S\bibinitperiod},
+           given={Janko},
+           giveni={J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=b92b9241b4c25551cd7ea434e96dc8de}{%
+           family={Nothman},
+           familyi={N\bibinitperiod},
+           given={Joel},
+           giveni={J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=4a66cc2c3e7389d3fe45a0517beadeb0}{%
+           family={Buchner},
+           familyi={B\bibinitperiod},
+           given={Johannes},
+           giveni={J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=6ad936d33caf10e79930dd94371fa21f}{%
+           family={Kulick},
+           familyi={K\bibinitperiod},
+           given={Johannes},
+           giveni={J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=85c10679ad8f08c2b0ea65e5de627728}{%
+           family={Schönberger},
+           familyi={S\bibinitperiod},
+           given={Johannes\bibnamedelima L.},
+           giveni={J\bibinitperiod\bibinitdelim L\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=41468f7fa2c19a7c5888e3d0ce686cf2}{%
+           family={Miranda\bibnamedelima Cardoso},
+           familyi={M\bibinitperiod\bibinitdelim C\bibinitperiod},
+           given={José\bibnamedelima Vinícius},
+           giveni={J\bibinitperiod\bibinitdelim V\bibinitperiod},
+           givenun=0,
+           prefix={de},
+           prefixi={d\bibinitperiod}}}%
+        {{un=0,uniquepart=base,hash=00626d473856bea1990e1c2236d987bb}{%
+           family={Reimer},
+           familyi={R\bibinitperiod},
+           given={Joscha},
+           giveni={J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=e469354cc6ed20924b52439df7606aa2}{%
+           family={Harrington},
+           familyi={H\bibinitperiod},
+           given={Joseph},
+           giveni={J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=0c7ac973adeee6d9391d583b298c3e4d}{%
+           family={Rodríguez},
+           familyi={R\bibinitperiod},
+           given={Juan\bibnamedelimb Luis\bibnamedelima Cano},
+           giveni={J\bibinitperiod\bibinitdelim L\bibinitperiod\bibinitdelim C\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=8c435c98f7175eec5cb17c38ccd93512}{%
+           family={Nunez-Iglesias},
+           familyi={N\bibinithyphendelim I\bibinitperiod},
+           given={Juan},
+           giveni={J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=0568dd9ebd78bb327b3ad58f66444daa}{%
+           family={Kuczynski},
+           familyi={K\bibinitperiod},
+           given={Justin},
+           giveni={J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=b66b79f7398fdf7e05f13d995e0085f0}{%
+           family={Tritz},
+           familyi={T\bibinitperiod},
+           given={Kevin},
+           giveni={K\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=140f3f1af8537ad5e6f9e6ef92c046d8}{%
+           family={Thoma},
+           familyi={T\bibinitperiod},
+           given={Martin},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=60eb67cc225c58ee93309a22b68a3776}{%
+           family={Newville},
+           familyi={N\bibinitperiod},
+           given={Matthew},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=9110ca3cb1148151e8c6c4402b54e220}{%
+           family={Kümmerer},
+           familyi={K\bibinitperiod},
+           given={Matthias},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=49770833f6986345aaf831d83e18c697}{%
+           family={Bolingbroke},
+           familyi={B\bibinitperiod},
+           given={Maximilian},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=f8a39cb6c0141eb1be39621d310d3bae}{%
+           family={Tartre},
+           familyi={T\bibinitperiod},
+           given={Michael},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=81b9dd62937b64275110797d8a43ba1b}{%
+           family={Pak},
+           familyi={P\bibinitperiod},
+           given={Mikhail},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=e4d23819637a961e0e598e1c82a8f10d}{%
+           family={Smith},
+           familyi={S\bibinitperiod},
+           given={Nathaniel\bibnamedelima J.},
+           giveni={N\bibinitperiod\bibinitdelim J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=98c47f992836f8ea7d889f5134f751f4}{%
+           family={Nowaczyk},
+           familyi={N\bibinitperiod},
+           given={Nikolai},
+           giveni={N\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=44efb56671232d232b95014856ca438d}{%
+           family={Shebanov},
+           familyi={S\bibinitperiod},
+           given={Nikolay},
+           giveni={N\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=47a2574f7100983f6caf38bde6abc7cd}{%
+           family={Pavlyk},
+           familyi={P\bibinitperiod},
+           given={Oleksandr},
+           giveni={O\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=3aa5fcd928686e8420ae5df426418e04}{%
+           family={Brodtkorb},
+           familyi={B\bibinitperiod},
+           given={Per\bibnamedelima A.},
+           giveni={P\bibinitperiod\bibinitdelim A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=6d61e2f2c7fea6ab51c26c2caf6fe957}{%
+           family={Lee},
+           familyi={L\bibinitperiod},
+           given={Perry},
+           giveni={P\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=7e8f543421b415613202c26e32c43f1d}{%
+           family={McGibbon},
+           familyi={M\bibinitperiod},
+           given={Robert\bibnamedelima T.},
+           giveni={R\bibinitperiod\bibinitdelim T\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=5137612ca11ad7b3dcd5fe4273348265}{%
+           family={Feldbauer},
+           familyi={F\bibinitperiod},
+           given={Roman},
+           giveni={R\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=c1ec5d726b397cbdde5d399cd578a9ac}{%
+           family={Lewis},
+           familyi={L\bibinitperiod},
+           given={Sam},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=a97d5d83dca4b11b91cc05daba7cde59}{%
+           family={Tygier},
+           familyi={T\bibinitperiod},
+           given={Sam},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=6ac85e461ddda955d4724d185829529c}{%
+           family={Sievert},
+           familyi={S\bibinitperiod},
+           given={Scott},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=fb3b77ad742e7c12096b67272f1cf7e5}{%
+           family={Vigna},
+           familyi={V\bibinitperiod},
+           given={Sebastiano},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=8c6d5e5a357ab6333c33f718b25985e4}{%
+           family={Peterson},
+           familyi={P\bibinitperiod},
+           given={Stefan},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=9eb1d76883803e1d1c7ca78792273163}{%
+           family={More},
+           familyi={M\bibinitperiod},
+           given={Surhud},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=9e6336c94d448e3efed147cf15bcdbe7}{%
+           family={Pudlik},
+           familyi={P\bibinitperiod},
+           given={Tadeusz},
+           giveni={T\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=4c89667601d344e72ad8807ce00a1e6b}{%
+           family={Oshima},
+           familyi={O\bibinitperiod},
+           given={Takuya},
+           giveni={T\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=493c3600e64c3952e72887ef47eedf2e}{%
+           family={Pingel},
+           familyi={P\bibinitperiod},
+           given={Thomas\bibnamedelima J.},
+           giveni={T\bibinitperiod\bibinitdelim J\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=3236a008975b02dc3605613ce12da1c4}{%
+           family={Robitaille},
+           familyi={R\bibinitperiod},
+           given={Thomas\bibnamedelima P.},
+           giveni={T\bibinitperiod\bibinitdelim P\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=96cc97b5c8d21d7f8fe98412e20339e6}{%
+           family={Spura},
+           familyi={S\bibinitperiod},
+           given={Thomas},
+           giveni={T\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=513dd6de64f279f2db06ae98629a452f}{%
+           family={Jones},
+           familyi={J\bibinitperiod},
+           given={Thouis\bibnamedelima R.},
+           giveni={T\bibinitperiod\bibinitdelim R\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=ed4111dcc8b824a2aa5c2d782f1ca57a}{%
+           family={Cera},
+           familyi={C\bibinitperiod},
+           given={Tim},
+           giveni={T\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=b9aafe8db25e9e0504ef1975bde9a59d}{%
+           family={Leslie},
+           familyi={L\bibinitperiod},
+           given={Tim},
+           giveni={T\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=0f2d393099735f59c19ebcf04efbb524}{%
+           family={Zito},
+           familyi={Z\bibinitperiod},
+           given={Tiziano},
+           giveni={T\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=02500b85887810c5283b5ccff6767f84}{%
+           family={Krauss},
+           familyi={K\bibinitperiod},
+           given={Tom},
+           giveni={T\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=7360c864bd358b9cfd6c68cd9aecc77c}{%
+           family={Upadhyay},
+           familyi={U\bibinitperiod},
+           given={Utkarsh},
+           giveni={U\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=e2fb284cc447dda0b361d24f661475ce}{%
+           family={Halchenko},
+           familyi={H\bibinitperiod},
+           given={Yaroslav\bibnamedelima O.},
+           giveni={Y\bibinitperiod\bibinitdelim O\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=12df80534e59fa5a3d59c001f6d1fca1}{%
+           family={Vázquez-Baeza},
+           familyi={V\bibinithyphendelim B\bibinitperiod},
+           given={Yoshiki},
+           giveni={Y\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{2}{%
+        {Springer Science}%
+        {Business Media LLC}%
+      }
+      \strng{namehash}{f252038edd7f112d75da3bf0c1edecbc}
+      \strng{fullhash}{f246fa3ac781d04e4ac2713d3fcea43e}
+      \strng{fullhashraw}{f246fa3ac781d04e4ac2713d3fcea43e}
+      \strng{bibnamehash}{dc159e012c4dc37ee525c8496a42c366}
+      \strng{authorbibnamehash}{dc159e012c4dc37ee525c8496a42c366}
+      \strng{authornamehash}{f252038edd7f112d75da3bf0c1edecbc}
+      \strng{authorfullhash}{f246fa3ac781d04e4ac2713d3fcea43e}
+      \strng{authorfullhashraw}{f246fa3ac781d04e4ac2713d3fcea43e}
+      \field{sortinit}{V}
+      \field{sortinithash}{afb52128e5b4dc4b843768c0113d673b}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \true{uniqueprimaryauthor}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{issn}{1548-7105}
+      \field{journaltitle}{Nature Methods}
+      \field{month}{2}
+      \field{number}{3}
+      \field{title}{SciPy 1.0: fundamental algorithms for scientific computing in Python}
+      \field{volume}{17}
+      \field{year}{2020}
+      \field{pages}{261\bibrangedash 272}
+      \range{pages}{12}
+      \verb{doi}
+      \verb 10.1038/s41592-019-0686-2
+      \endverb
+      \verb{urlraw}
+      \verb http://dx.doi.org/10.1038/s41592-019-0686-2
+      \endverb
+      \verb{url}
+      \verb http://dx.doi.org/10.1038/s41592-019-0686-2
+      \endverb
+    \endentry
+  \enddatalist
+\endrefsection
+\endinput
+

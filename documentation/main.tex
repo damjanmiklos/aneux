@@ -1,0 +1,171 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[T1]{fontenc}
+\usepackage[american]{babel}
+\usepackage{graphicx}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{geometry}
+\usepackage{changepage}
+\usepackage[backend=biber,style=apa, natbib=true]{biblatex}
+\usepackage{indentfirst}
+\usepackage{setspace}
+\usepackage{float}%images inline
+\usepackage{hyperref}%references are clickable
+\usepackage{caption}%caption size
+\usepackage{csquotes}
+\usepackage{mathtools}
+%\usepackage{array}%for table line thickness
+%\usepackage{siunitx} %makes the dash look better
+\usepackage[dvipsnames]{xcolor}
+
+% Deep sapphire / midnight navy
+\definecolor{navyblue}{RGB}{16, 68, 128}
+
+\addbibresource{sources.bib}
+
+
+\geometry{a4paper, margin=2.5cm}
+\setlength{\parindent}{1cm}
+\setstretch{1.25}
+\graphicspath{{images/}}
+\setcounter{tocdepth}{2}
+\hypersetup{
+    unicode=true,
+    pdfnewwindow=true,
+    colorlinks=true,
+    linkcolor=navyblue,    % Sections, figures, equations, footnotes
+    citecolor=navyblue,    % Literature citations
+    urlcolor=navyblue,     % External links / DOIs
+    filecolor=navyblue
+}
+\captionsetup{font=footnotesize}
+
+% Make the entire parenthetical citation a single hyperlink target
+\DeclareFieldFormat{citehyperref}{%
+  \DeclareFieldAlias{bibhyperref}{default}% Prevents nested link warnings
+  \bibhyperref{#1}%
+}
+
+\savebibmacro{cite}
+\renewbibmacro*{cite}{%
+  \printtext[citehyperref]{%
+    \restorebibmacro{cite}%
+    \usebibmacro{cite}%
+  }%
+}
+
+
+%\title{Evaluating uncertainty quantification methods in a simplified aneurysm model}
+%\author{Damján Miklós}
+%\date{September 2025}
+
+\begin{document}
+
+\begin{titlepage}
+    \centering
+    % --- TOP SECTION: LOGO AND UNIVERSITY ---
+    % Add a flexible space at the very top to push content down a bit.
+    %\vspace*{1cm}
+    \includegraphics[width=8cm]{figures/bme_logo_kicsi.png}\\[0.5cm] % Reduced fixed space
+    {\large\textsc{\textbf{Budapest University of Technology and Economics}}}\\[0.5cm]
+    %{\large\textsc{Faculty of Mechanical Engineering}}\\[0.5cm]
+    {\large\textsc{Department of Hydrodynamic Systems}}
+
+    % \vfill will automatically add the right amount of space here.
+    \vfill
+
+    % --- MIDDLE SECTION: AUTHOR AND TITLES ---
+    {\Huge Miklós Damján}\\[1cm]
+    {\Large\bfseries Reconstructing CFD-ready intracranial vessel surfaces with aneurysms}\\[1cm]
+
+
+    % \vfill will also add flexible space here.
+    \vfill
+
+    % --- CONSULTANT SECTION ---
+    % This section is pushed towards the bottom third of the page.
+    \begin{minipage}[t]{0.45\textwidth}
+        \raggedright
+        \textbf{Supervisors:}\\[0.5cm]
+        Dr. Csippa Benjamin\\
+        Assistant professor\\[1cm]
+        Sándor Levente\\
+        Research assistant
+    \end{minipage}
+    \hfill
+    \begin{minipage}[t]{0.45\textwidth}
+        % Intentionally left empty.
+    \end{minipage}
+
+    % Add a final bit of fixed space before the date.
+    \vspace{3cm}
+
+    % --- BOTTOM SECTION: LOCATION AND DATE ---
+    {\large Scientific Students' Associations Conference, Budapest, 2026}
+    
+    \vspace*{0.5cm}
+    {\large Faculty of Electrical Engineering and Informatics}
+    \vspace*{1cm} % A bit of space at the very bottom.
+
+\end{titlepage}
+
+
+%\maketitle
+%\thispagestyle{empty}
+\newpage
+
+\setcounter{page}{1}
+\begin{adjustwidth}{0.5in}{0.5in} 
+    \begin{center}
+        \large\bfseries Abstract
+    \end{center}
+\noindent Computational fluid dynamics (CFD) is increasingly being used to assess the likelihood of a successful treatment using a flow diverting stent, but it requires vessel surfaces that are watertight, have open outlets, and contain high-resolution texture data. Furthermore, surgical treatment options, such as the choice of patient-specific stents, require uncertainty quantification (UQ). A large part of the uncertainty arises from the geometry of the internal carotid artery (ICA), which prompts the need for a large database compared to existing ones, as well as the need to parameterise the meshes for distribution-based sampling. Our goal was to build a generative neural network that can generate anatomically accurate high-resolution meshes from a condition vector with no additional 3D inputs. Our paper works toward achieving this goal by building a network to reconstruct the ICA with an aneurysm present. We built this network with the constraint that it needs to perform well not only in reconstruction but also as a second-stage model in the aforementioned project. This greatly limited our options, such as the construction of the latent space. Our reconstruction model can create anatomically accurate CFD-ready meshes without the need for manual repair.
+\end{adjustwidth}
+
+
+\tableofcontents
+
+\section{Introduction}
+
+This work builds upon the uncertainty quantification methods developed in our previous Scientific Students' Associations Conference (TDK) paper \citep{miklos2025} with a later version presented at the 2026 Virtual Physiological Human Conference \citep{miklos2026}.
+
+Our study focuses on the treatment of intracranial aneurysms, which occur when the wall of an artery in the skull weakens. This weakening causes an abnormal bulge to develop very slowly, which can cascade as the wall naturally continues to weaken from the bulging. This abnormal bulge is referred to as an aneurysm. Examples are shown in Figure~\ref{fig:aneurysm}.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.6\linewidth]{aneurysmexample.png}
+    \caption{Intracranial sidewall aneurysm examples. The aneurysm sac is highlighted in blue. \citep{csippa2021}}
+    \label{fig:aneurysm}
+\end{figure}
+
+An unruptured intracranial aneurysm is present in about 3.2\%--6\% of the general population \citep{cianfoni2013, hackett2023}. This can have noticeable but non-fatal side effects such as headache, vertigo, cognitive and visual disturbances in 46\%, 21\%, 15\% and 14\% of the population, respectively \citep{hackett2023}. The main risk however is rupture risk, if the aneurysm grows too much or the walls weaken, it can rupture. That has a very high mortality rate, \citet{nieuwkamp2009} finds that while the mortality rate of ruptures varies between studies in Europe it generally falls into the 40\%--50\% range, with 66\% of patients experiencing lifelong neurological disability thereafter \citep{hackett2023}. \citet{cianfoni2013} finds that half of rupture cases are patients aged below 55. These risk factors combined mean that aneurysm is very serious health concerned even for modern medicine.
+
+The three main treatment options are surgical clipping, endovascular coiling and flow diversion (FD) using stent. All of the aforementioned methods aim to slow down the blood flow inside the aneurysm sac. If the blood's velocity inside the sac decreases sufficiently occlusion can occur. This can yield to the start of the aneurysm's natural healing process, although the exact values to facilitate that are currently an actively researched with no agreed upon figures \citep{kulcsar2012,mut2015,oared2016}. Clipping aims to place a strong clip onto the neck of the aneurysm, thereby decreasing its cross section and therefore the flow rate into the sac. Coiling places a long wire inside the sac which creates a strong resistance for the blood flow. Stenting uses a mesh-like tube in the parent artery to divert blood flow away from the aneurysm as shown in Figure~\ref{fig:stent}. 
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.5\linewidth]{stent.png}
+    \caption{Example of a fully deployed flow diverter stent. \citep{zavodszky2020}}
+    \label{fig:stent}
+\end{figure}
+
+These treatment options mean that computational fluid dynamics (CFD) plays a very important role in both evaluating the efficacy of these methods and comparing the patient-specific surgical options. Our paper is part of the growing field of virtual patient research using in-silico trials \citep{viceconti2016}. By replicating a given patient digitally, we can take measurements that would otherwise be invasive or impossible such as measuring the entire mean relative velocity reduction inside the sac when a stent is inserted compared to a baseline without the stent using CFD. Other statistics such as measuring the wall shear stress (WSS) on the healthy vessel can give us an indication on the likelihood of an aneurysm developing \citep{Frösen2019}.
+
+These predictions trough CFD require a very high resolution and accurate mesh for both flow field and WSS calculations. This very high resolution meshes are very hard to come by when it comes to the internal carotid artery (ICA) with aneurysms. There are numerous datasets with meshes that are derived from magnetic resonance angiography (MRA) or computed tomography angiography (CTA) based images, these are not high enough resolution to run our simulations. For this reason we looked at 3D rotational angiography (3DRA), the only publicly available segmented dataset currently is the AneuX dataset \citep{juchler2022}, this contains meshes based on 0.2 mm resolution images.
+
+In our preliminary research \citep{miklos2025}, we modelled the uncertainty of stents as treatment options, while we were able to model uncertainties in boundary and treatment conditions we were unable to model geometric uncertainty and we estimate that to be the largest contributor to uncertainty. This was the original motivation for this study. While AneuX contains 682 vessels, when we filter it to an aneurysm type that our study looks at, for example, one at the bifurcation of the ICA, we are left with only 39 meshes, that few meshes don't have enough variation to cover a wide range of geometries. Ideally we would approximate the prior distribution of the geometries than sample from that based on an optimal sampling approach. Due to discrete nature of that distribution and data scarcity this study aims to bypass that by building the first steps towards a fully generative conditional neural network where we can continuously vary the condition vector that results in the posterior distribution of these vessel geometries allowing us to extend our uncertainty quantification methods to geometric uncertainty which is a gap in existing literature to measure how real geometric variations influence the uncertainty in the treatment outcome.
+
+In addition to the original motivation of continuous sampling of geometries, this presents numerous other benefits. This neural network is a two-stage model in which the first stage builds a global geometry using the centreline of the vessel and a feature-rich set of latent vectors on it; the second stage then builds a high-fidelity mesh of the entire vessel. Low-resolution or poorly segmented anatomical meshes are easy to obtain, but even for those, the boundary noise and inaccuracies largely cancel out when calculating the centreline because it radially averages around the lumen. This allows us to easily modify stage two in such a way that it can upscale these types of low-quality images based on our highly accurate prior distribution. Crucially, this does not require the first stage.
+
+Other options that only require a conditional stage two are morphological manipulations of an existing vessel. This allows us to, for example, study the effects of placing the aneurysm somewhere else or changing the curvature or torsion of the bends by altering the condition vector. This allows us to attain precise results for the variation of a single parameter. Additionally, it allows us to study the effects of demographic variables such as age and sex, which are available in the AneuX dataset. \citet{fonck2009} already documented the structural degradation of the ICA with ageing; a neural network like ours could allow the study of this effect from the other direction. We know that structural integrity decreases, but do the stresses such as WSS change too, due to changes in the wall texture? To answer this question, we would need to use this model to generate two synthetic patient meshes with identical parameters, then inside the latent space continuously sweep the global latent vector using high-dimensional interpolation, and isolate the effects of aging.
+
+In this study, we successfully developed, validated, and tested the unconditional second stage of this pipeline in a manner that can be seamlessly integrated into the two-stage model that has not yet been built. This current version does not allow us to study the aforementioned effects as this model is not conditional; however, this is the first and necessary step in achieving that goal. Stage two of this network can not alone act as a generative model without stage one; instead, it functions as a reconstruction model. Crucially, in every step of the development of this model, we tightly constrained our options, such as not using any skip connections between the encoder and decoder, using a tree-based latent that stage one could natively output, and a variational autoencoder to create a highly regularised, continuous latent space that is optimal for stage one.
+
+While these necessary constrains inevitably decrease the model's accuracy we were able to achieve \textbf{NOT FINISHED PARAGRAPH}
+
+\section*{Acknowledgements}
+\addcontentsline{toc}{section}{Acknowledgements}
+This study was supported by the NVIDIA Corporation via the Academic Hardware Grants Program.
+
+\printbibliography
+
+\end{document}
