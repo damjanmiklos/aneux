@@ -1,0 +1,66 @@
+% Standalone build of the Data preparation chapter.
+% Same preamble as ../main.tex, plus TikZ for the pipeline figure.
+% Build:  latexmk -pdf data_preparation_standalone.tex
+%   (or pdflatex -> biber -> pdflatex -> pdflatex)
+\documentclass[12pt,a4paper]{article}
+\usepackage[T1]{fontenc}
+\usepackage[american]{babel}
+\usepackage{graphicx}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{geometry}
+\usepackage{changepage}
+\usepackage[backend=biber,style=apa, natbib=true]{biblatex}
+\usepackage{indentfirst}
+\usepackage{setspace}
+\usepackage{float}%images inline
+\usepackage{hyperref}%references are clickable
+\usepackage{caption}%caption size
+\usepackage{csquotes}
+\usepackage{mathtools}
+\usepackage[dvipsnames]{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{positioning,arrows.meta}
+
+% Deep sapphire / midnight navy
+\definecolor{navyblue}{RGB}{16, 68, 128}
+
+\addbibresource{dataprep.bib}
+
+\geometry{a4paper, margin=2.5cm}
+\setlength{\parindent}{1cm}
+\setstretch{1.25}
+\graphicspath{{./}}
+\setcounter{tocdepth}{2}
+\hypersetup{
+    unicode=true,
+    pdfnewwindow=true,
+    colorlinks=true,
+    linkcolor=navyblue,
+    citecolor=navyblue,
+    urlcolor=navyblue,
+    filecolor=navyblue
+}
+\captionsetup{font=footnotesize}
+
+% Make the entire parenthetical citation a single hyperlink target
+\DeclareFieldFormat{citehyperref}{%
+  \DeclareFieldAlias{bibhyperref}{default}%
+  \bibhyperref{#1}%
+}
+\savebibmacro{cite}
+\renewbibmacro*{cite}{%
+  \printtext[citehyperref]{%
+    \restorebibmacro{cite}%
+    \usebibmacro{cite}%
+  }%
+}
+
+\begin{document}
+
+% Numbered as section 2 so cross-references read as they will in the paper.
+\setcounter{section}{1}
+\input{data_preparation.tex}
+
+\printbibliography
+
+\end{document}

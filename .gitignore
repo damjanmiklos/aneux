@@ -77,3 +77,6 @@ datatransform/template_creation/build/
 # Parent tubes kept between variable_remeshing.py runs
 .variable_tube_cache/
 1test_encoder_decoder_only/train_pipeline/_build/
+
+# Raw renders for the data-preparation chapter (the figures actually used live in figures/)
+documentation/data prep/renders/
